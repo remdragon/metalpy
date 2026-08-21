@@ -49,25 +49,22 @@ class OwnState( Enum ):
 	COPY = 'copy'
 	MOVED = 'moved'
 
-# is_rc/rc_leaves/_is_direct_pointer_rc all used to be open-coded isinstance
-# ladders right here, which is how the same bug shipped three separate times:
-# a new Type kind appeared, this ladder wasn't updated, and the new kind
-# silently defaulted to "not RC" (nested-union leaf -> leak; generic union's
+# rc_leaves/_is_direct_pointer_rc used to be open-coded isinstance ladders
+# right here, which is how the same bug shipped three separate times: a new
+# Type kind appeared, this ladder wasn't updated, and the new kind silently
+# defaulted to "not RC" (nested-union leaf -> leak; generic union's
 # unsubstituted TypeVar leaves -> UAF; unresolved union -> order-dependent
 # UAF). Each type kind now answers for itself - see mpy_types.Type's own
 # is_rc/is_rc_pointer/rc_leaves, which carry the full history of those bugs.
-# These stay as module-level names purely because ~20 call sites in this file
-# and lowering.py already spell them that way.
-
-def is_rc( t: Type ) -> bool:
-	return t.is_rc()
+# These two stay as module-level names purely because their call sites in
+# this file and lowering.py already spell them that way. is_result_type
+# likewise delegates to mpy_types.Type.is_result_type(), but stays a free
+# function (rather than being replaced by direct .is_result_type() calls)
+# since every call site passes a Type|None and needs the None-guard.
 
 def is_result_type( t: Type|None ) -> bool:
 	''' True when `t` is a concrete Result[T,E] specialization. '''
-	if t is None:
-		return False
-	base = t.base if isinstance( t, Specialization ) else t
-	return isinstance( base, TaggedUnion ) and base.stem == 'Result'
+	return t is not None and t.is_result_type()
 
 def rc_leaves( t: Type ) -> list[Type]:
 	return t.rc_leaves()
@@ -103,6 +100,7 @@ class Epilogue:
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
 	captured: bool = False # current_epilogue_label() has handed this entry's own .name out as a live jump target at least once - see manually_decreffed()/deleted()/move()'s shared _neutralize() helper for why this matters: a plain compile-time `cancelled = True` is only correct for an entry NO earlier return has already committed a goto into, since build_epilogue_ladder() bakes the entry's FINAL cancelled state into every jump site that shares it, not the state at each individual jump's own time
+	is_construction_attr: bool = False # a self.<attr> entry pushed by attr_assign()/complete_base_construction() during a fallible __init__ - see current_epilogue_label_for_construction_err()'s own docstring for why these can never share a label the way a defer/errdefer or plain local entry can
 
 	@property
 	def is_flag_guarded( self ) -> bool:
@@ -129,6 +127,26 @@ class InlineScope:
 	that matters. '''
 	boundary_depth: int # len(self._epilogue_stack) at push time - entries below this belong to an outer scope (the caller, or an outer splice) and must never be inspected/replayed from inside this one
 	label: str # this scope's own shared-ladder fallback target - see current_epilogue_label()'s own comment
+	# two INDEPENDENT captured flags, not one shared bit - lowering.py's own
+	# _splice_multi_statement_inline_body builds two labels around this
+	# scope (`label` itself, and a separate merge_label it owns directly,
+	# not stored here), and an early exit only ever reaches ONE of them: an
+	# ordinary .or_return()/checked-arithmetic with nothing else pending
+	# jumps straight to `label` via current_epilogue_label() (captured
+	# below), after which merge_label is reached only by ordinary
+	# fallthrough (from label's own replayed ladder) - NEVER a real goto,
+	# UNLESS some other early exit in the SAME splice took the separate
+	# inline-unwind bypass path instead (mark_inline_scope_captured() below,
+	# called directly by _stmt_Return/_consume_checked_result - see their
+	# own comments), which jumps PAST `label` straight to merge_label.
+	# Conflating the two into one flag is a real, confirmed bug: it makes
+	# merge_label look "used" whenever ANY early exit occurred anywhere in
+	# the splice, even one that only ever captured `label` - still a
+	# genuine -Wunused-label on merge_label specifically, confirmed by a
+	# real repro (a splice with a SINGLE or_return() call, going through
+	# `label`'s own capture path, not the bypass one).
+	captured: bool = False # `label` has been handed out as a live jump target - see current_epilogue_label()
+	merge_captured: bool = False # merge_label has been jumped to DIRECTLY (the inline-unwind bypass) - see mark_inline_scope_captured()
 
 @dataclass
 class _Snapshot:
@@ -138,6 +156,7 @@ class _Snapshot:
 	stack_depth: int
 	results: set[str]
 	narrowed: dict[str,Variable]
+	live: set[str]
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -179,7 +198,9 @@ class CFGState:
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
+		self._break_live_stack: list[list[set[str]]] = [] # the definite-assignment analogue of _break_narrowed_stack above - one set[str] snapshot per break, see record_break_live()
 		self.bindings: Bindings = {}
+		self._live: set[str] = set() # names of locals DEFINITELY ASSIGNED on the current path - independent of RC tracking above (unlike bindings/rc_leaves, tracks EVERY local regardless of type - see assign()/is_live()/_expr_Name's own liveness gate). Parameters/self are always live from entry (seeded below/in enter_self()); a bare AnnAssign's own name is added to fn.names but NOT here until its first real assignment
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._narrowed: dict[str,list[Variable]] = {} # name -> the non-empty set of the UNION's own members it could still be (each .type the narrowed leaf, .stem the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead", and ONLY when the set has collapsed to exactly one member - see narrowed_member(). A single narrow() call always starts as a one-element list; merge_if's own soft-merge can grow it (two disagreeing-but-both-still-possible branches union together rather than discarding the fact) or drop it (a name narrowed on only SOME surviving paths)
 		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
@@ -197,6 +218,7 @@ class CFGState:
 		# down to T, recording the ownership fact on is_move/is_copy
 		# instead - see Parameter's own docstring) - only the OWNERSHIP
 		# STATE this prologue sets up differs by which flag is set
+		self._live.add( param.stem ) # every parameter is definitely assigned from function entry, RC or not
 		if param.is_move:
 			# the callee now fully owns the incoming reference - MOVED is
 			# the CALLER's state at the call site, not the callee's own
@@ -224,6 +246,7 @@ class CFGState:
 		because __del__ already guards the double-free via the
 		BYTEARRAY_INVALID sentinel, unrelated to this). Otherwise BORROWED,
 		like any other plain parameter - self is never copy[T]. '''
+		self._live.add( self_param.stem ) # self is definitely assigned from entry, RC or not - unlike the rc_leaves early-return below, this must run unconditionally
 		if not rc_leaves( self_param.type ):
 			return
 		if is_move:
@@ -245,10 +268,20 @@ class CFGState:
 		local, no separate "uninitialized" state needed. '''
 		self.enter_self( self_param, is_move = False )
 		self._construction_self = self_param
-		self._construction_required = required
+		# a COPY, not the caller's own list by reference - the caller passes
+		# self_cls.attributes directly (lowering.py), the class's own
+		# permanent declared-fields list; complete_base_construction() below
+		# appends base attributes onto self._construction_required so
+		# complete_construction()'s success-path cancellation loop also
+		# covers them (see its own comment) - without this copy, that append
+		# would mutate self_cls.attributes itself, permanently duplicating
+		# the base attribute into the subclass's own field list (confirmed
+		# by a real "duplicate member" C struct compile error while fixing
+		# the bug complete_base_construction's own comment describes).
+		self._construction_required = list( required )
 
-	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None ) -> Epilogue:
-		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref )
+	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None, is_construction_attr: bool = False ) -> Epilogue:
+		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref, is_construction_attr = is_construction_attr )
 		self._epilogue_stack.append( entry )
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
@@ -284,22 +317,47 @@ class CFGState:
 		self._inline_scope_stack.append( scope )
 		return scope.label
 
-	def pop_inline_scope( self ) -> None:
+	def inline_scope_captured( self ) -> bool:
+		''' whether the innermost active scope's own `label` (NOT its
+		separate merge_label - see InlineScope's own docstring for why the
+		two need independent tracking) has been handed out as a real jump
+		target so far. Peeks without popping, so lowering.py can gate its
+		scope_label ir.Label BEFORE build_inline_scope_ladder() runs (pop_
+		inline_scope() only happens after that, but merge_label's own ir.
+		Label is emitted after the pop - see its own return value instead). '''
+		return self._inline_scope_stack[-1].captured
+
+	def mark_inline_scope_captured( self ) -> None:
+		''' called by lowering.py right before it emits a real jump straight
+		to the innermost active scope's own merge_label, bypassing `label`
+		entirely (the "inline-unwind return_()/.or_return() already
+		replayed everything itself" shape - see _stmt_Return/_consume_
+		checked_result's own inline_exit branches) - current_epilogue_label()
+		only marks `label` captured when IT hands that one out, so this
+		separate bypass path (which never calls it, and targets the OTHER
+		label) needs its own explicit signal. '''
+		self._inline_scope_stack[-1].merge_captured = True
+
+	def pop_inline_scope( self ) -> bool:
 		''' called once the splice's own local ladder has been fully emitted
 		(lowering.py's own responsibility - this just stops
 		current_epilogue_label()/return_() from consulting this scope's
 		boundary any further, restoring the immediately-enclosing scope, if
 		any, to visibility - the caller/outer splice's own entries were never
 		touched while this scope was active, so there's nothing left to
-		reconcile here beyond popping the stack entry itself. '''
-		self._inline_scope_stack.pop()
+		reconcile here beyond popping the stack entry itself. Returns
+		whether the popped scope's own merge_label was ever captured -
+		lowering.py's own merge_label ir.Label is emitted right after this
+		call, gated on it (see inline_scope_captured()'s own docstring for
+		why `label` itself is peeked separately, before this pop, instead). '''
+		return self._inline_scope_stack.pop().merge_captured
 
 	# --- snapshot/restore, for IF/loop orchestration ----------------------------
 
 	def snapshot( self ) -> _Snapshot:
 		return _Snapshot(
 			bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ),
-			narrowed = dict( self._narrowed ),
+			narrowed = dict( self._narrowed ), live = set( self._live ),
 		)
 
 	def restore( self, snap: _Snapshot ) -> None:
@@ -321,10 +379,18 @@ class CFGState:
 		above, and (v1 scope, see TODO.txt's own "union disambiguation"
 		section) narrowing never survives past its own branch regardless of
 		whether that branch could only have been entered when it's true -
-		no cross-branch/post-if narrowing tracking is attempted yet. '''
+		no cross-branch/post-if narrowing tracking is attempted yet.
+
+		_live reverts the same unconditional way, for the identical reason:
+		a name only definitely-assigned INSIDE a branch/loop body is never
+		assumed definitely-assigned once back outside it - merge_if()/
+		merge_loop_exits() are what let a name's liveness survive past the
+		construct, via their own explicit reconciliation, same split of
+		responsibility as bindings/narrowed above. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
+		self._live = set( snap.live )
 		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
@@ -351,18 +417,21 @@ class CFGState:
 		empty collection list onto _break_narrowed_stack (Phase 8) - every
 		`break` reached while lowering THIS loop's own body records a
 		narrowed-state snapshot into it, consumed by exit_loop()'s own
-		return value once this loop's body is fully lowered. '''
+		return value once this loop's body is fully lowered. _break_live_
+		stack is the definite-assignment analogue, pushed/popped in lockstep
+		- see record_break_live()/merge_loop_exits(). '''
 		self._confinement_depths.append( stack_depth )
 		self._break_narrowed_stack.append( [] )
+		self._break_live_stack.append( [] )
 
-	def exit_loop( self ) -> list[dict[str,list[Variable]]]:
-		''' pops and returns every narrowed-state snapshot record_break_
-		narrowed() collected while lowering this loop's own body (Phase 8)
-		- the caller (lowering.py's _stmt_While/for-loop lowerers) merges
-		these together with whatever the loop's own natural exit implies
-		via merge_loop_exits(). '''
+	def exit_loop( self ) -> tuple[list[dict[str,list[Variable]]],list[set[str]]]:
+		''' pops and returns every narrowed-state/live-state snapshot
+		record_break_narrowed()/record_break_live() collected while lowering
+		this loop's own body (Phase 8) - the caller (lowering.py's
+		_stmt_While/for-loop lowerers) merges these together with whatever
+		the loop's own natural exit implies via merge_loop_exits(). '''
 		self._confinement_depths.pop()
-		return self._break_narrowed_stack.pop()
+		return self._break_narrowed_stack.pop(), self._break_live_stack.pop()
 
 	def record_break_narrowed( self ) -> None:
 		''' called by lowering.py's _stmt_Break, BEFORE its own unwind_to()
@@ -379,7 +448,21 @@ class CFGState:
 		if self._break_narrowed_stack:
 			self._break_narrowed_stack[-1].append( dict( self._narrowed ))
 
-	def merge_loop_exits( self, natural_exit_narrowed: dict[str,list[Variable]] | None, break_narrowed: list[dict[str,list[Variable]]] ) -> None:
+	def record_break_live( self ) -> None:
+		''' the definite-assignment analogue of record_break_narrowed() -
+		called from the same _stmt_Break call site, alongside it. Captures
+		the CURRENT _live state at the exact point this break fires, into
+		the innermost currently-lowering loop's own collection list -
+		consumed by merge_loop_exits() below. Same "not for continue/return"
+		reasoning as record_break_narrowed(). '''
+		if self._break_live_stack:
+			self._break_live_stack[-1].append( set( self._live ))
+
+	def merge_loop_exits(
+		self,
+		natural_exit_narrowed: dict[str,list[Variable]] | None, break_narrowed: list[dict[str,list[Variable]]],
+		natural_exit_live: set[str] | None = None, break_live: list[set[str]] = (),
+	) -> None:
 		''' called once a loop's own body has been fully lowered (after
 		its own restore() back to the loop's entry snapshot) - reconciles
 		every way execution can actually reach the code AFTER this loop:
@@ -393,26 +476,65 @@ class CFGState:
 		value is the UNION (dedup by identity) of what each one narrowed
 		it to - not just an identical-only intersection. No candidates at
 		all (an unconditional `while True:` with no break) means nothing
-		reaches past the loop - empty is correct (dead code follows). '''
+		reaches past the loop - empty is correct (dead code follows).
+
+		natural_exit_live/break_live are the definite-assignment analogue,
+		reconciled by plain set INTERSECTION across every candidate (same
+		"AND, never an error here" rule as _merge_live_soft) rather than
+		narrowed's union-of-possible-members - a name is live past the loop
+		only if EVERY way of reaching here leaves it definitely assigned.
+
+		No candidates at all (dead code follows) is handled differently
+		here than for narrowed, on purpose: narrowed information can only
+		ever cause an over-eager ACCEPT if kept, so wiping it is the safe
+		default; but self._live gates whether a read is accepted AT ALL -
+		wiping it to empty would make every single name in that dead code
+		look uninitialized, including parameters/self (live from function
+		entry, unconditionally). This compiler doesn't strip unreachable
+		statements - they still get lowered structurally, same as any
+		other statement (confirmed by a real repro: `while True: pass`
+		with no break, followed by an ordinary `return <a parameter>`,
+		fails "not initialized on all code branches" even though the
+		parameter obviously IS - PLAN_GENERATORS.md's own generator
+		rebuild hit this for real: its $$__next__ body always has more
+		code after a user's own while-True-with-no-break loop, namely the
+		generator's own tail). Leaving self._live untouched here (already
+		restore()'d to the loop's own entry snapshot by every caller
+		before this runs) is a safe over-approximation either way: if the
+		code really is dead, an over-generous live set just lets reads
+		that never execute through harmlessly; if it isn't (a resumable
+		generator jumping back in), the loop's own entry liveness is
+		exactly the right starting point, since nothing between loop
+		entry and here could have invalidated it. '''
 		candidates = list( break_narrowed )
 		if natural_exit_narrowed is not None:
 			candidates.append( natural_exit_narrowed )
 		if not candidates:
 			self._narrowed = {}
-			return
-		merged: dict[str,list[Variable]] = dict( candidates[0] )
-		for other in candidates[1:]:
-			next_merged: dict[str,list[Variable]] = {}
-			for name, members in merged.items():
-				if name not in other:
-					continue
-				combined = list( members )
-				for m in other[name]:
-					if not any( m is existing for existing in combined ):
-						combined.append( m )
-				next_merged[name] = combined
-			merged = next_merged
-		self._narrowed = merged
+		else:
+			merged: dict[str,list[Variable]] = dict( candidates[0] )
+			for other in candidates[1:]:
+				next_merged: dict[str,list[Variable]] = {}
+				for name, members in merged.items():
+					if name not in other:
+						continue
+					combined = list( members )
+					for m in other[name]:
+						if not any( m is existing for existing in combined ):
+							combined.append( m )
+					next_merged[name] = combined
+				merged = next_merged
+			self._narrowed = merged
+		live_candidates = list( break_live )
+		if natural_exit_live is not None:
+			live_candidates.append( natural_exit_live )
+		if not live_candidates:
+			pass # dead code follows - leave self._live exactly as restore() already set it (the loop's own entry snapshot), see this method's own docstring for why that's the safe choice here, unlike self._narrowed above
+		else:
+			live_merged = set( live_candidates[0] )
+			for other_live in live_candidates[1:]:
+				live_merged &= other_live
+			self._live = live_merged
 
 	def enter_branch( self, stack_depth: int ) -> None:
 		''' called by lowering.py's own _stmt_If, bracketing one if/elif/
@@ -475,6 +597,60 @@ class CFGState:
 		own true_end_narrowed/false_end_narrowed params) - mirrors
 		unchecked_results()'s own identical purpose. '''
 		return dict( self._narrowed )
+
+	# --- definite-assignment ("liveness") tracking -------------------------
+
+	def live_snapshot( self ) -> set[str]:
+		''' a defensive copy for lowering.py to capture alongside bindings/
+		narrowed/unchecked_results() around if/loop orchestration (see
+		merge_if()'s own true_end_live/false_end_live params) - mirrors
+		narrowed_snapshot()'s own identical purpose. '''
+		return set( self._live )
+
+	def is_live( self, name: str ) -> bool:
+		''' True if `name` is definitely assigned on the CURRENT path -
+		called from lowering.py's _expr_Name (every Name read) and
+		_stmt_Delete, the two places a local's value is actually consumed.
+		Type-independent, unlike self.bindings (RC-only) - a plain scalar/
+		struct/enum local is tracked here even though it has no entry in
+		bindings at all. '''
+		return name in self._live
+
+	def mark_live( self, name: str ) -> None:
+		''' marks `name` live directly, bypassing assign()'s own RC/Result
+		bookkeeping - for lowering.py plumbing that legitimately bypasses
+		_cfg_assign by design (compiler-synthesized loop scaffolding via
+		_declare_hidden_local/_bind_loop_target; @inline's own parameter/
+		self binding, which is deliberately untracked by cfg.py at all -
+		see _lower_inline_call's own "no _cfg_assign/incref here,
+		deliberately" comment) but is still unconditionally bound at
+		exactly the point this is called - same reasoning as parameters/
+		self being seeded live from function entry in __init__/enter_self. '''
+		self._live.add( name )
+
+	def unmark_live( self, name: str ) -> None:
+		''' the inverse of mark_live() - lets a caller that temporarily
+		marks a name live (inline parameter binding, which shadows-and-
+		restores fn.names the same way) put the name's liveness back
+		exactly as found afterward, rather than leaking a permanent
+		liveness fact for a name that wasn't actually live before the
+		splice (e.g. an outer local that happens to share a spliced
+		function's own parameter name). '''
+		self._live.discard( name )
+
+	def set_live( self, live: set[str] ) -> None:
+		''' overwrites the ENTIRE live set wholesale - used by @inline's
+		own multi-statement splice (lowering.py's _lower_inline_call) to
+		fully revert whatever liveness the splice's own pre-return
+		statements produced, once the whole splice returns. Safe as a
+		blunt full-revert (unlike merge_if/merge_loop_exits' own precise
+		reconciliation) because every name the splice's body could mark
+		live is either alpha-renamed to a name unique to that one splice
+		(never referenced again by the caller) or a self/parameter binding
+		that's deliberately reverted rather than leaking past the call -
+		mirrors the provisional Function itself being single-use and
+		discarded once the splice returns. '''
+		self._live = set( live )
 
 	# --- unchecked Result tracking ----------------------------------------
 
@@ -552,6 +728,7 @@ class CFGState:
 		entry_results: set[str] = frozenset(), true_end_results: set[str] = frozenset(), false_end_results: set[str] = frozenset(),
 		true_terminates: bool = False, false_terminates: bool = False,
 		true_end_narrowed: dict[str,list[Variable]] | None = None, false_end_narrowed: dict[str,list[Variable]] | None = None,
+		true_end_live: set[str] = frozenset(), false_end_live: set[str] = frozenset(),
 	) -> tuple[list[ir.Instruction],list[ir.Instruction],list[str]]:
 		''' called after lowering.py has already restore()'d back to the
 		if's own entry snapshot (so self.bindings/self._epilogue_stack are
@@ -629,7 +806,21 @@ class CFGState:
 		is needed - unlike bindings (which needs entry state to distinguish
 		"already live" from "needs a fresh push") or results (whose own
 		error path checks entry_results), a narrowed fact's survival past
-		the join depends only on the two end-states. '''
+		the join depends only on the two end-states.
+
+		true_end_live/false_end_live are the definite-assignment analogue -
+		captured by lowering.py via live_snapshot() at the same points it
+		captures narrowed_snapshot() - reconciled the same soft way narrowing
+		is (see _merge_live_soft), except by INTERSECTION rather than union:
+		a name survives only if BOTH branches leave it definitely assigned,
+		since ANY disagreement means a later read could hit the not-assigned
+		path. Unlike bindings' own hard "exists on only one branch" error
+		above, disagreement here is never a CompileError at the merge point -
+		it's deferred to the actual read/del (_expr_Name/_stmt_Delete), which
+		is where the user-facing "not initialized on all code branches"
+		message belongs. This is deliberately independent of Bindings/
+		rc_leaves - it covers every local, RC or not (see assign()'s own
+		unconditional self._live.add()). '''
 		true_instructions: list[ir.Instruction] = []
 		false_instructions: list[ir.Instruction] = []
 		removed: list[str] = []
@@ -639,7 +830,16 @@ class CFGState:
 				if already_live:
 					self.bindings[name] = binding
 				else:
-					self._push( binding.operand, binding.type, binding.state )
+					# key=name, not the default (binding.operand.stem) - for
+					# an ordinary local these are identical, but for a
+					# 'self.<attr>'-keyed construction binding (attr_assign's
+					# own convention) operand.stem is just the bare attribute
+					# name ('a'), not the tracking key ('self.a') -
+					# defaulting silently re-keyed the reconciled entry under
+					# the wrong name, so complete_construction()'s own
+					# f'self.{attr.stem}' membership check never found it
+					# again even though both branches genuinely set it
+					self._push( binding.operand, binding.type, binding.state, key = name )
 			else:
 				self.bindings[name] = _Binding( operand = binding.operand, type = binding.type, state = binding.state, entry = None )
 
@@ -647,14 +847,17 @@ class CFGState:
 			survivor = None
 			survivor_results = None
 			survivor_narrowed = None
+			survivor_live = None
 			if true_terminates and not false_terminates:
 				survivor = false_end
 				survivor_results = false_end_results
 				survivor_narrowed = false_end_narrowed
+				survivor_live = false_end_live
 			elif false_terminates and not true_terminates:
 				survivor = true_end
 				survivor_results = true_end_results
 				survivor_narrowed = true_end_narrowed
+				survivor_live = true_end_live
 			if survivor is not None:
 				for name, binding in survivor.items():
 					prior = entry_bindings.get( name )
@@ -663,26 +866,63 @@ class CFGState:
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
 			# safe choice; one terminates -> only the survivor's own results/
-			# narrowed state can possibly reach the join
+			# narrowed/live state can possibly reach the join
 			self._unchecked_results = set( survivor_results ) if survivor_results is not None else set()
 			self._narrowed = dict( survivor_narrowed ) if survivor_narrowed is not None else {}
+			self._live = set( survivor_live ) if survivor_live is not None else set()
 			return true_instructions, false_instructions, removed
 		for name in set( true_end ) | set( false_end ):
 			in_true = name in true_end
 			in_false = name in false_end
+			true_binding = true_end.get( name )
+			false_binding = false_end.get( name )
 			if in_true and in_false:
-				if true_end[name].state != false_end[name].state:
-					raise CompileError(
-						f"{ctx}: {name!r} is in an indeterminate state after the if - "
-						f"{true_end[name].state.value} on one branch, {false_end[name].state.value} on the other"
+				assert true_binding is not None and false_binding is not None
+				if true_binding.state != false_binding.state:
+					# ALIVENESS agrees (the variable definitely exists both
+					# ways - that's what got it here), only OWNERSHIP
+					# disagrees. That's not the hazard the error below exists
+					# for (a variable that might not exist at all) - it's the
+					# ordinary "fill in a default when still borrowed" idiom
+					# (`if x is None: x = Owned(...)`). Only OWNED/COPY-vs-
+					# BORROWED is safe to reconcile this way (the value is
+					# valid either way, only "do we own it" differs) - any
+					# OTHER disagreement (MOVED involved, etc) stays a hard
+					# error, unchanged.
+					owning, borrowed = (
+						( true_binding, false_binding ) if true_binding.state in ( OwnState.OWNED, OwnState.COPY )
+						else ( false_binding, true_binding )
 					)
+					if not ( owning.state in ( OwnState.OWNED, OwnState.COPY ) and borrowed.state == OwnState.BORROWED ):
+						raise CompileError(
+							f"{ctx}: {name!r} is in an indeterminate state after the if - "
+							f"{true_binding.state.value} on one branch, {false_binding.state.value} on the other"
+						)
+					# synthesize a runtime flag so the eventual epilogue
+					# decides AT RUNTIME whether to decref, instead of
+					# requiring the compiler to know statically which branch
+					# ran - reuses _mint_cancel_flag()'s own flag-guarded-
+					# entry mechanism (_neutralize()'s "disarm instead of
+					# statically cancel" pattern) rather than inventing a
+					# second one; default-True-at-prologue already gives the
+					# owning branch its correct value for free, only the
+					# borrowed branch needs an explicit disarm
+					flag = self._mint_cancel_flag()
+					disarm = [ ir.Assign( dest = flag, src = ir.Const( type = flag.type, value = False )) ]
+					if true_binding is borrowed:
+						true_instructions += disarm
+					else:
+						false_instructions += disarm
+					entry = self._push( owning.operand, owning.type, owning.state )
+					entry.flag = flag
+					continue
 				prior = entry_bindings.get( name )
 				already_live = (
 					prior is not None
-					and prior.entry is true_end[name].entry
-					and prior.entry is false_end[name].entry
+					and prior.entry is true_binding.entry
+					and prior.entry is false_binding.entry
 				)
-				reestablish( name, true_end[name], already_live )
+				reestablish( name, true_binding, already_live )
 				continue
 			if name in entry_bindings:
 				raise CompileError(
@@ -693,7 +933,8 @@ class CFGState:
 			# fine (per your clarification: confined to that branch, no
 			# matching assignment needed on the other) - tear it down
 			# inside THAT branch's own code only
-			binding = true_end[name] if in_true else false_end[name]
+			binding = true_binding if in_true else false_binding
+			assert binding is not None
 			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state in ( OwnState.OWNED, OwnState.COPY ) else []
 			if in_true:
 				true_instructions += decref
@@ -702,6 +943,7 @@ class CFGState:
 			removed.append( name )
 		self._merge_results( entry_results, true_end_results, false_end_results, ctx )
 		self._merge_narrowed_soft( true_end_narrowed, false_end_narrowed )
+		self._merge_live_soft( true_end_live, false_end_live )
 		return true_instructions, false_instructions, removed
 
 	def _merge_narrowed_soft( self, true_end_narrowed: dict[str,list[Variable]] | None, false_end_narrowed: dict[str,list[Variable]] | None ) -> None:
@@ -737,6 +979,19 @@ class CFGState:
 					combined.append( m )
 			merged[name] = combined
 		self._narrowed = merged
+
+	def _merge_live_soft( self, true_end_live: set[str], false_end_live: set[str] ) -> None:
+		''' the definite-assignment analogue of _merge_narrowed_soft, for the
+		neither-branch-terminates case (the terminates case is handled
+		directly in merge_if() - only the survivor's own live state matters
+		there). Unlike narrowing (union) or bindings (hard error),
+		disagreement here is a plain, silent INTERSECTION: a name survives
+		as live past the join only if BOTH branches leave it definitely
+		assigned - live on only one branch means a path exists where it
+		isn't, so it can't be trusted past the join, but that's never an
+		error HERE, only at the eventual read/del (see merge_if()'s own
+		docstring on true_end_live/false_end_live). '''
+		self._live = true_end_live & false_end_live
 
 	def _merge_results( self, entry_results: set[str], true_end_results: set[str], false_end_results: set[str], ctx: str ) -> None:
 		''' the unchecked-Result analogue of merge_if()'s own binding
@@ -934,7 +1189,7 @@ class CFGState:
 			not entry.cancelled and entry.operand is operand for entry in self._epilogue_stack
 		)
 
-	def current_epilogue_label( self, returned_operand: ir.Operand | None = None ) -> str | None:
+	def current_epilogue_label( self, returned_operand: ir.Operand | None = None, *, mark_captured: bool = True ) -> str | None:
 		''' the label a `return` (or the function's own fall-off-the-end)
 		should jump to instead of unwinding inline via return_() - the
 		topmost still-active entry's own name (skipping only cancelled ones -
@@ -990,7 +1245,21 @@ class CFGState:
 		the stack the same way they'd apply to a real function's - see
 		return_()'s own matching comment for why THOSE cases still need a
 		self-contained inline unwind rather than the shared label even
-		inside a splice. '''
+		inside a splice.
+
+		mark_captured=False: the caller only wants to know WHETHER there's
+		still something pending (is not None), not to actually commit a
+		`goto` using the returned name - e.g. lower_function's own "does
+		the fall-off-the-end path need build_epilogue_ladder() at all"
+		probe, which relies on placing the ladder immediately after the
+		function's own body (pure fallthrough is already correct there, no
+		goto needed). The normal call already marks entry.captured=True
+		unconditionally on the assumption its caller is about to emit a
+		real jump to entry.name; a probe that never does that would
+		otherwise spuriously mark an entry captured with no goto anywhere
+		actually referencing it - a real, confirmed -Wunused-label/C4102
+		(build_epilogue_ladder() gates the Label itself on entry.captured -
+		see its own docstring). '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
@@ -1018,6 +1287,8 @@ class CFGState:
 		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
 		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
 			if inline_scope is not None and i < inline_scope.boundary_depth:
+				if mark_captured:
+					inline_scope.captured = True
 				return inline_scope.label
 			if entry.cancelled:
 				continue
@@ -1038,18 +1309,115 @@ class CFGState:
 			# (confirmed via a real regression: an @inline splice's own
 			# internal early return/.or_return() must never manufacture a
 			# second real ir.Return in the CALLER).
-			if inline_scope is None:
-				self._any_shared_label_used = True
-			# this jump is now committed to entry.name regardless of what
-			# happens to `entry` afterward - a LATER manually_decreffed()/
-			# deleted()/move() on this same entry must not silently turn this
-			# already-emitted goto into a no-op landing (see their shared
-			# _neutralize() helper)
-			entry.captured = True
+			if mark_captured:
+				if inline_scope is None:
+					self._any_shared_label_used = True
+				# this jump is now committed to entry.name regardless of what
+				# happens to `entry` afterward - a LATER manually_decreffed()/
+				# deleted()/move() on this same entry must not silently turn
+				# this already-emitted goto into a no-op landing (see their
+				# shared _neutralize() helper)
+				entry.captured = True
 			return entry.name
 		if inline_scope is not None:
+			if mark_captured:
+				inline_scope.captured = True
 			return inline_scope.label
 		return None
+
+	def current_epilogue_label_for_construction_err(
+		self, returned_operand: ir.Operand | None,
+	) -> tuple[str | None, list[ir.Instruction]]:
+		''' current_epilogue_label()'s counterpart for a fallible __init__'s
+		own Err-path return (lowering.py's _stmt_Return, construction_err_
+		path) - a self.<attr> entry (attr_assign()/complete_base_
+		construction(), entry.is_construction_attr) can never be handed out
+		as a shared label's own JUMP TARGET: complete_construction() cancels
+		every required attribute WITHOUT a per-jump-site record (Epilogue.
+		cancelled is one mutable flag, not a snapshot - see its own
+		docstring), and an attribute has no runtime flag of its own the way
+		defer/errdefer does, so treating an attribute's OWN rung as
+		reachable via `goto` is only sound for returns strictly AFTER its
+		assignment - never provably true once more than one Err return
+		exists (this class's own fix #3, the ORIGINAL regression this whole
+		construction_err_path mechanism exists to prevent). Every live
+		attribute entry is therefore always decref'd INLINE, right here,
+		regardless of where it sits in the stack.
+
+		Everything else pending (defer/errdefer, or a plain non-attribute
+		RC local) is never touched by complete_construction() at all -
+		exactly as safe to route through the ordinary shared epilogue
+		label as in a non-__init__ function, and safe to let an
+		attribute's own (labelless, unreachable-via-goto) rung sit ABOVE
+		OR BELOW it in the stack: build_epilogue_ladder()/build_inline_
+		scope_ladder() unconditionally skip replaying is_construction_attr
+		entries (see their own comments) - never just because .cancelled
+		happens to be set by ladder-build time (relying on that would
+		reintroduce a narrower version of the exact same hazard for a
+		fallible __init__ with no textual success-shaped return at all,
+		where complete_construction() never runs and an attribute would
+		stay .cancelled=False forever) - so an attribute's rung is a
+		guaranteed no-op wherever a shared jump happens to fall through
+		it, and this method never needs to inspect stack ORDER at all,
+		only liveness. Returns (label, inline instructions to emit before
+		jumping to it) - label is None when nothing needs a shared jump
+		(caller falls back to a plain Return), or when current_epilogue_
+		label()'s own bail-outs apply (returned_operand aliasing a live
+		entry anywhere in the stack, or a confined loop/branch entry -
+		both rare enough in a constructor to not warrant a partial-inline
+		treatment here); the caller then falls back to plain return_() for
+		the WHOLE stack, exactly as before this method existed - the
+		returned instruction list is always [] alongside a None label,
+		nothing to double-emit.
+
+		Pure classification first (which indices need an inline decref, and
+		whether a shared label is even reachable), THEN - only once that's
+		fully decided - a second pass that actually calls _decref_
+		instructions() for just the entries being kept. Not merged into one
+		pass: _decref_instructions() can mint fresh temps/labels for a
+		union-typed attribute (_extract_payload()'s own tag-gated path),
+		which land as real DeclareTemp instructions in the CURRENT
+		instruction stream as an unconditional side effect the moment
+		they're minted (lowering.py's own _new_temp(), passed in as this
+		class's new_temp callback) - calling it speculatively for an
+		attribute later discarded by a bail-out below would leak a stray,
+		never-populated temp declaration into the emitted C even though
+		this method's own contract is "never emits anything by itself". '''
+		if returned_operand is not None and any(
+			not entry.cancelled and entry.operand is returned_operand for entry in self._epilogue_stack
+		):
+			return None, []
+		confinement_floor = min( self._confinement_depths ) if self._confinement_depths else None
+		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
+		floor = inline_scope.boundary_depth if inline_scope is not None else 0
+		attr_indices: list[int] = []
+		candidate_index: int | None = None
+		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
+			if i < floor:
+				break
+			if entry.cancelled:
+				continue
+			if confinement_floor is not None and not entry.is_flag_guarded and i >= confinement_floor:
+				return None, []
+			if entry.is_construction_attr:
+				attr_indices.append( i )
+				continue
+			if candidate_index is None:
+				candidate_index = i
+		inline_instructions: list[ir.Instruction] = []
+		for i in attr_indices:
+			entry = self._epilogue_stack[i]
+			inline_instructions += self._decref_instructions( entry.type, entry.operand )
+		if candidate_index is None:
+			if inline_scope is not None:
+				inline_scope.captured = True
+				return inline_scope.label, inline_instructions
+			return None, inline_instructions
+		entry = self._epilogue_stack[candidate_index]
+		if inline_scope is None:
+			self._any_shared_label_used = True
+		entry.captured = True
+		return entry.name, inline_instructions
 
 	def used_shared_epilogue_label( self ) -> bool:
 		''' whether some ALREADY-LOWERED return/OrJump actually committed a
@@ -1091,18 +1459,42 @@ class CFGState:
 	) -> list[ir.Instruction]:
 		''' the shared unwind sequence every return that used
 		current_epilogue_label() (and the function's own fall-off-the-end)
-		jumps into - one Label + that entry's own still-live replay per
-		pending entry (RC Decref, or a flag-guarded defer/errdefer replay -
-		see _replay()), deepest (most-recently-pushed) first, each falling
-		straight through into the next with no Jump needed. Cancelled
-		entries still get their own Label (current_epilogue_label() can
-		still point straight at one - see its own comment), just no
-		instructions. Callers append their own final ir.Return - cfg.py has
-		no notion of a function's return type or return-value slot. '''
+		jumps into - one Label (only when entry.captured - see below) +
+		that entry's own still-live replay per pending entry (RC Decref, or
+		a flag-guarded defer/errdefer replay - see _replay()), deepest
+		(most-recently-pushed) first, each falling straight through into
+		the next with no Jump needed. Cancelled entries still get their own
+		Label whenever captured (current_epilogue_label() can still point
+		straight at one - see its own comment), just no instructions. An
+		entry current_epilogue_label() never actually handed out as a live
+		jump target (entry.captured stays False - no return anywhere in the
+		function needed to unwind from exactly that depth) gets NO Label
+		either: every OTHER rung still reaches it purely by falling
+		through from the one above, so a Label with nothing branching to it
+		would be a real, always-on -Wunused-label/C4102 on every compiler.
+		Callers append their own final ir.Return - cfg.py has no notion of
+		a function's return type or return-value slot.
+
+		entry.is_construction_attr is skipped UNCONDITIONALLY here (never
+		just because .cancelled happens to be set) - a self.<attr> entry
+		is NEVER a valid ladder rung, full stop: current_epilogue_label_
+		for_construction_err() never hands one out as a jump target, so its
+		own rung only exists as fallthrough scenery for some OTHER entry's
+		jump, and it was already decref'd inline, right at whichever Err
+		return actually needed it, by that same method. Gating this on
+		.cancelled instead (relying on complete_construction() having
+		already flipped it by the time this ladder is built) would still
+		be correct for the common case, but not for a fallible __init__
+		with no textual success-shaped return at all: complete_
+		construction() then never runs, .cancelled stays False forever,
+		and this same rung - reached by an unrelated entry's shared jump
+		simply falling through it - would double-decref an attribute
+		some earlier Err return already handled. '''
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
-			instructions.append( ir.Label( name = entry.name ))
-			if not entry.cancelled:
+			if entry.captured: # see this method's own docstring
+				instructions.append( ir.Label( name = entry.name ))
+			if not entry.cancelled and not entry.is_construction_attr:
 				instructions += self._replay( entry, get_is_err_check )
 		return instructions
 
@@ -1129,8 +1521,11 @@ class CFGState:
 		scope = self._inline_scope_stack[-1]
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack[scope.boundary_depth:] ):
-			instructions.append( ir.Label( name = entry.name ))
-			if not entry.cancelled:
+			# see build_epilogue_ladder()'s own identical comment, including
+			# on why is_construction_attr is skipped unconditionally
+			if entry.captured:
+				instructions.append( ir.Label( name = entry.name ))
+			if not entry.cancelled and not entry.is_construction_attr:
 				instructions += self._replay( entry, get_is_err_check )
 		del self._epilogue_stack[scope.boundary_depth:]
 		return instructions
@@ -1306,9 +1701,8 @@ class CFGState:
 		track_result=False opts a specific destination out of ever becoming
 		a tracked obligation - used for compiler-synthesized locals whose
 		Result-ness is scaffolding, not something user code is expected to
-		inspect itself (the match-statement subject temp, and the hidden
-		locals _emit_fallible_construction threads a fallible __init__'s
-		Result through - see their own lowering.py call sites).
+		inspect itself (the match-statement subject temp - see its own
+		lowering.py call site).
 
 		borrow=True registers dest as a non-owning alias (BORROWED, like an
 		ordinary parameter - see _enter_parameter) instead of taking out its
@@ -1325,6 +1719,7 @@ class CFGState:
 		of the ORIGINAL still nets it to zero eventually) but inflated every
 		compiler.refcount() read taken inside a match arm by one, and every
 		match execution paid for a wholly unneeded retain/release pair. '''
+		self._live.add( dest.stem ) # unconditional, before every early-return below (borrow/rc_leaves) - liveness is type-independent, unlike bindings/rc_leaves themselves
 		if dest.stem in self._unchecked_results:
 			raise CompileError(
 				f"Result value {dest.stem!r} is discarded - it was never inspected: "
@@ -1347,6 +1742,31 @@ class CFGState:
 			# into dest, not a second independent owner - untrack it so its
 			# own eventual DeleteTemp doesn't ALSO decref the same object
 			self._temp_states.pop( src.id, None )
+		if dest.is_global:
+			# a global's storage isn't scoped to THIS function's own
+			# epilogue at all - whatever gets stored now must persist for
+			# FUTURE reads by other calls, long after this function
+			# returns (unlike an ordinary local, whose lifetime genuinely
+			# IS bounded by the function). Mirrors attr_replace()'s own
+			# model (a struct/union field's contents also aren't function-
+			# scoped, never tracked in self.bindings at all) rather than an
+			# ordinary local's push-a-fresh-epilogue-entry REPLACE below:
+			# release whatever the global currently holds (unconditionally
+			# - safe even the very first touch, when it's still whatever
+			# its own initializer set, since decref on a non-RC-tagged
+			# union member is already a documented no-op), store the new
+			# value, and never register a per-function decref obligation
+			# for it. self.bindings is never touched for a global here, so
+			# it can never reach merge_if's branch-reconciliation logic
+			# either - there's no function-scoped ownership state to
+			# disagree about in the first place. (A prior version of this
+			# fix DID push a function-scoped entry for a global, gated by a
+			# runtime ownership flag - that was wrong: decref'ing a global
+			# at ITS ASSIGNING FUNCTION's own exit would free the very
+			# value the global is supposed to keep alive for the NEXT
+			# call, a real use-after-free on the following read.)
+			instructions += self._decref_instructions( dest.type, dest ) # reads dest's CURRENT (pre-overwrite) value
+			return instructions
 		existing = self.bindings.get( dest.stem )
 		if existing is not None and existing.entry is not None:
 			if existing.state in ( OwnState.OWNED, OwnState.COPY ):
@@ -1383,7 +1803,7 @@ class CFGState:
 			existing.entry.cancelled = False
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = existing.entry )
 		elif is_rc:
-			self._push( attr, attr.type, OwnState.OWNED, key = key )
+			self._push( attr, attr.type, OwnState.OWNED, key = key, is_construction_attr = True )
 		else:
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
 		return instructions
@@ -1416,6 +1836,23 @@ class CFGState:
 		decref it. '''
 		if rc_leaves( t ):
 			self._temp_states[temp.id] = t
+
+	def is_fresh_temp( self, operand: ir.Operand ) -> bool:
+		''' True when `operand` is a still-tracked, fresh/owned temp (a
+		Call/Allocate result registered via fresh_temp() above, not yet
+		consumed into a named binding or untracked) - NOT the same as
+		`isinstance(operand, ir.Temp)` alone: some Temps are deliberately
+		never registered (a bare borrowing cast, e.g. compiler.cast(...) or
+		list._read_element's own returned slot - see this class's own
+		untrack_temp docstring and lowering.py's matching comments), so
+		checking membership in _temp_states is the only reliable signal.
+		Used by callers (e.g. _coerce_or_check_operand) that need to
+		release/untrack a PRE-coercion operand in place, rather than
+		leaving it as a dangling pending-temp obligation for whatever
+		later flush would otherwise decref it unconditionally - safe only
+		when the operand was genuinely fresh to begin with, never for a
+		borrowed one. '''
+		return isinstance( operand, ir.Temp ) and operand.id in self._temp_states
 
 	def delete_temp( self, temp: ir.Temp ) -> list[ir.Instruction]:
 		t = self._temp_states.pop( temp.id, None )
@@ -1506,13 +1943,17 @@ class CFGState:
 	# --- entry cancellation (move/del/compiler.decref) ----------------------
 
 	def _mint_cancel_flag( self ) -> Variable:
-		''' a fresh runtime bool for _neutralize()'s flag-guarded branch -
-		mirrors push_defer()'s own flag exactly (a real Variable, spliced in
-		as a body_start init by lowering.py's _emit_epilogue - see
-		cancel_flags()), except armed (True) by default instead of disarmed:
-		a defer flag starts False and gets armed by the defer statement
-		itself; this one starts True (still needs releasing) and gets
-		disarmed by whichever of move()/deleted()/manually_decreffed()
+		''' a fresh runtime bool for _neutralize()'s flag-guarded branch, OR
+		for merge_if()'s own ownership-disagreement reconciliation (an
+		OWNED/COPY-vs-BORROWED split across an if's two branches - "fill in
+		a default when still borrowed") - both share the identical shape, so
+		this one minting helper covers both callers. Mirrors push_defer()'s
+		own flag exactly (a real Variable, spliced in as a body_start init by
+		lowering.py's _emit_epilogue - see cancel_flags()), except armed
+		(True) by default instead of disarmed: a defer flag starts False and
+		gets armed by the defer statement itself; this one starts True
+		(still needs releasing) and gets disarmed by whichever of move()/
+		deleted()/manually_decreffed()/merge_if()'s own borrowed-branch case
 		actually neutralizes the entry - see _neutralize(). '''
 		index = len( self._cancel_flags )
 		qualname = f'{self.fn.qualname}.__cancel_flag_{index}' if self.fn is not None else f'__cancel_flag_{index}'
@@ -1579,19 +2020,34 @@ class CFGState:
 
 	# --- del x -------------------------------------------------------------
 
-	def deleted( self, variable: Variable ) -> list[ir.Instruction]:
+	def deleted( self, variable: Variable, ctx: str ) -> list[ir.Instruction]:
 		''' called for `del x` (see lowering.py's _stmt_Delete) - returns
 		the Decref to emit right there (if x was OWNED/COPY), and
 		neutralizes its epilogue entry so it's never decref'd again.
 		Independent-of-RC unchecked-Result check first, same reasoning as
 		assign()'s own early check - del'ing a still-unchecked Result is
 		exactly the "discarded via del" table entry, regardless of whether
-		its type has any RC leaves at all. '''
+		its type has any RC leaves at all.
+
+		Liveness check next, same reasoning again - `del` reads/consumes the
+		binding before removing it, so it needs the identical definite-
+		assignment gate _expr_Name applies to an ordinary read (this is the
+		"__del__ a variable that's not provably alive" half of that gate -
+		see is_live()'s own docstring). Checked before self.bindings.pop()
+		below so an already-live-but-never-RC-bound (scalar/struct/enum)
+		variable.stem still gets a real error instead of deleted() silently
+		no-op'ing (there was never a self.bindings entry to pop for those in
+		the first place). self._live is updated unconditionally afterward,
+		error or not - a name that WAS live is no longer live once del'd
+		either way (mirrors fn.names' own removal in lowering.py). '''
 		if variable.stem in self._unchecked_results:
 			raise CompileError(
 				f"Result value {variable.stem!r} is discarded via del - it was never inspected: "
 				f"use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
 			)
+		if variable.stem not in self._live:
+			raise CompileError( f"{ctx}: {variable.stem!r} is not initialized on all code branches" )
+		self._live.discard( variable.stem )
 		binding = self.bindings.pop( variable.stem, None )
 		if binding is None or binding.entry is None:
 			return []
@@ -1748,6 +2204,22 @@ class CFGState:
 			)
 			key = f'self.{attr.stem}'
 			if rc_leaves( attr.type ):
-				self._push( attr, attr.type, OwnState.OWNED, key = key )
+				self._push( attr, attr.type, OwnState.OWNED, key = key, is_construction_attr = True )
 			else:
 				self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = None )
+			# complete_construction()'s own success-path cancellation loop
+			# only walks self._construction_required (the SUBCLASS's own
+			# declared attributes - enter_construction()'s own docstring
+			# flags this as "not yet base-class-aware"). Without also
+			# appending base attrs here, a base-owned RC attribute's
+			# epilogue entry (just pushed above) is never cancelled on the
+			# subclass __init__'s success path, so an ordinary fall-off-the-
+			# end/plain `return` wrongly decrefs a field self now legitimately
+			# owns - confirmed by a real compile: any subclass whose base
+			# __init__ sets an RC field emits `release_object((ObjectHeader*)
+			# (<bare_field_name>))` unconditionally at the end of ITS OWN
+			# __init__, referencing a name that was never even declared as a
+			# local in the generated C (it's self's own field, not a local).
+			# already present in self.bindings (just pushed above), so this
+			# can't trip complete_construction()'s "missing" check.
+			self._construction_required.append( attr )

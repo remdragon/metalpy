@@ -72,49 +72,110 @@ specifically to treat these as equal, and several call sites use it correctly
   (emitter_c_test.py).
 - `lowering.py`'s `_lower_dispatch_tests` and `_maybe_unwrap_union_arg` (both
   `attr.type is leaf_type`/`attr.type is target_type`) - fixed via
-  `_same_type` for consistency with the rest of the codebase, but **no
-  positive repro could be constructed for either**: both are only ever
-  reached through the overload-dispatch mechanism
-  (`_lower_conditional_dispatch`), which is gated by `overload_resolution.py`'s
-  own SEPARATE identity-based leaf matching (`_leaf_is_accepted`, the
-  "awareness only" item below) - a call site that would trigger THIS
-  duality gets rejected by THAT earlier check first, before ever reaching
-  these two lines. The fix is a strict superset of the old behavior (only
-  accepts more correct programs, can never wrongly reject one already
-  accepted), so applied anyway for consistency; full suite green regardless.
-  No dedicated regression test added for these two specifically, since none
-  could be constructed - would need the `overload_resolution.py` item fixed
-  first to ever exercise them with a legitimately-mismatched-but-equal leaf.
+  `_same_type` for consistency with the rest of the codebase. **Now
+  independently confirmed reachable**, since `overload_resolution.py`'s own
+  identity-based matching (below) has since been fixed too - the repro that
+  proves that fix (`OverloadGenericSubstitutionMatchingRealCompileTests`,
+  emitter_c_test.py) genuinely reaches real runtime conditional-dispatch
+  codegen (`.tag` checks in the generated C), exercising both these lines
+  for real.
 
-**Medium confidence:**
+**Fixed** (both, this pass):
 
-- [lowering.py:2061-2062](lowering.py:2061) (`_stmt_Return`) - hand-rolled
-  reimplementation of `_check_assignable`'s CEnum/Specialization/TupleType
-  duality logic inline (`is_cenum_to_underlying`, then `value.type is not fn_type
-  and value.type is not expected_concrete and not is_cenum_to_underlying`)
-  instead of delegating to `_check_assignable`/`_same_type` directly. Not
-  confirmed broken - the logic looks carefully reasoned - but hand-duplicated
-  logic is exactly how the `_coerce_into_union` gap happened in the first place.
-  Worth checking whether this can just call the shared helper instead of
-  re-deriving it.
-- [lowering.py:4281](lowering.py:4281) (`_expr_Name`) - `if member is not None and
-  expected_type is not name.type:` - the "caller wants the whole union back, not
-  the narrowed payload" escape hatch. Its own comment (4298-4302) already flags
-  "Same Specialization gap as `_stmt_Assign`'s own narrowing-bind handling
-  above" as a known concern. Could misfire (wrongly unwrap when the whole union
-  was wanted) if `expected_type` and `name.type` are two non-identical objects
-  for the same generic instantiation.
+- `lowering.py`'s `_stmt_Return` - the hand-rolled reimplementation of
+  `_check_assignable`'s CEnum duality logic turned out to be a real,
+  confirmed bug, not just a maintainability smell: it only ever re-derived
+  ONE of `_check_assignable`'s two CEnum<->value_type exemption directions
+  (`is_cenum_to_underlying` - a CEnum value returned where the function
+  declares the underlying scalar). The REVERSE direction (a raw scalar
+  returned where the function declares the CEnum) was missing entirely -
+  confirmed via a real repro (`return x` where `x: i32` inside a function
+  declared `-> Color`, wrongly rejected as "function returns Color, not
+  i32"). Fixed by adding the missing `is_underlying_to_cenum` check;
+  genuine mismatches (a real repro with an unrelated `str` return) still
+  correctly rejected. Regression tests: new
+  `CEnumReturnCoercionTests.test_programs_compile_and_run` /
+  `.test_genuinely_mismatched_return_type_still_rejected`
+  (emitter_c_test.py). Not delegated to `_check_assignable` directly -
+  that method's own `strict=False` is deliberate, to let the
+  covered-Result-error-widening case get a chance before a stricter check
+  would reject it outright (see the method's own comment) - so the fix
+  stays as a hand-derived exemption, matching the existing pattern, rather
+  than folding in the shared helper.
 
-**Awareness only - deliberately identity-based by design, per their own
-comments. Do not touch without separately confirming the design intent still
-holds:**
+  **Fixed** (was flagged, not fixed, when the `_stmt_Return` bug above was
+  found - now fixed): `lowering.py`'s `_expr_Constant` unconditionally
+  exempted every `CEnum` `expected_type` from its own kind-compatibility
+  validation, on the theory that "a CEnum has exactly the same runtime
+  representation as its underlying type" (true, but that reasoning only
+  covers a literal whose KIND already matches the underlying scalar - an
+  int for an i32-backed CEnum - not literally any literal). A
+  kind-mismatched literal (e.g. a string) sailed through unchecked, tagging
+  the resulting `ir.Const` with the CEnum type while its own `.value`
+  stayed the mismatched Python value - confirmed to reach TWO separate call
+  sites (a bare literal via `return`/assignment, AND an explicit
+  `Color(...)` construction call, whose own magnitude-only check at
+  `_try_lower_construct_call` defers everything else to `_expr_Constant`),
+  both crashing `emitter_c.py`'s `_emit_const` with an uncaught Python
+  `NotImplementedError` instead of a clean `CompileError`. Fixed by
+  validating a CEnum-expected literal against the CEnum's own
+  `.value_type`'s stem (kind AND magnitude) instead of exempting it
+  outright; both crash sites now report a clean `CompileError`. Valid
+  cases (an in-range int literal via either return or construction)
+  confirmed still working. Regression tests: new
+  `CEnumReturnCoercionTests.test_bare_literal_via_return_and_construction`
+  / `.test_kind_mismatched_literal_rejected_cleanly_not_crashed` /
+  `.test_kind_mismatched_construction_literal_rejected_cleanly_not_crashed`
+  / `.test_out_of_range_literal_rejected` (emitter_c_test.py) - the two
+  crash-shape tests independently confirmed to fail (silently accept, no
+  error recorded) without the fix and pass with it.
+- `lowering.py`'s `_expr_Name` escape hatch (`expected_type is not
+  name.type`) - fixed via `_same_type` for consistency, but **no repro
+  could be constructed** despite several attempts (generic-substituted vs.
+  fresh-annotation parameter types; local-variable-annotation vs.
+  fresh-annotation parameter types - both patterns that DID trigger other
+  Shape 1 candidates). Current best guess, not fully confirmed: unlike a
+  bare member-level Specialization, the WHOLE union types being compared
+  here (`expected_type`/`name.type`) are both `_get_or_create_union`
+  results, which cache by a qualname-TEXT key (see `ARCHITECTURE.md`) -
+  insensitive to whether the union's own member Specializations are
+  identical objects, so two structurally-identical union annotations seem
+  to always land on the same cached object regardless of which resolution
+  path produced them. This is a DIFFERENT reason for "unconfirmed" than
+  the two `lowering.py` dispatch candidates above (those are gated by a
+  separate, known upstream bug) - this one may simply not be reachable at
+  all. No dedicated regression test added, for the same reason as those
+  two.
+
+**Fixed** (was "awareness only" - confirmed with the user that the
+documented design assumption no longer held, then fixed):
+
+- `overload_resolution.py`'s `_contains`/`_intersect`/`_subtract` (and the
+  combo-dispatch leaf comparisons inside `resolve_call` itself) claimed the
+  existing dedup/interning caches guarantee "same type == same object" for
+  every Type this module ever compares - confirmed FALSE via a real repro:
+  a generic function's own `list[T]`, specialized to `list[i32]`, is a
+  different `Specialization` object than an `@overload` candidate's own
+  freshly-annotated `list[i32]` parameter, raising "no matching overload"
+  for a call that should resolve cleanly. This also fully explains why the
+  two `lowering.py` dispatch candidates above couldn't get a positive repro
+  in the previous pass - this bug gated them.
+
+  This module is deliberately dependency-free ("pure function of types, no
+  Discovery reference" - own docstring, load-bearing for
+  `overload_resolution_test.py`'s isolated unit tests), so it can't just
+  call `TypeResolver._same_type` directly. Fixed by threading a
+  caller-supplied `same_type` predicate through `resolve_call`/
+  `stub_covers_call`/`_contains`/`_intersect`/`_subtract`, defaulting to
+  plain `is` (every existing unit test - all built from simple, non-generic
+  classes - is unaffected); `lowering.py`/`type_resolver.py`, the two real
+  production callers, now pass `TypeResolver._same_type`. Regression test:
+  `OverloadGenericSubstitutionMatchingRealCompileTests` (emitter_c_test.py).
 
 - [cfg.py:1251](cfg.py:1251) (`_tag_gated_refcount_instructions`) - `members =
-  [m for m in t.attributes if any(m.type is leaf for leaf in leaves)]`.
-- [overload_resolution.py:41-48](overload_resolution.py:41) (`_contains`/
-  `_intersect`/`_subtract`) - relies on the existing dedup/interning caches
-  (`_get_or_create_union`/`_specialization`/`_move`) guaranteeing "same type ==
-  same object" for the specific universe these functions operate over.
+  [m for m in t.attributes if any(m.type is leaf for leaf in leaves)]` -
+  still genuinely "awareness only", not investigated this pass. Do not
+  touch without separately confirming its own design intent still holds.
 
 ## Shape 2 - parallel type-resolution paths that drifted out of sync
 
@@ -203,16 +264,17 @@ trailing call to a `-> NoReturn` function (`sys.panic(...)`). Fixed via a new
   `match_bound_name_receiver_call_does_not_crash_the_compiler`
   (emitter_c_test.py) - each independently confirmed to fail without its
   fix and pass with it.
-- [lowering.py:683](lowering.py:683) (`_body_may_fall_off_the_end`) - `return
-  not body or not isinstance(body[-1], ast.Return)`, used to decide whether to
-  synthesize an implicit `return None` at a function's close. Lower priority:
-  per its own comment (672-682), a false positive here is explicitly argued to
-  be harmless (produces dead-but-unreachable code after a real diverging call,
-  not a compile break). Its comment ("same 'future work' scope cut as
-  `_stmt_If`'s own true_terminates/false_terminates detection") is now
-  slightly stale, since `_stmt_If` no longer has that exact scope cut - worth a
-  comment update even if the behavior itself is judged low-risk enough to leave
-  alone.
+- **Fixed (comment only):** `lowering.py`'s `_body_may_fall_off_the_end` -
+  `return not body or not isinstance(body[-1], ast.Return)`, used to decide
+  whether to synthesize an implicit `return None` at a function's close. Its
+  behavior is unchanged - a false positive here (a trailing `sys.panic()`,
+  an exhaustive-if, a `while True:` with no break, ...) stays explicitly
+  harmless (produces dead-but-unreachable code, never a compile break, per
+  its own comment), so intentionally NOT wired into `_stmt_diverges` the way
+  `_stmt_If`/`visit_Match` were. Its comment claiming "same 'future work'
+  scope cut as `_stmt_If`'s own true_terminates/false_terminates detection"
+  was stale (that method no longer shares this scope cut) - updated to
+  explain the current, deliberate divergence instead.
 
 **Checked, ruled out - no comparable gap:** `cfg.py`'s `merge_loop_exits`,
 `type_resolver.py`'s `visit_While`/`visit_For`, and `lowering.py`'s
@@ -256,18 +318,23 @@ which needs no hint).
 
 1. ~~`type_resolver.py:4593` (Shape 3, `visit_Match`)~~ - **fixed**, see above.
 2. ~~Shape 1's three high-confidence candidates~~ - **fixed**, see above.
-3. **Shape 1's two medium-confidence candidates** (`lowering.py:2061-2062`,
-   `lowering.py:4281`) - worth a repro attempt each; the `_stmt_Return` one may
-   turn out to be correct-but-duplicated rather than actually broken. Next up.
-4. **`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)** - low risk, low
-   priority; at minimum update its stale comment.
-5. Everything under "awareness only" - do not fix without first confirming with
-   the user that the documented deliberate-design reasoning no longer holds.
-   Note: `overload_resolution.py`'s `_leaf_is_accepted`/`_contains` (its own
-   identity-based design, documented as relying on the dedup caches) is now
-   the more load-bearing of the two "awareness only" items - it's the reason
-   the two fixed-but-unverified `lowering.py` candidates above couldn't get a
-   positive repro; worth reconsidering whether it should move up in priority.
+3. ~~Shape 1's two medium-confidence candidates~~ - **fixed**, see above. The
+   `_stmt_Return` one turned out to be a real, confirmed bug (not just
+   duplicated logic); a new, unrelated, pre-existing crash bug
+   (`_expr_Constant`/`_emit_const`, kind-mismatched CEnum-return literals)
+   was found incidentally and flagged, not fixed.
+4. ~~`lowering.py:683` (Shape 3, `_body_may_fall_off_the_end`)~~ - **fixed
+   (comment only)**, see above. Behavior deliberately unchanged.
+5. ~~`lowering.py`'s `_expr_Constant`/`_emit_const` crash~~ - **fixed**, see
+   above. Found reachable via TWO call sites (bare literal return/assignment,
+   and explicit `Color(...)` construction), both now cleanly rejected.
+6. ~~`overload_resolution.py`'s `_contains`/`_intersect`/`_subtract`~~ -
+   **fixed**, see above (user confirmed the design assumption no longer held,
+   then approved the fix). Also retroactively confirmed the two `lowering.py`
+   Shape 1 dispatch candidates as genuinely reachable.
+7. `cfg.py:1251` (`_tag_gated_refcount_instructions`) - the one remaining
+   "awareness only" item. Do not fix without first confirming with the user
+   that its own documented deliberate-design reasoning no longer holds.
 
 ## Verification plan for any fix made from this list
 

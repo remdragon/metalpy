@@ -5,7 +5,8 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType, by_value_dependency
+from errors import RedundantCompilationError
+from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, RCClass, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType, by_value_dependency
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage, build_member_constructor
 
@@ -304,6 +305,13 @@ class Monomorphizer:
 		base = spec.base
 		if base.resolve is not None:
 			base.resolve()
+		if base.broken:
+			# already reported at the point base's own resolution failed -
+			# without this, a fully-failed base (base.parameters is None)
+			# would silently substitute ZERO parameters into the
+			# monomorphized copy below instead of failing at all (see
+			# mpy_types.Name.broken)
+			raise RedundantCompilationError()
 		type_params = base.type_params
 		substituted_cls = base.cls
 		if not type_params and base.cls is not None and base.cls.type_params:
@@ -480,6 +488,14 @@ class Monomorphizer:
 			base = spec.base
 			if base.resolve is not None:
 				base.resolve()
+			if base.broken:
+				# already reported at the point base's own resolution
+				# failed - without this, a half-populated base (only some
+				# of its body's members registered, per the class-body-scan
+				# gap _parse_ClassDef_* now guards against) would silently
+				# build a wrong-shape specialization instead of failing at
+				# all (see mpy_types.Name.broken)
+				raise RedundantCompilationError()
 			for attr in base.attributes:
 				self._ensure_resolved( attr ) # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's own identical resolve loop
 			if isinstance( base, TaggedUnion ):
@@ -523,6 +539,25 @@ class Monomorphizer:
 				substituted_names[member.stem] = self.monomorphized_function( method_spec )
 
 			extra: dict = {}
+			if isinstance( base, RCClass ) and isinstance( base.base, Specialization ):
+				# a generic ancestor parameterized by THIS class's own type
+				# params (class Bar[T](Real[T]): pass, base.base = Real[T]) -
+				# substitute_type_params's own Specialization branch eagerly
+				# monomorphizes the moment substitution makes the result fully
+				# concrete (see its own "single highest-leverage fix point"
+				# comment), which it always does here: spec.args (THIS exact
+				# instantiation) are guaranteed concrete - monomorphize_class
+				# is only ever invoked on an already-fully-concrete
+				# Specialization - so this always produces a real, substituted
+				# RCClass (e.g. Real[i32], attributes/methods already
+				# substituted) rather than handing back a bare Specialization.
+				# Every downstream consumer of .base (chain_lookup,
+				# flattened_attributes, compiler.py's own _enqueue(monomorphized
+				# .base), emitter_c.py's field-flattening walk) then sees a
+				# real, concrete ancestor, exactly like a plain (non-generic)
+				# base already does - no separate substitution-aware code path
+				# needed anywhere else.
+				extra['base'] = self.substitute_type_params( base.base, type_params, spec.args )
 			if isinstance( base, TaggedUnion ):
 				# base.names['tag']/['data'] (synthesized by UnionStorage.get,
 				# already triggered above) are SHARED across every specialization

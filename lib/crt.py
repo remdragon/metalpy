@@ -13,7 +13,24 @@ def __error() -> Ptr[i32]:
 @extern( 'c', '_exit' )
 def _exit(
 	status: i32,
-) -> None:
+) -> NoReturn:
+	...
+
+# the size of a live malloc'd block, for sys.free()'s own debug-only
+# mempoison-before-free - glibc/Linux and macOS expose this under two
+# different names (macOS's <malloc/malloc.h> malloc_size vs glibc's
+# malloc_usable_size), same os split as __error/__errno_location above.
+# Both may return a genuinely LARGER size than what was originally
+# requested (allocator rounding) - fine here, poisoning a few extra
+# trailing bytes inside the same live block is harmless.
+@compiler.target( os = not ( 'windows', 'macos' ))
+@extern( 'c', 'malloc_usable_size' )
+def malloc_usable_size( ptr: ConstPtr[None] ) -> usize:
+	...
+
+@compiler.target( os = 'macos' )
+@extern( 'c', 'malloc_size' )
+def malloc_usable_size( ptr: ConstPtr[None] ) -> usize:
 	...
 
 @extern( 'c', 'free' )
@@ -41,34 +58,37 @@ def malloc(
 
 @extern( 'c', 'memset' )
 def memset(
-	ptr: Ptr[u8],
-	value: u8,
+	# void*/int/void* (not Ptr[u8]/u8) to match libc's real `void*
+	# memset(void*, int, size_t)` exactly - see free()'s comment above for
+	# why (GCC's -Wbuiltin-declaration-mismatch)
+	ptr: Ptr[None],
+	value: i32,
 	length: usize,
-) -> None:
+) -> Ptr[None]:
 	...
 
 @extern( 'c', 'memcpy' )
 def memcpy(
-	dest: Ptr[u8],
-	src: ConstPtr[u8],
+	dest: Ptr[None],
+	src: ConstPtr[None],
 	n: usize,
-) -> Ptr[u8]:
+) -> Ptr[None]:
 	...
 
 @extern( 'c', 'memcmp' )
 def memcmp(
-	a: ConstPtr[u8],
-	b: ConstPtr[u8],
+	a: ConstPtr[None],
+	b: ConstPtr[None],
 	n: usize,
 ) -> i32:
 	...
 
 @extern( 'c', 'memmove' )
 def memmove(
-	dest: Ptr[u8],
-	src: ConstPtr[u8],
+	dest: Ptr[None],
+	src: ConstPtr[None],
 	n: usize,
-) -> Ptr[u8]:
+) -> Ptr[None]:
 	...
 
 @extern( 'c', 'readlink' )
@@ -80,7 +100,7 @@ def readlink(
 	...
 
 @extern( 'c', 'strerror' )
-def strerror( errnum: i32 ) -> ConstPtr[u8]|None:
+def strerror( errnum: i32 ) -> ConstPtr[u8]:
 	...
 
 @extern( 'c', 'strnlen' )
@@ -133,6 +153,15 @@ def ftruncate(
 	fd: i32,
 	length: i64,
 ) -> i32:
+	...
+
+@extern( 'c', 'getcwd' )
+def getcwd(
+	buf: Ptr[u8],
+	size: usize,
+) -> Ptr[u8]:
+	# NULL on failure (e.g. ERANGE if buf is too small for the real cwd) -
+	# callers must check get_errno() to distinguish the failure reason.
 	...
 
 # ---------------------------------------------------------------------------

@@ -478,6 +478,32 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIsNone( myerr.resolve )
 		self.assertEqual( myerr.members, { 'FileNotFound': 2, 'Other': 3 } )
 
+	def test_local_shadowing_global_function_is_not_scheduled( self ) -> None:
+		# _try_resolve_callable_namespace's bare Name lookup can land on an
+		# unrelated module-level function sharing a name with a plain local
+		# variable (fn.names isn't populated until lowering runs - see that
+		# method's own docstring). Calling a method on such a local used to
+		# unconditionally schedule the wrongly-guessed function - and
+		# everything IT calls - as a side effect of a probe that ultimately,
+		# correctly, found nothing.
+		mod = self._import( '\n'.join([
+			'def heavy_dep() -> i32:',
+			'	return 999',
+			'',
+			'def head( x: i32 ) -> i32:', # unrelated top-level fn, same name as the local below
+			'	return heavy_dep()',
+			'',
+			'def main() -> str:',
+			'	head: str = "hi"',
+			'	return head.upper()',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		head_fn = mod.get_local( 'head' )
+		heavy_dep_fn = mod.get_local( 'heavy_dep' )
+		self.assertNotIn( id( head_fn ), self.resolver._seen )
+		self.assertNotIn( id( heavy_dep_fn ), self.resolver._seen )
+
 	# --- idempotency --------------------------------------------------------
 
 	def test_resolve_function_body_is_idempotent( self ) -> None:
@@ -510,7 +536,12 @@ class TypeResolutionTests( unittest.TestCase ):
 	def test_implicit_generic_call_tags_resolved_callee_per_argument_type( self ) -> None:
 		# the exact shape from ARCHITECTURE's own generic-function example -
 		# foo('hello') and foo(42) each get their own monomorphized foo,
-		# distinguished by argument type alone (no explicit foo[T])
+		# distinguished by argument type alone (no explicit foo[T]). foo(42)
+		# infers intrinsics.i32 - a bare int literal's own natural type
+		# (matching what Lowering._expr_Constant will actually tag it as),
+		# NOT this module's own locally-defined `int` class (a literal
+		# argument's inferred type must never depend on what name happens to
+		# be bound to 'int' in scope - see _natural_literal_type)
 		mod = self._import( '\n'.join([
 			'class str: pass',
 			'class int: pass',
@@ -528,7 +559,7 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIsNotNone( str_callee )
 		self.assertIsNotNone( int_callee )
 		self.assertEqual( str_callee.qualname, '__test__.foo[__test__.str]' )
-		self.assertEqual( int_callee.qualname, '__test__.foo[__test__.int]' )
+		self.assertEqual( int_callee.qualname, '__test__.foo[intrinsics.i32]' )
 		self.assertIsNot( str_callee, int_callee )
 		self.assertIsNot( str_callee.node, int_callee.node ) # independent, deep-copied bodies - not the shared abstract one
 
@@ -600,6 +631,63 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		[ callee ] = self._resolved_callees( fn )
 		self.assertIsNone( callee )
+
+	def test_generic_call_after_terminating_is_none_branch_infers_narrowed_type( self ) -> None:
+		# `if m is None: return` then a bare `mylen(m)` - the ONLY way past
+		# the if is m already being non-None, same "post-if survival" real
+		# lowering (cfg.py) already gives ordinary code (see lowering_test.py's
+		# IfIsNotNoneNarrowingTests). This pass's OWN self._narrowed (driving
+		# _infer_generic_args -> _type_of_expr for a bare generic call like
+		# len(x)) is a separate tracker over the same AST and needs its own
+		# explicit update for this - previously bound T to the WHOLE union
+		# (Maybe, tag included), monomorphizing an incorrect mylen[Maybe] and
+		# in turn making len(x)-after-narrowing crash resolving T's own
+		# dunder methods against the union's None leaf (the reported bug)
+		mod = self._import( '\n'.join([
+			'@union',
+			'class Maybe:',
+			'	Some: i32',
+			'	Nothing: None',
+			'',
+			'def mylen[T]( t: T ) -> i32:',
+			'	return 0',
+			'',
+			'def main( m: Maybe ) -> None:',
+			'	if m is None:',
+			'		return',
+			'	mylen( m )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNotNone( callee )
+		self.assertEqual( callee.qualname, '__test__.mylen[intrinsics.i32]' )
+
+	def test_generic_call_after_non_terminating_if_does_not_narrow( self ) -> None:
+		# neither branch of `if m is not None: pass` terminates, so nothing
+		# proves m is non-None by the time execution reaches the bare
+		# mylen(m) call after it - T must still be inferred as the WHOLE
+		# union, matching lowering_test.py's
+		# test_no_narrowing_survival_when_neither_branch_terminates
+		mod = self._import( '\n'.join([
+			'@union',
+			'class Maybe:',
+			'	Some: i32',
+			'	Nothing: None',
+			'',
+			'def mylen[T]( t: T ) -> i32:',
+			'	return 0',
+			'',
+			'def main( m: Maybe ) -> None:',
+			'	if m is not None:',
+			'		pass',
+			'	mylen( m )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNotNone( callee )
+		self.assertEqual( callee.qualname, '__test__.mylen[__test__.Maybe]' )
 
 	# --- generic construction resolution --------------------------------------
 

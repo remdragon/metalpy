@@ -48,7 +48,7 @@ _TYPE_CHAR_F: i32 = 102 # ord('f')
 _TYPE_CHAR_G: i32 = 103 # ord('g') - the "no type char at all" default's own underlying conversion, see _f64_none_type_digits_raw
 _TYPE_CHAR_E: i32 = 101 # ord('e') - _f64_repr_digits_raw's own shortest-round-trip search always uses this conversion (see its own comment on why 'e', not 'f'/'g')
 
-_DECIMAL_DIGIT_CHARS: str = str( '0123456789' ) # _f64_exponent_text's own hand-built int-to-string table - see its own comment on why not a general-purpose one
+_DECIMAL_DIGIT_CHARS: str = '0123456789' # _f64_exponent_text's own hand-built int-to-string table - see its own comment on why not a general-purpose one
 
 # 17 significant digits is always enough to exactly round-trip any IEEE754
 # double (the standard DBL_DECIMAL_DIG guarantee) - _f64_repr_digits_raw's
@@ -82,26 +82,14 @@ def _group_integer_part( digits: str, sep: str ) -> str:
 	reconstructs the plain digit text unchanged"), so callers never need to
 	special-case "no grouping requested". '''
 	dot_index: usize = digits.byte_len()
-	match digits.find( str( '.' )):
-		case Result.Ok( idx ):
-			dot_index = idx
-		case Result.Err( _ ):
-			pass
+	found: isize = digits.find( '.' )
+	if found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			dot_index = usize( found )
 	int_part: str = digits._byte_slice( 0, dot_index )
 	rest: str = digits._byte_slice( dot_index, digits.byte_len() )
 	count: usize = int_part.byte_len() # ASCII-only digit text - byte length is codepoint count here
 	if count <= 3:
-		# digits is a BORROWED parameter (ordinary, non-move calling
-		# convention) - returning it directly as this function's own result
-		# needs an explicit incref first, giving the caller a real +1 of its
-		# own, the same "explicit incref after a borrowing return" pattern
-		# str.concat's own comment documents (lib/builtins/__init__.py) -
-		# without it, this function's own local `digits` going out of scope
-		# on return double-releases the very value the caller still holds a
-		# reference to (confirmed by a real crash/garbage-read while writing
-		# this, the exact failure shape that pattern's own comment warns
-		# about).
-		compiler.incref( digits )
 		return digits
 	groups: list[str] = list[str]() # least-significant GROUP first
 	end: usize = count
@@ -140,12 +128,12 @@ def _f64_sign_prefix( value: f64, mode: str ) -> str:
 	calls this on the ORIGINAL, un-scaled value - multiplying by the
 	positive constant 100 never changes the sign). '''
 	if value < 0.0:
-		return str( '-' )
+		return '-'
 	if mode == '+':
-		return str( '+' )
+		return '+'
 	if mode == ' ':
-		return str( ' ' )
-	return str( '' )
+		return ' '
+	return ''
 
 
 @private
@@ -195,9 +183,9 @@ def _f64_fixed_digits_raw( value: f64, precision: usize, type_char: i32, alt: bo
 	__metalpy_isnan/__metalpy_isinf macros already used for checked
 	arithmetic (emitter_c.py's PROLOGUE). '''
 	if compiler.is_nan( value ):
-		return str( 'nan' )
+		return 'nan'
 	if compiler.is_inf( value ):
-		return str( 'inf' )
+		return 'inf'
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		with compiler.panic_arithmetic( 'an integer-digit bound plus a decimal point plus precision fractional digits plus a zero terminator cannot overflow usize for any real f-string format spec' ):
@@ -205,7 +193,6 @@ def _f64_fixed_digits_raw( value: f64, precision: usize, type_char: i32, alt: bo
 		buf: Ptr[u8] = sys.alloc[u8]( buf_size )
 		n: i32 = compiler.format_f64( buf, buf_size, i32( precision ), type_char, alt, magnitude )
 		if n < 0:
-			sys.free( buf )
 			sys.panic( 'f-string float formatting failed' )
 		return str._from_owned_cstr( buf, usize( n ) + 1 ).unwrap(
 			'compiler.format_f64 produced invalid utf-8 (unreachable - only ASCII digits, \'.\', and \'e\'/\'E\'/\'+\'/\'-\' are ever written)'
@@ -247,7 +234,7 @@ def _f64_percent_digits( value: f64, precision: usize, alt: bool, sep: str ) -> 
 	unaffected by scaling by the positive constant 100, so lowering.py
 	still calls _f64_sign_prefix on the ORIGINAL, un-scaled value for this
 	case - no separate percent-specific sign handling needed. '''
-	return _group_integer_part( _f64_percent_digits_raw( value, precision, alt ), sep ) + str( '%' )
+	return _group_integer_part( _f64_percent_digits_raw( value, precision, alt ), sep ) + '%'
 
 
 @private
@@ -268,25 +255,15 @@ def _f64_none_type_digits_raw( value: f64, precision: usize, alt: bool ) -> str:
 	are also passed through unchanged - the "always show a fractional
 	digit" tweak only applies to FIXED-point results. '''
 	raw: str = _f64_fixed_digits_raw( value, precision, _TYPE_CHAR_G, alt )
-	if raw == str( 'nan' ) or raw == str( 'inf' ):
+	if raw == 'nan' or raw == 'inf':
 		return raw
-	has_dot: bool = False
-	match raw.find( str( '.' )):
-		case Result.Ok( _ ):
-			has_dot = True
-		case Result.Err( _ ):
-			pass
+	has_dot: bool = raw.find( '.' ) != isize( -1 )
 	if has_dot:
 		return raw
-	has_exp: bool = False
-	match raw.find( str( 'e' )):
-		case Result.Ok( _ ):
-			has_exp = True
-		case Result.Err( _ ):
-			pass
+	has_exp: bool = raw.find( 'e' ) != isize( -1 )
 	if has_exp:
 		return raw
-	return raw + str( '.0' )
+	return raw + '.0'
 
 
 @private
@@ -354,18 +331,16 @@ def _f64_repr_from_scientific( sci_text: str ) -> str:
 	is already the FEWEST significant digits that round-trip exactly (see
 	this function's only caller). '''
 	e_index: usize = sci_text.byte_len()
-	match sci_text.find( str( 'e' )):
-		case Result.Ok( idx ):
-			e_index = idx
-		case Result.Err( _ ):
-			pass
+	e_found: isize = sci_text.find( 'e' )
+	if e_found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			e_index = usize( e_found )
 	mantissa: str = sci_text._byte_slice( 0, e_index )
 	dot_index: usize = mantissa.byte_len()
-	match mantissa.find( str( '.' )):
-		case Result.Ok( idx ):
-			dot_index = idx
-		case Result.Err( _ ):
-			pass
+	dot_found: isize = mantissa.find( '.' )
+	if dot_found != isize( -1 ):
+		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
+			dot_index = usize( dot_found )
 	digits: str
 	if dot_index < mantissa.byte_len():
 		with compiler.panic_arithmetic( 'bounded by mantissa length' ):
@@ -396,24 +371,24 @@ def _f64_repr_from_scientific( sci_text: str ) -> str:
 			with compiler.wrap_arithmetic:
 				int_digit_count: usize = usize( exponent ) + 1
 			if int_digit_count >= digit_count:
-				return digits.ljust( int_digit_count, str( '0' )) + str( '.0' )
+				return digits.ljust( int_digit_count, '0' ) + '.0'
 			int_part: str = digits._byte_slice( 0, int_digit_count )
 			frac_part: str = digits._byte_slice( int_digit_count, digit_count )
-			return int_part + str( '.' ) + frac_part
+			return int_part + '.' + frac_part
 		with compiler.wrap_arithmetic:
 			zero_count: usize = usize( -exponent ) - 1
-		leading_zeros: str = str( '' ).rjust( zero_count, str( '0' ))
-		return str( '0.' ) + leading_zeros + digits
+		leading_zeros: str = ''.rjust( zero_count, '0' )
+		return '0.' + leading_zeros + digits
 
 	mantissa_text: str
 	if digit_count > 1:
-		mantissa_text = digits._byte_slice( 0, 1 ) + str( '.' ) + digits._byte_slice( 1, digit_count )
+		mantissa_text = digits._byte_slice( 0, 1 ) + '.' + digits._byte_slice( 1, digit_count )
 	else:
 		mantissa_text = digits
-	exp_sign: str = str( '-' ) if exponent < 0 else str( '+' )
+	exp_sign: str = '-' if exponent < 0 else '+'
 	with compiler.wrap_arithmetic:
 		exp_magnitude: i32 = -exponent if exponent < 0 else exponent
-	return mantissa_text + str( 'e' ) + exp_sign + _f64_exponent_text( exp_magnitude )
+	return mantissa_text + 'e' + exp_sign + _f64_exponent_text( exp_magnitude )
 
 
 @private
@@ -451,11 +426,11 @@ def _f64_repr_digits_raw( value: f64 ) -> str:
 	"0.0" anyway, but skipping the search entirely for a known, constant
 	answer is simpler and cheaper). '''
 	if compiler.is_nan( value ):
-		return str( 'nan' )
+		return 'nan'
 	if compiler.is_inf( value ):
-		return str( 'inf' )
+		return 'inf'
 	if value == 0.0:
-		return str( '0.0' )
+		return '0.0'
 	with compiler.wrap_arithmetic:
 		magnitude: f64 = -value if value < 0.0 else value
 		buf: Ptr[u8] = sys.alloc[u8]( _REPR_SEARCH_BUF_SIZE )
@@ -464,7 +439,6 @@ def _f64_repr_digits_raw( value: f64 ) -> str:
 		while True:
 			n = compiler.format_f64( buf, _REPR_SEARCH_BUF_SIZE, i32( precision ), _TYPE_CHAR_E, False, magnitude )
 			if n < 0:
-				sys.free( buf )
 				sys.panic( 'f-string float repr formatting failed' )
 			parsed: f64 = compiler.parse_f64( compiler.cast( ConstPtr[u8], buf ))
 			if parsed == magnitude or precision >= _MAX_REPR_SIGNIFICANT_DIGITS - 1:
@@ -486,7 +460,7 @@ def _f64_str( value: f64 ) -> str:
 	''' bare f"{x}" (no format spec at all) / str(x) - real Python's own
 	str(float)/repr(float) are identical, always (unlike int, where they
 	merely happen to coincide) - see _f64_repr below. '''
-	return _f64_sign_prefix( value, str( '-' )) + _f64_repr_digits_raw( value )
+	return _f64_sign_prefix( value, '-' ) + _f64_repr_digits_raw( value )
 
 
 @private
@@ -503,61 +477,102 @@ f64._repr_digits_raw = _f64_repr_digits_raw
 @private
 def _f32_sign_prefix( value: f32, mode: str ) -> str:
 	''' f32 has no format-spec digit conversion of its own - widens to f64
-	and delegates, same as _f32_fixed_digits/_f32_percent_digits below.
-	Widening f32 -> f64 is always exact (every f32 value is exactly
-	representable in f64), so this loses no precision beyond what value
-	already had. '''
-	return f64( value )._sign_prefix( mode )
+	and delegates, same as every other _f32_* function below. Widening f32
+	-> f64 is always exact (every f32 value, including NaN/Infinity, is
+	exactly representable in f64 - a NaN/Infinity source stays NaN/
+	Infinity, not "produced" by the cast), so this loses no precision
+	beyond what value already had.
+
+	The `f64( value )` conversion itself is a checked-mode float cast by
+	default (lowering.py's _lower_scalar_cast -> arithmetic_mode.py's
+	GetFloatCast - the SAME opcode covers every to-float direction, with
+	no widening-vs-narrowing distinction, since the checked contract is
+	about "could the RESULT be non-finite", not "could this specific
+	conversion lose bits" - checked mode's own established philosophy
+	elsewhere, e.g. finite-plus-finite float addition that overflows to
+	infinity is flagged too, even though IEEE754 defines that outcome).
+	That's a real requirement for a NaN/Infinity SOURCE, not a compiler
+	false positive - but every one of these functions exists specifically
+	to produce a text representation of whatever value f32 already holds,
+	including "nan"/"inf" (matching f64.__str__'s own confirmed behavior
+	on non-finite input) - panicking here would make it impossible to
+	print/format a non-finite f32 via any of the natural spellings
+	(str(f), f.__str__(), f'{f}'). `with compiler.wrap_arithmetic:` is the
+	textually-correct choice for this specific direction, not a "silently
+	wrong on overflow" shortcut the way integer wrap is: per arithmetic_
+	mode.py's own _raw_float_cast, wrap-mode float widening lowers to a
+	single plain C cast (`(double)(value)`) - the literal, unconditional,
+	standard, lossless widening operation, identical in EVERY arithmetic
+	mode for this direction; only the CHECKED-mode wrapper (a Result the
+	caller must then unwrap/propagate) actually differs, and every one of
+	these functions has no way to return that Result (they're all plain
+	`-> str`) nor any reason to reject a value merely for being non-finite
+	when the whole point is to render it as text. Confirmed via a real
+	compile: nothing in this codebase ever exercised these bodies before
+	(f'{f32_value}' failed to compile with the exact same error every
+	other spelling below does), so this had never been caught. '''
+	with compiler.wrap_arithmetic:
+		return f64( value )._sign_prefix( mode )
 
 
 @private
 def _f32_fixed_digits( value: f32, precision: usize, type_char: i32, alt: bool, sep: str ) -> str:
-	return f64( value )._fixed_digits( precision, type_char, alt, sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._fixed_digits( precision, type_char, alt, sep )
 
 
 @private
 def _f32_fixed_digits_raw( value: f32, precision: usize, type_char: i32, alt: bool ) -> str:
-	return f64( value )._fixed_digits_raw( precision, type_char, alt )
+	with compiler.wrap_arithmetic:
+		return f64( value )._fixed_digits_raw( precision, type_char, alt )
 
 
 @private
 def _f32_percent_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
-	return f64( value )._percent_digits( precision, alt, sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._percent_digits( precision, alt, sep )
 
 
 @private
 def _f32_percent_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
-	return f64( value )._percent_digits_raw( precision, alt )
+	with compiler.wrap_arithmetic:
+		return f64( value )._percent_digits_raw( precision, alt )
 
 
 @private
 def _f32_none_type_digits( value: f32, precision: usize, alt: bool, sep: str ) -> str:
-	return f64( value )._none_type_digits( precision, alt, sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._none_type_digits( precision, alt, sep )
 
 
 @private
 def _f32_none_type_digits_raw( value: f32, precision: usize, alt: bool ) -> str:
-	return f64( value )._none_type_digits_raw( precision, alt )
+	with compiler.wrap_arithmetic:
+		return f64( value )._none_type_digits_raw( precision, alt )
 
 
 @private
 def _f32_repr_digits( value: f32, sep: str ) -> str:
-	return f64( value )._repr_digits( sep )
+	with compiler.wrap_arithmetic:
+		return f64( value )._repr_digits( sep )
 
 
 @private
 def _f32_repr_digits_raw( value: f32 ) -> str:
-	return f64( value )._repr_digits_raw()
+	with compiler.wrap_arithmetic:
+		return f64( value )._repr_digits_raw()
 
 
 @private
 def _f32_str( value: f32 ) -> str:
-	return f64( value ).__str__()
+	with compiler.wrap_arithmetic:
+		return f64( value ).__str__()
 
 
 @private
 def _f32_repr( value: f32 ) -> str:
-	return f64( value ).__repr__()
+	with compiler.wrap_arithmetic:
+		return f64( value ).__repr__()
 
 
 f32._sign_prefix = _f32_sign_prefix

@@ -1,7 +1,8 @@
 # Real-compile-and-run tests for lib/http/client.py's Phase 0 pieces (see
 # PLAN_HTTP_CLIENT.md): the zero-prerequisite pure wire-format functions -
-# HTTPHeaders, status-line/header-line parsing, percent-encoding, base64
-# encoding, and chunked-transfer decoding. None of this depends on the
+# HTTPHeaders, status-line/header-line parsing, base64 encoding, and
+# chunked-transfer decoding (percent-encoding moved to urllib.parse - see
+# urllib_parse_test.py). None of this depends on the
 # socket library (still unimplemented - see the plan), so it's tested here
 # entirely against in-memory strings/bytes, the same way lib/codecs/*.py's
 # own encode/decode round trips are tested.
@@ -11,6 +12,8 @@
 # decodes a failure back to the offending case name and sub-code.
 
 # stdlib imports:
+import os
+import sys
 import unittest
 
 # local imports:
@@ -116,19 +119,6 @@ def main() -> i32:
 		return 6
 	return 0
 ''' ),
-			( 'percent_encode_reserved_and_unreserved', '''
-from http.client import percent_encode
-
-def main() -> i32:
-	if percent_encode( 'hello world!' ) != 'hello%20world%21':
-		return 1
-	# every RFC 3986 unreserved character must pass through unchanged
-	if percent_encode( 'abc-._~XYZ019' ) != 'abc-._~XYZ019':
-		return 2
-	if percent_encode( '' ) != '':
-		return 3
-	return 0
-''' ),
 			( 'base64_encode_known_vectors', '''
 from http.client import base64_encode
 
@@ -180,6 +170,730 @@ def main() -> i32:
 	return 0
 ''' ),
 		])
+
+
+class HTTPConnectionLoopbackTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' real-compile-and-run tests for HTTPConnection/Response (see
+	PLAN_HTTP_CLIENT.md's Phase 3a) over an actual loopback TCP connection -
+	a background thread (lib/threading.py) plays a minimal HTTP server
+	(bind/listen/accept/recv/send via lib/socket.py directly), the main
+	thread is the HTTPConnection client. Kept in a separate assert_programs_
+	run cluster from HTTPClientPhase0Tests above (real sockets/threads, not
+	pure in-memory string/bytes transforms). '''
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile http.client tests' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'get_request_content_length_body_and_headers', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import HTTPConnection, _Connection, Response, HTTPError
+
+class EchoServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				conn.recv( buf.get_ptr(), 4096 ).unwrap( 'server: recv' )
+				response: str = 'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 5\\r\\n\\r\\nhello'
+				rb: bytes = response.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+				self.ok.store( True )
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: EchoServer = EchoServer( u16( 18765 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	conn: _Connection[Socket] = HTTPConnection.connect( '127.0.0.1', u16( 18765 )).unwrap( 'client connect' )
+	conn.request( 'GET', '/', None, None ).unwrap( 'client request' )
+	resp: Response = conn.getresponse().unwrap( 'client getresponse' )
+	conn.close()
+	t.join()
+
+	if not server.ok.load():
+		return 1
+	if resp.status_code != 200:
+		return 2
+	body: str = resp.text().unwrap( 'text' )
+	if body != 'hello':
+		return 3
+	ct: str|None = resp.headers.get( 'Content-Type' )
+	match ct:
+		case None:
+			return 4
+		case _:
+			if ct != 'text/plain':
+				return 5
+	return 0
+''' ),
+			( 'get_request_chunked_body', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import HTTPConnection, _Connection, Response, HTTPError
+
+class ChunkedServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				conn.recv( buf.get_ptr(), 4096 ).unwrap( 'server: recv' )
+				response: str = 'HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n4\\r\\nWiki\\r\\n5\\r\\npedia\\r\\n0\\r\\n\\r\\n'
+				rb: bytes = response.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+				self.ok.store( True )
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: ChunkedServer = ChunkedServer( u16( 18766 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	conn: _Connection[Socket] = HTTPConnection.connect( '127.0.0.1', u16( 18766 )).unwrap( 'client connect' )
+	conn.request( 'GET', '/', None, None ).unwrap( 'client request' )
+	resp: Response = conn.getresponse().unwrap( 'client getresponse' )
+	conn.close()
+	t.join()
+
+	if not server.ok.load():
+		return 1
+	if resp.status_code != 200:
+		return 2
+	body: str = resp.text().unwrap( 'text' )
+	if body != 'Wikipedia':
+		return 3
+	return 0
+''' ),
+			( 'connect_refused_surfaces_as_err', '''
+from socket import Socket
+from http.client import HTTPConnection, _Connection, HTTPError
+
+def main() -> i32:
+	result: Result[_Connection[Socket], HTTPError] = HTTPConnection.connect( '127.0.0.1', u16( 18767 )) # nothing listening
+	if result.is_ok():
+		return 1
+	return 0
+''' ),
+			( 'unresolvable_hostname_surfaces_as_name_resolution_failed', '''
+from http.client import HTTPConnection, HTTPError
+
+def main() -> i32:
+	# .invalid is reserved (RFC 2606) - guaranteed to never resolve, same
+	# hostname socket_test.py's own resolution-failure tests already use
+	match HTTPConnection.connect( 'this-host-should-not-exist.invalid', u16( 80 )):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( HTTPError.NameResolutionFailed( _ )):
+			return 0
+		case Result.Err( _ ):
+			return 2
+''' ),
+		])
+
+
+class SessionLoopbackTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' real-compile-and-run tests for Session (see PLAN_HTTP_CLIENT.md's
+	Phase 3b) over real loopback TCP - same background-thread-plays-a-
+	server approach as HTTPConnectionLoopbackTests above, but exercising
+	Session's own cookie jar, redirect-following, params=/form=, and auth=
+	handling by inspecting the raw bytes each fake server actually
+	received. '''
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile http.client tests' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'session_cookie_jar_roundtrip', '''
+import compiler
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+
+class CookieJarServer:
+	port: u16
+	ready: Atomic[bool]
+	cookie_seen: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.cookie_seen = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 2 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+
+		match listener.accept():
+			case Result.Ok( pair1 ):
+				conn1: Socket = pair1[0]
+				buf1: bytearray = bytearray( 4096 )
+				conn1.recv( buf1.get_ptr(), 4096 ).unwrap( 'server: recv 1' )
+				resp1: str = 'HTTP/1.1 200 OK\\r\\nSet-Cookie: sid=abc123\\r\\nContent-Length: 2\\r\\n\\r\\nok'
+				rb1: bytes = resp1.encode().unwrap( 'server: encode 1' )
+				conn1.send( rb1.get_const_ptr(), rb1.__len__() ).unwrap( 'server: send 1' )
+				conn1.close()
+			case Result.Err( _ ):
+				pass
+
+		match listener.accept():
+			case Result.Ok( pair2 ):
+				conn2: Socket = pair2[0]
+				buf2: bytearray = bytearray( 4096 )
+				recv_total2: usize = 0
+				attempts2: usize = 0
+				req2: str = ''
+				with compiler.wrap_arithmetic:
+					while attempts2 < 50:
+						dest2: Ptr[u8] = buf2.get_ptr() + recv_total2
+						room2: usize = 4096 - recv_total2
+						n2: usize = conn2.recv( dest2, room2 ).unwrap( 'server: recv 2' )
+						recv_total2 += n2
+						attempts2 += 1
+						req2 = buf2.decode().unwrap( 'server: decode 2' )
+						if req2.find( 'Cookie: sid=abc123' ) != isize( -1 ) or n2 == 0:
+							break
+				if req2.find( 'Cookie: sid=abc123' ) != isize( -1 ):
+					self.cookie_seen.store( True )
+				resp2: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'
+				rb2: bytes = resp2.encode().unwrap( 'server: encode 2' )
+				conn2.send( rb2.get_const_ptr(), rb2.__len__() ).unwrap( 'server: send 2' )
+				conn2.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: CookieJarServer = CookieJarServer( u16( 18770 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	url: str = 'http://127.0.0.1:18770/'
+	r1: Response = s.get( url ).unwrap( 'client request 1' )
+	r2: Response = s.get( url ).unwrap( 'client request 2' )
+	t.join()
+
+	if r1.status_code != 200:
+		return 1
+	if r2.status_code != 200:
+		return 2
+	if not server.cookie_seen.load():
+		return 3
+	return 0
+''' ),
+			( 'session_follows_redirect_and_merges_query_params', '''
+import compiler
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+
+class RedirectServer:
+	port: u16
+	ready: Atomic[bool]
+	saw_query: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.saw_query = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 2 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+
+		match listener.accept():
+			case Result.Ok( pair1 ):
+				conn1: Socket = pair1[0]
+				buf1: bytearray = bytearray( 4096 )
+				recv_total1: usize = 0
+				attempts1: usize = 0
+				req1: str = ''
+				with compiler.wrap_arithmetic:
+					while attempts1 < 50:
+						dest1: Ptr[u8] = buf1.get_ptr() + recv_total1
+						room1: usize = 4096 - recv_total1
+						n1: usize = conn1.recv( dest1, room1 ).unwrap( 'server: recv 1' )
+						recv_total1 += n1
+						attempts1 += 1
+						req1 = buf1.decode().unwrap( 'server: decode 1' )
+						if req1.find( '/search?q=hello+world' ) != isize( -1 ) or n1 == 0:
+							break
+				if req1.find( '/search?q=hello+world' ) != isize( -1 ):
+					self.saw_query.store( True )
+				resp1: str = 'HTTP/1.1 302 Found\\r\\nLocation: http://127.0.0.1:18771/final\\r\\nContent-Length: 0\\r\\n\\r\\n'
+				rb1: bytes = resp1.encode().unwrap( 'server: encode 1' )
+				conn1.send( rb1.get_const_ptr(), rb1.__len__() ).unwrap( 'server: send 1' )
+				conn1.close()
+			case Result.Err( _ ):
+				pass
+
+		match listener.accept():
+			case Result.Ok( pair2 ):
+				conn2: Socket = pair2[0]
+				buf2: bytearray = bytearray( 4096 )
+				conn2.recv( buf2.get_ptr(), 4096 ).unwrap( 'server: recv 2' )
+				resp2: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nfinal'
+				rb2: bytes = resp2.encode().unwrap( 'server: encode 2' )
+				conn2.send( rb2.get_const_ptr(), rb2.__len__() ).unwrap( 'server: send 2' )
+				conn2.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: RedirectServer = RedirectServer( u16( 18771 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	params: dict[str,str] = dict[str,str]()
+	params[ 'q' ] = 'hello world'
+	r: Response = s.get( 'http://127.0.0.1:18771/search', params = params ).unwrap( 'client request' )
+	t.join()
+
+	if not server.saw_query.load():
+		return 1
+	if r.status_code != 200:
+		return 2
+	body: str = r.text().unwrap( 'text' )
+	if body != 'final':
+		return 3
+	if r.url != 'http://127.0.0.1:18771/final':
+		return 4
+	return 0
+''' ),
+			( 'session_follows_relative_redirect', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+
+class RelativeRedirectServer:
+	port: u16
+	ready: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 2 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+
+		match listener.accept():
+			case Result.Ok( pair1 ):
+				conn1: Socket = pair1[0]
+				buf1: bytearray = bytearray( 4096 )
+				conn1.recv( buf1.get_ptr(), 4096 ).unwrap( 'server: recv 1' )
+				# a RELATIVE Location - resolved against the request URL via
+				# urllib.parse.urljoin() now, previously "don't redirect"
+				resp1: str = 'HTTP/1.1 302 Found\\r\\nLocation: /final\\r\\nContent-Length: 0\\r\\n\\r\\n'
+				rb1: bytes = resp1.encode().unwrap( 'server: encode 1' )
+				conn1.send( rb1.get_const_ptr(), rb1.__len__() ).unwrap( 'server: send 1' )
+				conn1.close()
+			case Result.Err( _ ):
+				pass
+
+		match listener.accept():
+			case Result.Ok( pair2 ):
+				conn2: Socket = pair2[0]
+				buf2: bytearray = bytearray( 4096 )
+				conn2.recv( buf2.get_ptr(), 4096 ).unwrap( 'server: recv 2' )
+				resp2: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nfinal'
+				rb2: bytes = resp2.encode().unwrap( 'server: encode 2' )
+				conn2.send( rb2.get_const_ptr(), rb2.__len__() ).unwrap( 'server: send 2' )
+				conn2.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: RelativeRedirectServer = RelativeRedirectServer( u16( 18773 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	r: Response = s.get( 'http://127.0.0.1:18773/start' ).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+	body: str = r.text().unwrap( 'text' )
+	if body != 'final':
+		return 2
+	if r.url != 'http://127.0.0.1:18773/final':
+		return 3
+	return 0
+''' ),
+			( 'session_form_post_and_basic_auth', '''
+import compiler
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+
+class FormAuthServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				recv_total: usize = 0
+				attempts: usize = 0
+				req: str = ''
+				with compiler.wrap_arithmetic:
+					while attempts < 50:
+						dest: Ptr[u8] = buf.get_ptr() + recv_total
+						room: usize = 4096 - recv_total
+						n: usize = conn.recv( dest, room ).unwrap( 'server: recv' )
+						recv_total += n
+						attempts += 1
+						req = buf.decode().unwrap( 'server: decode' )
+						has_ct0: bool = req.find( 'Content-Type: application/x-www-form-urlencoded' ) != isize( -1 )
+						has_body0: bool = req.find( 'a=1&b=2' ) != isize( -1 )
+						has_auth0: bool = req.find( 'Authorization: Basic dXNlcjpwYXNz' ) != isize( -1 )
+						if ( has_ct0 and has_body0 and has_auth0 ) or n == 0:
+							break
+				has_ct: bool = req.find( 'Content-Type: application/x-www-form-urlencoded' ) != isize( -1 )
+				has_body: bool = req.find( 'a=1&b=2' ) != isize( -1 )
+				has_auth: bool = req.find( 'Authorization: Basic dXNlcjpwYXNz' ) != isize( -1 )
+				if has_ct and has_body and has_auth:
+					self.ok.store( True )
+				resp: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'
+				rb: bytes = resp.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: FormAuthServer = FormAuthServer( u16( 18772 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	form: dict[str,str] = dict[str,str]()
+	form[ 'a' ] = '1'
+	form[ 'b' ] = '2'
+	r: Response = s.post( 'http://127.0.0.1:18772/submit', form = form, auth = ( 'user', 'pass' )).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+	if not server.ok.load():
+		return 2
+	return 0
+''' ),
+			( 'session_json_request_and_response', '''
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response
+from json import JSONValue
+
+class JsonServer:
+	port: u16
+	ready: Atomic[bool]
+	ok: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+		self.ok = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				recv_total: usize = 0
+				attempts: usize = 0
+				req: str = ''
+				with compiler.wrap_arithmetic:
+					while attempts < 50:
+						dest: Ptr[u8] = buf.get_ptr() + recv_total
+						room: usize = 4096 - recv_total
+						n: usize = conn.recv( dest, room ).unwrap( 'server: recv' )
+						recv_total += n
+						attempts += 1
+						req = buf.decode().unwrap( 'server: decode' )
+						has_ct0: bool = req.find( 'Content-Type: application/json' ) != isize( -1 )
+						has_body0: bool = req.find( '{"a":1,"b":"hello"}' ) != isize( -1 )
+						if ( has_ct0 and has_body0 ) or n == 0:
+							break
+				has_ct: bool = req.find( 'Content-Type: application/json' ) != isize( -1 )
+				has_body: bool = req.find( '{"a":1,"b":"hello"}' ) != isize( -1 )
+				if has_ct and has_body:
+					self.ok.store( True )
+				resp: str = 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: 25\\r\\n\\r\\n{"status":"ok","count":3}'
+				rb: bytes = resp.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+def main() -> i32:
+	server: JsonServer = JsonServer( u16( 18774 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	body: JSONValue = JSONValue.object()
+	body.object_set( 'a', JSONValue.from_int( int( 1 ))).unwrap( 'object_set a' )
+	body.object_set( 'b', JSONValue.from_str( 'hello' )).unwrap( 'object_set b' )
+	r: Response = s.post( 'http://127.0.0.1:18774/submit', json = body ).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+	if not server.ok.load():
+		return 2
+
+	parsed: JSONValue = r.json().unwrap( 'response json' )
+	status: str = parsed.object_get( 'status' ).unwrap( 'get status' ).as_str().unwrap( 'as_str' )
+	if status != 'ok':
+		return 3
+	count: int = parsed.object_get( 'count' ).unwrap( 'get count' ).as_int().unwrap( 'as_int' )
+	if count != int( 3 ):
+		return 4
+	return 0
+''' ),
+			( 'session_log_with_secret_redaction', '''
+import compiler
+import threading
+from atomic import Atomic
+from socket import Socket
+from http.client import Session, Response, HTTPHeaders
+
+class EchoOkServer:
+	port: u16
+	ready: Atomic[bool]
+
+	def __init__( self, port: u16 ) -> None:
+		self.port = port
+		self.ready = Atomic[bool]( False )
+
+	def run( self ) -> None:
+		listener: Socket = Socket.tcp().unwrap( 'server: tcp' )
+		listener.set_reuseaddr( True ).unwrap( 'server: reuseaddr' )
+		listener.bind( '127.0.0.1', self.port ).unwrap( 'server: bind' )
+		listener.listen( 1 ).unwrap( 'server: listen' )
+		self.ready.store( True )
+
+		match listener.accept():
+			case Result.Ok( pair ):
+				conn: Socket = pair[0]
+				buf: bytearray = bytearray( 4096 )
+				conn.recv( buf.get_ptr(), 4096 ).unwrap( 'server: recv' )
+				resp: str = 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'
+				rb: bytes = resp.encode().unwrap( 'server: encode' )
+				conn.send( rb.get_const_ptr(), rb.__len__() ).unwrap( 'server: send' )
+				conn.close()
+			case Result.Err( _ ):
+				pass
+		listener.close()
+
+_captured: str = ''
+
+def _capture( s: str ) -> None:
+	global _captured
+	_captured = _captured + s + '\\n---\\n'
+
+def main() -> i32:
+	server: EchoOkServer = EchoOkServer( u16( 18775 ))
+	t: threading.Thread = threading.Thread( server.run )
+	while not server.ready.load():
+		pass
+
+	s: Session = Session()
+	req_headers: HTTPHeaders = HTTPHeaders()
+	req_headers.set( 'X-Api-Key', 'sw0rdfish' )
+	secrets: list[str] = list[str]()
+	secrets.append( 'sw0rdfish' ).unwrap( 'append' )
+	r: Response = s.get( 'http://127.0.0.1:18775/', headers = req_headers, log = _capture, sensitive_values = secrets ).unwrap( 'client request' )
+	t.join()
+
+	if r.status_code != 200:
+		return 1
+
+	# request line + response status line both made it into the log
+	if _captured.find( 'GET / HTTP/1.1' ) == isize( -1 ):
+		return 2
+	if _captured.find( 'HTTP/1.1 200 OK' ) == isize( -1 ):
+		return 3
+	# the secret itself never appears in cleartext...
+	if _captured.find( 'sw0rdfish' ) != isize( -1 ):
+		return 4
+	# ...but the redaction placeholder does, proving it was actually swapped
+	# in rather than the header simply being dropped
+	if _captured.find( '***CENSORED***' ) == isize( -1 ):
+		return 5
+	return 0
+''' ),
+		])
+
+
+_NETWORK_OK = os.environ.get( 'METALPY_TEST_NETWORK', '1' ) not in ( '0', 'false', 'False' )
+_HAS_TLS_BACKEND = os.name == 'nt' or sys.platform.startswith( 'linux' )
+
+
+@unittest.skipUnless( _HAS_TLS_BACKEND, 'lib/ssl.py only has Windows/Linux backends so far - see PLAN_SSL.md' )
+@unittest.skipUnless( _NETWORK_OK, 'set METALPY_TEST_NETWORK=0 to acknowledge - these tests dial out to example.com' )
+class HTTPSClientTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' HTTPConnection/HTTPSConnection/Session over real https:// - same
+	network-dependent departure ssl_test.py's own handshake tests already
+	are (there's no loopback TLS server here either, for the same reason:
+	lib/ssl.py is client-only - see PLAN_SSL.md). Exercises the actual
+	wiring in lib/http/client.py (the generic _Connection[T], _connect_tls_
+	or_http_err, _parse_url's https:// support, HTTPSConnection) against a
+	real server, not just that it compiles. '''
+
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'session_get_https', '''
+from http.client import get
+
+def main() -> i32:
+	r = get( 'https://example.com/' ).unwrap( 'https get' )
+	if r.status_code != 200:
+		return 1
+	body: str = r.text().unwrap( 'decode body' )
+	if not body.startswith( '<!doctype html>' ):
+		return 2
+	return 0
+''' ),
+			( 'httpsconnection_direct', '''
+from http.client import HTTPSConnection, Response
+
+def main() -> i32:
+	conn = HTTPSConnection.connect( 'example.com' ).unwrap( 'https connect' )
+	conn.request( 'GET', '/', None, None ).unwrap( 'request' )
+	resp: Response = conn.getresponse().unwrap( 'getresponse' )
+	conn.close()
+	if resp.status_code != 200:
+		return 1
+	if resp.headers.get( 'Content-Type' ) is None:
+		return 2
+	return 0
+''' ),
+			( 'https_certificate_failure_surfaces_as_tlserror', '''
+from http.client import get, HTTPError
+
+def main() -> i32:
+	match get( 'https://expired.badssl.com/' ):
+		case Result.Ok( _ ):
+			return 1  # unexpected - badssl.com's cert should never validate
+		case Result.Err( HTTPError.TLSError( _ )):
+			return 0
+		case Result.Err( _ ):
+			return 2  # wrong HTTPError variant
+''' ),
+			( 'https_verify_false_accepts_expired_cert', '''
+from http.client import get
+
+def main() -> i32:
+	# same expired-cert endpoint as https_certificate_failure_surfaces_as_
+	# tlserror above, but verify=False should skip validation entirely and
+	# let the handshake (and request) succeed anyway
+	r = get( 'https://expired.badssl.com/', verify = False ).unwrap( 'verify=False https get' )
+	if r.status_code != 200:
+		return 1
+	return 0
+''' ),
+		], timeout = 90.0 )  # four real external TLS handshakes - generous margin for network jitter
 
 
 if __name__ == '__main__':

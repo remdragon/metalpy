@@ -145,17 +145,22 @@ def _b64encode( data: bytes|bytearray, alphabet: list[u8] ) -> bytes:
 			in_idx += 3
 			out_idx += 4
 
+		# tb0/tv declared bare here, once - a variable's type is only ever
+		# declared once per function, even across mutually exclusive
+		# if/elif arms (see del_reuse_and_emitter_naming_bug)
+		tb0: u8
+		tv: u32
 		if remainder == 1:
-			tb0: u8 = in_ptr[in_idx]
-			tv: u32 = u32( tb0 ) << 16
+			tb0 = in_ptr[in_idx]
+			tv = u32( tb0 ) << 16
 			out_ptr[out_idx] = alphabet.__getitem__( usize( ( tv >> 18 ) & 0x3F ) ).unwrap( 'sextet always < 64' )
 			out_ptr[out_idx + 1] = alphabet.__getitem__( usize( ( tv >> 12 ) & 0x3F ) ).unwrap( 'sextet always < 64' )
 			out_ptr[out_idx + 2] = _PAD
 			out_ptr[out_idx + 3] = _PAD
 		elif remainder == 2:
-			tb0: u8 = in_ptr[in_idx]
+			tb0 = in_ptr[in_idx]
 			tb1: u8 = in_ptr[in_idx + 1]
-			tv: u32 = ( u32( tb0 ) << 16 ) | ( u32( tb1 ) << 8 )
+			tv = ( u32( tb0 ) << 16 ) | ( u32( tb1 ) << 8 )
 			out_ptr[out_idx] = alphabet.__getitem__( usize( ( tv >> 18 ) & 0x3F ) ).unwrap( 'sextet always < 64' )
 			out_ptr[out_idx + 1] = alphabet.__getitem__( usize( ( tv >> 12 ) & 0x3F ) ).unwrap( 'sextet always < 64' )
 			out_ptr[out_idx + 2] = alphabet.__getitem__( usize( ( tv >> 6 ) & 0x3F ) ).unwrap( 'sextet always < 64' )
@@ -234,9 +239,11 @@ def _b64decode( data: bytes|bytearray, sym62: u8, sym63: u8, validate: bool ) ->
 	i = 0
 	with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
 		while i < n:
-			c: u8 = in_ptr[i]
-			if c == _PAD or _b64_char_value( c, sym62, sym63 ).is_ok():
-				f_ptr[f_idx] = c
+			# distinct name from the counting loop's own `c` above - a
+			# variable's type is only ever declared once per function
+			fc: u8 = in_ptr[i]
+			if fc == _PAD or _b64_char_value( fc, sym62, sym63 ).is_ok():
+				f_ptr[f_idx] = fc
 				f_idx += 1
 			i += 1
 
@@ -286,31 +293,39 @@ def _b64decode_core( in_ptr: ConstPtr[u8], n: usize, sym62: u8, sym63: u8 ) -> R
 			out_idx += 3
 
 		# Final group (exactly 4 chars): the only place padding may appear.
-		c0: u8 = in_ptr[in_idx]
-		c1: u8 = in_ptr[in_idx + 1]
-		c2: u8 = in_ptr[in_idx + 2]
-		c3: u8 = in_ptr[in_idx + 3]
-		v0: u8 = _b64_char_value( c0, sym62, sym63 ).or_return()
-		v1: u8 = _b64_char_value( c1, sym62, sym63 ).or_return()
+		# f-prefixed names throughout - distinct from the main loop's own
+		# c0-c3/v0-v3 above (this language has no block scoping, so those
+		# are still live here even though the loop itself has exited) and
+		# from each other's own if/elif/else arm below (v2/pv declared
+		# bare once, since a variable's type is only ever declared once
+		# per function, even across mutually exclusive branches)
+		fc0: u8 = in_ptr[in_idx]
+		fc1: u8 = in_ptr[in_idx + 1]
+		fc2: u8 = in_ptr[in_idx + 2]
+		fc3: u8 = in_ptr[in_idx + 3]
+		fv0: u8 = _b64_char_value( fc0, sym62, sym63 ).or_return()
+		fv1: u8 = _b64_char_value( fc1, sym62, sym63 ).or_return()
+		fv2: u8
+		pv: u32
 
 		if pad_count == 2:
-			if c2 != _PAD or c3 != _PAD:
+			if fc2 != _PAD or fc3 != _PAD:
 				return Result.Err( Base64Error( 'invalid base64 padding' ) )
-			pv: u32 = ( u32( v0 ) << 18 ) | ( u32( v1 ) << 12 )
+			pv = ( u32( fv0 ) << 18 ) | ( u32( fv1 ) << 12 )
 			out_ptr[out_idx] = u8( ( pv >> 16 ) & 0xFF )
 		elif pad_count == 1:
-			if c3 != _PAD or c2 == _PAD:
+			if fc3 != _PAD or fc2 == _PAD:
 				return Result.Err( Base64Error( 'invalid base64 padding' ) )
-			v2: u8 = _b64_char_value( c2, sym62, sym63 ).or_return()
-			pv: u32 = ( u32( v0 ) << 18 ) | ( u32( v1 ) << 12 ) | ( u32( v2 ) << 6 )
+			fv2 = _b64_char_value( fc2, sym62, sym63 ).or_return()
+			pv = ( u32( fv0 ) << 18 ) | ( u32( fv1 ) << 12 ) | ( u32( fv2 ) << 6 )
 			out_ptr[out_idx] = u8( ( pv >> 16 ) & 0xFF )
 			out_ptr[out_idx + 1] = u8( ( pv >> 8 ) & 0xFF )
 		else:
-			if c2 == _PAD or c3 == _PAD:
+			if fc2 == _PAD or fc3 == _PAD:
 				return Result.Err( Base64Error( 'invalid base64 padding' ) )
-			v2: u8 = _b64_char_value( c2, sym62, sym63 ).or_return()
-			v3: u8 = _b64_char_value( c3, sym62, sym63 ).or_return()
-			pv: u32 = ( u32( v0 ) << 18 ) | ( u32( v1 ) << 12 ) | ( u32( v2 ) << 6 ) | u32( v3 )
+			fv2 = _b64_char_value( fc2, sym62, sym63 ).or_return()
+			fv3: u8 = _b64_char_value( fc3, sym62, sym63 ).or_return()
+			pv = ( u32( fv0 ) << 18 ) | ( u32( fv1 ) << 12 ) | ( u32( fv2 ) << 6 ) | u32( fv3 )
 			out_ptr[out_idx] = u8( ( pv >> 16 ) & 0xFF )
 			out_ptr[out_idx + 1] = u8( ( pv >> 8 ) & 0xFF )
 			out_ptr[out_idx + 2] = u8( pv & 0xFF )

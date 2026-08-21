@@ -18,10 +18,26 @@
 # digit counts is wrapped in a single `with compiler.panic_arithmetic(...)`
 # per method (SYNTAX.md Section 5) instead -- one declarative statement
 # instead of a manual checked-call before every `+`. Genuine, expected
-# failure conditions (allocation failure, division by zero, malformed input,
-# narrowing a value too big for a fixed-width type) still go through
-# `Result[T, IntError]` rather than being panics, since those aren't bugs --
-# they're normal outcomes a caller needs to handle.
+# failure conditions (malformed input, narrowing a value too big for a
+# fixed-width type) still go through `Result[T, IntError]` rather than being
+# panics, since those aren't bugs -- they're normal outcomes a caller needs
+# to handle. Division by zero is the same canonical `ZeroDivisionError`
+# scalar division already raises (lib/builtins/__init__.py), not a fourth
+# IntError variant -- divmod()/__floordiv__()/__mod__() declare
+# `Result[_, IntError|ZeroDivisionError]` (IntError there is purely a
+# type-system formality, carried through from internal bookkeeping calls
+# that never actually reach Err in practice - see divmod()'s own comment),
+# so ZeroDivisionError composes cleanly with scalar division in a shared
+# error union, and __floordiv__/__mod__ (@fallible_arithmetic) participate in the
+# caller's ambient
+# arithmetic mode the same way a bare checked `/` on a scalar already does:
+# `with compiler.panic_arithmetic(...): a // b` auto-panics, default mode
+# auto-propagates. __add__/__sub__/__mul__/__neg__ stay unconditionally
+# `Result[int, IntError]`, deliberately NOT @fallible_arithmetic or mode-aware -
+# arbitrary-precision add/sub/mul/negate can't overflow (the digit buffer
+# just grows; sys.alloc panics on OOM rather than returning a Result - see
+# clone()'s own comment), so unlike division there's no failure mode for a
+# `with compiler.wrap_arithmetic:`/etc. block to meaningfully retarget.
 
 import sys
 
@@ -49,7 +65,6 @@ import sys
 # referenced bare.
 @union
 class IntError:
-	DivideByZero: None
 	InvalidDigit: None
 	Overflow: None
 	Other: None
@@ -145,9 +160,12 @@ class int:
 		if length == 0:
 			return Result.Err( IntError.InvalidDigit( None ))
 
-		is_negative: bool = cstr[0] == _ASCII_MINUS
+		# negative, not is_negative - int.is_negative() is a real instance
+		# method, and this language has no local-shadows-outer-scope
+		# semantics (see _existing_local_or_none's own comment)
+		negative: bool = cstr[0] == _ASCII_MINUS
 		with compiler.panic_arithmetic( 'a leading sign character is at most one byte within the string\'s own length' ):
-			start: usize = 1 if is_negative else 0
+			start: usize = 1 if negative else 0
 
 			# Skip leading zeros, but always leave at least one digit
 			# character behind (so "0" and "-0" still parse to zero
@@ -179,7 +197,7 @@ class int:
 			__num_allocated = num_digits,
 			__is_negative = False,
 		)
-		result.__is_negative = is_negative and not result.is_zero()
+		result.__is_negative = negative and not result.is_zero()
 		return Result.Ok( result )
 
 	def clone( self ) -> int:
@@ -368,8 +386,14 @@ class int:
 	def __eq__( self, other: int ) -> bool:
 		return self.compare( other ) == 0
 
+	def __eq__( self, other: i32 ) -> bool:
+		return self.compare( int( other ) ) == 0
+
 	def __ne__( self, other: int ) -> bool:
 		return self.compare( other ) != 0
+
+	def __ne__( self, other: i32 ) -> bool:
+		return self.compare( int( other ) ) != 0
 
 	def __lt__( self, other: int ) -> bool:
 		return self.compare( other ) < 0
@@ -497,9 +521,16 @@ class int:
 	# doesn't reach into struct fields - see PLAN_TUPLE.md's own "why
 	# RCClass, not CStruct" reasoning) - a real, if narrow, leak this
 	# migration fixes as a side effect, not just a workaround removed.
-	def divmod( self, divisor: int ) -> Result[tuple[int,int], IntError]:
+	def divmod( self, divisor: int ) -> Result[tuple[int,int], IntError|ZeroDivisionError]:
+		# IntError here is purely a type-system formality carried through
+		# from the .or_return() calls on _add_magnitude/_subtract_magnitude/
+		# _shift_and_add_digit below (bookkeeping Result[None,IntError] -
+		# never actually reachable as Err in practice, since sys.alloc
+		# panics on OOM rather than returning one - see clone()'s own
+		# comment) - the only error THIS method itself ever really produces
+		# is ZeroDivisionError.
 		if divisor.is_zero():
-			return Result.Err( IntError.DivideByZero( None ))
+			return Result.Err( ZeroDivisionError() )
 
 		base = divisor.clone()
 		base.__is_negative = False
@@ -557,11 +588,13 @@ class int:
 
 		return Result.Ok( ( quotient, remainder ))
 
-	def __floordiv__( self, other: int ) -> Result[int, IntError]:
+	@fallible_arithmetic
+	def __floordiv__( self, other: int ) -> Result[int, IntError|ZeroDivisionError]:
 		result = self.divmod( other ).or_return()
 		return Result.Ok( result[0] )
 
-	def __mod__( self, other: int ) -> Result[int, IntError]:
+	@fallible_arithmetic
+	def __mod__( self, other: int ) -> Result[int, IntError|ZeroDivisionError]:
 		result = self.divmod( other ).or_return()
 		return Result.Ok( result[1] )
 
@@ -647,12 +680,12 @@ class int:
 		(complex logic orchestrated from lowering.py itself) elsewhere in
 		this same pass. '''
 		if self.__is_negative:
-			return str( '-' )
+			return '-'
 		if mode == '+':
-			return str( '+' )
+			return '+'
 		if mode == ' ':
-			return str( ' ' )
-		return str( '' )
+			return ' '
+		return ''
 
 	@private
 	def _to_radix_digits( self, base: i32, uppercase: bool ) -> str:
@@ -684,7 +717,7 @@ class int:
 		this gap, written before tuples existed to reach it) and fixed
 		there - see that function's own comment for the full account. '''
 		if self.is_zero():
-			return str( '0' )
+			return '0'
 		magnitude: int = self.clone()
 		magnitude.__is_negative = False
 		radix: int = int( base )
@@ -706,7 +739,7 @@ class int:
 			while i > 0:
 				i -= 1
 				ordered.append( digits.__getitem__( i ).unwrap( '_to_radix_digits: index in bounds by construction' )).unwrap( '_to_radix_digits: append failed' )
-		return str( '' ).join( ordered )
+		return ''.join( ordered )
 
 	@private
 	def _decimal_digits( self ) -> str:

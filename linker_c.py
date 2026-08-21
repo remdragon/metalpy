@@ -17,7 +17,71 @@ import subprocess
 import sys
 
 
-def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
+def resolve_no_crt( no_crt: bool, asan: bool ) -> bool:
+	'''
+	--asan requires the C runtime: the ASan runtime library itself depends on
+	CRT symbols (getenv, memcpy, malloc, ...) regardless of what the user's
+	own program needs, so a no-CRT link against it dies with a wall of
+	LNK2019s. Force real CRT linking whenever asan is requested, overriding
+	whatever no_crt the caller auto-detected.
+
+	Must be called BEFORE emitter_c.emit_c(), not just before
+	CcTool.compile()/link(): no_crt also selects which entry-point shape
+	emit_c() generates (a hand-rolled mainCRTStartup stub that calls main(),
+	vs plain main() as the real entry) - overriding only the compile/link
+	flags after C source generation would link CRT-provided startup code
+	against a source file that still defines its own conflicting
+	mainCRTStartup, trading one wall of link errors for another.
+	'''
+	if asan and no_crt:
+		print( 'WARNING - --asan requires the C runtime - forcing CRT linking (no_crt=True request ignored)', file = sys.stderr )
+		return False
+	return no_crt
+
+
+def ensure_cache_dir( cache_dir: Path ) -> bool:
+	''' best-effort mkdir for one of this codebase's %TEMP%/metalpy/<category>
+	disk-cache directories - shared by every cache call site (atomic_write_
+	cache below, and each cache_dir.mkdir(...) that gates a read attempt
+	before ever reaching it: lowering._eval_cexpr, has_symbol,
+	ntdll_import_lib, wide_int_runtime_lib). A cache directory being
+	unavailable - most commonly a DIFFERENT user's earlier process having
+	left one behind at a restrictive mode (confirmed: root-owned, 0o755,
+	blocking every non-root user from creating anything inside it) - must
+	never fail the compile the caller actually asked for; it only means
+	this call, and every other process sharing the directory, pays the real
+	cost the cache exists to avoid. Warns via stderr (NOT silent - unlike
+	atomic_write_cache's own publish-race retries, this is a standing
+	environment problem worth a human noticing, not a routine microseconds-
+	wide contention window) and returns False so the caller skips the
+	read/write attempt entirely instead of tripping over a directory that
+	still doesn't actually exist.
+
+	On POSIX, ALSO chmods cache_dir and its immediate parent (the shared
+	.../metalpy directory itself, but never higher - tempfile.gettempdir()
+	is a real system directory, e.g. /tmp, this code must never touch) to
+	0o777 whenever it can, regardless of whether THIS call just created
+	them: Path.mkdir(mode=...) is filtered through the process umask, so
+	passing a permissive mode there is not reliable, and re-asserting 0o777
+	on a directory this process (or a past run of this same fixed code)
+	already owns is a harmless, self-healing no-op. A directory owned by a
+	different user simply raises EPERM here, silently ignored - not ours to
+	fix, that's exactly the "unavailable, fall through" case above. '''
+	try:
+		cache_dir.mkdir( parents = True, exist_ok = True )
+	except OSError as e:
+		print( f'WARNING - metalpy: cache directory {cache_dir} is unavailable ({e}) - continuing without caching', file = sys.stderr )
+		return False
+	if os.name == 'posix':
+		for d in ( cache_dir, cache_dir.parent ):
+			try:
+				os.chmod( d, 0o777 )
+			except OSError:
+				pass
+	return True
+
+
+def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> bool:
 	''' publish a disk-cache entry so a concurrent reader sees either the
 	complete previous state or the complete new one, never a half-written file.
 
@@ -46,12 +110,19 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	Readers should ALSO treat empty/unparseable content as a miss - this fixes
 	new writes, but cannot repair a corrupt file some earlier run left behind.
 
-	PUBLISHING IS BEST-EFFORT, deliberately. On Windows os.replace fails with
-	PermissionError (WinError 5) when the destination is currently OPEN - which
-	a concurrent reader doing cache_file.read_text() briefly makes it. The first
-	version of this raised, which turned the original rare silent-wrong-answer
-	into a rare hard crash that aborted the compile - strictly worse, and caught
-	by the same test that motivated the fix in the first place.
+	PUBLISHING IS BEST-EFFORT, deliberately - returns whether it actually
+	succeeded (True) or gave up (False), but NEVER raises. On Windows
+	os.replace fails with PermissionError (WinError 5) when the destination
+	is currently OPEN - which a concurrent reader doing cache_file.
+	read_text() briefly makes it. The first version of this raised, which
+	turned the original rare silent-wrong-answer into a rare hard crash
+	that aborted the compile - strictly worse, and caught by the same test
+	that motivated the fix in the first place. The SAME posture now also
+	covers the write itself (tmp.write_bytes/write_text) and the directory
+	creation (ensure_cache_dir) - a different user's earlier process having
+	left the cache directory at a mode this process can't write into hits
+	PermissionError right there, before os.replace is even reached, and
+	needs the identical "don't crash the caller's compile" treatment.
 
 	Losing that race is harmless: this cache is IDEMPOTENT, every writer for a
 	given key computes the same value from the same (lib, symbol, compiler) or
@@ -59,26 +130,40 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> None:
 	caller already has its own correct value in hand and returns it either way;
 	all that's lost is the chance to save the NEXT process a re-probe. A few
 	tight retries first, since a reader's handle is only open for microseconds
-	and retrying usually wins immediately - but never at the cost of failing. '''
-	cache_file.parent.mkdir( parents = True, exist_ok = True )
+	and retrying usually wins immediately.
+
+	A give-up IS reported (stderr WARNING, not silent - see ensure_cache_dir's
+	own identical reasoning): losing one publish is harmless noise, but a
+	caller like ntdll_import_lib whose own contract needs the file to actually
+	land on disk checks this return value and needs to know why it came back
+	False, and a standing "this directory is unusable" environment problem is
+	worth a human noticing even where the immediate caller doesn't care. '''
+	if not ensure_cache_dir( cache_file.parent ):
+		return False
 	tmp = cache_file.with_name( f'{cache_file.name}.{os.getpid()}.tmp' )
 	try:
-		if isinstance( data, bytes ):
-			tmp.write_bytes( data )
-		else:
-			tmp.write_text( data, encoding = 'utf-8' )
+		try:
+			if isinstance( data, bytes ):
+				tmp.write_bytes( data )
+			else:
+				tmp.write_text( data, encoding = 'utf-8' )
+		except OSError as e:
+			print( f'WARNING - metalpy: cannot write cache file {cache_file} ({e}) - continuing without caching', file = sys.stderr )
+			return False
+		if os.name == 'posix':
+			try:
+				os.chmod( tmp, 0o666 )
+			except OSError:
+				pass
 		for attempt in range( 3 ):
 			try:
 				os.replace( tmp, cache_file )
-				return
-			except OSError:
+				return True
+			except OSError as e:
 				if attempt == 2:
-					# give up publishing - see "best-effort" above. NOT an error
-					# to report: a failed publish costs a future re-probe, never
-					# correctness, and the cache lives in %TEMP% where a full
-					# disk / locked file is the user's environment, not a bug in
-					# the compile they asked for.
-					break
+					# give up publishing - see "best-effort" above
+					print( f'WARNING - metalpy: cannot publish cache file {cache_file} ({e}) - continuing without caching', file = sys.stderr )
+					return False
 	finally:
 		# never leave a stray .tmp behind - on the give-up path above, and on
 		# any exception from the writes themselves. Nothing reaps %TEMP%/metalpy
@@ -108,7 +193,14 @@ class CcTool:
 		if self.name == 'cl':
 			cmd = [ self.path, '/nologo', '/std:c11',
 				'/experimental:c11atomics',
-				'/W4', '-c', str( src ), f'/Fo:{obj}' ]
+				# /wd4701 ("potentially uninitialized local variable used") -
+				# see the matching -Wno-sometimes-uninitialized/-Wno-
+				# uninitialized below for the full reasoning (a confirmed
+				# false positive: __return_value, this codebase's own shared
+				# multi-entry function epilogue, is a goto-heavy pattern this
+				# static analysis can't prove exhaustive even when metalpy's
+				# own discovery/type-checking already has)
+				'/W4', '/wd4701', '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
 			if want_debug_info:
@@ -140,6 +232,13 @@ class CcTool:
 				cmd += [ '/fsanitize=address' ]
 		else:
 			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
+			# -Wno-sometimes-uninitialized (clang) / -Wno-maybe-uninitialized
+			# (gcc) - see cl.exe's /wd4701 branch above for the full
+			# reasoning; -Wno-uninitialized covers both compilers' own
+			# plain (not just conditional) flavor of the same false
+			# positive
+			cmd += [ '-Wno-uninitialized' ]
+			cmd += [ '-Wno-sometimes-uninitialized' ] if self.name == 'clang' else [ '-Wno-maybe-uninitialized' ]
 			if want_debug_info:
 				cmd += [ '-g' ]
 			if debug:
@@ -217,8 +316,20 @@ class CcTool:
 			# linker input. Harmless to add even when unused - a static
 			# archive only pulls in symbols something else in the link
 			# actually references
+			#
+			# extra (ldflags, e.g. -lssl) MUST come after obj_args, not
+			# before - GNU ld resolves a -l<name> against whatever undefined
+			# references are ALREADY pending when it reaches that flag on the
+			# command line; a library placed before the objects that need it
+			# is a no-op (confirmed by a real repro: `gcc -lssl generated.o`
+			# silently fails to resolve SSL_new, `gcc generated.o -lssl`
+			# resolves it fine). This was invisible until lib/ssl.py's Linux
+			# backend (has_library=('ssl', 'SSL_new')) - every prior has_
+			# library/extern_libs use on Linux was libc ('c'), which every
+			# compiler driver links implicitly regardless of -l ordering, so
+			# the bug never affected a real -l<name> flag before.
 			wide_int_lib = _find_wide_int_runtime_lib( self )
-			cmd = [ self.path ] + extra + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + [ '-o', str( exe ) ]
+			cmd = [ self.path ] + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + extra + [ '-o', str( exe ) ]
 			if asan:
 				# clang/gcc's own driver acts as the linker frontend even for
 				# an objects-only link, and only links the ASan runtime when
@@ -274,9 +385,8 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 
 	key = hashlib.sha256( f'{lib}\0{symbol}\0{cc.name}'.encode() ).hexdigest()[:16]
 	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'has_symbol'
-	cache_dir.mkdir( parents = True, exist_ok = True )
 	cache_file = cache_dir / key
-	if cache_file.is_file():
+	if ensure_cache_dir( cache_dir ) and cache_file.is_file():
 		# an empty/unrecognized body is a TORN or half-written entry, not a
 		# real answer - fall through and re-probe rather than reporting "not
 		# available" for something that is (see atomic_write_cache). Cheap:
@@ -313,6 +423,336 @@ def has_symbol( cc: CcTool, lib: str, symbol: str ) -> bool:
 	return available
 
 
+def _default_link_provides( cc: CcTool, symbol: str ) -> bool:
+	'''
+	True if `symbol` resolves through an ORDINARY, CRT-linked build's own
+	default linking alone (the compiler's implicit default libraries - e.g.
+	ucrt.lib under MSVC/clang) - i.e. with no extra -l/.lib flag at all.
+	Distinguishes "ntdll genuinely is the only source of this symbol" from
+	"the default C runtime already provides an identically-named,
+	functionally-equivalent symbol" - see build_ntdll_import_lib's own
+	docstring for why this matters (a synthetic ntdll import entry for a
+	name the default CRT libraries ALSO define, e.g. strnlen via ucrt.lib,
+	produces a real LNK2005 duplicate-symbol error the moment a build links
+	both).
+
+	No no_crt parameter, deliberately: this is only ever meaningful - and
+	only ever called (see build_ntdll_import_lib) - for a build that IS
+	linking its default C runtime (no_crt=False). A genuinely freestanding
+	build never needs it: no_crt=True means /NODEFAULTLIB under MSVC (ucrt.
+	lib is explicitly excluded, full stop), and under clang/gcc it means
+	emitter_c.py emitted the freestanding program's OWN mainCRTStartup -
+	which, confirmed empirically, is what actually keeps the real ucrt/CRT
+	default libraries out of a clang/gcc link in the first place (nothing
+	else in this codebase ever pulls in the CRT's own startup object, which
+	is what would otherwise drag ucrt.lib onto the default library search
+	list at all - clang has no unconditional "-defaultlib:ucrt"-style flag
+	of its own). A bare `int main(void)` probe - the only shape this
+	function could reasonably synthesize - does NOT define its own
+	mainCRTStartup, so probing it under a claimed no_crt=True would silently
+	answer for the WRONG program shape and could wrongly report a symbol as
+	default-linked when the real freestanding build never links it at all.
+
+	Mirrors has_symbol()'s probe shape (compile+link only, no run - see its
+	own docstring), but without an extra lib argument.
+
+	Cached to disk under %TEMP%/metalpy/default_link_symbol/, keyed by
+	(compiler name, symbol) - same spirit as has_symbol()'s own cache.
+	'''
+	import hashlib
+	import tempfile
+
+	key = hashlib.sha256( f'{cc.name}\0{symbol}'.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'default_link_symbol'
+	cache_file = cache_dir / key
+	if ensure_cache_dir( cache_dir ) and cache_file.is_file():
+		# see has_symbol's identical reasoning: a torn/unreadable cache entry
+		# is a miss to re-probe, never a hard error
+		try:
+			cached = cache_file.read_text().strip()
+		except OSError:
+			cached = ''
+		if cached in ( '0', '1' ):
+			return cached == '1'
+
+	c_src = f'char {symbol}();\nint main(void) {{ return {symbol}(); }}\n'
+	with tempfile.TemporaryDirectory() as tmp:
+		src_path = Path( tmp ) / 'probe.c'
+		obj_path = Path( tmp ) / 'probe.o'
+		exe_path = Path( tmp ) / 'probe'
+		src_path.write_text( c_src, encoding = 'utf-8' )
+		compile_result = cc.compile( src_path, obj_path )
+		if compile_result.returncode != 0:
+			available = False
+		else:
+			link_result = cc.link( exe_path, [ obj_path ] )
+			available = link_result.returncode == 0
+
+	atomic_write_cache( cache_file, '1' if available else '0' )
+	return available
+
+
+_NTDLL_PATH = Path( os.environ.get( 'SystemRoot', r'C:\Windows' ) ) / 'System32' / 'ntdll.dll'
+
+
+def _ntdll_toolchain( cc: CcTool ) -> tuple[str,str]:
+	'''
+	(export-lister, lib-builder) for reading/rebuilding an MS-COFF import
+	library - see build_ntdll_import_lib's docstring for why this exists at
+	all. Deliberately tied to `cc`, not just "whatever's on PATH": cl.exe
+	only runs after vcvars has put its whole VC\\Tools\\...\\bin\\Hostx64\\x64
+	directory on PATH, so MSVC's own dumpbin.exe/lib.exe are guaranteed to
+	be right there too - but clang needs no such thing (it locates link.exe
+	itself via its own internal Visual Studio probing, not PATH), so a build
+	using --cc clang without vcvars having ever run would newly require it
+	if this reached for dumpbin/lib.exe the same way. LLVM ships its own
+	drop-in equivalents (llvm-readobj/llvm-lib, MS-COFF compatible -
+	confirmed empirically: a .lib llvm-lib built from a hand-written .def
+	links fine against link.exe-produced objects) colocated with clang.exe
+	itself, so use those instead when cc is clang.
+	'''
+	if cc.name == 'cl':
+		dumpbin = shutil.which( 'dumpbin' )
+		lib_exe = shutil.which( 'lib' )
+		if not dumpbin or not lib_exe:
+			raise RuntimeError( "can't build a custom ntdll import library: dumpbin.exe/lib.exe not found on PATH "
+				"(they normally sit right alongside cl.exe once vcvars has run)" )
+		return dumpbin, lib_exe
+	if cc.name == 'clang':
+		bindir = Path( cc.path ).parent
+		readobj = bindir / 'llvm-readobj.exe'
+		llvmlib = bindir / 'llvm-lib.exe'
+		if not readobj.is_file() or not llvmlib.is_file():
+			raise RuntimeError( f"can't build a custom ntdll import library: llvm-readobj.exe/llvm-lib.exe not found alongside {cc.path}" )
+		return str( readobj ), str( llvmlib )
+	raise RuntimeError( f'generating a custom ntdll import library is not supported for compiler {cc.name!r} '
+		'(only cl/clang ever target Windows in this codebase - gcc here is WSL-only, for posix targets)' )
+
+
+def _parse_dumpbin_exports( text: str ) -> set[str]:
+	''' names of every real, named, non-forwarded export in a `dumpbin
+	/exports` listing. A forwarder line ("name = OtherDll.OtherName") and
+	an ordinal-only "[NONAME]" line both fail this line shape on purpose -
+	neither is a symbol @extern('ntdll', ...) could ever bind to directly. '''
+	import re
+	return set( re.findall( r'^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)\s*$', text, re.MULTILINE ) )
+
+
+def _parse_llvm_readobj_exports( text: str ) -> set[str]:
+	''' same as _parse_dumpbin_exports, for `llvm-readobj --coff-exports`'s
+	block-structured "Export { ... }" output. '''
+	names: set[str] = set()
+	name: str|None = None
+	forwarded = False
+	for raw in text.splitlines():
+		line = raw.strip()
+		if line == 'Export {':
+			name, forwarded = None, False
+		elif line.startswith( 'Name:' ):
+			name = line[ len( 'Name:' ): ].strip()
+		elif line.startswith( 'ForwardedTo:' ):
+			forwarded = True
+		elif line == '}':
+			if name and not forwarded:
+				names.add( name )
+			name, forwarded = None, False
+	return names
+
+
+def _real_ntdll_exports( cc: CcTool ) -> set[str]:
+	''' the real system ntdll.dll's own export table (NOT the Windows SDK's
+	curated ntdll.lib stub - see build_ntdll_import_lib's docstring). '''
+	lister, _ = _ntdll_toolchain( cc )
+	args = [ lister, '/exports', str( _NTDLL_PATH ) ] if cc.name == 'cl' else [ lister, '--coff-exports', str( _NTDLL_PATH ) ]
+	result = subprocess.run( args, capture_output = True, text = True )
+	if result.returncode != 0:
+		raise RuntimeError( f"failed to read {_NTDLL_PATH}'s export table:\n{result.stdout}{result.stderr}" )
+	return _parse_dumpbin_exports( result.stdout ) if cc.name == 'cl' else _parse_llvm_readobj_exports( result.stdout )
+
+
+def build_ntdll_import_lib( cc: CcTool, symbols: set[str], verbose: bool = False, no_crt: bool = False ) -> Path|None:
+	'''
+	Builds (and disk-caches) a small MS-COFF import library exposing exactly
+	`symbols` from the REAL system ntdll.dll, bypassing the Windows SDK's
+	own ntdll.lib import library entirely.
+
+	When `no_crt` is False (this build links its default C runtime for
+	real), symbols the default CRT linking already provides (see
+	_default_link_provides) are dropped from `symbols` FIRST, before
+	anything else below - ntdll.dll and a CRT-linked build's own default
+	libraries (e.g. MSVC/clang's ucrt.lib) both genuinely export a real
+	`strnlen`, two unrelated functions that happen to share a name and, for
+	this exact `size_t(const char*, size_t)` shape, are functionally
+	interchangeable to a caller. Synthesizing an ntdll import entry for one
+	of those names on top of a build that ALSO links the library already
+	providing it produces a real LNK2005 "already defined" - the fix is to
+	simply not manufacture a duplicate, and let the symbol resolve through
+	the normal default link it was already going to resolve through.
+	Returns None (no import library needed at all - `resolve_lib_ldflag`
+	then omits the ldflag entirely) if every requested symbol was dropped
+	this way. A symbol dropped here is NOT re-validated against ntdll's own
+	export table below: the default link already proves it resolves,
+	regardless of whether it happens to also be a genuine ntdll export.
+
+	When `no_crt` is True, this filtering is skipped entirely - a
+	genuinely freestanding build never links the default CRT at all (see
+	_default_link_provides's own docstring for why: MSVC's explicit
+	/NODEFAULTLIB, and clang/gcc's own default-CRT-library pull being
+	conditioned on nothing here ever defining a competing mainCRTStartup),
+	so every requested symbol still genuinely needs its own ntdll import
+	entry, exactly as before this whole default-CRT-overlap check existed.
+	`no_crt` MUST match whatever this same build will actually pass to
+	CcTool.compile()/link() - see resolve_lib_ldflag's own docstring for the
+	two ways getting this wrong is unsafe.
+
+	Why this exists: ntdll.dll's actual export table (confirmed via `dumpbin
+	/exports`) is far larger than what the SDK's ntdll.lib import library
+	exposes - that .lib is a curated, documented-APIs-only subset. strnlen
+	is a real, confirmed ntdll export the stub omits, which produces a real
+	LNK2019 at link time for any program that needs it despite the DLL
+	genuinely providing it (see lib/windows/ntdll.py's own note on its
+	strnlen binding - the motivating case for this function). Rather than
+	hand-roll a workaround per missing symbol, this generates a *real*
+	import library straight from the DLL's own export table, so any
+	genuine ntdll export metalpy declares via @extern works - not just
+	the SDK-blessed subset.
+
+	Scoped to `symbols` (not all ~2500 of ntdll's exports) rather than a
+	wholesale replacement of the SDK's ntdll.lib: those are the only names
+	any @extern('ntdll', ...) binding in this build could reference, and
+	staying scoped sidesteps having to correctly model data exports/
+	forwarders for symbols nothing here ever uses (ntdll's own export table
+	happens to have neither today, confirmed by parsing its full dump, but
+	nothing guarantees that stays true on every future Windows version).
+
+	Raises RuntimeError if a requested symbol is not actually a real,
+	named, non-forwarded export of the system ntdll.dll - a much clearer
+	error than the LNK2019 that would otherwise surface deep in the link
+	step for a genuine typo/nonexistent-symbol @extern binding.
+
+	Cached to disk under %TEMP%/metalpy/ntdll_import_lib/, keyed by
+	(compiler name, POST-filter symbol set) - same spirit as has_symbol()'s
+	own cache - so the dumpbin/llvm-readobj probe and the lib.exe/llvm-lib
+	build are each only ever paid once per distinct (compiler, symbol set).
+	The no_crt=False default-CRT filtering above always runs first
+	regardless (it has its own, separate cache), since it decides what the
+	effective symbol set even is.
+	'''
+	import hashlib
+	import tempfile
+
+	if not no_crt:
+		symbols = { s for s in symbols if not _default_link_provides( cc, s ) }
+	if not symbols:
+		return None
+
+	key = hashlib.sha256( f'{cc.name}\0{",".join( sorted( symbols ))}'.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'ntdll_import_lib'
+	lib_path = cache_dir / f'{key}.lib'
+	if ensure_cache_dir( cache_dir ) and lib_path.is_file():
+		# cache hit - skip both the export-table probe and the lib.exe/
+		# llvm-lib build below entirely, same spirit as has_symbol()'s own
+		# cache (this is the whole point of caching: a cache hit must not
+		# still pay for the thing being cached)
+		return lib_path
+
+	real_exports = _real_ntdll_exports( cc )
+	missing = symbols - real_exports
+	if missing:
+		raise RuntimeError(
+			f"ntdll.dll does not export {sorted( missing )} as real, named, non-forwarded "
+			f"symbols - check lib/windows/ntdll.py's @extern('ntdll', ...) declarations "
+			f"against a real `dumpbin /exports {_NTDLL_PATH}`" )
+
+	_, lib_builder = _ntdll_toolchain( cc )
+	with tempfile.TemporaryDirectory() as tmp:
+		def_path = Path( tmp ) / 'ntdll.def'
+		out_path = Path( tmp ) / 'ntdll.lib'
+		def_path.write_text(
+			'LIBRARY ntdll.dll\nEXPORTS\n' + '\n'.join( f'\t{s}' for s in sorted( symbols ) ) + '\n',
+			encoding = 'utf-8' )
+		# x64-only, matching this whole file's existing implicit assumption
+		# (compile()/link() above have no arch parameter either)
+		cmd = [ lib_builder, f'/def:{def_path}', f'/out:{out_path}', '/machine:x64', '/nologo' ]
+		if verbose:
+			print( ' '.join( cmd ), file = sys.stderr )
+		result = subprocess.run( cmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True )
+		if result.returncode != 0 or not out_path.is_file():
+			raise RuntimeError( f'failed to build a custom ntdll import library:\n{result.stdout}' )
+		data = out_path.read_bytes()
+		if atomic_write_cache( lib_path, data ):
+			return lib_path
+		# the shared cache directory is unavailable this run (atomic_write_
+		# cache already warned why) - out_path is about to be deleted along
+		# with this TemporaryDirectory, but this function's own contract is
+		# a real, on-disk .lib path regardless of whether caching it
+		# actually worked, so fall back to a private, uncached copy outside
+		# the shared tree rather than returning a path that was just
+		# confirmed not to exist
+		fallback_fd, fallback_name = tempfile.mkstemp( suffix = '.lib', prefix = 'metalpy_ntdll_' )
+		with os.fdopen( fallback_fd, 'wb' ) as f:
+			f.write( data )
+		return Path( fallback_name )
+
+
+def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool = False, no_crt: bool = False ) -> str:
+	'''
+	The linker flag/path for one @extern library dependency, given the set
+	of symbol names this build's program actually references from it.
+	Every library except 'ntdll' resolves the ordinary way (a plain -l/.lib
+	flag, searched against the compiler's own default library path) -
+	ntdll is special-cased because the SDK's own ntdll.lib is missing real
+	exports it should have (see build_ntdll_import_lib's docstring).
+
+	`no_crt` must match whatever this same build will actually pass to
+	CcTool.compile()/link(): build_ntdll_import_lib uses it to decide which
+	requested ntdll symbols are already covered by this build's own default
+	libraries (and so need no synthetic import entry at all) - passing the
+	wrong value here can either wastefully synthesize an entry a no-CRT
+	build didn't need, or - the actually unsafe direction - wrongly skip one
+	a no-CRT build genuinely does need because a *different*, CRT-linked
+	probe found it "already available".
+
+	Returns '' when build_ntdll_import_lib determines no synthetic import
+	library is needed at all (every requested ntdll symbol already resolves
+	through this build's own default linking) - safe to append as an ldflag,
+	same as any other empty/no-op flag.
+	'''
+	if lib == 'ntdll':
+		lib_path = build_ntdll_import_lib( cc, symbols, verbose = verbose, no_crt = no_crt )
+		return str( lib_path ) if lib_path is not None else ''
+	return f'{lib}.lib' if cc.name == 'cl' else f'-l{lib}'
+
+
+def find_dll( name: str ) -> Path|None:
+	'''
+	Locates a runtime DLL by bare filename (e.g. 'tcl86t.dll') for
+	bundling into a build's output directory - see mpy.py's post-link
+	step, driven by compiler.extern_dlls (populated from
+	@extern(..., dll=...) declarations on functions actually reached).
+
+	Searches PATH, in order - the same place a real Windows process
+	resolves an unqualified DLL import from, so "found here" is a direct
+	stand-in for "the exe would find this DLL too, if PATH weren't
+	different at run time" (e.g. on a machine without this build's own
+	dev tools installed). Not a general library search (no LIB/
+	LIBRARY_PATH, no system directories) - those are for the .lib import
+	library at link time, a different file that can live somewhere else
+	entirely (see mpy_types.Function.extern_dll's own comment).
+
+	Returns None (best-effort) if not found anywhere on PATH - mpy.py
+	warns and continues rather than failing the build over a bundling
+	step; the exe already linked successfully.
+	'''
+	for entry in os.environ.get( 'PATH', '' ).split( os.pathsep ):
+		if not entry:
+			continue
+		candidate = Path( entry ) / name
+		if candidate.is_file():
+			return candidate
+	return None
+
+
 def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
 	'''
 	Locates the static runtime library providing GCC/Clang's own float<->
@@ -341,10 +781,14 @@ def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
 
 	key = hashlib.sha256( f'{cc.name}\0{cc.path}'.encode() ).hexdigest()[:16]
 	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'wide_int_runtime_lib'
-	cache_dir.mkdir( parents = True, exist_ok = True )
 	cache_file = cache_dir / key
-	if cache_file.is_file():
-		return cache_file.read_text( encoding = 'utf-8' ).strip() or None
+	if ensure_cache_dir( cache_dir ) and cache_file.is_file():
+		# best-effort read, same reasoning as has_symbol's identical guard -
+		# a torn/mid-replace read costs one re-probe, never correctness
+		try:
+			return cache_file.read_text( encoding = 'utf-8' ).strip() or None
+		except OSError:
+			pass
 
 	found: str|None = None
 	if cc.name == 'clang':
@@ -373,7 +817,7 @@ def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
 		if result.returncode == 0 and path is not None and path.is_file():
 			found = str( path )
 
-	cache_file.write_text( found or '', encoding = 'utf-8' )
+	atomic_write_cache( cache_file, found or '' )
 	return found
 
 

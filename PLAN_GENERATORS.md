@@ -1,5 +1,236 @@
 Generator functions (`yield`, state-machine transform)
 
+> **Note (2026-08-19): Phase F, B, C (`.send()`), and now the A.4a
+> follow-up (`yield from`) have all been REIMPLEMENTED against current
+> master.** History recap: Phase F/B/C/A.4a were originally
+> built, merged to master (a4a1d5d), then silently discarded by the next
+> merge (1a89a86) before anyone noticed. By the time that was caught,
+> master had diverged too far (150+ commits touching the exact substrate
+> Phase F depends on) for the old branch to be reapplied as a patch, so
+> Phase F/B were rebuilt FRESH first (worktree `generator-phase-f-
+> rebuild`), then Phase C on top of that rebuild (worktree `generator-
+> phase-c-send`, same day) - both using the sections below as a design
+> REFERENCE, not a diff. Both reach the same destination the original
+> branch describes, but internal names differ throughout - see `type_
+> resolver.py`'s `_assign_generator_yield_dispatch`/`_build_generator_
+> next_function`/`_build_generator_send_wrappers`/`_hoist_yield_from_rc_
+> reassignment` and `lowering.py`'s `_lower_generator_yield`/`_expr_
+> Yield`/`_emit_generator_dispatch_prologue` for the ACTUAL current
+> mechanism; the design sections below are kept for their reasoning, not
+> as a literal function-by-function map. Phase B's own nesting/
+> multiplicity verification is covered by `emitter_c_test.py`'s `test_
+> previously_rejected_shapes_now_compile_and_run`; Phase C's own `.send()`
+> tests are `test_send_scalar_and_rc_values`/`test_send_before_first_
+> yield_panics`/`test_bare_next_at_captured_yield_panics`.
+>
+> Four real, generator-unrelated bugs were found (and fixed) across both
+> rebuilds, via real compile-and-run testing exactly like the original
+> build: (1) a yield reached outside a successfully-synthesized generator
+> needs a graceful `discovery.fail()`, not a raw crash, when an earlier,
+> unrelated error left synthesis only partially done; (2) `cfg.py`'s
+> `merge_loop_exits()` wiped `self._live` to empty (rather than
+> preserving the loop's own entry snapshot) whenever a `while True:` loop
+> had no `break` at all - harmless for genuinely dead code in an ordinary
+> function, but wrong the moment code after such a loop is actually
+> reachable (a generator's own synthesized tail, in particular); (3)
+> `_lower_generator_yield`/`_expr_Yield` need the same `_cfg.untrack_
+> temp(value)` call `_stmt_Return` already makes before its own temp
+> flush, or the flush immediately decrefs the very value a union-
+> coercion's own constructor just increfed, silently cancelling it out -
+> confirmed via a real `compiler.refcount()` repro; (4) a separate,
+> unrelated bug found and fixed the same day as the Phase F rebuild:
+> negating a value (`-x`) directly into a union return/yield type
+> produced invalid C - see `_expr_UnaryOp`'s own `operand_hint` comment.
+>
+> **The A.4a follow-up (`yield from`) has ALSO now been REIMPLEMENTED**
+> (worktree `generator-a4a-yield-from`, 2026-08-19), on top of the Phase
+> F/B/C rebuild above: `yield from <expr>` desugars into `for __yield_
+> from_N in <expr>: yield __yield_from_N` (`TypeResolver._desugar_
+> generator_yield_from`), sharing the same for-loop-over-iterator
+> desugaring (`_desugar_iterator_for`) any user-written `for x in some_
+> generator(): yield x` already went through - so this landed BOTH
+> `yield from` itself AND, for free, general support for an ordinary for-
+> loop-with-yield forwarding another generator's values (previously only
+> exercised over `list[T]`/`range()`).
+>
+> **A follow-up same-day fix (worktree `generator-for-obj-lazy-init`)
+> then LIFTED the nesting restriction entirely**, rather than leaving it
+> as a permanent compile-time rejection: a for-loop-with-yield (or
+> `yield from`) reachable through a while/for that could re-enter it used
+> to be rejected outright, because `__for_obj_N` (the iterated
+> expression) was constructed exactly once, EAGERLY, in the generator's
+> own constructor - reusing the same already-exhausted object on every
+> re-entry instead of freshly reconstructing it, a real silent wrong-
+> output bug (confirmed via a repro: `while j < count: yield from
+> inner(); j += 1` only forwarded `inner()`'s own values on the outer
+> loop's first pass). `_new_for_obj_field` now builds `__for_obj_N` as an
+> ordinary, live-flag-guarded promoted local instead - re-derived from
+> its real expression every time program execution reaches the loop, the
+> same as a real Python generator's own lazy per-entry construction, not
+> merely a safe approximation of it. `_reject_generator_for_or_yield_
+> from_nested_inside_loop` and its helper walker are gone entirely, not
+> just relaxed.
+>
+> That same fix also found and fixed a SEPARATE, pre-existing bug this
+> newly-unblocked nesting shape exposed for the first time:
+> `_recurse_desugar_for_loops` never recursed into a for-loop-with-
+> yield's OWN body after desugaring it - so a for-loop-with-yield
+> DIRECTLY nested inside another one (`for x in xs: for y in gen(): yield
+> y`) silently fell through to lowering.py's ordinary, non-generator-
+> aware for-loop lowering for the inner one instead of ever getting its
+> own while-unit desugaring. This shape was always broken, just
+> unreachable before this fix (the blanket rejection blocked ANY for-
+> loop-with-yield nested inside another while/for, regardless of which
+> one was outer). Confirmed via a real repro: compiled clean, but crashed
+> at runtime under MSVC (debug build: heap-corruption breakpoint;
+> release build: access violation) - clang/gcc's own codegen happened not
+> to visibly corrupt anything for the same wrong IR, masking it
+> completely until tested on MSVC specifically (re-verified clean under
+> AddressSanitizer too, not just "didn't crash this time"). Fixed by
+> having `_recurse_desugar_for_loops` recurse into a for-loop-with-
+> yield's own desugared output, not just plain if/while/for/with bodies.
+>
+> Three real, pre-existing bugs were found and fixed while building this
+> (none specific to `yield from` itself - all three are general gaps
+> this was just the first thing to actually exercise): (1) `yield <expr>`
+> whose type didn't match the generator's own declared element type
+> silently produced invalid C instead of a clean error - `_emit_
+> generator_yield_suspend`'s `strict=False` coercion had no follow-up
+> type check (now added, mirroring `_stmt_Return`'s own); (2) a for-
+> loop's synthesized loop-target zero-placeholder (`_desugar_iterator_
+> for`'s `target_zero`) didn't tag itself `generator_zero_rc_field` for
+> an RC-typed `elem_type`, so ANY for-loop-with-yield consuming an RC-
+> typed generator/iterable failed to compile at all ("an int literal
+> cannot be used where Box is expected") - never previously exercised
+> since every existing for-loop-with-yield test used a scalar element
+> type; (3) **the significant one**: forwarding an RC-typed value through
+> `yield from`/a for-loop-with-yield leaked exactly one reference per
+> forwarded value. Root cause: `_desugar_iterator_for` builds a while
+> loop whose body is `__for_next_N = obj.__next__(); match __for_next_N:
+> ...; yield <extracted>` - a genuine yield/suspend sits INSIDE that
+> loop's own body, so any CFG-tracked plain-local binding introduced
+> there (the raw `.__next__()` result, and the match arm's own extracted-
+> payload temp) has its `cfg.py` `loop_back_edge()`-scheduled teardown
+> land on the FAR SIDE of the yield - a separate `$$__resume__` call with
+> a fresh stack frame, where that plain local's storage no longer exists
+> (confirmed via a real repro: `release_object()` on garbage/uninitialized
+> memory). Fixed two different ways for the two different temps: `__for_
+> next_N` gets promoted to an ordinary live-flag-guarded field exactly
+> like any user-written RC-typed local (an `AnnAssign` instead of a bare
+> `Assign`, so `_collect_generator_locals`'s existing scan picks it up
+> for free) whenever `elem_type.is_rc()` and BODY contains a yield; the
+> match arm's own extraction temp can't use the same trick (`_match_
+> pattern` always binds via a bare, un-renamed `ast.Name`, so a promoted
+> name there just creates a SECOND, disjoint plain local shadowing the
+> real field - confirmed via a real repro where the yielded value came
+> back wrapped around a null pointer) - kept as a plain local instead,
+> with an explicit `compiler.decref(...)` call synthesized right after
+> its one real use, the same established idiom `list.__del__`/`dict`'s
+> own `_release_key`/`_release_value` already use for tearing down a
+> value read out of a container (`cfg.py`'s `manually_decreffed` stops
+> the loop's own back-edge reconciliation from trying a second time).
+> Verified via real compile-and-run refcount checks: forwarding two RC
+> values through a full `yield from` cycle and fully consuming both
+> leaves refcounts exactly back to baseline; dropping the outer generator
+> mid-iteration (abandonment) still releases every field it was holding,
+> via the ordinary state/flag-gated destructor cascade, no new machinery
+> needed there. See `emitter_c_test.py`'s `test_yield_from_basic_and_
+> nesting`/`test_yield_wrong_element_type_is_rejected`/`test_yield_from_
+> nested_inside_reenterable_loop_forwards_correctly` (covers both the
+> lazy-reconstruction fix and the doubly-nested-for-loop recursion fix).
+> Full test suite green on all 3 compilers (clang/MSVC/WSL gcc) for both
+> fixes.
+>
+> **StopIteration reversal (2026-08-20): the "Consumption protocol"
+> section below now describes the OPPOSITE of what actually ships.**
+> `__next__(self)` returns `Result[elem_type,error_type]` UNCONDITIONALLY
+> - there is no more `T|None`/nullable-union shape, for ANY generator,
+> "infallible" ones included. Reaching the end of a generator produces
+> `Err(StopIteration())` in the ordinary error channel, not `Ok(None)` in
+> the success channel. This was a deliberate reversal, confirmed directly
+> with the user: representing exhaustion as a real `Err` unifies
+> "infallible" and "fallible" generators into one honest shape and removes
+> the special-casing that used to block `yield from`/a for-loop-with-yield
+> from ever forwarding a fallible generator's own values (the old design
+> had no way to represent an inner generator's own real error at all).
+> Deliberately NO implicit compiler magic anywhere: `Iterator[T]` now
+> means `Iterator[Result[T,StopIteration]]` - the user must spell
+> `StopIteration` out explicitly in the type argument, same posture as
+> `with compiler.panic_arithmetic(...):` never being silently chosen for
+> you. `Generator[T,E]`/`Generator[T,SendType,E]` require `E` to include
+> `StopIteration` among its own leaves too, for the identical reason - no
+> Iterator-specific carve-out. `Iterator[Result[T,StopIteration]]` and
+> `Generator[T,E-including-StopIteration]` are two spellings of the exact
+> same underlying `GeneratorType` construction (`discovery.py`'s
+> `visit_Subscript`).
+>
+> Consumption rule (both an ordinary `for x in gen():` outside any
+> generator body, and a for-loop-with-yield/`yield from` inside one -
+> confirmed directly with the user): the loop always calls `__next__()`.
+> `Err(StopIteration)` is always handled by the loop itself as ordinary
+> termination - never surfaced to the loop body. If `StopIteration` is
+> the ONLY declared error, the loop target binds to plain `T` -
+> ergonomically identical to the old `T|None` experience. If there's any
+> OTHER error alongside `StopIteration`, the loop target binds to
+> `Result[T,E']` (`E'` = the declared error minus `StopIteration`) - the
+> user handles the real error explicitly inside the loop body (match/
+> `.is_err()`/`.or_return()`/`.unwrap()`); the loop does NOT auto-
+> propagate it (deliberately different from `_maybe_consume_result`'s own
+> auto-propagate idiom for `__len__`/`__getitem__` elsewhere in this
+> codebase - don't conflate the two). `yield from <expr>` requires an
+> EXACT match (identity-compared, not covering/widening) between the
+> inner generator's own `Result[T,E]` and the outer's own declared
+> `Result[T,E]` - forwarding every value untouched (`Ok` and `Err` alike)
+> except `Err(StopIteration)` specifically, which terminates the `yield
+> from`'s own loop rather than being forwarded as the outer's own
+> exhaustion. A mismatched shape is a clear compile error directing the
+> user to write an explicit `for` loop instead, which has the more
+> permissive per-loop binding rule above. Deferred future work, noted but
+> not built: a narrower inner `Result[T,E_inner]` could legally widen into
+> a wider outer `Result[T,E_outer]` for `yield from` (reusing `_require_
+> result_return`'s existing union-widening idiom), on both the error side
+> (`E_inner` ⊆ `E_outer`) and the success side (`Result[T,E]` widening
+> into `Result[T|U,E]`).
+>
+> Landed across 4 checkpoint commits on worktree `generator-stopiteration-
+> phase-a` (Phase A: `f8428ef`, StopIteration builtin + type-level
+> recognition; Phase B: `415feac`, core `$$__next__` semantics, plus a
+> real, general, pre-existing match-pattern bug found and fixed along the
+> way - `case SomeUnion.Variant(x):` resolved `SomeUnion` from pattern
+> text alone, silently wrong when `SomeUnion` is nested opaquely inside a
+> WIDER union that is the subject's actual type, practically severe here
+> since `StopIteration` (in `builtins`) sorts ahead of most user error
+> types alphabetically; Phase C: `9daaafa`/`cfe959c`, for-loop consumption
+> + `yield from`; Phase D: `4d1ce21`, the IR-level ordinary for-loop
+> consumer + `lib/re.py`'s `finditer`). Verified via real compile-and-run
+> on clang, MSVC, and WSL gcc, plus AddressSanitizer, throughout - found
+> and fixed several more real bugs THIS reversal newly exercised: an
+> `emitter_c.py` gap where a compiler-synthesized "not assigned yet" zero
+> placeholder for an RC-typed `TaggedUnion` field with no `None` member
+> (e.g. `Result[T,E]` itself) emitted a bare `0` into a C struct field
+> (invalid C on all 3 compilers) - needed a zero-initialized compound
+> literal instead; a multi-leaf remaining-error case (`Result[T,E1|E2]`)
+> needed one explicit `case Leaf(bound):` match arm per leaf rather than a
+> single wildcard, since `cfg.py`'s `narrowed_member()` only collapses to
+> a concrete type when exactly one candidate remains; a StopIteration-only
+> `yield from` tried to match a non-union payload type ("match subject is
+> not a union type") since a BARE `StopIteration` error type isn't itself
+> a union at all.
+>
+> One deliberately deferred gap: the ordinary (non-generator-body) `for`
+> loop's own `Result[T,E']` binding (a real error alongside StopIteration)
+> is NOT implemented in `lowering.py`'s `_lower_for_over_iterator` - it
+> fails cleanly, directing the user to consume via `.__next__()` +
+> `match` instead. The in-generator-body version (`_desugar_iterator_for`)
+> builds fresh AST processed by a later type-checking/desugaring pass with
+> real narrowing machinery already available to it; this method lowers
+> straight to IR, where the same result needs either a genuine per-leaf
+> tag dispatch or hand-rolled `_stmt_If`-style branch-merge machinery, and
+> there is no real caller in this codebase to verify it against (every
+> for-loop-over-a-generator here, `lib/re.py`'s `finditer` included, is
+> StopIteration-only). Worth building for real if a genuine caller shows
+> up rather than risking under-tested CFG-merge code now.
+
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
 <expr>:` containing yield, over a non-range() indexable OR another
@@ -29,6 +260,58 @@ inside a generator body has ALSO landed (own separate mini-plan, not
 part of the numbered sequence above - see "defer/errdefer phase design"
 below), including a prerequisite fix (a bare `return` inside a generator
 body now correctly ends iteration permanently, not just once).
+
+Past THAT, a second major rebuild has landed (reimplemented from scratch
+2026-08-19, after the original build was lost to a merge conflict - see
+this doc's own top-of-file note): **Phase F** replaced the entire AST-
+synthesis dispatch mechanism (the old `_collect_generator_units` and its
+per-shape guard builders - the flat-unit-recognition machinery every
+phase above this point was built on top of) with a real IR-level
+`ir.Yield` + `self.__state` goto/label dispatch, built directly by
+lowering.py instead of hand-assembled AST. This is what finally lifted
+the structural restrictions every phase above inherited from the unit
+model: multiple yields per loop/branch, yield nested at ARBITRARY depth
+(if-in-while, while-in-if, three-plus levels), `elif` chains containing
+yield, and `break`/`continue` inside a yield-containing loop are all now
+ordinary compile-and-run cases, not compile errors - real-compile-and-run
+verified via `emitter_c_test.py`'s `test_previously_rejected_shapes_now_
+compile_and_run` (the **Phase B** nesting/multiplicity verification bar),
+all 3 compilers. See "Phase F design" below for the ORIGINAL build's own
+reasoning (still broadly accurate) - its literal internal names describe
+the original, now-superseded implementation; see this doc's own top note
+for where the CURRENT mechanism actually lives.
+
+**Phase C (`.send()`) has ALSO landed** (reimplemented from scratch,
+same day, on top of the Phase F/B rebuild above): `Generator[T,SendType,
+E]` (3-arg form - `T`/`E` are the existing `elem_type`/`error_type`,
+`SendType` new, inserted in the middle) makes `(yield expr)` usable as
+an EXPRESSION, evaluating to plain `SendType`, delivered via `.send(v)`.
+Backing-class shape and the overall `__next__()`/`send(v)` wrapper split
+over a real `$$__resume__` match the ORIGINAL design almost exactly (see
+"Phase C design" below for the reasoning) - `type_resolver.py`'s
+`_build_generator_send_wrappers` builds the two thin wrappers, and a new
+`_hoist_yield_from_rc_reassignment` pass (this rebuild's own name for
+the original's `_build_liveness_guard` restructuring - see bug #1 in
+"Phase C design") avoids duplicating a captured yield when
+`_apply_live_flag_guards` would otherwise deep-copy it for an RC-typed
+promoted local's own first-assignment branch. Verified via real
+compile-and-run refcount-delta checks matching the original design's own
+bar exactly: an RC-typed `Box` sent through `.send()` into a captured
+`held = yield i` ends up with THREE independent owners (caller, `__
+send_slot`, `held`), a second `.send()` drops the first back to one and
+brings the new one to three, `.send()` before the first yield panics,
+and resuming a captured yield via bare `.__next__()` panics too. Unlike
+the original build, there is no separate 3-arg-vs-2-arg `SendType`-is-
+independent-of-`E` nuance write-up needed here - it carries over
+unchanged (see "Phase C design" below).
+
+**The A.4a follow-up (`yield from`) has ALSO now been reimplemented**,
+on top of the Phase F/B/C rebuild above - see this doc's own top-of-file
+note for the current mechanism and the three bugs found building it. The
+A.4a section further down still describes the ORIGINAL branch's own
+design/reasoning (kept as reference - internal names differ from the
+current rebuild, same posture as every other phase's own design section
+in this doc).
 
 PLAN_GENERATORS.md's own motivating example now compiles and runs in its
 most natural, idiomatic spelling: `for i in range(count): yield i`,
@@ -676,12 +959,20 @@ per-state validity table, once the actual edge cases were worked
 through). Lifts the scalar-only restriction everywhere it applied,
 including Phase 1's own for-loop element type.
 
-Explicitly not planned, no forcing use case: `yield from`; `.send()`/
-`.throw()`/`.close()`; generator methods (a generator must stay a plain
-function for now, same posture as PLAN_CALLABLE.md/PLAN_LAMBDA.md's own
-deferred closures); async/await (unrelated mechanism entirely).
-(`defer`/`errdefer` inside a generator body WAS in this "not planned"
-list - it has since landed, own separate mini-plan below.)
+Explicitly not planned, no forcing use case: generator methods (a
+generator must stay a plain function for now, same posture as
+PLAN_CALLABLE.md/PLAN_LAMBDA.md's own deferred closures); async/await
+(unrelated mechanism entirely). (`defer`/`errdefer` inside a generator
+body WAS in this "not planned" list - it has since landed, own separate
+mini-plan below. `yield from`, `.send()`, and `.close()` WERE also in
+this list - all three have since landed too, see "Phase C design"/A.4a
+follow-up/A.4b below; `.throw()` alone was explicitly, permanently
+rejected during Phase C's own scoping - this language has no exception
+handling at all, and bolting one on just for generators would contradict
+this whole plan's own "reuse existing machinery" discipline. `Generator[
+T,SendType,E]`'s own `SendType` declared as `Result[V,Err]` is the
+supported alternative for error-injection-shaped needs - see "Phase C
+design".)
 
 defer/errdefer phase design (own separate mini-plan, past the original
 9-phase roadmap above)
@@ -826,6 +1117,324 @@ the exact same error message text as the ordinary check for consistency.
 Verified via two rejection tests (`test_return_inside_generator_defer_
 body_is_rejected`, and a second confirming the nested-inside-an-if case
 specifically).
+
+Phase F design (the AST-synthesis-to-real-dispatch rebuild)
+
+Two independent research passes and a planning pass, cross-checked
+against the actual code, converged on the same finding: everything above
+this point was built on `_collect_generator_units`, which only ever
+TEMPLATE-MATCHES four flat, top-level shapes (bare yield, a while loop
+with exactly one yield, an if/else with at most one yield per branch,
+each occupying a small FIXED state count). This is why every restriction
+above (elif, break/continue, nesting, multiple yields) existed - not
+because any of them were individually hard, but because the "two states,
+one resume-flag" trick each unit builder relied on is fundamentally
+single-suspend-point-per-unit, and generalizing it to N yields at
+arbitrary depth means re-deriving a state discriminant RECURSIVELY
+inside the AST - unbounded complexity for no benefit over what a real
+flat integer state already gives for free. `.send()` (Phase C, below)
+independently needed the identical foundation: yield recognized in
+EXPRESSION position (never supported - the unit matcher only ever saw
+`ast.Expr(ast.Yield(...))`, a bare statement) and a second entry point
+sharing the same dispatch as `$$__next__`. Both point at the same
+missing piece, so this was landed as one foundational rebuild rather
+than patching the old mechanism twice.
+
+The rebuild itself: a generator body is now lowered ONCE, through the
+ORDINARY `Lowering._lower_stmt`/`_lower_expr` pipeline every non-
+generator function already uses for arbitrary `if`/`while`/`for`
+nesting, with one new case - an `ast.Yield` reached during lowering
+emits `ir.Yield(value, state, resume_label)` (state assigned in AST-walk
+order per textual yield site, `FunctionLowering._emit_generator_
+dispatch_prologue`) and lowering continues immediately after. This
+confirmed the plan doc's own long-standing observation (see "New IR"
+below): `ir.Jump`/`ir.Label`/`ir.JumpIfFalse` ALREADY compile to real
+flat C `goto`/label pairs, unchanged since v1 - the hardest
+infrastructure piece this rebuild needed was already there and already
+proven, just never wired up to a real dispatch table. `ir.Yield` itself
+turned out NOT to need to own "state store + return + resume label" as
+a single opaque unit the way the plan's own original IR sketch (below)
+implied - splitting it into three ordinary, already-existing
+instructions (`ir.SetAttr` for the state store, `ir.Yield` for a plain
+`return value;`, `ir.Label` for the resume point) reuses two already-
+correct codegen paths verbatim and needed zero new emitter_c.py logic
+beyond `ir.Yield`'s own trivial `return` case - `Function.is_generator_
+next` ended up mirroring `is_destructor`'s own precedent exactly as
+originally sketched, just gating a lowering-level dispatch-prologue
+builder instead of an emitter-level signature/prologue special-case.
+
+What survived completely unmodified, confirmed dispatch-shape-agnostic
+rather than just assumed: field promotion (`_collect_generator_locals`
+already walked the whole body, any depth); the RC live-flag FIELD
+mechanics (`_live_flag_stem`, the `__<stem>_live` bool, the zero-
+placeholder exemption); the destructor's overall shape; both defer/
+errdefer mechanisms (Mechanism 1's own AST-synthesized arm/replay flags
+don't care about nesting depth; Mechanism 2 was ALREADY lowering-level,
+and needed no redesign - see "Phase F: defer/errdefer under real nested
+lowering" below for the one thing that DID need re-verifying there).
+
+What got deleted: `_collect_generator_units`, `_split_generator_
+segments`, `_build_yield_unit_guard`/`_build_while_unit_guard`/
+`_build_if_unit_guard`, `_validate_while_yield_unit`/`_validate_if_
+yield_unit`, `_pessimistic_done_prefix`, `_wrap_generator_next_returns_
+in_ok`'s old per-unit callers (the method itself survives, see below).
+`type_resolver.py`'s own remaining job shrank to: rename locals/
+parameters to `self.<field>` and split RC-typed field writes for the
+live-flag dance over the WHOLE (unsplit) body in one pass instead of per
+flat unit fragment (`_rename_and_track_liveness`, generalized to recurse
+into nested if/while/for/with bodies via a new `_recurse_liveness_wrap`
+- same shape reused twice more later, see below); tag Mechanism 2's
+armed-defer-site prefix over the whole body in one call (confirmed via
+`_tag_armed_defer_sites`'s own pre-existing docstring that tagging only
+the TOP-LEVEL statement in a slice was already sufficient - lowering.py's
+own push/pop keeps a tag active for that whole statement's recursive
+lowering, so this generalized with ZERO changes to that method itself);
+assemble the DONE-check + tail-exhaustion wrapper around the otherwise-
+untouched user body (`_build_generator_next_function`, rewritten).
+
+Fallibility's own pessimistic-done trick (Phase 8's `self.__state = done`
+inserted BEFORE any block that might fail) is re-derived at the lowering
+level instead of the AST level: `_consume_checked_result` (lowering.py,
+the single method shared by both `.or_return()` and checked-arithmetic
+under Check mode) now appends a `SetAttr(self.__state, done_state)` into
+every `OrReturn`'s own `epilogue` list whenever `self._current_fn.is_
+generator_next` and the generator is fallible (`_generator_pessimistic_
+done_replay`), reusing the EXACT hook Mechanism 2's own error-defer
+replay (`_build_generator_error_defer_replay`) already established at
+that same call site, for the identical reason - both need "run this
+extra thing on the Err branch, before the return." This naturally
+reaches every fallible operation anywhere in the body, any nesting
+depth, where the old AST pass could only see "immediately before a
+unit's own yield/fall-through."
+
+Two real, non-obvious bugs surfaced via real compile-and-run testing
+while landing this (not caught by reasoning alone):
+
+1. `resolve_function_body`'s own `for stmt in fn.node.body:` loop
+   captures a generator's ORIGINAL body once, up front - if resolving
+   one of the body's OWN later statements needs the generator's own
+   return type (confirmed via a real repro: `.or_return()` checks the
+   ENCLOSING function's declared error type for propagation
+   compatibility), that resolution can reentrantly trigger `ensure_
+   generator_synthesized` MID-LOOP, which rewrites `fn.node.body` out
+   from under the still-running iteration - the loop's own stale
+   reference keeps resolving the OLD statements regardless, and this
+   method's own unconditional `fn.node.body = new_body` at the end then
+   CLOBBERS the freshly-synthesized constructor-call body with a
+   resolved copy of the stale original one. Fixed by synthesizing
+   eagerly, at the very top of `resolve_function_body`, before its own
+   per-statement loop ever starts - a cheap, idempotent no-op for every
+   non-generator function (the same `_function_contains_yield` check
+   `Lowering.lower_function`'s own identical safety-net call already
+   pays for every function).
+
+2. `_lower_generator_yield`'s own `_flush_pending_temps()` call was
+   decref-ing the YIELDED VALUE ITSELF, because it was never `untrack_
+   temp`'d first, unlike `_stmt_Return`'s own identical case (see its
+   own comment on why this matters) - confirmed via a real repro: a
+   `Box` yielded through a bare while-unit came back already released
+   (tag intact, payload pointer pointing at freed memory). Fixed by
+   adding the missing `untrack_temp` call, mirroring `_stmt_Return`
+   exactly.
+
+A yield reached OUTSIDE a successfully-synthesized generator (e.g. one
+whose own synthesis failed earlier for an unrelated, already-reported
+reason - see bug 1 above for how that state becomes reachable even with
+the fix, via a genuinely invalid generator like `return` inside a defer
+body) now fails gracefully via `discovery.fail()` instead of a raw
+`AssertionError` escaping the compiler's own per-unit recovery
+boundaries - a single bad generator no longer risks crashing the whole
+compile run.
+
+Phase F's own regression gate is the ENTIRE pre-existing
+`GeneratorFunctionTests` suite passing unmodified (behavioral tests, not
+IR-shape assertions - exactly what an internal-mechanism swap needs to
+prove) - it does, except five rejection tests whose own shapes are now
+legitimately supported (multiple yields per loop/branch, yield nested
+inside if-in-while, elif chains, break inside a yield-containing while,
+two yields in one if branch), each replaced with a positive compile-and-
+run test of the same shape.
+
+Phase B design (nesting/multiplicity verification)
+
+Once Phase F landed, this was almost entirely VERIFICATION, not new
+mechanism - real compile-and-run coverage for every shape the unit model
+used to reject, confirming the dispatch prologue genuinely doesn't care
+about nesting shape/depth/multiplicity: `while` nested inside a yield-
+containing `if` branch AND the reverse (`if` nested inside `while`),
+yield nested THREE levels deep (if-in-if-in-while, resuming the correct
+arm), `elif` chains with a yield in each arm, `continue` skipping a
+loop's own yield mid-iteration (not just `break`, already covered by
+Phase F's own regression-gate replacement tests), and an RC refcount-
+delta variant (a captured parameter still torn down correctly when a
+generator is dropped mid-iteration with its suspended state nested
+inside if/while, not just at the old flat single-yield-in-while depth).
+
+Phase C design (`.send()`)
+
+Landed the plan's own final, simplified design after live back-and-forth
+during scoping (see the plan file this session started from for the
+full reasoning trail - not reproduced here): `Generator[T, SendType, E]`
+- three type parameters. `T`/`E` are the existing `elem_type`/
+`error_type`, completely unchanged; `SendType` is new. `(yield expr)`
+used as an EXPRESSION evaluates to plain `SendType` - no automatic
+Result-wrapping by the compiler. A generator author who wants `.send()`
+to be able to inject a failure the body can react to simply declares
+`SendType` as `Result[V,Err]` themselves and uses the ALREADY-EXISTING,
+already-tested `.or_return()`/`.unwrap_or()`/`match` machinery on it
+like any other Result value - confirmed these already work generically
+on any properly-typed Result-shaped expression reaching lowering.py, no
+special-casing tied to the receiver's origin. `SendType` and `E` are
+deliberately independent: a generator can `.unwrap_or()` an injected
+error into a default without `E`/`or_return()` ever being involved.
+`Iterator[T]` (1 arg) and the existing 2-arg `Generator[T,E]` are
+completely unaffected - only the new 3-arg form gets `.send()` at all,
+dispatched on tuple arity in discovery.py's own `Generator[...]`
+recognition.
+
+Backing-class shape: `__send_slot: SendType` (an ordinary promoted
+field - participates in the EXISTING RC live-flag/zero-placeholder/
+destructor-teardown machinery whenever `SendType` is RC-typed, no new RC
+design needed) and `__send_ready: bool` (armed by `send()`, consumed and
+cleared by the next captured-yield resume). `_build_generator_next_
+function`'s own body-assembly becomes `$$__resume__` instead of
+`$$__next__` whenever `send_type` is set (Iterator[T]/the 2-arg form are
+unaffected - `$$__next__` stays the one real method, exactly as every
+phase before this one built it); two thin public wrappers delegate into
+it - `__next__()` (leaves `__send_ready` untouched) and `send(v)`
+(panics via `sys.panic()` if `self.__state == 0`, mirroring Python's own
+`TypeError` for sending before the first yield, otherwise arms `__send_
+slot`/`__send_ready` - live-flag-guarded via `_build_liveness_guard`
+directly, when `SendType` is RC-typed - then resumes).
+
+Yield-as-expression itself is a new `_expr_Yield` case registered the
+same way every other `_expr_X` handler is (`_lower_expr`'s own getattr-
+based dispatch, no special-casing needed) - `_lower_generator_yield`'s
+own suspend-building logic (state store, `ir.Yield`, resume `ir.Label`)
+is factored into a shared `_emit_generator_yield_suspend`, used by both
+the discarded (statement-position, unchanged since Phase F) and captured
+(expression-position, new) cases. After resuming, `_expr_Yield` reads
+back `self.__send_ready`: true means `send(v)` armed `__send_slot` since
+this suspend - clears the flag and returns an incref'd read of it (a
+genuine aliasing read, same category as an ordinary field read); false
+means this resume came from a bare `__next__()`/for-loop consumption
+instead - panics with a clear message pointing at `.send()`. Because
+this is ordinary expression lowering, it composes for FREE with
+anything wrapping the yield (`x = yield v`, `x = (yield v).or_return()`,
+...) - no special-casing needed for nesting, the exact same reason Phase
+F's own dispatch mechanism generalized nesting/multiplicity for free.
+`_validate_generator_yield_positions` allows yield anywhere inside a
+generator that declared a `SendType` (the old bare-statement-only
+restriction stays exactly as before for `Iterator[T]`/the 2-arg form,
+which have no `SendType` to ever deliver a captured yield's own value
+through).
+
+Two more real, non-obvious bugs surfaced via real compile-and-run
+testing of an RC-typed `SendType` specifically (a scalar `SendType`
+never exercises either path):
+
+1. `_build_liveness_guard`'s own deep-copy strategy (the "if self.__
+   stem_live: ... else: ..." guard around an RC-typed promoted local's
+   assignment, unmodified since Phase 9) silently DUPLICATES a yield
+   when the value expression contains one (`held = yield i`) - each
+   copy becomes its own independent `(state, resume_label)` suspend
+   point for what must be ONE textual yield site, corrupting the whole
+   dispatch state count. An ordinary value expression is safe to
+   duplicate this way (only one of the two branches ever actually
+   RUNS for a given dynamic execution, so a Call/constructor appearing
+   twice in the compiled C still only executes once) - a `yield`
+   specifically breaks that assumption, since it's a real suspend point,
+   not a value computation. Fixed by detecting a yield in the value
+   expression and restructuring into "capture the value once into an
+   ordinary local, branch only on the simple re-store" instead of deep-
+   copying the whole statement - the yield now appears exactly once,
+   textually and state-wise, regardless of which branch the live-flag
+   selects at runtime. (`_build_liveness_guard` now returns `list[ast.
+   stmt]` instead of a single `ast.If` for this reason - one of its
+   three call sites, inside the `send()` wrapper builder above, had
+   been silently producing a corrupt nested-list AST body for an RC-
+   typed `SendType` before this was caught.)
+
+2. The new capture-temp local was then getting DOUBLE-incremented:
+   `_is_aliasing_expr` didn't recognize a captured yield (reading
+   `self.__send_slot`, a field that independently owns its own
+   reference) as aliasing, so the capture assignment was treated as
+   "fresh" and given its own tracked ownership that never gets balanced
+   (a yield's own suspend deliberately skips the ordinary epilogue
+   unwind - locals persist across it, nothing to unwind), while the
+   SUBSEQUENT re-store from the capture temp added its own separate
+   increment on top. Fixed by teaching `_is_aliasing_expr` that a
+   captured `ast.Yield` is aliasing (same category `ast.Attribute`
+   already is - it reads an existing field), and tagging the capture
+   assignment the same way `visit_Match`'s own `__match_subj_N` relay
+   already is (`is_alias` -> borrow, no independent tracked ownership) -
+   mirrors that existing, proven mechanism exactly rather than inventing
+   a new one.
+
+Verified via real compile-and-run refcount-delta checks: an RC-typed
+`Box` sent through `.send()` into a captured `held = yield i` correctly
+ends up with THREE independent owners (the caller's own binding, `__
+send_slot`, and `held`), and a second `.send()` call correctly drops the
+first value back to one owner and brings the new one up to three; a
+scalar accumulator round-trips real values through repeated `.send()`
+calls; `.send()` before the first yield panics; resuming a captured
+yield via a bare `.__next__()` instead of `.send()` panics too.
+
+A.4a follow-up design (`yield from` / for-loop-with-yield at non-top-
+level positions)
+
+`_desugar_generator_yield_from` and `_desugar_generator_for_loops` both
+generalized from top-level-only to recursing into nested if/while/for/
+with bodies (`_recurse_desugar_yield_from`/`_recurse_desugar_for_loops`,
+the SAME shape as Phase F's own `_recurse_liveness_wrap`, now used a
+third time) - a `yield from` (or an ordinary for-loop containing yield)
+reachable through `if`/`with` now forwards/desugars correctly at any
+nesting depth, not just the top level.
+
+A real, deeper bug surfaced along the way, not just the narrow "nested
+positions are unreachable" gap this started as: `_new_for_obj_field`'s
+own "evaluate the iterated expression once, at construction" design
+(Phase 1, still unchanged at the time) is silently WRONG once the for-
+loop is reachable through a while/for loop that can re-enter it - the
+same already-exhausted iterated object gets reused on every re-entry
+instead of being freshly reconstructed, confirmed via a real repro
+(`while j < count: yield from inner(); j += 1` only ever forwarded
+`inner()`'s own values during the outer loop's FIRST pass - every later
+pass silently forwarded nothing at all). This turn landed only a stopgap
+for it: an explicit pre-desugar validator
+(`_reject_generator_for_or_yield_from_nested_inside_loop`) that rejected
+the shape outright with a clear message rather than shipping the silent
+miscompile - nested inside `if`/`with` still worked fine; nested inside
+`while`/`for` (at ANY depth reachable through one) was a compile error.
+**Superseded the same day, in a follow-up turn** (worktree `generator-
+for-obj-lazy-init`) that did the larger fix instead: `__for_obj_N` re-
+derives from its real expression every time the loop is actually
+reached, via the same live-flag-guarded promoted-local machinery A.4a
+had already built for `__for_next_N` - so the validator (and its helper
+walker) were removed entirely rather than left as a permanent
+restriction. See this doc's own top-of-file note for the full writeup,
+including a second, unrelated pre-existing bug (`_recurse_desugar_for_
+loops` never recursed into a for-loop-with-yield's own body) that this
+newly-unblocked nesting shape exposed and that turn also fixed.
+
+Phase F: defer/errdefer under real nested lowering
+
+Mechanism 2 (the lowering-level lowering.py hook, `_generator_armed_
+defer_sites` push/pop in `_lower_stmt` plus `_build_generator_error_
+defer_replay`) needed re-verification under Phase F's real nested
+lowering, not a redesign - and didn't need one: `_tag_armed_defer_
+sites`'s own pre-existing docstring already established that tagging
+only the TOP-LEVEL statement in a slice is sufficient (lowering.py's own
+push/pop keeps a tag active for that whole statement's own recursive
+lowering, so a fallible operation nested arbitrarily deep inside a
+tagged statement still sees the right armed set) - calling it once over
+the WHOLE (renamed) body, instead of once per flat unit-fragment
+preamble as before, required zero changes to that method itself. The
+existing `GeneratorFunctionTests` defer/errdefer suite (armed-then-
+fired-exactly-once, LIFO ordering, `defer`/`errdefer` both firing on the
+same error exit, the preamble/tail-only positional restriction) passed
+unmodified through the whole rebuild, confirmed by Phase F's own
+regression gate.
 
 Original planning notes follow, kept for historical context and for the
 phases not yet attempted (the fallible-generator sketch below predates,
@@ -1112,6 +1721,12 @@ and-run tests in emitter_c_test.py, e.g. the `ListThreadSafetyTests`/
   through an ordinary `for i in range(n):` call site.
 
 Deferred / explicitly out of scope for this whole plan
+
+(This list is part of the ORIGINAL planning notes above - a snapshot of
+v1's own starting scope, kept verbatim for historical context. By the
+time this doc reached Phase C, every item below except `.throw()` and
+`async`/`await` had landed - see the STATUS section at the top of this
+doc for the current, up-to-date picture.)
 
 - `Generator[T,E]` fallible generators (sketched above, not designed).
 - `yield from`, `.send()`, `.throw()`, `.close()` beyond ordinary RC drop.

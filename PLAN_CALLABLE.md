@@ -22,13 +22,11 @@ In scope:
    @staticmethod (no bound receiver) lowers to a Ptr[Callable[...]]-typed
    value.
 3. Calling through a Ptr[Callable[...]]-typed value (an indirect call).
-4. Using Ptr[Callable[...]] as a function parameter type and a local
-   variable type - not yet as a struct field, not deeply nested, and NOT
-   as a function's own return type (confirmed: crashes today - a function
-   RETURNING a function pointer is C's gnarliest declarator shape,
-   `RetType (*name(Params))(InnerParams)`, genuinely different from every
-   other declarator _declarator handles. Not needed by dict[K,V] - it only
-   ever passes a callback as a parameter, never returns one).
+4. Using Ptr[Callable[...]] as a function parameter type, a local
+   variable type, a struct/RCClass field, and (both closed in later
+   passes - see status updates below) a function's own return type and
+   a call directly through a field-access expression. Not yet deeply
+   nested (e.g. inside another container type).
 
 Deferred (flagged, not attempted this pass):
 - Lambda expressions / nested function defs - needed for zoneinfo.py's
@@ -103,3 +101,98 @@ Verification
 - dict[K,V] real compile-and-run coverage once rebuilt: dict[str,i32] and
   dict[i32,str] (RC and non-RC key) - insert, overwrite-existing-key,
   lookup-miss (KeyError), destruction without leak/double-free.
+
+Status update: a function returning Ptr[Callable[...]] (item 4's original
+exclusion, above) turned out to need no new machinery at all -
+_function_prototype's own "TYPE NAME" spelling had the exact same bug
+_emit_global_declaration independently hit for module-level Ptr[Callable[...]]
+globals (see git history around commit 32a5c90): a bare c_type(...) prefix
+can't express C's function-pointer declarator, which puts the name INSIDE
+the parens. Fixed by reusing _declarator as-is - passing "name( params )" as
+its own `name` argument nests the two declarator layers correctly
+(`RetType (*name(Params))(InnerParams)`), with no separate code path needed.
+Verified: free function, method (self ordering unaffected), and a generic
+function monomorphized to K = Ptr[Callable[...]] - real compile-and-run,
+MSVC/clang/WSL-gcc all green.
+
+Status update: storing Ptr[Callable[...]] as a plain struct/RCClass field
+(declaration/construction/read into a local) already worked - both
+_struct_or_union_body and emit_rcclass route every field through
+_declarator, same as any parameter/local. The real remaining gap was
+CALLING directly through the field-access expression itself (`o.field(...)`)
+- _try_lower_indirect_call was deliberately scoped to a bare Name callee
+only, per this doc's own original item 4 wording. Closed by extending it to
+also recognize an Attribute callee, using a purely static, non-emitting
+type lookup (_static_type_of_value_expr / a new non-failing _find_field
+probe) to decide the shape applies BEFORE ever lowering the receiver -
+required because _resolve_callee's own Attribute fallback lowers the
+receiver again on any non-match, so lowering it speculatively here first
+would double-evaluate a receiver with side effects. Verified: @cstruct and
+RCClass fields, a nested field chain (outer.inner.handler(...)), and a
+regression guard that an ordinary same-shaped method call (o.method(...))
+still dispatches normally rather than being misrouted - real compile-and-
+run, MSVC/clang/WSL-gcc all green, plus lowering_test.py IR-level coverage.
+
+Status update: the LAST remaining callee shape - calling directly through
+ANY other expression (get_callback()(...), t[0](...)) - is now closed too.
+Considered and rejected: retrofitting CallableType with a real `__call__`
+dunder so it could ride the ordinary class-method dispatch machinery every
+other call in the language already flows through (the user's own
+suggestion, worth recording) - CallableType isn't a ScopeMixin (no members
+at all, see Implementation #1 above), so this would mean teaching the
+SHARED method-resolution/dispatch core to recognize a synthetic member on a
+non-class type, a real but more invasive change than warranted here.
+Instead, _try_lower_indirect_call's existing Name/Attribute branches (each
+statically type-checked before ever evaluating anything, to stay double-
+evaluation-safe against _resolve_callee's own fallback) gained one more,
+simpler branch: for any OTHER node.func shape, evaluate it once via the
+ordinary _lower_expr and inspect the REAL resulting operand's type. This is
+double-evaluation-safe too, for a different reason than the static-check
+branches - _resolve_callee's own fallback for a non-Attribute/non-Name
+func_node fails IMMEDIATELY today, with zero evaluation attempted, so
+nothing downstream ever gets a second chance at the same expression.
+One real regression found and fixed while building this: a bare Subscript
+node.func isn't always "index a runtime value" - `some_generic_fn[T](...)`/
+`compiler.atomic_add[T](...)` is NAMESPACE-RESOLVED generic-call syntax
+(the exact same _try_resolve_namespace lookup the construction-sugar
+recognizers above already use), and evaluating it as an ordinary expression
+broke 11 existing tests (generic-function-call and compiler-intrinsic
+tests, plus one exercising `sys` used bare). Fixed by trying
+_try_resolve_namespace(node.func) first (a purely static, non-evaluating
+lookup) and bailing out untouched whenever it resolves to anything,
+BEFORE ever calling _lower_expr - leaving that whole class of call
+completely unaffected by this change.
+Verified: a call-result callee (get_callback()(...)) and a subscript-result
+callee via a custom __getitem__ (isolated from whatever separate, unrelated
+gaps a generic container's OWN internals might still have storing a
+Ptr[Callable[...]] element - never investigated), plus a regression guard
+that a genuinely non-callable call-result still fails with the ordinary
+"cannot call ..." diagnostic. Real compile-and-run plus lowering_test.py
+IR-level coverage (including the generic-call/compiler-intrinsic
+regression tests that caught the Subscript bug), MSVC/clang/WSL-gcc all
+green, full test suite clean on all three.
+
+Status update: the "generic container storing Ptr[Callable[...]]" question
+above turned out to be a REAL, confirmed bug, not just unverified -
+list[Ptr[Callable[...]]] crashed emit_c() with the SAME NotImplementedError
+as every earlier bug in this file, one level deeper.
+list.__getitem__'s own Result[Ptr[Callable[...]],IndexError] return type
+indirects its Ok-leaf through an EXTRA pointer (UnionStorage's own payload
+representation - not something specific to list, any Result/Optional whose
+leaf is itself Ptr[Callable[...]] hits this), producing
+Ptr[Ptr[Callable[...]]] - a shape _callable_ptr_type only ever recognized
+at exactly ONE indirection level. Fixed by generalizing _callable_ptr_type
+to report the indirection DEPTH (not just yes/no) and threading that
+through every one of its 5 call sites' own star count - C's function-
+pointer declarator generalizes to N indirection levels via N stars INSIDE
+the parens (RetType (**name)(Params) for N=2), structurally different from
+an ordinary object pointer chain's trailing stars, which is why this
+couldn't just be "call c_type twice". Confirmed the fix produces exactly
+`int32_t (**v_Ok)( int32_t );` in the real generated C. Verified: real
+compile-and-run of list[Ptr[Callable[...]]] end to end (construct, append,
+Result-checked __getitem__, indirect call through the retrieved value),
+MSVC/clang/WSL-gcc all green, full test suite clean on all three.
+list[T]'s OWN storage array itself was never the problem in this specific
+bug (it's an ordinary Ptr[T]-typed field, always depth 1) - this was
+entirely inside the Result-payload union machinery, reachable through ANY
+Result/Optional wrapping a Ptr[Callable[...]] leaf, not just via list.

@@ -383,22 +383,6 @@ class FastList[T]:
 		compiler.incref( val )
 		return Result.Ok( val )
 
-	# Get a borrowed pointer directly into the buffer (no copy, no incref).
-	# Caller must NOT store this pointer beyond the next mutation of the list.
-	# NOTE: for an RC element type, Ptr[T] itself stays single-indirection
-	# (see _read_element's own comment) - a slot only ever holds a T
-	# HANDLE, not a T value, so there is no correctly-typed Ptr[T] this
-	# method could return today. Value-typed T only, for now.
-	def get_ptr( self, id: usize ) -> Result[Ptr[T], IndexError]:
-		ptr: Ptr[T] = compiler.cast( Ptr[T], self.__raw._get( id ).or_return())
-		return Result.Ok( ptr )
-
-	# Get a borrowed data-index pointer directly (for hot iteration loops).
-	# NOTE: same RC-element limitation as get_ptr above.
-	def get_ptr_at( self, idx: usize ) -> Result[Ptr[T], IndexError]:
-		ptr: Ptr[T] = compiler.cast( Ptr[T], self.__raw._get_at( idx ).or_return())
-		return Result.Ok( ptr )
-
 	# Remove by stable ID. Decrefs the removed element if T is RC.
 	def erase( self, id: usize ) -> Result[None, IndexError]:
 		val: T = self._read_element( self.__raw._get( id ).or_return())

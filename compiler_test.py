@@ -20,6 +20,7 @@ class CompilerTestCase( unittest.TestCase ):
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
 		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 
 	def setUp( self ) -> None:
@@ -40,6 +41,11 @@ class CompilerTestCase( unittest.TestCase ):
 			libs['kernel32'].discard( 'ExitProcess' )
 			if not libs['kernel32']:
 				del libs['kernel32']
+		if 'ntdll' in libs:
+			libs['ntdll'].discard( 'RtlFillMemory' )
+			libs['ntdll'].discard( 'RtlCopyMemory' )
+			if not libs['ntdll']:
+				del libs['ntdll']
 		return libs
 
 	def _instructions_for( self, qualname: str ) -> list[ir.Instruction]:
@@ -52,6 +58,11 @@ class ArchitectureExampleTests( CompilerTestCase ):
 	''' hand-verifies ARCHITECTURE.md's own shape: FuncStart, DeclareTemp, AddWrap, Call, DeleteTemp, Return, FuncEnd '''
 
 	def test_foo_sequence_and_schedule_order( self ) -> None:
+		# x + 1 dispatches through i32.__wrapped_add__ now - the literal `1`
+		# isn't already a Variable, so it's spliced into a synthesized local
+		# (an extra Assign) before AddWrap, same as lowering_test.py's own
+		# migrated arithmetic tests
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def main() -> None:
 	foo( 3 )
@@ -68,13 +79,14 @@ def echo( x: i32 ) -> None:
 
 		instructions = self._instructions_for( '__main__.foo' )
 		kinds = [ type( instr ) for instr in instructions ]
-		self.assertEqual( kinds, [ ir.FuncStart, ir.DeclareTemp, ir.AddWrap, ir.Call, ir.DeleteTemp, ir.Return, ir.FuncEnd ] )
+		self.assertEqual( kinds, [ ir.FuncStart, ir.Assign, ir.DeclareTemp, ir.AddWrap, ir.Call, ir.DeleteTemp, ir.Return, ir.FuncEnd ] )
 
-		add_wrap = instructions[2]
+		add_wrap = instructions[3]
 		self.assertIsInstance( add_wrap, ir.AddWrap )
-		self.assertEqual( add_wrap.right, ir.Const( type = add_wrap.left.type, value = 1 ))
+		self.assertEqual( add_wrap.right, instructions[1].dest ) # the spliced $inline0$other local
+		self.assertEqual( instructions[1].src, ir.Const( type = add_wrap.left.type, value = 1 ))
 
-		call = instructions[3]
+		call = instructions[4]
 		self.assertIsInstance( call, ir.Call )
 		self.assertEqual( call.target.qualname, '__main__.echo' )
 		self.assertIsNone( call.dest )
@@ -337,9 +349,7 @@ def len( x: Foo ) -> usize:
 def len( x: Bar ) -> usize:
 	return x.__len__()
 
-def main() -> None:
-	f: Foo
-	b: Bar
+def main( f: Foo, b: Bar ) -> None:
 	x: usize = len( f )
 	y: usize = len( b )
 ''' )
@@ -373,15 +383,27 @@ def foo( x: int|None = None ) -> None:
 def foo( x: str ) -> None:
 	pass
 
-def main() -> None:
-	x: int
+def main( x: int ) -> None:
 	foo( x )
 ''' )
 		names = self._function_names()
 		self.assertIn( 'main', names )
-		# exactly one of the two plain implementations was scheduled, never
-		# the whole group and never the stub (stubs have no body to lower)
-		self.assertEqual( len( names ), 2 )
+		self.assertIn( '__main__.foo', names )
+		# 3, not 2: exactly one of the two plain implementations was
+		# scheduled (never the whole group and never the stub - stubs have
+		# no body to lower), PLUS the union's own synthesized 'int' member
+		# constructor - x's own plain `int` type doesn't match the winning
+		# implementation's real declared parameter type (int|None, a union),
+		# so it must be coerced into it first (see lowering_test.py's
+		# test_overload_call_resolves_to_unconditional_target for the exact
+		# IR shape this produces). Before this fix, that coercion was
+		# skipped entirely for this exact case (a non-literal argument whose
+		# plain type is a LEAF of an overloaded call's winning target's own
+		# union-typed parameter) - confirmed via a real compile of the
+		# equivalent real-builtins shape, which produced a genuine "passing
+		# 'int32_t' to parameter of incompatible type 'struct $__u$$...'" C
+		# mismatch
+		self.assertEqual( len( names ), 3 )
 
 	def test_multi_branch_dispatch_resolves_via_runtime_tag_check( self ) -> None:
 		# a union-typed argument (x: int|str) makes foo(x) ambiguous at
@@ -406,8 +428,7 @@ def foo( x: int ) -> None:
 def foo( x: str ) -> None:
 	pass
 
-def main() -> None:
-	x: int|str
+def main( x: int|str ) -> None:
 	foo( x )
 ''', Path( '__main__.py' ), scope = None )
 		self.compiler.run()
@@ -421,6 +442,7 @@ def main() -> None:
 		# alloc[u32](...) must compile exactly one function - the
 		# monomorphized alloc[u32] - never the shared, unspecialized alloc
 		# itself (T never gets bound there, so it can't actually compile)
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def alloc[T]( count: usize ) -> usize:
 	with compiler.wrap_arithmetic:
@@ -504,6 +526,235 @@ def main() -> None:
 	pass
 ''' )
 		self.assertEqual( self._extern_libs(), {} )
+
+class ExternDllDependencyTests( CompilerTestCase ):
+	''' compiler.extern_dlls - populated only from @extern(..., dll=...)
+	declarations on functions actually reached/lowered, the same
+	reachability gate ExternLibraryDependencyTests above verifies for
+	extern_libs (see compiler.py's Function-lowering branch: both are
+	registered together, from the same `if unit.extern_lib is not None:`
+	check). Drives mpy.py's post-link DLL-bundling step. '''
+
+	def test_called_extern_function_registers_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll' } )
+
+	def test_declared_but_uncalled_extern_function_does_not_register_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_dlls, set() )
+
+	def test_extern_without_dll_leaves_the_registry_empty( self ) -> None:
+		self._run( '''
+@extern( 'c', 'malloc' )
+def malloc( size: usize ) -> Ptr[u8]:
+	...
+
+def main() -> None:
+	malloc( 4 )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, set() )
+
+	def test_dll_list_registers_every_entry( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = [ 'tcl86t.dll', 'zlib1.dll' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'zlib1.dll' } )
+
+	def test_dlls_union_across_multiple_reached_functions( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tk86t', 'Tk_Init', dll = 'tk86t.dll' )
+def Tk_Init( interp: Ptr[None] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tk_Init( None )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'tk86t.dll' } )
+
+class ExternNoticeDependencyTests( CompilerTestCase ):
+	''' compiler.extern_notices - populated only from
+	@extern(..., notice=...) declarations on functions actually
+	reached/lowered, same reachability gate and same registration point as
+	extern_dlls above. Drives mpy.py's post-link THIRD-PARTY-LICENSES
+	combination step. Deliberately independent of extern_dlls (see
+	mpy_types.Function.extern_notices's own comment) - covered explicitly
+	below, not assumed. '''
+
+	def test_called_extern_function_registers_its_notice( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL' } )
+
+	def test_declared_but_uncalled_extern_function_does_not_register_its_notice( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_notices, set() )
+
+	def test_notice_list_registers_every_entry( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = [ 'TCL', 'ZLIB' ] )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL', 'ZLIB' } )
+
+	def test_notice_independent_of_dll( self ) -> None:
+		''' a notice can be declared with no dll= at all (e.g. a header-only
+		or statically-linked dependency that still needs attribution), and
+		a dll= with no notice= (the author's call) - the two registries
+		never imply each other. '''
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tk86t', 'Tk_Init', notice = 'TCL' )
+def Tk_Init( interp: Ptr[None] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tk_Init( None )
+''' )
+		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll' } )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL' } )
+
+	def test_notices_union_across_multiple_reached_functions( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', notice = 'TCL' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+@extern( 'tcl86t', 'Tcl_Eval', notice = [ 'TCL', 'ZLIB' ] )
+def Tcl_Eval( interp: Ptr[None], script: ConstPtr[u8] ) -> i32:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+	Tcl_Eval( None, None )
+''' )
+		self.assertEqual( self.compiler.extern_notices, { 'TCL', 'ZLIB' } )
+
+class ColdQueueDrainModuleContextTests( unittest.TestCase ):
+	''' compiler._lower's own class-registration branches (RCClass/CStruct/
+	CUnion/TaggedUnion, both bare and Specialization-wrapped) can need to
+	synthesize a fresh anonymous union's member constructor for a field's
+	own type, touched here for the FIRST time - UnionStorage.get() stamps
+	that constructor's own .file from "whichever module is currently
+	active" (discovery.module_stack[-1]) - but unlike an ordinary function
+	body (FunctionLowering.run always pushes its own module_context first)
+	or a global's own initializer (TypeResolver.resolve_global_init does
+	the same), nothing established one by the time these branches run
+	reached directly off the work queue. Normally masked by scheduling
+	order (whatever first REFERENCES the class already touched its fields
+	with valid context, from inside its own module_context, before the
+	class's own turn on the queue) - not always: see worktree-fix-result-
+	ok-tuple-union-infer's own bug #2, where a tuple[T|None,...]'s own
+	backing RCClass (built via monomorphize.py's substitute_type_params as
+	a side effect of generic type-parameter inference) reached this
+	completely decoupled from any real construction expression.
+
+	Pre-enqueuing the class directly, before compiler.run() ever pushes any
+	module context at all, forces the same "first touch happens cold"
+	condition deterministically instead of depending on a scheduling-order
+	coincidence - every case below reliably crashed ("no module found
+	owning ...") before compiler.py's own module_context wraps (mirroring
+	_synthesize_rcclass_destructor's own, earlier fix) and UnionStorage.
+	get()'s own (the root cause: reachable from schedule()'s eager class-
+	registration dispatch with no context guarantee at all, not just from
+	compiler._lower()'s cold branches). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _run_with_precocious_enqueue( self, code: str, class_name: str ) -> None:
+		self.compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		cls = self.discovery.modules['__main__'].get_local( class_name )
+		self.compiler._enqueue( cls )
+		self.compiler.run()
+
+	def test_rcclass_field_typed_as_anonymous_union( self ) -> None:
+		self._run_with_precocious_enqueue( '''
+class Box:
+	v: i32|None
+	def __init__( self, v: i32|None ) -> None:
+		self.v = v
+
+def main() -> i32:
+	b: Box = Box( 5 )
+	return 0
+''', 'Box' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_cstruct_field_typed_as_anonymous_union( self ) -> None:
+		self._run_with_precocious_enqueue( '''
+@cstruct
+class Holder:
+	r: i32|None
+
+def g() -> i32|None:
+	return 5
+
+def main() -> i32:
+	v: i32|None = g()
+	return 0
+''', 'Holder' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_union_variant_payload_typed_as_anonymous_union( self ) -> None:
+		self._run_with_precocious_enqueue( '''
+@union
+class Foo:
+	A: i32|None
+
+def g() -> i32|None:
+	return 5
+
+def main() -> i32:
+	v: i32|None = g()
+	return 0
+''', 'Foo' )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
 if __name__ == '__main__':
 	unittest.main()

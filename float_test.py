@@ -58,12 +58,11 @@ class FloatBehaviorTests( unittest.TestCase ):
 			# already has whatever the generated boilerplate itself needs too
 			# (kernel32 on a no-CRT Windows build - windows._console/sys.exit
 			# are compiler-forced reachable, see Compiler.force_reachable)
-			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( libs ):
+			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -342,6 +341,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		x: f64 = 1.0e308
 		y: f64 = x * x
+		if y != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -352,6 +352,7 @@ def main() -> i32:
 		z: f64 = 0.0
 		one: f64 = 1.0
 		y: f64 = one / z
+		if y != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -361,6 +362,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		big: f64 = 1.0e300
 		n: i32 = i32(big)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -371,6 +373,7 @@ def main() -> i32:
 		z: f64 = 0.0
 		nan: f64 = z / z
 		n: i32 = i32(nan)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -403,6 +406,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		big: f64 = 1.0e40
 		n: i128 = i128(big)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -412,6 +416,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		neg: f64 = -1.0
 		n: u128 = u128(neg)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -478,6 +483,7 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		boundary: f64 = 9223372036854775808.0
 		n: i64 = i64(boundary)
+		if n != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -740,6 +746,7 @@ def main() -> i32:
 		big: f64 = 1.0e308
 		small: f64 = 1.0e-308
 		q: f64 = big / small
+		if q != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -756,27 +763,35 @@ def main() -> i32:
 	with compiler.panic_arithmetic("fp"):
 		two: f64 = 2.0
 		q: f64 = nan / two
+		if q != 0.0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
 	# --- signed INT_MIN/-1 is defined per mode (item 2) ---------------------
 
 	def test_int_min_div_checked_panics( self ) -> None:
-		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError
+		# checked/panic: INT_MIN / -1 (and INT_MIN % -1) is an OverflowError.
+		# i8::MIN constructed directly (-128), not via the old i8(128)
+		# bit-reinterpretation idiom - that literal no longer bypasses the
+		# range check (128 doesn't fit i8's real value range, confirmed
+		# with the user as a deliberate, wanted change - see lowering_
+		# test.py's test_narrowing_literal_cast_is_range_checked)
 		self._assert_program_panics( '''
 def main() -> i32:
 	with compiler.panic_arithmetic("ov"):
 		neg_one: i8 = -1
-		mn: i8 = i8(128)
+		mn: i8 = -128
 		q: i8 = mn // neg_one
+		if q != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 		self._assert_program_panics( '''
 def main() -> i32:
 	with compiler.panic_arithmetic("ov"):
 		neg_one: i8 = -1
-		mn: i8 = i8(128)
+		mn: i8 = -128
 		m: i8 = mn % neg_one
+		if m != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -798,8 +813,8 @@ def sdiv( a: i8, b: i8 ) -> Result[i8, ZeroDivisionError]:
 		return Result.Ok( a // b )
 
 def main() -> i32:
-	mn: i8 = i8(128)
-	neg_one: i8 = i8(255)
+	mn: i8 = -128
+	neg_one: i8 = -1
 	wq: Result[i8, ZeroDivisionError] = wdiv( mn, neg_one )
 	match wq:
 		case Result.Ok( v ):
@@ -841,6 +856,143 @@ def main() -> i32:
 			return 2
 	return 0
 ''', [ 'unsigned 200//4 == 50', 'unsigned div Err (unexpected)' ] )
+
+	def test_f64_str_and_repr_direct_call( self ) -> None:
+		# f64.__str__/f64.__repr__ are attached via post-hoc assignment
+		# (f64.__str__ = _f64_str in lib/builtins/__float.py), not declared
+		# inside a class body - discovery.py never strips a "self" off
+		# _f64_str's own single `value: f64` parameter the way it would for
+		# an ordinary method, so a Call built with BOTH a receiver AND the
+		# untouched parameter list double-counted the receiver, crashing
+		# emitter_c.py's _emit_call_args with a bare KeyError('value') the
+		# moment user code called f.__str__()/f.__repr__() directly (as
+		# opposed to via f-string interpolation, which reaches the same
+		# formatter through a different, already-correct call path -
+		# lowering.py's own _lower_method_call). Confirmed to crash before
+		# the fix (lowering.py's _lower_call, the general call-lowering
+		# path every ordinary `receiver.method()` call site goes through,
+		# now carries the same "receiver is really just a leading
+		# positional argument for a Scalar-attached free function"
+		# adjustment _lower_method_call already had for its own narrower
+		# set of f-string-only callers).
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f64 = 3.5
+	s: str = f.__str__()
+	if s != '3.5':
+		return 1
+	r: str = f.__repr__()
+	if r != '3.5':
+		return 2
+	return 0
+''', [ 'f64.__str__() == "3.5"', 'f64.__repr__() == "3.5"' ] )
+
+	def test_f64_str_via_local_receiver_variable( self ) -> None:
+		# same call shape, but through a receiver bound to an ordinary named
+		# local first (rather than a fresh literal) - the exact shape
+		# lib/json.py's dumps() originally hit this bug through
+		self._assert_program_succeeds( '''
+def format_value( value: f64 ) -> str:
+	return value.__str__()
+
+def main() -> i32:
+	f: f64 = 2.0
+	got: str = format_value( f )
+	if got != '2.0':
+		return 1
+	return 0
+''', [ 'format_value(f64) via .__str__() == "2.0"' ] )
+
+	def test_f32_string_formatting_entry_points( self ) -> None:
+		# lib/builtins/__float.py's f32-side functions all widen to f64 and
+		# delegate (_f32_str( value ) -> f64( value ).__str__(), etc). The
+		# f64( value ) widening conversion is a checked-mode float cast by
+		# default (arithmetic_mode.py's GetFloatCast makes no widening-vs-
+		# narrowing distinction - every to-float direction is treated as
+		# "could produce a non-finite result", which is only actually true
+		# when the SOURCE is already NaN/Infinity), so every one of these
+		# functions used to fail to compile outright with "f64(value)
+		# requires the enclosing function to return Result[_,
+		# FloatingPointError]" - none of them return a Result (they're all
+		# plain `-> str`), and panicking on a merely-non-finite INPUT would
+		# make it impossible to ever print/format such a value. Confirmed
+		# unconditional (present even via the plain f-string path, which
+		# has nothing to do with the SEPARATE Scalar-attached-method-call
+		# crash fixed just above) and apparently never caught before -
+		# nothing in this suite had ever compiled these specific function
+		# bodies. Fixed by wrapping each f64( value ) conversion in `with
+		# compiler.wrap_arithmetic:` - per arithmetic_mode.py's own
+		# _raw_float_cast, wrap-mode float widening lowers to a single
+		# plain C cast (`(double)(value)`), the literal always-correct,
+		# lossless widening operation for THIS direction specifically, not
+		# a "silently wrong on overflow" shortcut the way integer wrap is.
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f32 = 3.5
+	if f.__str__() != '3.5':
+		return 1
+	if f.__repr__() != '3.5':
+		return 2
+	if f'{f}' != '3.5':
+		return 3
+	if f'{f:.1f}' != '3.5':
+		return 4
+	return 0
+''', [
+			'f32.__str__() == "3.5"',
+			'f32.__repr__() == "3.5"',
+			'bare f-string interpolation of an f32 == "3.5"',
+			"format-spec'd f-string interpolation of an f32 == \"3.5\"",
+		] )
+
+	def test_f32_string_formatting_of_non_finite_values( self ) -> None:
+		# the whole reason `with compiler.wrap_arithmetic:` (not panic_
+		# arithmetic) is the right choice above: these functions need to be
+		# able to render a NaN/Infinity f32 as text too, matching f64's own
+		# confirmed str()/repr() behavior on non-finite input - panicking
+		# on a merely non-finite INPUT (as opposed to an operation that
+		# PRODUCES one) would make this impossible.
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		zero: f32 = 0.0
+		nan: f32 = zero / zero
+		pos_inf: f32 = 1.0 / zero
+	if nan.__str__() != 'nan':
+		return 1
+	if pos_inf.__str__() != 'inf':
+		return 2
+	return 0
+''', [ 'f32 NaN.__str__() == "nan"', 'f32 +Infinity.__str__() == "inf"' ] )
+
+	def test_scalar_attached_method_call_with_explicit_argument_beyond_receiver( self ) -> None:
+		# a SEPARATE gap in the fix just above (test_f64_str_and_repr_
+		# direct_call): _lower_call's own receiver-prepend only patches
+		# `args` AFTER _match_call_args/_lower_call_args has already
+		# matched the call site's own EXPLICIT arguments against target.
+		# parameters from index 0, with no idea a receiver will later
+		# occupy slot 0. For a receiver-taking call with ZERO explicit
+		# arguments (f.__str__()) this degenerates harmlessly (nothing to
+		# mismatch), which is why that fix alone looked complete - but any
+		# Scalar-attached method taking one or more EXPLICIT arguments
+		# beyond the receiver (f64._sign_prefix(mode), reached via lib/
+		# builtins/__float.py's own f32->f64 format-spec delegation above)
+		# had every explicit argument matched one parameter slot too EARLY
+		# (mode checked against value's own f64-typed slot), confirmed by a
+		# real type error the first time such a call was ever actually
+		# compiled. Fixed by matching the call site's own arguments against
+		# a parameter list with the receiver's slot already excluded.
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	f: f64 = 5.0
+	got: str = f._sign_prefix( '+' )
+	if got != '+':
+		return 1
+	got2: str = f._sign_prefix( '-' )
+	if got2 != '':
+		return 2
+	return 0
+''', [ "f64._sign_prefix('+') on a non-negative value == \"+\"", "f64._sign_prefix('-') on a non-negative value == \"\"" ] )
 
 
 if __name__ == '__main__':

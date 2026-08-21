@@ -195,17 +195,21 @@ class RealCompileMixin:
 
 	def _extern_ldflags( self, compiler: Compiler ) -> str:
 		''' derive linker flags from compiler.extern_libs, matching mpy.py's
-		own link step. 'c' is the CRT, handled by the compiler/link defaults. '''
+		own link step (including linker_c.resolve_lib_ldflag's ntdll special
+		case). 'c' is the CRT, handled by the compiler/link defaults. '''
 		flags: list[str] = []
 		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			flags.append( f'{lib}.lib' if _CC is not None and _CC.name == 'cl' else f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
-	def _build_and_run( self, compiler: Compiler, c_source: str, timeout: float | None ) -> subprocess.CompletedProcess:
+	def _build_and_run( self, compiler: Compiler, c_source: str, timeout: float | None, *, extra_args: list[str] | None = None ) -> subprocess.CompletedProcess:
 		''' shared tail: write C, compile, link (with the program's extern libs),
-		run, and return the finished process. Asserts compile/link succeed. '''
+		run, and return the finished process. Asserts compile/link succeed.
+		extra_args are appended to the exe's own argv (argv[0] is always the
+		exe path itself, same as any real process) - for tests of sys.argv
+		specifically; every other caller leaves this at its default (none). '''
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'generated.c'
 			obj_path = Path( tmp ) / 'generated.o'
@@ -218,7 +222,14 @@ class RealCompileMixin:
 			self.assertEqual( link_result.returncode, 0,
 				f'{_CC.name} link failed:\nstdout: {link_result.stdout}\nstderr: {link_result.stderr}' )
 			try:
-				return subprocess.run( [ str( exe_path ) ], capture_output = True, timeout = timeout )
+				# cwd=tmp: a compiled program that writes/reads a relative
+				# path (csv_*_test.py's File.binary_writer('some.tmp'), etc)
+				# otherwise inherits the TEST RUNNER's own cwd, littering the
+				# repo/worktree root with files that never get cleaned up.
+				# tmp already gets deleted when this `with` block exits, so
+				# this is free cleanup too.
+				argv = [ str( exe_path ) ] + ( extra_args or [] )
+				return subprocess.run( argv, capture_output = True, timeout = timeout, cwd = tmp )
 			except subprocess.TimeoutExpired:
 				self.fail( f'exe did not finish within {timeout}s' )
 
@@ -233,11 +244,11 @@ class RealCompileMixin:
 			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ) )
 		return compiler
 
-	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0, *, compiler: Compiler | None = None, timeout: float | None = None ) -> None:
+	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0, *, compiler: Compiler | None = None, timeout: float | None = None, extra_args: list[str] | None = None ) -> None:
 		''' original one-program path: compile+link+run already-emitted C and
 		assert the exit code. `compiler` supplies the program's extern libs for
 		linking (defaults to self.compiler, matching the legacy callers). '''
-		result = self._build_and_run( compiler or self.compiler, c_source, timeout )
+		result = self._build_and_run( compiler or self.compiler, c_source, timeout, extra_args = extra_args )
 		self.assertEqual( result.returncode, expected_exit,
 			f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
 

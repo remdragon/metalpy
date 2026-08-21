@@ -51,12 +51,11 @@ class WideIntBehaviorTests( unittest.TestCase ):
 			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
 			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
 
-			libs = set( compiler.extern_libs )
 			ldflags = ''
-			for lib in sorted( libs ):
+			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -306,28 +305,54 @@ def main() -> i32:
 	return 0
 ''', checks )
 
-	# a NEGATIVE signed source cast to a u128 TARGET - exercises the
-	# target-is-u128 branch's own negative-source check specifically (the
-	# upper bound can never fire there - no other stem's range exceeds
-	# u128's own - so only this lower-bound path matters).
+	# a NEGATIVE signed source cast to a u128 TARGET, via T(x) construct-cast
+	# syntax - widening (i32, 4 bytes -> u128, 16 bytes), so per the T(x)
+	# redesign (confirmed with the user: "fully unconditional... consistency
+	# is important, even with a larger blast-radius") this is now an
+	# UNCONDITIONAL bit-reinterpretation in every mode, same as any other
+	# widening conversion - no clamp, no panic, matching plain two's-
+	# complement sign-extension (-5 -> 2**128-5). This REPLACES the old
+	# expectation (saturate clamped to 0, panic mode aborted) - that
+	# behavior belongs to x.to_u128() now instead (the value-RANGE-checked
+	# conversion, independent of width - see compiler.checked_convert/
+	# ir.ConvertCheck), not to T(x) (a pure width/bit-pattern operation).
+	# TODO once lib/builtins/__scalar_dunders.py's .to_T() methods land
+	# (Part 2 of the same rollout): add x.to_u128() coverage here for the
+	# "negative can't go into unsigned" case this test used to check via
+	# T(x) - to_u128() is a fixed, single check (no wrapped/saturated
+	# variant - see compiler.checked_convert's own comment), so its
+	# ambient-mode-consumption behavior (propagate under checked/wrap/
+	# saturate, panic under panic mode) is what should be asserted there,
+	# not a numeric clamp.
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
 	def test_negative_signed_source_into_u128_target( self ) -> None:
-		checks = [ 'saturating i32(-5) -> u128 clamps to 0' ]
+		checks = [
+			'widening i32(-5) -> u128 sign-extends and reinterprets under saturate mode',
+			'widening i32(-5) -> u128 sign-extends and reinterprets under wrap mode',
+			'widening i32(-5) -> u128 sign-extends and reinterprets under panic mode',
+			'widening i32(-5) -> u128 sign-extends and reinterprets under default checked mode',
+		]
 		self._assert_program_succeeds( '''
 def main() -> i32:
+	x: i32 = -5
+	expected: u128 = 340282366920938463463374607431768211451
 	with compiler.saturate_arithmetic:
-		x: i32 = -5
 		y: u128 = u128(x)
-		if y != 0:
+		if y != expected:
 			return 1
+	with compiler.wrap_arithmetic:
+		y2: u128 = u128(x)
+		if y2 != expected:
+			return 2
+	with compiler.panic_arithmetic("ov"):
+		y3: u128 = u128(x)
+		if y3 != expected:
+			return 3
+	y4: u128 = u128(x)
+	if y4 != expected:
+		return 4
 	return 0
 ''', checks )
-		self._assert_program_panics( '''
-def main() -> i32:
-	with compiler.panic_arithmetic("ov"):
-		x: i32 = -5
-		y: u128 = u128(x)
-	return 0
-''' )
 
 	# regression test for the u64/usize-SOURCE promotion bug: the u128-source
 	# fix below promoted ONLY a literal u128 source to __metalpy_wideuint -
@@ -366,6 +391,7 @@ def main() -> i32:
 		u64_max: u64 = one - 2
 	with compiler.panic_arithmetic("ov"):
 		bad: i32 = i32(u64_max)
+		if bad != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 		self._assert_program_panics( '''
@@ -375,6 +401,7 @@ def main() -> i32:
 		usize_max: usize = one - 2
 	with compiler.panic_arithmetic("ov"):
 		bad: i32 = i32(usize_max)
+		if bad != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 
@@ -414,6 +441,7 @@ def main() -> i32:
 		u128_max: u128 = ( one << 127 ) * 2 - 1
 	with compiler.panic_arithmetic("ov"):
 		bad: i32 = i32(u128_max)
+		if bad != 0: pass # touch it - the panic above means this never actually runs
 	return 0
 ''' )
 

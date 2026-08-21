@@ -18,6 +18,7 @@ The compiler pipeline:
 import argparse
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 
@@ -35,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
 	)
 	p.add_argument( 'source', type = Path, help = 'MetalPy source file (.py)' )
 	p.add_argument( '-o', '--output', type = Path, default = None,
-		help = 'output executable name (default: source stem)' )
+		help = 'output executable path (default: ./dist/<source stem>, created on demand)' )
 	p.add_argument( '--release', action = 'store_true',
 		help = 'build in release mode (default: debug)' )
 	p.add_argument( '--cc', type = str, default = None,
@@ -55,12 +56,32 @@ def _parse_args() -> argparse.Namespace:
 	p.add_argument( '--strip', action = 'store_true',
 		help = 'strip symbols / fold identical code for a smaller binary' )
 	p.add_argument( '--asan', action = 'store_true',
-		help = 'build with AddressSanitizer (requires the C runtime - not compatible with a freestanding/no-CRT program)' )
+		help = 'build with AddressSanitizer (requires the C runtime - forces CRT linking for a program that would otherwise build freestanding/no-CRT)' )
+	p.add_argument( '--crt', action = 'store_true',
+		help = 'force CRT linking even if the program itself never uses a \'c\' extern (normally: no_crt = \'c\' not in compiler.extern_libs) - e.g. to get __chkstk/other CRT-only support routines without adding a throwaway extern call' )
+	p.add_argument( '--show-warnings', action = 'store_true',
+		help = 'print compiler warnings even on a successful build (off by default - the shared builtins runtime currently emits pre-existing warnings on every build)' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
 	print( f'mpy: error: {msg}', file = sys.stderr )
 	sys.exit( 1 )
+
+_DIST_DIR = Path( 'dist' )
+
+def _default_output_path( source: Path, suffix: str ) -> Path:
+	'''
+	Default build output location when -o/--output isn't given:
+	./dist/<source stem><suffix>, creating dist/ on demand. A real project
+	build directory rather than wherever the source file happens to live
+	(which could be deep in lib/), so a program that also needs to bundle
+	runtime files alongside its exe (DLLs, script libraries, ...) has
+	somewhere real to put them. Only used for the DEFAULT - an explicit
+	-o/--output path is always respected as given, with no directory
+	auto-creation, so it stays predictable for scripts that pass one.
+	'''
+	_DIST_DIR.mkdir( parents = True, exist_ok = True )
+	return _DIST_DIR / ( source.stem + suffix )
 
 def _build_active_target( args: argparse.Namespace, cc: linker_c.CcTool|None ) -> dict[str,object]:
 	'''
@@ -170,12 +191,24 @@ def main() -> None:
 		return
 
 	# --- stage 5: emit C ---
-	no_crt = 'c' not in compiler.extern_libs
-	c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+	no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+	if args.crt:
+		no_crt = False
+	no_crt = linker_c.resolve_no_crt( no_crt, args.asan )
+	try:
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+	except CompileError:
+		pass # errors already in disco.errors - e.g. _topologically_sort_globals' own circular-dependency fail_loc
+
+	# --- report emission errors (e.g. circular global-initializer dependency) ---
+	if disco.errors.errors:
+		for err in disco.errors.errors:
+			print( f'mpy: {err}', file = sys.stderr )
+		sys.exit( 1 )
 
 	# --- -c: emit C source only ---
 	if args.c:
-		c_path = args.output or args.source.with_suffix( '.c' )
+		c_path = args.output or _default_output_path( args.source, '.c' )
 		c_path.write_text( c_source, encoding = 'utf-8' )
 		print( f'mpy: wrote {c_path}' )
 		return
@@ -183,11 +216,6 @@ def main() -> None:
 	# --- stage 6: compiler was already detected above (needed early for has_i128) ---
 	if cc is None:
 		_die( 'no C compiler found (try --cc or METALPY_CC)' )
-
-	if args.asan and no_crt:
-		_die( "--asan requires a program that imports the C runtime (e.g. `import c`) - "
-			"it has nothing to instrument against metalpy's own freestanding allocator, "
-			"and the no-CRT path excludes the ASan runtime's own CRT dependencies too" )
 
 	with tempfile.TemporaryDirectory() as tmp:
 		src_path = Path( tmp ) / 'generated.c'
@@ -199,37 +227,102 @@ def main() -> None:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( compile_result.stdout, file = sys.stderr )
 			if args.keep_c:
-				c_path = args.output or args.source.with_suffix( '.c' )
+				c_path = args.output or _default_output_path( args.source, '.c' )
 				src_path.rename( c_path )
 				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
+		elif args.show_warnings and compile_result.stdout.strip():
+			# build succeeded but the compiler still had something to say (e.g.
+			# -Wall/-Wextra or /W4 warnings) - opt-in only: the shared builtins
+			# runtime currently emits warnings of its own on every build, so
+			# printing this unconditionally would make --show-warnings the
+			# only way to ever get quiet output again
+			print( f'mpy: {cc.name} compile warnings:', file = sys.stderr )
+			print( compile_result.stdout, file = sys.stderr )
 
 		# --- link .o → executable ---
-		exe_path = (args.output or args.source.with_suffix( '' )).resolve()
+		exe_path = (args.output or _default_output_path( args.source, '' )).resolve()
 		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
 			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
-		libs = set( compiler.extern_libs )
-		for lib in sorted( libs ):
+		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue
 			if lib not in ldflags:
-				if cc.name == 'cl':
-					flag = f'{lib}.lib'
-				else:
-					flag = f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( cc, lib, compiler.extern_libs[lib], verbose = args.v, no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip )
 		if link_result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
 			print( link_result.stdout, file = sys.stderr )
 			if args.keep_c:
-				c_path = args.output or args.source.with_suffix( '.c' )
+				c_path = args.output or _default_output_path( args.source, '.c' )
 				src_path.rename( c_path )
 				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
+		elif args.show_warnings and link_result.stdout.strip():
+			print( f'mpy: {cc.name} link warnings:', file = sys.stderr )
+			print( link_result.stdout, file = sys.stderr )
 
 		print( f'mpy: built {exe_path}' )
+
+		# --- bundle runtime DLL dependencies declared via @extern(..., dll=...) -
+		# driven entirely by compiler.extern_dlls (populated only from functions
+		# actually reached/lowered, same reachability gate as extern_libs), never
+		# anything hardcoded to a particular library here. Every declared name is
+		# something the author explicitly said this program needs at runtime, so
+		# unlike a merely-advisory step, failing to find or copy one fails the
+		# whole build - a program missing a runtime dependency it's known to need
+		# isn't safely deployable, and finding out via mpy's own exit code beats
+		# finding out when the shipped exe won't start on another machine. ---
+		bundle_errors: list[str] = []
+		for dll_name in sorted( compiler.extern_dlls ):
+			found = linker_c.find_dll( dll_name )
+			if found is None:
+				bundle_errors.append( f'{dll_name}: not found on PATH' )
+				continue
+			dest = exe_path.parent / dll_name
+			try:
+				shutil.copy2( found, dest )
+				print( f'mpy: bundled {dest}' )
+			except OSError as e:
+				bundle_errors.append( f'{dll_name}: {e}' )
+
+		# --- combine 3rd-party license notices declared via
+		# @extern(..., notice=...) into one dist/THIRD-PARTY-LICENSES.txt -
+		# driven entirely by compiler.extern_notices (same reachability
+		# gate as extern_dlls above, same "explicit, author-listed, fails
+		# the build if unresolvable" philosophy). Each identifier resolves
+		# to licenses/<NAME>.txt next to this script - a fixed metalpy-
+		# installation-relative directory (Path(__file__).parent), the
+		# same anchor discovery.py's own Discovery.__init__ uses to find
+		# lib/ (licenses/ is source material shipped with metalpy itself,
+		# not build output - unlike dist/, which is CWD-relative because
+		# it belongs wherever the caller is building). Deliberately
+		# separate from extern_dlls: one notice (e.g. 'ZLIB') can cover
+		# several otherwise-unrelated DLL dependencies across different
+		# libraries, so a program bundling zlib1.dll for a reason unrelated
+		# to Tcl/Tk would reference the same file rather than a duplicate
+		# copy. ---
+		if compiler.extern_notices:
+			licenses_dir = Path( __file__ ).parent / 'licenses'
+			notice_blocks: list[str] = []
+			for name in sorted( compiler.extern_notices ):
+				notice_path = licenses_dir / f'{name}.txt'
+				try:
+					notice_blocks.append( f'{"=" * 20} {name} {"=" * 20}\n{notice_path.read_text( encoding = "utf-8" )}' )
+				except OSError:
+					bundle_errors.append( f'{name}: license notice not found at {notice_path}' )
+			if notice_blocks:
+				notices_dest = exe_path.parent / 'THIRD-PARTY-LICENSES.txt'
+				notices_dest.write_text( '\n\n'.join( notice_blocks ), encoding = 'utf-8' )
+				print( f'mpy: wrote {notices_dest}' )
+
+		if bundle_errors:
+			print( 'mpy: error: failed to bundle required runtime DLL(s)/license notice(s):', file = sys.stderr )
+			for err in bundle_errors:
+				print( f'  {err}', file = sys.stderr )
+			sys.exit( 1 )
 
 if __name__ == '__main__':
 	main()

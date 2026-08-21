@@ -143,6 +143,43 @@ class SetItem( Instruction ):
 	def test_repr( self ) -> str:
 		return f'SetItem( obj={self.obj!r}, index={self.index!r}, value={self.value!r} )'
 
+@dataclass( kw_only = True )
+class GetAttrIndex( Instruction ):
+	# f.arr[i] - element-level read of a FixedArrayType field (mpy_types.
+	# FixedArrayType, `u8[8]`-style inline C array). obj is always the ROOT
+	# object holding the field (never itself a GetAttr result), the same
+	# "obj+attr, not obj already reduced to the field's own value" shape
+	# AddrOfField uses and for the same reason: a real C array member
+	# decays to a pointer on use, but is never itself a loadable VALUE (no
+	# `dest = (obj).field;` exists to build on) - so this is a distinct
+	# instruction rather than GetAttr+GetItem composed, letting emission
+	# spell one flat `(obj)OP field[index]` expression directly against the
+	# field's real storage. Unchecked (no bounds check emitted), matching
+	# Ptr[T]/ConstPtr[T]'s own GetItem convention - see lowering.py's
+	# _lower_fixed_array_index for the one bit of free compile-time
+	# checking a LITERAL constant index still gets, same as tuple indexing.
+	dest: Temp
+	obj: Operand
+	attr: str
+	index: Operand
+
+	def test_repr( self ) -> str:
+		return f'GetAttrIndex( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r}, index={self.index!r} )'
+
+@dataclass( kw_only = True )
+class SetAttrIndex( Instruction ):
+	# f.arr[i] = value - element-level write, the SetItem-shaped sibling of
+	# GetAttrIndex above (see its own docstring). Targets the field's REAL
+	# storage in place, same "obj is always the root, one flat `(obj)OP
+	# field[index] = value` expression" reasoning as AddrOfField.
+	obj: Operand
+	attr: str
+	index: Operand
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'SetAttrIndex( obj={self.obj!r}, attr={self.attr!r}, index={self.index!r}, value={self.value!r} )'
+
 # Arithmetic (mode-specific opcodes) + bitwise + unary.
 #
 # dest's type differs by mode: Wrap/Saturate produce a plain T; Check
@@ -232,6 +269,14 @@ class BitOr( BinOp ): pass
 class BitXor( BinOp ): pass
 class Shr( BinOp ): pass
 
+# Ptr[T]/ConstPtr[T] - Ptr[T]/ConstPtr[T] -> isize: raw byte distance between
+# two pointers (never sizeof(T)-scaled, consistent with this compiler's other
+# pointer arithmetic - see emitter_c.py's _is_pointer_type). Infallible: an
+# address difference can't meaningfully overflow/underflow the way pointer
+# ADDITION can against a fixed-size buffer, so unlike Add/Sub there's no
+# Wrap/Check/Saturate split here, just one opcode.
+class PtrDiff( BinOp ): pass
+
 @dataclass( kw_only = True )
 class UnaryOp( Instruction ):
 	dest: Temp
@@ -254,6 +299,17 @@ class CastWrap( UnaryOp ): pass
 class CastCheck( UnaryOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
 class CastSaturate( UnaryOp ): pass
 
+# compiler.checked_convert(T, x) - deliberately separate from CastCheck, not
+# a reuse: CastCheck's own range check only applies to a WIDTH-CHANGING
+# (narrowing) conversion - same-width/widening always succeed unconditionally
+# (T(x) construct-cast syntax, see _lower_scalar_cast). ConvertCheck's own
+# check is a genuine VALUE-range comparison against the target type's own
+# [MIN,MAX], independent of width - it can fail even for a same-width,
+# cross-signedness conversion (i8(-1).to_u8() must fail; u8(i8(-1)) via
+# construct-cast syntax never does). See SYNTAX.md's own T(x)-vs-.to_T()
+# section for the full rationale.
+class ConvertCheck( UnaryOp ): checked_errors = ( 'OverflowError', ) # dest.type is Result[T,OverflowError]
+
 # float-involving scalar casts (see the float-arithmetic note above). Unary `-`
 # on a float always reuses the plain NegWrap opcode (negation never introduces
 # inf/nan, so there's nothing to check), so no float negate opcode is needed.
@@ -271,6 +327,25 @@ class Not( Instruction ): # boolean negation: dest = !operand
 
 	def test_repr( self ) -> str:
 		return f'Not( dest={self.dest!r}, operand={self.operand!r} )'
+
+@dataclass( kw_only = True )
+class MarkUsed( Instruction ):
+	''' no runtime effect - marks operand as read without actually reading
+	it, purely to keep the C compiler from flagging its already-completed
+	definition as dead (-Wunused-variable/-Wunused-but-set-variable/
+	C4189). Emitted only where lowering.py already knows operand's real
+	definition happened and won't be read again through any other path -
+	e.g. compiler.decref(x)/compiler.incref(x) silently no-op for a non-RC
+	x inside a monomorphized generic-class method (_in_generic_class_
+	method) rather than failing, so x can end up with no other reader at
+	all in that specific instantiation (list[i32].__del__'s `val`, never
+	RC, only ever passed to decref). NEVER emit this before operand's real
+	definition - that would silence a genuine uninitialized-value bug
+	instead of a spurious warning. '''
+	operand: Operand
+
+	def test_repr( self ) -> str:
+		return f'MarkUsed( operand={self.operand!r} )'
 
 # Result-consuming ops - Check-mode arithmetic and Div/Mod hand back a
 # Result[T,OverflowError] rather than panicking inline. These mirror the real
@@ -519,6 +594,64 @@ class AddrOf( Instruction ): # compiler.addrof(x) - yields &x, x a local variabl
 	def test_repr( self ) -> str:
 		return f'AddrOf( dest={self.dest!r}, value={self.value!r} )'
 
+@dataclass( kw_only = True )
+class AddrOfField( Instruction ):
+	# compiler.addrof(x.field) - yields &(x.field)/&(x->field) directly, one
+	# level of field access on a bare local/parameter x (see lowering.py's
+	# _lower_compiler_addrof for why deeper chains/non-Name roots aren't
+	# accepted). Distinct from AddrOf(GetAttr(...)) - GetAttr loads a COPY of
+	# the field's value into a fresh temp, whose address would be the copy's,
+	# not the real field's (useless for the FFI out-parameter idiom this
+	# exists for, e.g. inet_pton(af, str, &addr.sin_addr) needs the callee to
+	# write into `addr` itself). obj is always the ROOT object (never itself
+	# a GetAttr result) so emission can spell one flat `&(obj)OP field`
+	# expression, OP chosen the same way GetAttr/SetAttr already choose it
+	# (_member_access_operator - '.' for a plain value, '->' for an RCClass
+	# instance or a raw Ptr[T]/ConstPtr[T]).
+	dest: Temp
+	obj: Operand
+	attr: str
+
+	def test_repr( self ) -> str:
+		return f'AddrOfField( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r} )'
+
+@dataclass( kw_only = True )
+class ArrayFieldPtr( Instruction ):
+	# compiler.addrof(x.field) where field is a FixedArrayType (mpy_types.
+	# FixedArrayType, `u8[8]`-style inline C array) - yields Ptr[ElemType]
+	# pointing at the array's first element via C's own array-to-pointer
+	# decay, e.g. `dest = (x.field);` / `dest = (x->field);` - deliberately
+	# NOT `dest = &(x.field);` (that would be AddrOfField's own emission,
+	# giving a DIFFERENT C type, ElemType(*)[N] - pointer-TO-array, not
+	# pointer-to-element - a real type mismatch against the declared
+	# Ptr[ElemType] destination, even though the underlying address value
+	# is identical). Same "obj is always the ROOT object" shape as
+	# AddrOfField/GetAttrIndex/SetAttrIndex, for the same reason.
+	dest: Temp
+	obj: Operand
+	attr: str
+
+	def test_repr( self ) -> str:
+		return f'ArrayFieldPtr( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r} )'
+
+@dataclass( kw_only = True )
+class AddrOfArrayIndex( Instruction ):
+	# compiler.addrof(x.field[i]) where field is a FixedArrayType - yields
+	# Ptr[ElemType] pointing at element i specifically (not the array's
+	# start the way ArrayFieldPtr does), e.g. `dest = &(x.field[i]);` /
+	# `dest = &(x->field[i]);`. A real, well-defined C operation (indexing
+	# then &-ing gives ElemType* directly, no decay-vs-pointer-to-array
+	# ambiguity the way ArrayFieldPtr's own bare-array-decay case has).
+	# Same "obj is always the ROOT object" shape as AddrOfField/
+	# ArrayFieldPtr/GetAttrIndex/SetAttrIndex.
+	dest: Temp
+	obj: Operand
+	attr: str
+	index: Operand
+
+	def test_repr( self ) -> str:
+		return f'AddrOfArrayIndex( dest={self.dest!r}, obj={self.obj!r}, attr={self.attr!r}, index={self.index!r} )'
+
 class AtomicRMWOp( Enum ): # compiler.atomic_add/atomic_sub/atomic_exchange - fetch-and-op, dest gets the value BEFORE the op
 	ADD = 'add'
 	SUB = 'sub'
@@ -613,6 +746,34 @@ class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no fi
 @dataclass( kw_only = True )
 class Return( Instruction ):
 	value: Operand|None
-	
+
 	def test_repr( self ) -> str:
 		return f'Return( value={self.value!r} )'
+
+@dataclass( kw_only = True )
+class Yield( Instruction ):
+	''' PLAN_GENERATORS.md Phase F - a real `yield` suspend point inside a
+	generator's $$__next__ body (Function.is_generator_next). Codegen
+	(emitter_c.py) is deliberately trivial - `return value;`, the exact
+	same shape ir.Return's own non-void/non-entry-point branch already
+	emits ($$__next__ always has a concrete, non-void return type, and is
+	never the program's entry point) - the state store (self.__state =
+	state) is an ordinary, separate ir.SetAttr emitted immediately BEFORE
+	this instruction, and the resume point is an ordinary, separate
+	ir.Label(name=resume_label) emitted immediately AFTER it
+	(lowering.py's own yield-lowering emits all three, back to back) -
+	both already-proven, unmodified machinery, reused as-is rather than
+	reimplemented inside this instruction's own codegen. A LATER call,
+	dispatched via the function's own state-check prologue jumping
+	straight to that label, resumes execution there. state/resume_label
+	are carried here anyway (not read back by codegen at all) purely so a
+	dumped/test_repr'd instruction stream is self-describing - state is
+	this yield's own dispatch discriminant (unique per textual yield
+	site, assigned by TypeResolver._assign_generator_yield_dispatch,
+	starting at 1 - state 0 means "not yet started"). '''
+	value: Operand # already coerced/wrapped to match the function's own declared return type (elem_type|None, or Result[elem_type|None,error_type] when fallible) - same convention ir.Return's own `value` field expects
+	state: int
+	resume_label: str
+
+	def test_repr( self ) -> str:
+		return f'Yield( value={self.value!r}, state={self.state}, resume_label={self.resume_label!r} )'

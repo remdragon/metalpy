@@ -163,6 +163,91 @@ def main() -> i32:
 	return 0
 '''
 
+# bug (4): a tuple LITERAL passed directly as a generic call's own argument
+# (Result.Ok((a, b)), not merely a return value/AnnAssign RHS already fixed
+# by 98c2010 "tuple: coerce elements into their declared union types during
+# construction") against a declared Result[tuple[T1|None,T2|None],E] return
+# type used to fail generic inference outright: "type parameter 'T' is
+# inferred as both tuple[str|None,str|None] and tuple[str,str]". Root cause:
+# monomorphize.py's substitute_type_params eagerly resolves a TupleType bound
+# to a TypeVar into its backing RCClass before handing it down the call's own
+# argument-lowering as an expected-type hint (needed so the emitter, which
+# has no ensure_resolved of its own, never sees a bare unresolved TupleType -
+# see that function's own comment) - but _expr_Tuple's own per-element
+# union-coercion only recognized a BARE TupleType, not its already-resolved
+# backing RCClass, so it silently skipped coercing the tuple's own elements
+# into their declared union types, inferring the tuple's plain NATURAL type
+# instead - which then disagreed with the return type's own binding.
+# _expr_Tuple now falls back to TupleStorage's own reverse lookup (backing
+# RCClass -> the TupleType it backs) to recover the original elem_types
+# (with their union members) in that case too.
+_RESULT_OK_TUPLE_LITERAL_UNION_ELEMENTS = '''
+@union
+class SomeErr:
+	Bad: None
+
+def f( a: str, b: str|None ) -> Result[tuple[str|None,str|None], SomeErr]:
+	return Result.Ok(( a, b ))
+
+def main() -> i32:
+	r = f( 'hello', None )
+	if r.is_err():
+		return 1
+	t: tuple[str|None,str|None] = r.unwrap( 'f: expected Ok' )
+	match t[0]:
+		case str( s ):
+			if s != 'hello':
+				return 2
+		case None:
+			return 3
+	match t[1]:
+		case str( s ):
+			return 4
+		case None:
+			pass
+	return 0
+'''
+
+_UNARY_OP_INTO_UNION = '''
+def maybe_neg( i: i32 ) -> i32|None:
+	with compiler.wrap_arithmetic:
+		return -i
+
+def maybe_invert( i: i32 ) -> i32|None:
+	with compiler.wrap_arithmetic:
+		return ~i
+
+def maybe_not( flag: bool ) -> bool|None:
+	return not flag
+
+def yield_neg( i: i32 ) -> Iterator[Result[i32, StopIteration]]:
+	with compiler.wrap_arithmetic:
+		yield -i
+
+def main() -> i32:
+	a = maybe_neg( 5 )
+	if a is None or a != -5:
+		return 1
+	b = maybe_invert( 5 )
+	if b is None or b != -6:
+		return 2
+	c = maybe_not( True )
+	if c is None or c != False:
+		return 3
+	d = maybe_not( False )
+	if d is None or d != True:
+		return 4
+	g = yield_neg( 7 )
+	r = g.__next__()
+	match r:
+		case Result.Err( _ ):
+			return 5
+		case Result.Ok( e ):
+			if e != -7:
+				return 5
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
 class UnionCoercionRCTests( RealCompileMixin, unittest.TestCase ):
@@ -171,6 +256,27 @@ class UnionCoercionRCTests( RealCompileMixin, unittest.TestCase ):
 			( 'return_borrowed_through_union', _RETURN_BORROWED_THROUGH_UNION ),
 			( 'union_coerce_field_read', _UNION_COERCE_FIELD_READ ),
 			( 'union_coerce_tracked_local', _UNION_COERCE_TRACKED_LOCAL ),
+		])
+
+	def test_tuple_literal_union_elements_via_generic_call( self ) -> None:
+		self.assert_programs_run([
+			( 'result_ok_tuple_literal_union_elements', _RESULT_OK_TUPLE_LITERAL_UNION_ELEMENTS ),
+		])
+
+	def test_unary_op_coerces_into_union_correctly( self ) -> None:
+		# the scalar (non-RC) analog of this file's own bug class: a UnaryOp
+		# (-x/~x/not x) whose OUTER context expects a union return/yield type
+		# (e.g. `return -i` from a function declared -> i32|None) used to hint
+		# node.operand's own lowering with that union type DIRECTLY, silently
+		# wrapping the operand into Some(i) BEFORE the operator ever ran, and
+		# (the `not` case specifically) forcing the RESULT temp itself to be
+		# union-typed too - both produced invalid C (assigning a bare
+		# int/bool straight into a union struct), confirmed via a real
+		# compile failure, not just reasoning. Found while rebuilding
+		# generator Phase F (`yield -i` hit the identical bug) - see
+		# _expr_UnaryOp's own operand_hint/dest comments for the fix.
+		self.assert_programs_run([
+			( 'unary_op_into_union', _UNARY_OP_INTO_UNION ),
 		])
 
 

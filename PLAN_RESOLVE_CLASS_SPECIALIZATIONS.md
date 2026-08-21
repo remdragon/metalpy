@@ -477,3 +477,76 @@ tagging path and forced through the old untagged lowering.py fallback via
 a literal argument) - 2 new emitter_c_test.py tests, one per path.
 
 Full suite: 563/563 passing (561 + 2 new).
+
+Source 2 (eager-monomorphize a Function's OWN declared parameter/return
+type, not just a substituted one) - DONE, narrow slice
+
+Re-attempted per a direct user prompt after PLAN_COMPILER_BUG_SWEEP.md's
+overload_resolution.py fix ("I worked hard to get Specialization out of
+lowering.py... how can we make sure that monomorphizer can find the
+actual RCClass for list[i32] instead of the Specialization object?") -
+that fix had papered over the real gap with an injected `same_type`
+predicate inside overload_resolution.py rather than closing it at the
+source this section originally proposed.
+
+Landed as `TypeResolver.resolve_declared_types(fn)`: resolves `fn` (if
+not already), then runs every concrete, ClassLike-based Specialization
+directly typing one of `fn`'s own declared parameters or its return type
+through `monomorphize_class`, mutating `param.type`/`fn.return_type` in
+place. Wired into the two real production callers of
+`overload_resolution.resolve_call` (`TypeResolver._resolve_callable` and
+_ReferenceResolver's `_overload_call_return_type`) - NOT the full "every
+declared type everywhere" sweep the original plan scoped; that stays
+separate, bigger work if it's ever wanted.
+
+Fallout, once a plain declared type could ALSO show up already-
+monomorphized (previously only a SUBSTITUTED one could):
+
+- `Compiler._virtual_signatures_match` compared `a.return_type is
+  b.return_type` (and per-parameter) by raw identity - an override and
+  its base method can end up with one side monomorphized and the other
+  not, depending on which was resolved through a real call first. Fixed
+  via `_same_type`.
+- `Lowering._expr_List`/`_expr_Set` required `isinstance(expected_type,
+  Specialization)` directly to read `.args[0]` (the element type) - a
+  function's own declared return type used as the list/set literal's
+  target type could now already be the real RCClass. Fixed via
+  `_as_specialization`.
+- The bigger one: `_ReferenceResolver.visit_Match` and every sibling
+  narrowing helper in the same class (`_rewrite_tagged_union_truthiness`,
+  the `type(x) is T` rewrite, `_try_desugar_type_is_if`'s shape helper,
+  `_match_pattern`'s `case None:`/leaf-class branches, and
+  `_resolved_union_members` itself) all computed `base = t.base if
+  isinstance(t, Specialization) else t` - correct ONLY when a
+  non-Specialization `t` means "genuinely non-generic union", which
+  stopped being true the moment a GENERIC union's own return type could
+  now arrive pre-monomorphized. Using the concrete union as `base`
+  directly breaks `_resolve_case_member`'s `owner is not base` check,
+  since a case pattern's Owner (`Result.Ok`) is always resolved by NAME
+  against the ABSTRACT class - `owner` (abstract) is never identical to
+  `base` (now concrete), so EVERY case in the match silently fails to
+  match its own pattern. Confirmed via a real, minimal-looking repro that
+  took a while to pin down: `csv_reader_test.py`'s
+  `test_programs_compile_and_run` merges several independent programs
+  that all call `csv.reader()` (whose return type is `Result[csv.Reader,
+  csv.Error]`) into one compiled unit; the FIRST program to call it
+  triggered the eager monomorphization (fine, its own match had already
+  been desugared against the still-abstract type), but every SUBSEQUENT
+  program's `match csv.reader(path): case Result.Ok(rr): r = rr ...`
+  silently dropped the Ok arm's entire body - `r` never got assigned, so
+  a LATER `r.__next__()` failed with a confusing "name 'r' is not
+  defined" instead of any error pointing at the match statement itself.
+  Fixed every site the same way: `spec = self.resolver._as_specialization
+  (t); base = spec.base if spec is not None else t`.
+
+Verified: the new csv_reader_test failure (which single-handedly caught
+this) now passes, plus `lowering_test.py`'s
+`test_or_return_call_expands_to_or_return_ir_at_call_site` (a pre-existing
+test whose OWN fixture built a throwaway Specialization via
+`_get_or_create_specialization` for comparison, instead of reading the
+real callee's now-possibly-monomorphized `.return_type` - fixed in the
+test, not the compiler). Full suite green across 20+ consecutive runs
+(this class of bug is inherently order-dependent - which call site
+resolves a shared generic callee FIRST determines whether every OTHER
+call site sees a Specialization or the real class - so a single green run
+proves little on its own).

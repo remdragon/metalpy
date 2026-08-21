@@ -9,7 +9,7 @@ import ir
 from compiler import Compiler, LoweredFunction, LoweredGlobal
 from discovery import is_stub_body
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, Function, Overload,
+	CallableType, CEnum, ClassLike, CStruct, CType, CUnion, FixedArrayType, Function, Overload,
 	RCClass, Scalar, Specialization, TaggedUnion, Type, TupleType, Variable,
 )
 
@@ -23,13 +23,39 @@ from mpy_types import (
 # verbatim from C_EMITTER.md - avoids any Windows-CRT (msvcrt) dependency
 # from metalpy's own stdlib output; atomic because __del__ can run on any
 # thread the moment a refcount hits 0.
-PROLOGUE = '''\
+# PROLOGUE used to be one monolithic always-emitted blob (verbatim from
+# C_EMITTER.md's own proposal). Split into pieces here so emit_c() can leave
+# out the ones a given program doesn't need (retain_object/release_object/
+# the format_f64+parse_f64 pair) - avoids -Wunused-function on every build
+# that doesn't happen to retain/release an RCClass or format/parse a float
+# (i.e. most trivial programs). PROLOGUE itself (the full concatenation)
+# stays around unchanged for callers that want the whole thing regardless
+# (see emitter_c_test.py's own release_object test).
+_PROLOGUE_HEADER = '''\
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdatomic.h>
 
 #define METALPY_IMMORTAL_REFCOUNT INT32_MAX
+
+// marks a static const that's legitimately unreferenced in SOME compiled
+// programs but not others (a CEnum member no compiled code happens to name,
+// a class's own vtable instance when nothing constructs it this time round)
+// - unlike retain_object/__metalpy_format_f64/.../the format_f64+parse_f64
+// pair (see emit_c), these aren't worth conditionally emitting: a CEnum
+// member reference always constant-folds away before it ever reaches this
+// module (lowering.py's own _expr_Attribute), so "referenced" can only ever
+// be judged by matching against ir.Allocate call sites one at a time - real
+// dead-code elimination, not a cheap "does the IR use this instruction
+// kind anywhere" check. MSVC doesn't warn on an unused static/static const
+// at all (confirmed directly - no /W4 diagnostic for it), so this only
+// needs to matter to GCC/Clang.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define __metalpy_maybe_unused
+#else
+#define __metalpy_maybe_unused __attribute__((unused))
+#endif
 
 // the one universal, ALWAYS-leading member of every RCClass's own vtable
 // type, whatever else that type goes on to add for its own @virtual
@@ -60,13 +86,22 @@ typedef struct {
 	// __metalpy_ObjectVtbl instance, no synthesized type of its own.
 	const __metalpy_ObjectVtbl* vtable;
 } ObjectHeader;
+'''
 
+# only needed where an ir.Incref is actually emitted (see emit_c) - a
+# program that only ever gives up references (or never touches an RCClass
+# at all) never calls this
+_PROLOGUE_RETAIN = '''\
 static inline void retain_object( ObjectHeader* obj ) {
 	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
 		atomic_fetch_add( &obj->ref_count, 1 );
 	}
 }
+'''
 
+# only needed where an ir.Decref/DecrefDynamic is actually emitted (see
+# emit_c)
+_PROLOGUE_RELEASE = '''\
 // the destructor was previously an explicit argument, passed as a compile-
 // time literal at every call site - redundant with the header's own
 // vtable field (set once at construction), which every caller can
@@ -88,7 +123,9 @@ static inline void release_object( ObjectHeader* obj ) {
 		}
 	}
 }
+'''
 
+_PROLOGUE_ARITH = '''\
 // metalpy arithmetic intrinsics — dispatch to compiler builtins (GCC/Clang)
 // or manual checks (MSVC). All metalpy scalars are <= 64 bits.
 //
@@ -339,6 +376,27 @@ static inline bool __metalpy_isinf_f64( double x ) {
 #define __metalpy_nanf() __builtin_nanf("")
 #define __metalpy_nan()  __builtin_nan("")
 #endif
+'''
+
+# _PROLOGUE_FLOAT_FORMAT/_PROLOGUE_FLOAT_PARSE - only needed where an
+# ir.FormatFloat/ir.ParseFloat is actually emitted (see emit_c), i.e. a
+# program that formats a float as text (str(f), f-string float formatting)
+# or parses one (float(s)) respectively. Split into two independently-gated
+# parts (NOT kept as one combined unit, despite sharing the Windows branch's
+# GetModuleHandleA/LoadLibraryA/GetProcAddress declarations and msvcrt
+# resolution) so a program using only one direction doesn't pull in a
+# genuinely unused static inline function for the other - confirmed via a
+# real repro: an f-string-only program (formats, never parses) still showed
+# -Wunused-function on __metalpy_parse_f64 when this was one unit. The common
+# case (lib/builtins/__float.py's shortest-round-trip repr search) uses both
+# anyway, so both parts land together there - this only matters for a
+# program that formats-only or parses-only. The 3 extern prototypes are
+# duplicated verbatim into BOTH Windows branches rather than factored into a
+# shared third part: a repeated, IDENTICAL extern declaration is legal,
+# warning-free C on every one of clang/gcc/MSVC, and keeping each part fully
+# self-contained is simpler than threading a third always-emitted-if-either-
+# part-is dependency through emit_c().
+_PROLOGUE_FLOAT_FORMAT = '''\
 // backs compiler.format_f64(buf, size, precision, type_char, alt, value)
 // (lowering.py's _lower_compiler_format_f64 / ir.FormatFloat) - writes
 // value's fixed-precision decimal digits into buf via a dynamically-built
@@ -423,6 +481,9 @@ static inline void __metalpy_fixup_msvcrt_exponent( char* buf, int* n ) {
 		break; // at most one exponent in a real float conversion
 	}
 }
+// see this module's own _PROLOGUE_FLOAT_FORMAT/_PROLOGUE_FLOAT_PARSE
+// comment on why these 3 are duplicated into _PROLOGUE_FLOAT_PARSE too
+// rather than factored into a shared part
 void* __stdcall GetModuleHandleA( const char* lpModuleName );
 void* __stdcall LoadLibraryA( const char* lpLibFileName );
 void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
@@ -459,6 +520,23 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 	if ( n > 0 ) __metalpy_fixup_msvcrt_exponent( buf, &n );
 	return n;
 }
+#else
+#include <stdio.h>
+static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
+	char fmt[6];
+	int fi = 0;
+	fmt[fi++] = '%';
+	if ( alt ) fmt[fi++] = '#';
+	fmt[fi++] = '.';
+	fmt[fi++] = '*';
+	fmt[fi++] = (char)type_char;
+	fmt[fi] = 0;
+	return snprintf( buf, size, fmt, precision, value );
+}
+#endif
+'''
+
+_PROLOGUE_FLOAT_PARSE = '''\
 // backs compiler.parse_f64(buf) - the inverse of compiler.format_f64, needed
 // for the shortest-round-trip repr search (lib/builtins/__float.py's
 // _f64_repr_digits_raw). msvcrt.dll's own strtod was verified correct
@@ -469,7 +547,14 @@ static inline int __metalpy_format_f64( char* buf, size_t size, int precision, i
 // exactly. strtod is an ordinary (non-variadic) function - no ABI hazard
 // like _snprintf has - but resolved the same dynamic way regardless, since
 // a plain @extern('c', ...) binding would still wrongly flip the no-crt
-// Windows build (same reasoning __metalpy_format_f64 above documents).
+// Windows build (same reasoning _PROLOGUE_FLOAT_FORMAT's own
+// __metalpy_format_f64 comment documents).
+#ifdef _WIN32
+// see _PROLOGUE_FLOAT_FORMAT's own identical comment on why these 3 are
+// duplicated here rather than factored into a shared part
+void* __stdcall GetModuleHandleA( const char* lpModuleName );
+void* __stdcall LoadLibraryA( const char* lpLibFileName );
+void* __stdcall GetProcAddress( void* hModule, const char* lpProcName );
 typedef double ( __cdecl *__metalpy_strtod_fn )( const char*, char** );
 static inline double __metalpy_parse_f64( const char* text ) {
 	static __metalpy_strtod_fn fn = 0;
@@ -482,24 +567,18 @@ static inline double __metalpy_parse_f64( const char* text ) {
 	return fn( text, 0 );
 }
 #else
-#include <stdio.h>
 #include <stdlib.h>
-static inline int __metalpy_format_f64( char* buf, size_t size, int precision, int type_char, int alt, double value ) {
-	char fmt[6];
-	int fi = 0;
-	fmt[fi++] = '%';
-	if ( alt ) fmt[fi++] = '#';
-	fmt[fi++] = '.';
-	fmt[fi++] = '*';
-	fmt[fi++] = (char)type_char;
-	fmt[fi] = 0;
-	return snprintf( buf, size, fmt, precision, value );
-}
 static inline double __metalpy_parse_f64( const char* text ) {
 	return strtod( text, 0 );
 }
 #endif
 '''
+
+# the full, unconditional concatenation - kept for callers that want every
+# PROLOGUE helper regardless of whether a specific program needs it (e.g.
+# emitter_c_test.py's own release_object test). emit_c() itself assembles
+# the pieces above selectively instead of using this directly.
+PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE
 
 
 
@@ -524,10 +603,25 @@ _C_KEYWORDS: frozenset[str] = frozenset([
 	'_Static_assert', '_Thread_local',
 ])
 
-def _c_local_name( stem: str ) -> str:
-	''' return a C-safe local variable name. C keywords get a leading
-	underscore; everything else passes through unchanged. '''
-	return f'_{stem}' if stem in _C_KEYWORDS else stem
+def _c_local_name( var: Variable ) -> str:
+	''' return this local's own C identifier. C keywords get a leading
+	underscore. var.needs_uid_suffix - set by lowering.py, only at a
+	genuinely fresh declaration that follows an earlier `del` of the same
+	stem (see its own docstring) - appends var.uid ('$' can't appear in a
+	source identifier, same reasoning as _temp_name) so that Variable
+	never collides at the C level with whatever the old, deleted binding
+	left behind (see del_reuse_and_emitter_naming_bug). Every other local
+	(parameters, an ordinary reassignment reusing the SAME live binding
+	across if/elif/else arms, __return_value and other compiler-
+	synthesized slots) keeps its bare stem - lowering.py guarantees two
+	DIFFERENT Variable objects only ever share a bare, un-suffixed stem
+	when they're genuinely meant to (an inferred, non-annotated re-
+	assignment reusing an existing binding); a same-scope, no-del
+	REdeclaration (a second explicit `x: T = ...` for an already-live x)
+	is rejected as a compile error before it ever reaches here - see
+	_stmt_AnnAssign's own doc. '''
+	base = f'_{var.stem}' if var.stem in _C_KEYWORDS else var.stem
+	return f'{base}${var.uid}' if var.needs_uid_suffix else base
 
 def _temp_name( temp_id: int ) -> str:
 	''' the C name for a compiler-synthesized ir.Temp, e.g. for id=5, "$t5" -
@@ -742,7 +836,18 @@ def c_type( t: Type|None ) -> str:
 				inner = 'void'
 			else:
 				inner = _value_spelling( inner_type )
-			return f'{inner}*' if base.stem == 'Ptr' else f'const {inner}*'
+			if base.stem == 'Ptr':
+				return f'{inner}*'
+			# a flat, single leading const covers the whole pointer chain
+			# in this codebase's model (never a per-level const, e.g. real
+			# C's `const T* const*`) - inner_type itself being Ptr[U]/
+			# ConstPtr[U] (ConstPtr[ConstPtr[T]] etc) means the recursive
+			# _value_spelling/c_type call above already produced that
+			# single leading const, so just add this level's own pointer
+			# star; re-adding 'const ' here too would double it ("const
+			# const T**") - a real, confirmed -Wduplicate-decl-specifier
+			# on clang, not just cosmetic pickiness
+			return f'{inner}*' if inner.startswith( 'const ' ) else f'const {inner}*'
 		if t.is_rc_pointer():
 			return f'struct {mangle_type(t)}*'
 		if isinstance( base, ( CStruct, CUnion, TaggedUnion )):
@@ -789,34 +894,69 @@ def c_type( t: Type|None ) -> str:
 		return mangle_type( t ) # the typedef name itself, no struct/union prefix
 	if isinstance( t, CType ):
 		return t.c_name
+	if isinstance( t, FixedArrayType ):
+		# never reached on a legitimate path: a struct/union FIELD of this
+		# type is special-cased directly in _struct_or_union_body (C's own
+		# discontinuous array declarator, "TYPE NAME[N]", doesn't fit this
+		# function's plain "return a type string" shape at all) - discovery.py
+		# already rejects every OTHER annotation position (parameter, return
+		# type, local/global variable) before this module ever runs, and
+		# reading a FixedArrayType field back out as an ordinary value isn't
+		# implemented (see FixedArrayType's own docstring) - so reaching this
+		# function with one at all means something upstream failed to guard
+		# a position that needs its own guard, not a legitimate use.
+		raise NotImplementedError(
+			f'c_type: {t.qualname} (a fixed-size inline array) cannot be spelled as an ordinary C type - '
+			f'it only exists as a @cstruct/@cunion FIELD, handled directly by _struct_or_union_body'
+		)
 	raise NotImplementedError( f'c_type: unsupported type {t!r}' )
 
 def _is_noreturn( t: Type|None ) -> bool:
 	return isinstance( t, Scalar ) and t.stem == 'NoReturn'
 
-def _callable_ptr_type( t: Type|None ) -> CallableType|None:
-	''' t's own CallableType if t is Ptr[Callable[...]] (see
+def _callable_ptr_type( t: Type|None ) -> tuple[CallableType,int]|None:
+	''' (t's own CallableType, indirection depth) if t is N>=1 levels of
+	Ptr[Ptr[...[Callable[...]]...]] wrapping a bare CallableType (see
 	PLAN_CALLABLE.md) - the ptr-vs-bare distinction and the interning both
 	live in discovery.py/type_resolver.py already (see TypeResolver.
 	_callable_type_of); this is emitter_c.py's own copy of the same
 	structural check since this module works on Type objects directly,
-	with no TypeResolver instance around to call. '''
-	if isinstance( t, Specialization ) and isinstance( t.base, Scalar ) and t.base.stem == 'Ptr':
-		inner = t.args[0]
-		if isinstance( inner, CallableType ):
-			return inner
+	with no TypeResolver instance around to call.
+
+	depth is almost always 1 (an ordinary Ptr[Callable[...]] parameter/
+	local/field/return/global), but can be more: Result[Ptr[Callable[...]],
+	E]'s own union-payload storage indirects certain leaf types through an
+	EXTRA pointer (UnionStorage's own representation choice), producing
+	Ptr[Ptr[Callable[...]]] - real and reachable via any Result/Optional
+	whose leaf is itself Ptr[Callable[...]] (e.g. a plain
+	list[Ptr[Callable[...]]].__getitem__'s own Result[_,IndexError] -
+	confirmed via a real NotImplementedError crash, not just reasoning).
+	C's function-pointer declarator generalizes to N indirection levels by
+	adding N stars INSIDE the parens (RetType (**name)(Params) for N=2,
+	etc) - structurally different from an ordinary object pointer chain
+	(T**), which is why every caller below needs the depth, not just a
+	yes/no answer. '''
+	depth = 0
+	cur = t
+	while isinstance( cur, Specialization ) and isinstance( cur.base, Scalar ) and cur.base.stem in ( 'Ptr', 'ConstPtr' ):
+		depth += 1
+		cur = cur.args[0]
+	if depth > 0 and isinstance( cur, CallableType ):
+		return cur, depth
 	return None
 
-def _fn_ptr_cast_type( ret: str, params: list[str] ) -> str:
-	''' the C function-pointer TYPE spelling itself (RetType (*)(ParamTypes),
-	no name) - shared by emit_interface_vtable_instance (casting a concrete
-	implementation's address into a shared vtable slot type) and
+def _fn_ptr_cast_type( ret: str, params: list[str], *, stars: int = 1 ) -> str:
+	''' the C function-pointer TYPE spelling itself (RetType (*)(ParamTypes)
+	for stars=1, RetType (**)(ParamTypes) for stars=2, ...; no name) -
+	shared by emit_interface_vtable_instance (casting a concrete
+	implementation's address into a shared vtable slot type - always
+	stars=1, a vtable slot is never itself indirected) and
 	_emit_operand's own FunctionRef branch (spelling a bare function
 	reference's cast expression), from whichever (ret, params) tuple the
 	caller already has (_vtable_slot_c_type's own self-prepended shape, or
 	_function_pointer_c_type's plain one below). '''
 	params_str = ', '.join( params ) if params else 'void'
-	return f'{ret} (*)( {params_str} )'
+	return f'{ret} ({"*" * stars})( {params_str} )'
 
 def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
 	''' (return type spelling, param type spellings) for fn_type's own
@@ -831,20 +971,22 @@ def _function_pointer_c_type( fn_type: CallableType ) -> tuple[str,list[str]]:
 	params = [ c_type( a ) for a in fn_type.arg_types ]
 	return ret, params
 
-def _declarator( t: Type|None, name: str ) -> str:
-	''' "TYPE NAME" for an ordinary parameter/local-variable declaration -
-	except when t is Ptr[Callable[...]], where C's function-pointer syntax
-	is the one declarator shape that ISN'T "prefix type, then name": the
-	name goes INSIDE the parens (RetType (*name)(ParamTypes)), so plain
-	string concatenation of c_type(t) and name can't express it. Scoped to
-	parameter/local declarations only (see PLAN_CALLABLE.md) - not struct
-	fields (nothing needs that yet). '''
-	fn_type = _callable_ptr_type( t )
-	if fn_type is None:
-		return f'{c_type(t)} {name}'
+def _declarator( t: Type|None, name: str, *, volatile: bool = False ) -> str:
+	''' "TYPE NAME" for an ordinary parameter/local-variable/struct-or-union-
+	field declaration - except when t is Ptr[Callable[...]], where C's
+	function-pointer syntax is the one declarator shape that ISN'T "prefix
+	type, then name": the name goes INSIDE the parens (RetType (*name)
+	(ParamTypes)), so plain string concatenation of c_type(t) and name can't
+	express it. `volatile` is for Volatile[T] locals (_stmt_AnnAssign) only -
+	never set for a function-pointer declarator or a field. '''
+	callable_ptr = _callable_ptr_type( t )
+	prefix = 'volatile ' if volatile else ''
+	if callable_ptr is None:
+		return f'{prefix}{c_type(t)} {name}'
+	fn_type, depth = callable_ptr
 	ret, params = _function_pointer_c_type( fn_type )
 	params_str = ', '.join( params ) if params else 'void'
-	return f'{ret} (*{name})( {params_str} )'
+	return f'{prefix}{ret} ({"*" * depth}{name})( {params_str} )'
 
 def _value_spelling( t: Type ) -> str:
 	''' the C spelling of T's OWN VALUE representation - unlike c_type(),
@@ -865,10 +1007,23 @@ def _value_spelling( t: Type ) -> str:
 		return t.c_name
 	return c_type( t ) # scalars/CEnum - value and reference spelling are identical
 
-def _field_type_spelling( t: Type ) -> str:
-	if isinstance( t, Scalar ) and t.stem == 'NoneType':
-		return _NONE_PLACEHOLDER_TYPE
-	return c_type( t )
+def _mark_used_if_none( operand: ir.Operand ) -> list[str]:
+	''' MetalpyNone (see _NONE_PLACEHOLDER_TYPE) carries no real
+	information - assigning one is a structurally-required IR shape (e.g.
+	`ok: T = self.data.v_Ok` inside Result[T,E].unwrap()'s own generic
+	body when T=NoneType, or .or_return()'s own dest when used as a bare
+	statement, its value never actually consumed), not necessarily a value
+	any caller goes on to read. A genuinely-unused NoneType local was never
+	actionable dead code to begin with (there's nothing in it to act on),
+	so marking it read here - always AFTER its real assignment, never
+	before (an earlier read would be a genuine uninitialized-value bug,
+	not just a spurious warning) - is safe in every case and silences
+	-Wunused-variable/-Wunused-but-set-variable/C4189 on every such
+	monomorphization without risking a false negative on a real,
+	non-placeholder type. '''
+	if isinstance( operand.type, Scalar ) and operand.type.stem == 'NoneType':
+		return [ f'\t(void){_emit_operand(operand)};' ]
+	return []
 
 def _field_name( name: str ) -> str:
 	# a REAL struct/class field (x: i32) is already a plain identifier, so
@@ -895,8 +1050,8 @@ def _result_tag_data_names( result_spec: Type ) -> tuple[str,str,str,str]:
 	NAMES are looked up dynamically here. '''
 	base = result_spec.base if isinstance( result_spec, Specialization ) else result_spec
 	assert isinstance( base, TaggedUnion ), f'{base!r}: Result must be a real @union'
-	tag_attr = base.names.get( 'tag' )
-	data_attr = base.names.get( 'data' )
+	tag_attr = base.get_local_or_raise( 'tag' )
+	data_attr = base.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{base.qualname}: _tagged_union_storage has not run yet - no real storage shape to read'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem ), _field_name( 'v_Ok' ), _field_name( 'v_Err' )
@@ -906,8 +1061,8 @@ def _union_tag_data_fields( union: TaggedUnion ) -> tuple[str,str]:
 	Result[T,E] when E is itself a union like ZeroDivisionError|OverflowError).
 	Same UnionStorage-synthesized 'tag'/'data' shape _result_tag_data_names
 	reads for the outer Result, just for the inner error union. '''
-	tag_attr = union.names.get( 'tag' )
-	data_attr = union.names.get( 'data' )
+	tag_attr = union.get_local_or_raise( 'tag' )
+	data_attr = union.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: union storage not synthesized (UnionStorage.get must run before emit)'
 	return _field_name( tag_attr.stem ), _field_name( data_attr.stem )
@@ -948,17 +1103,30 @@ def _emit_widen_error( dest_expr: str, e_fn: Type, src_expr: str, e_op: Type ) -
 		return [ f'\t\t{dest_expr} = {src_expr};' ] # identical layout - plain struct copy (fast path, copies any payload already)
 	assert isinstance( e_fn, TaggedUnion ), f'widening into a non-union error type {e_fn!r}'
 	fn_tag, fn_data = _union_tag_data_fields( e_fn )
-	if not isinstance( e_op, TaggedUnion ):
-		# single class -> set the wide union's variant tag AND copy its
-		# payload pointer into the matching v_<member> field
+	# e_op is only genuinely FLATTENABLE into e_fn's own member list when it's
+	# itself a synthesized ANONYMOUS union (file is None) - the same
+	# distinguishing test discovery.py's _get_or_create_union already uses when
+	# flattening a wider union's own operands (only an anonymous operand
+	# contributes its own leaves; a real user `@union class Foo:` stays a
+	# single opaque member wherever it's nested). A NOMINAL union (e.g.
+	# HTTPError, itself one of e_fn's own members verbatim) takes the
+	# single-class path below just like any plain class leaf does - remapping
+	# ITS OWN internal variants against e_fn's member list would look for e.g.
+	# HTTPError's None-payload variant types as members of e_fn, which they
+	# never are (type_resolver._atomic_leaves applies this identical
+	# distinction to the type-checking side of the same widening, at lowering
+	# time - see its own docstring).
+	if not ( isinstance( e_op, TaggedUnion ) and e_op.file is None ):
+		# single class (or nominal union) -> set the wide union's variant tag AND
+		# copy its payload pointer into the matching v_<member> field
 		ordinal, fn_attr = _union_member( e_fn, e_op )
 		fn_field = _field_name( f'v_{fn_attr.stem}' )
 		return [
 			f'\t\t{dest_expr}.{fn_tag} = {ordinal};',
 			f'\t\t{dest_expr}.{fn_data}.{fn_field} = {src_expr};',
 		]
-	# e_op is itself a (narrower) union -> remap each member's tag AND copy
-	# its payload at runtime, one case per e_op member
+	# e_op is itself an anonymous (narrower) union -> remap each member's tag AND
+	# copy its payload at runtime, one case per e_op member
 	op_tag, op_data = _union_tag_data_fields( e_op )
 	lines = [ f'\t\tswitch ( ({src_expr}).{op_tag} ) {{' ]
 	for i, op_attr in enumerate( e_op.attributes ):
@@ -1001,15 +1169,85 @@ def _result_error_type( result_type: Type ) -> Type:
 # other class. This module never has to independently rediscover or
 # resynthesize one - it just walks those lists (see emit_c below).
 
-def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type]] ) -> str:
-	lines = [ f'{keyword} {name} {{' ]
+def _struct_or_union_body( name: str, keyword: str, attrs: list[tuple[str,Type,int|None]], packed: bool = False ) -> str:
+	''' packed=True (CStruct.packed/CUnion.packed, from @cstruct(packed=True)/
+	@cunion(packed=True)) wraps the WHOLE body in #pragma pack(push,1)/pop -
+	confirmed identical layout across MSVC/clang/gcc (a whole-aggregate
+	pack directive is portable; see the per-field case just below for why
+	that's NOT true of every #pragma pack usage).
+
+	Each attrs entry's own third element is a per-field C alignment
+	override (Variable.c_align, from a field declared `Aligned[N, T]`) -
+	works in EITHER direction (N below or above the field's own natural
+	alignment), independent of `packed`, and NEVER combined with it on the
+	same struct (compiler.py's _validate_packed_field_alignment_conflict
+	rejects that combination outright, before this ever runs). Deliberately
+	NOT emitted as a bare mid-struct #pragma pack(push,N)/pop bracketing
+	just that field: confirmed empirically that MSVC honors a pack change
+	made between two member declarations (mid-struct) on a PER-FIELD basis,
+	but clang/gcc silently ignore it and keep the struct's own natural
+	alignment instead - only a pack directive that wraps the ENTIRE
+	aggregate is portable on clang/gcc. The portable per-field mechanism is
+	instead a #if defined(_MSC_VER) && !defined(__clang__) split:
+
+	- real MSVC: #pragma pack(push,N)/pop (a CAP - can only shrink, never
+	  grow, alignment beyond natural) combined with __declspec(align(N))
+	  on the field itself (the opposite: __declspec can only GROW
+	  alignment, confirmed via a real repro that __declspec(align(4)) on a
+	  natural-8-aligned u64 field is silently a no-op, still offset 8, not
+	  4). Neither alone covers both directions, but layering both
+	  together does: confirmed empirically that pack+declspec combined
+	  reproduces the exact pack-alone result when shrinking and the exact
+	  declspec-alone result when growing, on real MSVC.
+	- clang/gcc: the single GNU __attribute__((packed,aligned(N))) field
+	  attribute already covers both directions on its own (confirmed
+	  empirically) - `packed` relaxes the field down to its own emitted
+	  alignment floor of 1 byte, then `aligned(N)` sets the exact final
+	  value, whether that's below or above the field's natural alignment.
+
+	The `!defined(__clang__)` half of the MSVC guard is load-bearing, not
+	defensive styling: this machine's own clang targets
+	x86_64-pc-windows-msvc and DOES define _MSC_VER (for MSVC-header
+	compatibility), so a bare `defined(_MSC_VER)` guard silently routed
+	clang down the MSVC branch too - where clang's real pragma-pack
+	semantics (the mid-struct case above) do NOT match real MSVC,
+	reproducing the exact wrong-size bug this feature exists to prevent.
+	Confirmed via a real repro: bare _MSC_VER guard gave sizeof==24 under
+	this clang instead of the correct 16 every other compiler (real MSVC,
+	gcc) agreed on. '''
+	body_lines: list[str] = []
 	if not attrs:
 		# MSVC (and pedantic C) reject empty structs/unions:
-		lines.append( '\tchar dummy;' )
+		body_lines.append( '\tchar dummy;' )
 	else:
-		for field_name, field_type in attrs:
-			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+		for field_name, field_type, align in attrs:
+			if isinstance( field_type, FixedArrayType ):
+				# C's array declarator is discontinuous ("TYPE NAME[N];", not
+				# a plain prefix type followed by the name - see
+				# FixedArrayType's own docstring and _declarator's identical
+				# function-pointer special case) - _declarator's plain
+				# "TYPE NAME" concatenation can't express this
+				decl = f'{c_type(field_type.elem_type)} {_field_name(field_name)}[{field_type.count}]'
+			else:
+				decl = _declarator( field_type, _field_name(field_name) )
+			if align is None:
+				body_lines.append( f'\t{decl};' )
+			else:
+				body_lines.append( '#if defined(_MSC_VER) && !defined(__clang__)' )
+				body_lines.append( f'#pragma pack(push, {align})' )
+				body_lines.append( f'\t__declspec(align({align})) {decl};' )
+				body_lines.append( '#pragma pack(pop)' )
+				body_lines.append( '#else' )
+				body_lines.append( f'\t{decl} __attribute__(( packed, aligned({align}) ));' )
+				body_lines.append( '#endif' )
+	lines: list[str] = []
+	if packed:
+		lines.append( '#pragma pack(push, 1)' )
+	lines.append( f'{keyword} {name} {{' )
+	lines.extend( body_lines )
 	lines.append( '};' )
+	if packed:
+		lines.append( '#pragma pack(pop)' )
 	return '\n'.join( lines )
 
 # --- functions -----------------------------------------------------------
@@ -1069,28 +1307,53 @@ def _function_prototype( function: Function ) -> str:
 	if _has_self( function ):
 		params.append( f'{_self_c_type(function.cls)} self' )
 	for p in ( function.parameters or [] ):
-		params.append( _declarator( p.type, _c_local_name( p.stem )))
+		params.append( _declarator( p.type, _c_local_name( p )))
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
+		# the real OS/CRT entry point always calls main with (argc, argv,
+		# envp) on the actual calling convention regardless of which
+		# prototype the source declares (a plain C fact, not something
+		# unique to this compiler) - so declaring the C-level signature as
+		# `int main(int argc, char** argv)` costs nothing and lets sys.argv
+		# (lib/sys.py) read real values, via emit_c()'s own argc/argv
+		# capture injected as the first statement of this function's body.
+		# Only for the ordinary, zero-parameter `def main() -> i32:` shape;
+		# a handful of lowering-only test fixtures declare a function
+		# LITERALLY named main with its own parameter for unrelated reasons
+		# (generic dispatch tests, never actually emitted through this path
+		# for real) - preserve the old behavior there rather than silently
+		# dropping a declared parameter from the C signature.
+		if not params:
+			return 'int main( int argc, char** argv )'
 		return f'int main( {params_str} )'
 	noreturn = '_Noreturn ' if _is_noreturn( function.return_type ) else ''
-	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
-	if _returns_void_in_c( function.return_type ):
-		ret = 'void'
-	else:
-		ret = c_type( function.return_type )
 	# @extern(lib, symbol) functions are declared with their raw C symbol
 	# name, not the metalpy-qualified name — the linker resolves the raw
 	# symbol from the foreign library, not from this translation unit
-	if function.extern_lib is not None:
-		name = function.extern_symbol
-		# generic @extern monomorphized to different pointer types
-		# share the same C symbol — use void* for all object pointers
-		# to avoid conflicting prototypes for the same symbol
-		if isinstance( ret, str ) and ret.endswith( '*' ):
-			ret = 'void*' if not ret.startswith( 'const' ) else 'const void*'
-	else:
-		name = mangle_function_qualname( function )
+	name = function.extern_symbol if function.extern_lib is not None else mangle_function_qualname( function )
+	# NoneType/NoReturn are value-less in C — return void, not MetalpyNone
+	if _returns_void_in_c( function.return_type ):
+		return f'{noreturn}void {name}( {params_str} )'
+	fn_ret_type = _callable_ptr_type( function.return_type )
+	if fn_ret_type is not None:
+		# a function RETURNING a function pointer is C's gnarliest
+		# declarator shape - RetType (*name(Params))(InnerParams) - the one
+		# case where the OUTER function's own name+params nest INSIDE the
+		# return type's own declarator, rather than the ordinary "prefix
+		# type, then name" order every other return type uses (see
+		# _declarator's own doc for the analogous parameter/local case).
+		# Reuses _declarator as-is: passing "name( params )" as ITS OWN
+		# `name` argument makes the two declarator layers nest correctly
+		# with no separate logic needed - _declarator wraps whatever string
+		# it's given in `(*...)`, and a call expression is a valid thing to
+		# wrap.
+		return f'{noreturn}{_declarator( function.return_type, f"{name}( {params_str} )" )}'
+	ret = c_type( function.return_type )
+	# generic @extern monomorphized to different pointer types share the
+	# same C symbol — use void* for all object pointers to avoid
+	# conflicting prototypes for the same symbol
+	if function.extern_lib is not None and ret.endswith( '*' ):
+		ret = 'void*' if not ret.startswith( 'const' ) else 'const void*'
 	return f'{noreturn}{ret} {name}( {params_str} )'
 
 def _emit_operand( op: ir.Operand ) -> str:
@@ -1104,14 +1367,15 @@ def _emit_operand( op: ir.Operand ) -> str:
 		# builds to point a vtable slot at a concrete implementation
 		# (a plain pointer-to-pointer function-pointer cast, safe and free
 		# at runtime, no wrapper needed) - reused via _function_pointer_c_type
-		fn_type = _callable_ptr_type( op.type )
-		assert fn_type is not None, f'_emit_operand: FunctionRef with non-Ptr[Callable] type {op.type!r}'
+		callable_ptr = _callable_ptr_type( op.type )
+		assert callable_ptr is not None, f'_emit_operand: FunctionRef with non-Ptr[Callable] type {op.type!r}'
+		fn_type, depth = callable_ptr
 		ret, params = _function_pointer_c_type( fn_type )
-		return f'({_fn_ptr_cast_type(ret, params)}){mangle_function_qualname(op.fn)}'
+		return f'({_fn_ptr_cast_type(ret, params, stars = depth)}){mangle_function_qualname(op.fn)}'
 	if isinstance( op, Variable ):
-		# locals (parameters, stack locals) use bare stem; globals
+		# locals (parameters, stack locals) use _c_local_name; globals
 		# need the full mangled qualname (cross-TU visibility)
-		return _c_local_name( op.stem ) if not op.is_global else mangle_qualname( op.qualname )
+		return _c_local_name( op ) if not op.is_global else mangle_qualname( op.qualname )
 	raise NotImplementedError( f'_emit_operand: unsupported operand {op!r}' )
 
 # stems wider than plain C `int` - a bare, un-cast literal like `1` silently
@@ -1162,10 +1426,45 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 		# is applied to the whole CAST expression afterward, never baked into
 		# the literal token itself - this also sidesteps INT64_MIN's own
 		# classic "positive magnitude doesn't fit a signed 64-bit literal"
-		# problem, since the magnitude is always spelled as unsigned
+		# problem, since the magnitude is always spelled as unsigned. The
+		# negation itself happens in UNSIGNED arithmetic (well-defined modular
+		# wraparound in C), with the cast to the signed ctype applied last -
+		# NOT `-((ctype)magnitude)`, which is real signed-overflow UB for the
+		# exact MIN magnitude of any width (e.g. i64: `-((int64_t)
+		# 9223372036854775808ULL)` casts an out-of-range unsigned magnitude to
+		# a negative int64_t - implementation-defined but two's-complement in
+		# practice, giving INT64_MIN already - then negates THAT, overflowing
+		# signed 64-bit a second time). Confirmed via a real crash: `e: i64 =
+		# -9223372036854775808` compiled clean but crashed with SIGILL at
+		# runtime (a hardware trap from the resulting UB), caught while
+		# building fixed-width int __str__ support and needing to construct
+		# MIN literals for test coverage - a real, independent, pre-existing
+		# bug, not caused by that work. The unsigned intermediate must be
+		# stem's OWN same-width unsigned counterpart (_SIGNED_TO_UNSIGNED), not
+		# a fixed 64-bit type - i128's ctype is 128-bit __metalpy_wideint, and
+		# negating in a narrower 64-bit `unsigned long long` first then
+		# widening the cast produces a WRONG positive value (a same-signedness
+		# 64->128 widen zero-extends instead of reinterpreting bits) - caught
+		# by a real test regression (wide_int_test's own
+		# test_saturating_negate_i128) while first drafting this fix.
+		#
+		# Only SIGNED stems need this uctype detour: a negative `value`
+		# reaching here for an UNSIGNED stem (e.g. -1 encoding USIZE_MAX as a
+		# two's-complement bit pattern) negates directly in ctype itself,
+		# which is already well-defined modular arithmetic with no signed-
+		# overflow UB possible - the double-negation bug this fix targets is
+		# specific to signed types. _SIGNED_TO_UNSIGNED has no 'usize' (etc.)
+		# entry, so routing unsigned stems through it too is a plain KeyError,
+		# not just unnecessary - caught by a real regression (socket_test/
+		# ssl_test both embed a negative-encoded usize global) while
+		# broadening this fix beyond the signed case it was first written for.
 		magnitude = abs( value )
-		cast_expr = f'(({ctype}){magnitude}ULL)'
-		return f'(-{cast_expr})' if value < 0 else cast_expr
+		if value < 0:
+			if stem in _SIGNED_TO_UNSIGNED:
+				uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
+				return f'(({ctype})(-({uctype}){magnitude}ULL))'
+			return f'(-(({ctype}){magnitude}ULL))'
+		return f'(({ctype}){magnitude}ULL)'
 	magnitude = abs( value )
 	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
 	# the shift amount is derived from __metalpy_wideuint's own real C width
@@ -1181,10 +1480,28 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 	unsigned_expr = f'( ( (__metalpy_wideuint){hi}ULL << ( sizeof(__metalpy_wideuint)*8 - 64 ) ) | (__metalpy_wideuint){lo}ULL )'
 	if _is_unsigned_stem( stem ):
 		return unsigned_expr
-	signed_expr = f'(__metalpy_wideint){unsigned_expr}'
-	return f'(-{signed_expr})' if value < 0 else signed_expr
+	# same unsigned-negate-then-cast fix as the <=64-bit branch above (see its
+	# own comment) - i128::MIN is exactly the same double-negation UB, just at
+	# 128 bits: `-((__metalpy_wideint)unsigned_expr)` casts the 2**127 bit
+	# pattern to a negative __int128 first (already the correct MIN, same
+	# implementation-defined-but-relied-upon two's-complement reinterpret this
+	# whole function already uses), then negates THAT, overflowing signed
+	# __int128 - confirmed via the same real SIGILL crash as i64::MIN above.
+	if value < 0:
+		return f'(__metalpy_wideint)(-{unsigned_expr})'
+	return f'(__metalpy_wideint){unsigned_expr}'
 
 def _emit_const( c: ir.Const ) -> str:
+	if isinstance( c.type, FixedArrayType ):
+		# the one supported FixedArrayType value (see its own docstring and
+		# lowering.py's _expr_Constant fixed-array branch): a bare `0`
+		# literal means "zero-fill the whole array" - the one shape a
+		# C11 initializer can express for an embedded array field, valid
+		# ONLY inside a designated-initializer compound literal (a plain
+		# @cstruct's own stack-construction shape - see ir.Allocate's
+		# emission), never as an ordinary assignment target
+		assert c.value == 0, f'_emit_const: {c.type.qualname} only supports a 0 (zero-fill) constant, got {c.value!r}'
+		return '{0}'
 	if isinstance( c.value, bool ):
 		return 'true' if c.value else 'false'
 	if isinstance( c.value, float ) or ( isinstance( c.value, int ) and _is_float_type( c.type )):
@@ -1210,14 +1527,64 @@ def _emit_const( c: ir.Const ) -> str:
 		text = repr( value )
 		return text + 'f' if is_f32 else text
 	if isinstance( c.value, int ):
-		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast
+		# pointer-typed constants (e.g. Ptr[None] = -1) need a cast.
+		# Ptr[Callable[...]] is a special case within that: c_type()
+		# doesn't know how to spell a bare function-pointer TYPE at all
+		# (see _declarator's own comment - the name goes inside the
+		# parens, so it's not an ordinary "prefix type" spelling) -
+		# needed for e.g. a null-function-pointer sentinel like SIG_DFL
+		# (`sig_dfl: Ptr[Callable[[i32],None]] = 0`)
+		callable_ptr = _callable_ptr_type( c.type )
+		if callable_ptr is not None:
+			fn_type, depth = callable_ptr
+			ret, params = _function_pointer_c_type( fn_type )
+			return f'({_fn_ptr_cast_type(ret, params, stars = depth)}){c.value}'
 		if isinstance( c.type, Specialization ):
 			base = c.type.base
 			if isinstance( base, Scalar ) and base.stem in ( 'Ptr', 'ConstPtr' ):
 				return f'({c_type(c.type)}){c.value}'
+		union_base = c.type.base if isinstance( c.type, Specialization ) else c.type
+		if c.value == 0 and isinstance( union_base, TaggedUnion ):
+			# PLAN_GENERATORS.md - type_resolver.py's generator_zero_rc_field
+			# placeholder (a promoted local/field "not assigned yet", never
+			# read before its own live-flag gates it) used to only ever
+			# target a plain RCClass pointer (0 is a valid null-pointer bit
+			# pattern there) or a T|None union (a real `None` Const used
+			# instead, see _rewrite_generator_constructor). Result[T,E] broke
+			# that: a TaggedUnion with NO None member (tag+data struct, no
+			# pointer-shaped representation) assigned a bare `0` - valid to
+			# the type checker (lowering.py's _check_assignable exempts every
+			# TaggedUnion target from the strict literal-compatibility check
+			# generally) but not valid C (assigning to 'struct ...' from
+			# incompatible type 'int'). A zero-initialized compound literal
+			# is valid C in assignment-RHS position (unlike the
+			# FixedArrayType '{0}' above, which is brace-initializer-only)
+			# and needs no real tag/payload - this placeholder is never read
+			# before being overwritten.
+			return f'({c_type(c.type)}){{0}}'
 		stem = c.type.stem if isinstance( c.type, Scalar ) else None
 		if stem in _WIDE_INT_STEMS:
 			return _emit_wide_int_const( c.value, stem )
+		if stem is not None and _is_unsigned_stem( stem ) and c.value < 0:
+			# a literal conversion like u32(-12) bit-reinterprets straight to a
+			# Const at lowering time (_lower_scalar_cast) rather than emitting a
+			# CastWrap, so there's no cast-emission path to go through here -
+			# cast explicitly or MSVC's /W4 flags the bare negative literal
+			# initializing an unsigned type as C4245
+			return f'({c_type(c.type)}){c.value}'
+		if stem is not None and stem in _FIXED_INT_BITS and not _is_unsigned_stem( stem ) and c.value > ( 2 ** ( _FIXED_INT_BITS[stem] - 1 ) - 1 ):
+			# the mirror case: a same-width construct-cast into a SIGNED type
+			# (HRESULT(0x80090318)-style winerror.h/SEC_E_ constants - see
+			# lib/windows/com/__init__.py's/lib/ssl.py's own matching
+			# comments, both already documenting this as deliberate, same-
+			# width, infallible bit-reinterpretation, exactly like T(x)'s own
+			# general same-width contract) bit-reinterprets straight to a
+			# Const here too - the literal's own natural (unsigned/wider)
+			# type doesn't fit the target signed stem's positive range even
+			# though its BIT PATTERN is exactly the intended value, which
+			# clang/MSVC both flag (-Wconstant-conversion/C4309) on a bare,
+			# uncast initializer
+			return f'({c_type(c.type)}){c.value}'
 		return str( c.value )
 	if c.value is None:
 		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
@@ -1723,10 +2090,11 @@ def _emit_cast( instr ) -> list[str]:
 	# cast-TO-a-function-pointer this emitter ever needed; every existing
 	# Ptr[Callable[...]] value came from ir.FunctionRef directly before,
 	# never through an explicit cast
-	fn_type = _callable_ptr_type( target_type )
-	if fn_type is not None:
+	callable_ptr = _callable_ptr_type( target_type )
+	if callable_ptr is not None:
+		fn_type, depth = callable_ptr
 		ret, params = _function_pointer_c_type( fn_type )
-		ctype = _fn_ptr_cast_type( ret, params )
+		ctype = _fn_ptr_cast_type( ret, params, stars = depth )
 	else:
 		ctype = c_type( target_type )
 	if mode == 'wrap':
@@ -1851,6 +2219,74 @@ def _emit_cast( instr ) -> list[str]:
 		'\t}',
 	]
 
+def _emit_convert_check( instr: 'ir.ConvertCheck' ) -> list[str]:
+	# compiler.checked_convert(T, x) - value-preserving numeric conversion:
+	# succeeds iff operand's VALUE fits in target's own [MIN,MAX], entirely
+	# independent of bit width. Deliberately NOT the same code path as
+	# CastCheck (T(x)/compiler.cast(T,x)'s own check opcode, reached only
+	# for a NARROWING conversion - see _lower_scalar_cast's width
+	# comparison) - see ir.ConvertCheck's own comment for why these are two
+	# separate opcodes despite needing near-identical comparison math. This
+	# is a deliberate, close adaptation of _emit_cast's own check-mode
+	# branch (same u128/wideint/wideuint/MSVC-fallback edge cases apply
+	# here identically - see that function's own extensive comments for
+	# the full rationale of each), kept as an independent function rather
+	# than a shared helper so the two opcodes' emitters stay independently
+	# readable/modifiable.
+	target_type = instr.dest.type.args[0]
+	operand = _emit_operand( instr.operand )
+	stem = target_type.stem if isinstance( target_type, Scalar ) else None
+	ctype = c_type( target_type )
+	min_c, max_c = _int_min_max_bit_pattern( stem )
+	source_stem = instr.operand.type.stem if isinstance( instr.operand.type, Scalar ) else None
+	dest = _temp_name( instr.dest.id )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.dest.type )
+	err_ctype = c_type( _result_error_type( instr.dest.type ))
+
+	if stem == 'u128' and source_stem != 'u128':
+		out_of_range = None if source_stem is not None and _is_unsigned_stem( source_stem ) else f'( ({operand}) < 0 )'
+		if out_of_range is None:
+			return [ f'\t{dest}.{tag_f} = 0;', f'\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});' ]
+		return [
+			'\t{',
+			f'\t\tbool __overflow = {out_of_range};',
+			'\t\tif ( __overflow ) {',
+			f'\t\t\t{dest}.{tag_f} = 1;',
+			f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
+			'\t\t} else {',
+			f'\t\t\t{dest}.{tag_f} = 0;',
+			f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+			'\t\t}',
+			'\t}',
+		]
+
+	wide_ctype = '__metalpy_wideuint' if source_stem is not None and _is_unsigned_stem( source_stem ) else '__metalpy_wideint'
+	wide_decl = f'{wide_ctype} __wide = ({wide_ctype})({operand});'
+	upper_needs_unsigned_domain = wide_ctype == '__metalpy_wideint' and stem in ( 'u64', 'usize' )
+	upper_bound = (
+		f'( (__metalpy_wideuint)(__wide) > (__metalpy_wideuint)({max_c}) )'
+		if upper_needs_unsigned_domain else
+		f'( __wide > ({wide_ctype})({max_c}) )'
+	)
+	overflow = (
+		upper_bound
+		if wide_ctype == '__metalpy_wideuint' else
+		f'( __wide < ({wide_ctype})({min_c}) ) || {upper_bound}'
+	)
+	return [
+		'\t{',
+		f'\t\t{wide_decl}',
+		f'\t\tbool __overflow = {overflow};',
+		'\t\tif ( __overflow ) {',
+		f'\t\t\t{dest}.{tag_f} = 1;',
+		f'\t\t\t{dest}.{data_f}.{err_f} = ({err_ctype}){{0}};', # see _emit_set_result_err's comment
+		'\t\t} else {',
+		f'\t\t\t{dest}.{tag_f} = 0;',
+		f'\t\t\t{dest}.{data_f}.{ok_f} = ({ctype})({operand});',
+		'\t\t}',
+		'\t}',
+	]
+
 # --- comparisons / control flow / calls / member access -----------------------
 
 _CMP_SYMBOLS = {
@@ -1912,6 +2348,28 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 	comment) with no separate metalpy-level Ptr[T] needed to get there. '''
 	receiver_text = _emit_operand( receiver )
 	target_cls = target.cls
+	if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, RCClass ):
+		# a monomorphized method whose genericity comes from its own
+		# enclosing class (Monomorphizer.monomorphized_function's "class
+		# genericity" branch) always carries fn.cls as a Specialization
+		# wrapping the ABSTRACT template, never the concrete monomorphized
+		# class directly - .monomorphized is that real object, guaranteed
+		# already built by now (this exact call's own target was already
+		# lowered as a compile unit before this call site could reference
+		# it). Without this unwrap, target_cls stayed a bare Specialization
+		# here - neither isinstance check below ever matched one, so this
+		# fell all the way through to "no cast at all", which is harmless
+		# for an ordinary same-class generic call (receiver is already the
+		# identical type) but produces an invalid C pointer-type mismatch
+		# the moment target_cls and the receiver's own concrete type
+		# genuinely differ - e.g. an inherited __init__ found via chain_
+		# lookup through a generic ancestor (class Bar[T](Real[T]): pass),
+		# where self is a Bar[i32]* but Real[i32].__init__ declares self as
+		# Real[i32]* - same idiom as emit_rcclass_instance's own identical
+		# unwrap for the same underlying reason.
+		concrete = target_cls.monomorphized
+		assert isinstance( concrete, RCClass )
+		target_cls = concrete
 	if isinstance( target_cls, CStruct ) and target_cls.is_interface:
 		if target.is_virtual:
 			receiver_pointee = receiver.type.args[0] if isinstance( receiver.type, Specialization ) else None
@@ -1969,12 +2427,22 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# this module synthesizes one inline at each local's first assignment
 	# (see the ir.Assign branch below) - pre-seed with every parameter
 	# (already declared via the signature itself, must never be
-	# re-declared) so only genuine first-time locals trigger it
+	# re-declared) so only genuine first-time locals trigger it. Keyed by
+	# each Variable's own _c_local_name (already uid-suffixed where
+	# lowering.py decided that's needed - see Variable.needs_uid_suffix)
+	# rather than by bare stem: lowering.py guarantees two DIFFERENT
+	# Variable objects only ever render to the SAME name here when
+	# they're genuinely meant to share one piece of C storage (an
+	# inferred, non-annotated reassignment reusing an existing binding,
+	# e.g. across if/elif/else arms) - a same-scope, no-del REdeclaration
+	# is rejected as a compile error before it ever reaches emission (see
+	# _stmt_AnnAssign's own doc), so this set no longer needs to reason
+	# about type compatibility itself.
 	declared: set[str] = set()
 	if _has_self( function ):
 		declared.add( 'self' )
 	for p in ( function.parameters or [] ):
-		declared.add( _c_local_name( p.stem ))
+		declared.add( _c_local_name( p ))
 	# __return_value (ir.OrJump's own return_slot - see Lowering.
 	# _return_value_var) is referenced two ways neither of which goes
 	# through the ordinary "declare on first Assign" mechanism below: a
@@ -1993,25 +2461,86 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# popped) stack, and a dead "fall off the end" epilogue can exist with
 	# no OrJump anywhere in the function at all (a while-True loop whose
 	# only exits are return/break, e.g. str.split() below). So this checks
-	# for EITHER shape, not just one: any OrJump with a return_slot, OR
-	# any Label at all whose name starts with 'epilogue' (cfg.py's
-	# Epilogue.name is always 'epilogue_N', from _new_label('epilogue') -
-	# a reliable proxy for "an Epilogue entry existed, so build_epilogue_
-	# ladder() ran" without replicating cfg.py's own push/cancel
-	# bookkeeping here). `declared` then makes any actual ir.Assign to it
-	# (from the function's own `return <expr>`) just an ordinary
-	# re-assignment, not a second declaration
+	# for any of THREE shapes: any OrJump with a return_slot; the shared
+	# epilogue ladder's own final `ir.Return(value=<__return_value>)`
+	# (_emit_epilogue's unconditional tail - the direct, unambiguous
+	# signal, not a proxy); OR (kept as a belt-and-suspenders fallback,
+	# cheaper to check and still correct whenever it fires) any Label at
+	# all whose name starts with 'epilogue' (cfg.py's Epilogue.name is
+	# always 'epilogue_N', from _new_label('epilogue')). The Label check
+	# ALONE is no longer sufficient on its own - build_epilogue_ladder()
+	# now omits an uncaptured entry's own Label entirely (see its own
+	# docstring), so a function whose only epilogue entry is reached
+	# purely by the fall-off-the-end path with no OTHER return capturing
+	# it can have _emit_epilogue() genuinely run (referencing __return_
+	# value) while NO Label with 'epilogue' in its name survives anywhere
+	# in fn.instructions - confirmed by a real repro (a plain "use of
+	# undeclared identifier '__return_value'" compile error) once the
+	# Label-omission fix shipped without this. `declared` then makes any
+	# actual ir.Assign to it (from the function's own `return <expr>`)
+	# just an ordinary re-assignment, not a second declaration
 	needs_return_value = any(
 		( isinstance( instr, ir.OrJump ) and instr.return_slot is not None )
-		or ( isinstance( instr, ir.Label ) and 'epilogue' in instr.name ) # _new_label('epilogue') -> '__epilogue_N__', not a bare prefix
+		or ( isinstance( instr, ir.Return ) and isinstance( instr.value, Variable ) and instr.value.stem == '__return_value' )
+		or ( isinstance( instr, ir.Label ) and instr.name.startswith( '__epilogue_' ) ) # _new_label('epilogue') -> '__epilogue_N__' - NOT a bare 'epilogue' substring test: _new_label('inline_epilogue') -> '__inline_epilogue_N__' also contains 'epilogue' but is a totally unrelated @inline splice-scope merge label (build_inline_scope_ladder's own, never touches __return_value at all) - a real, confirmed false-positive-triggered -Wunused-variable on a genuinely never-needed __return_value once one of those coexists in the same function with nothing that actually needs the real one
 		for instr in fn.instructions
 	)
 	if needs_return_value and not _returns_void_in_c( function.return_type ):
-		name = _c_local_name( '__return_value' )
+		name = '__return_value' # bare, not _c_local_name(var) - __return_value's own real Variable object (self._return_value_var) is never independently redeclared/deleted within a function, so needs_uid_suffix is always False for it; a no-Variable-in-hand fallback string is fine here for exactly that reason
+		# deliberately NOT zero-initialized (`= {0}`) despite a branch
+		# chain compiled from a match/if-elif over every variant of a
+		# union (or similarly exhaustive-at-the-metalpy-level shape) being
+		# only PROVABLY exhaustive to this compiler's own discovery/type-
+		# checking - the emitted C is ordinary if/else-if with no final
+		# catch-all else, so clang/MSVC's own (more conservative, per-
+		# branch) dataflow analysis can't see that every REACHABLE path
+		# already assigned this before the shared "fall off the end"
+		# `return __return_value;` ever reads it, and flags -Wsometimes-
+		# uninitialized/C4701 - a confirmed false positive (every test in
+		# the suite that hits this shape produces the correct, non-zero
+		# result). `= {0}` was tried here first and reverted: for a large
+		# enough struct/union return type it lowers to a real, CALLED
+		# memset() (confirmed via a real link failure - int.__add__'s own
+		# Result[i32,OverflowError] triggered it), bypassing this
+		# compiler's own extern_libs/no_crt bookkeeping entirely (the C
+		# compiler inserts the call on its own, invisibly, well after
+		# metalpy's own emission), so a no-CRT build (no memset available
+		# at all) fails to link. See CcTool.compile()'s own
+		# -Wno-sometimes-uninitialized/-Wno-uninitialized/wd4701 for the
+		# actual (diagnostic-suppression, zero behavior-risk) fix instead
 		lines.append( f'\t{_declarator( function.return_type, name )};' )
 		declared.add( name )
 	for instr in fn.instructions:
 		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
+	if not function.is_destructor:
+		# a parameter whose body never reads it (self included - e.g.
+		# UnsafeList._read_element, whose is_rc(T) branch only ever touches
+		# its slot argument; or an ordinary parameter kept only for a
+		# uniform call-site/overload shape) still has to be declared -
+		# dropping it from the C signature would make it a different
+		# function shape per instantiation/overload, and every call site
+		# already passes it uniformly. (void)param silences -Wunused-
+		# parameter without an attribute (MSVC doesn't support
+		# __attribute__ and doesn't warn on this by default anyway).
+		# `(?!\$)` matters now that a genuine local sharing a parameter's
+		# stem gets a '$uid' suffix (_c_local_name) - without it, a bare
+		# `\bname\b` search would count as "used" merely by matching the
+		# unsuffixed PREFIX of that unrelated local's own suffixed
+		# occurrence (e.g. parameter `x` against a later `del x; x: T2 =
+		# ...`-redeclared local emitted as `x$7` - see del_reuse_and_
+		# emitter_naming_bug). Destructors are exempted: their only
+		# "parameter" is __obj, never named self in the C signature itself
+		# (self is a real local, cast from __obj, just above)
+		body_text = '\n'.join( lines[1:] )
+		void_marks: list[str] = []
+		if _has_self( function ) and not re.search( r'\bself\b(?!\$)', body_text ):
+			void_marks.append( 'self' )
+		for p in ( function.parameters or [] ):
+			name = _c_local_name( p )
+			if not re.search( rf'\b{re.escape(name)}\b(?!\$)', body_text ):
+				void_marks.append( name )
+		for name in reversed( void_marks ):
+			lines.insert( 1, f'\t(void){name};' )
 	lines.append( '}' )
 	return '\n'.join( lines )
 
@@ -2037,8 +2566,20 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# real `return <T-typed-expr>;` in its own body (e.g. Result
 			# [None,E].unwrap()'s `return self.data.v_Ok`), which would
 			# otherwise emit `return $t2;` from a function declared void -
-			# see _returns_void_in_c's own comment
-			return [ '\treturn;' ]
+			# see _returns_void_in_c's own comment. instr.value's own
+			# defining instruction (DeclareTemp+GetAttr/Call/whatever, not
+			# necessarily an ir.Assign - _mark_used_if_none's other call
+			# sites don't cover every shape) already ran; mark it read here
+			# so discarding it doesn't turn that already-emitted definition
+			# into -Wunused-variable/-Wunused-but-set-variable
+			return _mark_used_if_none( instr.value ) + [ '\treturn;' ]
+		return [ f'\treturn {_emit_operand(instr.value)};' ]
+
+	if isinstance( instr, ir.Yield ):
+		# PLAN_GENERATORS.md Phase F - see ir.Yield's own docstring: a
+		# generator's $$__next__ is never void, never the entry point, so
+		# this is unconditionally the same shape as ir.Return's own
+		# simplest branch - no need to replicate its other special cases
 		return [ f'\treturn {_emit_operand(instr.value)};' ]
 
 	if isinstance( instr, ir.DeclareTemp ):
@@ -2051,20 +2592,20 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# (guaranteed by lowering.py to be a genuinely flat/unconditional
 		# point - never nested inside one of THIS module's own hand-emitted
 		# C `{ }` blocks)
-		name = _c_local_name( instr.variable.stem )
+		name = _c_local_name( instr.variable )
 		declared.add( name )
-		return [ f'\t{_declarator( instr.variable.type, name )};' ]
+		return [ f'\t{_declarator( instr.variable.type, name, volatile = instr.variable.is_volatile )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
-			name = _c_local_name( instr.dest.stem )
+			name = _c_local_name( instr.dest )
 			if name not in declared:
 				declared.add( name )
-				return [ f'\t{_declarator( instr.dest.type, name )} = {src};' ]
-			return [ f'\t{name} = {src};' ]
+				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ] + _mark_used_if_none( instr.dest )
+			return [ f'\t{name} = {src};' ] + _mark_used_if_none( instr.dest )
 		# a global Variable is declared separately at file scope (Phase 7 -
 		# emit_global) - never re-declared here, only assigned
-		return [ f'\t{_emit_operand(instr.dest)} = {src};' ]
+		return [ f'\t{_emit_operand(instr.dest)} = {src};' ] + _mark_used_if_none( instr.dest )
 
 	if type( instr ) in _ARITH_BINOP_INFO:
 		kind, mode = _ARITH_BINOP_INFO[type(instr)]
@@ -2109,14 +2650,26 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		symbol = _PLAIN_BITWISE_SYMBOL[type(instr)]
 		return [ f'\t{dest} = ({_emit_operand(instr.left)}) {symbol} ({_emit_operand(instr.right)});' ]
 
+	if isinstance( instr, ir.PtrDiff ):
+		# raw byte distance, isize - same uintptr_t round-trip _emit_wrap_arith
+		# already uses for pointer +/-, just signed and with no dest-type cast
+		# back to a pointer type (dest_type is isize here, not Ptr[T])
+		dest = _emit_operand( instr.dest )
+		l, r = _emit_operand( instr.left ), _emit_operand( instr.right )
+		return [ f'\t{dest} = (intptr_t)((uintptr_t)({l}) - (uintptr_t)({r}));' ]
+
 	if isinstance( instr, ir.Invert ):
 		return [ f'\t{_emit_operand(instr.dest)} = ~({_emit_operand(instr.operand)});' ]
 	if isinstance( instr, ir.Not ):
 		return [ f'\t{_emit_operand(instr.dest)} = !({_emit_operand(instr.operand)});' ]
+	if isinstance( instr, ir.MarkUsed ):
+		return [ f'\t(void){_emit_operand(instr.operand)};' ]
 	if type( instr ) in _NEG_MODE:
 		return _emit_neg( instr )
 	if type( instr ) in _CAST_MODE:
 		return _emit_cast( instr )
+	if isinstance( instr, ir.ConvertCheck ):
+		return _emit_convert_check( instr )
 
 	if isinstance( instr, ir.Cmp ):
 		symbol = _CMP_SYMBOLS[instr.op]
@@ -2232,6 +2785,39 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 
 	if isinstance( instr, ir.AddrOf ):
 		return [ f'\t{_emit_operand(instr.dest)} = &{_emit_operand(instr.value)};' ]
+
+	if isinstance( instr, ir.AddrOfField ):
+		# compiler.addrof(x.field) - one flat C expression, &(obj)OP field -
+		# see AddrOfField's own docstring for why this is a distinct
+		# instruction from AddrOf(GetAttr(...)) (that would take the
+		# address of a freshly loaded COPY, not the real field)
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = &({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+
+	if isinstance( instr, ir.ArrayFieldPtr ):
+		# compiler.addrof(x.field) where field is a FixedArrayType - one
+		# flat C expression, (obj)OP field, deliberately with NO leading &
+		# (see ArrayFieldPtr's own docstring: a real C array member decays
+		# to a pointer to its first element on use - &-ing it would give a
+		# pointer-TO-array instead, a different, mismatched C type)
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+
+	if isinstance( instr, ir.AddrOfArrayIndex ):
+		# compiler.addrof(x.field[i]) - one flat C expression,
+		# &(obj)OP field[index] - see AddrOfArrayIndex's own docstring
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = &(({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}]);' ]
+
+	if isinstance( instr, ir.GetAttrIndex ):
+		# f.arr[i] - one flat C expression, (obj)OP field[index] - see
+		# GetAttrIndex's own docstring for why this targets the field
+		# directly rather than composing GetAttr+GetItem
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}];' ]
+	if isinstance( instr, ir.SetAttrIndex ):
+		op = _member_access_operator( instr.obj.type )
+		return [ f'\t({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}] = {_emit_operand(instr.value)};' ]
 
 
 	if isinstance( instr, ir.SizeOf ):
@@ -2426,11 +3012,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			f'\t\t{panic_name}( {_emit_operand(instr.errmsg)} );',
 			'\t}',
 			f'\t{_emit_operand(instr.dest)} = ({value}).{data_f}.{ok_f};',
-		]
+		] + _mark_used_if_none( instr.dest )
 	if isinstance( instr, ir.UnwrapOr ):
 		value = _emit_operand( instr.value )
 		tag_f, data_f, ok_f, _err_f = _result_tag_data_names( instr.value.type )
-		return [ f'\t{_emit_operand(instr.dest)} = ( ({value}).{tag_f} == 1 ) ? {_emit_operand(instr.default)} : ({value}).{data_f}.{ok_f};' ]
+		return [ f'\t{_emit_operand(instr.dest)} = ( ({value}).{tag_f} == 1 ) ? {_emit_operand(instr.default)} : ({value}).{data_f}.{ok_f};' ] + _mark_used_if_none( instr.dest )
 
 	raise NotImplementedError( f'_emit_instruction: unsupported instruction {instr!r} (later-phase work)' )
 
@@ -2492,7 +3078,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 			f'\t\tgoto {_c_label(merge_label)};',
 			'\t}',
 			f'\t{dest} = ({value}).{data_f}.{ok_f};',
-		]
+		] + _mark_used_if_none( instr.dest )
 	return [
 		f'\tif ( ({value}).{tag_f} == 1 ) {{',
 		f'\t\t{ret_ctype} __err;',
@@ -2502,7 +3088,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 		'\t\treturn __err;',
 		'\t}',
 		f'\t{dest} = ({value}).{data_f}.{ok_f};',
-	]
+	] + _mark_used_if_none( instr.dest )
 
 def _emit_widen_result( instr: ir.WidenResult ) -> list[str]:
 	# a bare `return x` widening x's own Result[T,NarrowE] into dest's wider
@@ -2551,6 +3137,7 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
+	lines.extend( _mark_used_if_none( instr.dest ))
 	return lines
 
 # --- classes / globals -----------------------------------------------------
@@ -2582,7 +3169,7 @@ def emit_rcclass( cls: RCClass ) -> str:
 	name = mangle_type( cls )
 	lines = [ f'struct {name} {{', '\tObjectHeader $header;' ]
 	for field_name, field_type in attrs:
-		lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+		lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
 	lines.append( '};' )
 	return '\n'.join( lines )
 
@@ -2671,14 +3258,45 @@ def _emit_one_string_literal( qualname: str, value: str|bytes ) -> list[str]:
 	name = _string_literal_name( qualname, value )
 	data_name = f'{name}$data'
 	struct_name = mangle_qualname( qualname )
-	return [
+	lines = [
 		f'static const uint8_t {data_name}[] = {_c_string_literal(data_bytes)};',
+	]
+	extra_field_lines: list[str] = []
+	if qualname == 'builtins.str':
+		# str also caches __char_count/__index (lib/builtins/__init__.py's
+		# str._from_owned_cstr) - a literal is baked directly here rather
+		# than going through that runtime construction path, so it must
+		# independently bake the SAME cached metadata. Computed in Python at
+		# compile time instead of C: a Python str's own len()/iteration is
+		# already the Unicode codepoint sequence, so no UTF-8 decoding is
+		# needed here (unlike the runtime scan, which has to decode). Same
+		# entries=(byte_size>>8)+1 sizing formula as the runtime path, so a
+		# literal's __index is indistinguishable in shape from a runtime-
+		# constructed str's - __getitem__ doesn't know or care which built it.
+		assert isinstance( value, str )
+		index_name = f'{name}$index'
+		byte_size = len( data_bytes )
+		entries = ( byte_size >> 8 ) + 1
+		offsets = [ 0 ] * entries
+		byte_offset = 0
+		for i, ch in enumerate( value ):
+			if ( i & 0xFF ) == 0:
+				offsets[ i >> 8 ] = byte_offset
+			byte_offset += len( ch.encode( 'utf-8' ))
+		lines.append( f'static const uintptr_t {index_name}[] = {{ {", ".join(str(o) for o in offsets)} }};' )
+		extra_field_lines = [
+			f'\t.{_field_name("__char_count")} = {len(value)},',
+			f'\t.{_field_name("__index")} = (uintptr_t*){index_name},',
+		]
+	lines += [
 		f'static struct {struct_name} {name} = {{',
 		f'\t.$header = {{ .ref_count = METALPY_IMMORTAL_REFCOUNT }},',
 		f'\t.{_field_name(data_field)} = {data_name},',
 		f'\t.{_field_name(len_field)} = {len(data_bytes)},',
+		*extra_field_lines,
 		'};',
 	]
+	return lines
 
 def _emit_string_literals( compiler: Compiler ) -> list[str]:
 	# a program-wide collection pass, since C requires each static object
@@ -2745,6 +3363,33 @@ def _interface_vtbl_name( cls: CStruct ) -> str:
 	# FooImplVtbl for an ordinary implementation)
 	return f'{mangle_type(cls.vtbl_owner())}Vtbl'
 
+def _vtable_slot_referenced_classlikes( owner: RCClass|CStruct ) -> list[ClassLike]:
+	''' every RCClass/CStruct/CUnion/TaggedUnion referenced (as a return or
+	parameter type, unwrapping a Specialization to its own .base) by any of
+	owner's own virtual_slots() signatures - in encounter order, deduped.
+	Even a still-unfulfilled slot (@abstractmethod, never gets a real
+	vtable INSTANCE of its own) still contributes its OWN declared
+	signature to owner's shared Vtbl STRUCT TYPE, which is unconditional -
+	needed by any future concrete override's own real instance regardless
+	of whether one exists yet. A type reachable ONLY through such a slot,
+	with no concrete override ever actually compiled anywhere in THIS
+	particular program, can otherwise go completely unscheduled - a real,
+	confirmed -Wvisibility ("will not be visible outside of this
+	function"), since nothing else ever independently forward-tags it
+	(compiler.rcclasses/cstructs/cunions/tagged_unions, each unconditionally
+	forward-tagged in emit_c's own pass 1, only ever contain types that got
+	SCHEDULED as a real compile unit somewhere - a type ONLY ever named in
+	an abstract slot's signature never does). '''
+	found: list[ClassLike] = []
+	for slot in owner.virtual_slots():
+		if slot.resolve is not None:
+			slot.resolve()
+		for t in [ slot.return_type ] + [ p.type for p in ( slot.parameters or [] ) ]:
+			base = t.base if isinstance( t, Specialization ) else t
+			if isinstance( base, ( RCClass, CStruct, CUnion, TaggedUnion )) and base not in found:
+				found.append( base )
+	return found
+
 def _vtable_slot_c_type( owner: RCClass|CStruct, slot: Function ) -> tuple[str,list[str]]:
 	''' the function-pointer type for one vtable slot in `owner`'s own
 	Vtbl struct - self is Ptr[owner] UNIFORMLY for every slot in that one
@@ -2767,7 +3412,7 @@ def _vtable_slot_c_type( owner: RCClass|CStruct, slot: Function ) -> tuple[str,l
 	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
 	params = [ f'{_self_c_type(owner)} self' ]
 	for p in ( slot.parameters or [] ):
-		params.append( _declarator( p.type, _c_local_name( p.stem )))
+		params.append( _declarator( p.type, _c_local_name( p )))
 	return ret, params
 
 def emit_interface_vtbl_struct( owner: CStruct ) -> str:
@@ -2838,9 +3483,16 @@ def emit_interface_vtable_instance( cls: CStruct ) -> str|None:
 		field_inits.append( f'.{_field_name(slot.stem)} = ({_fn_ptr_cast_type(ret, params)}){mangle_qualname(impl.qualname)}' )
 	vtbl_type = _interface_vtbl_name( cls )
 	instance_name = f'{mangle_type(cls)}$$vtable'
+	# not every class reachable enough to get a full body emitted is ever
+	# actually constructed by THIS program (e.g. only reached through a
+	# subclass's own Allocate, or merely type-referenced) - unlike PROLOGUE's
+	# retain_object/etc (see emit_c), telling "constructed" from "not" here
+	# means matching every ir.Allocate site one at a time, real dead-code
+	# elimination rather than a cheap instruction-kind check - not worth it
+	# for a warning; see __metalpy_maybe_unused's own comment
 	if field_inits:
-		return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
-	return f'static const {vtbl_type} {instance_name} = {{0}};'
+		return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
+	return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{0}};'
 
 # --- RCClass vtable dispatch (RCClass-subclassing plan, Phase 4) -----------
 #
@@ -2957,10 +3609,13 @@ def emit_rcclass_vtable_instance( cls: RCClass ) -> str|None:
 		for slot, impl in zip( slots, slot_impls ):
 			ret, params = _vtable_slot_c_type( owner, slot )
 			field_inits.append( f'.{_field_name(slot.stem)} = ({_fn_ptr_cast_type(ret, params)}){mangle_qualname(impl.qualname)}' )
-	return f'static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
+	# see emit_interface_vtable_instance's identical comment: not every
+	# concrete RCClass reachable enough to get a full body is actually
+	# constructed by this particular program
+	return f'__metalpy_maybe_unused static const {vtbl_type} {instance_name} = {{ {", ".join(field_inits)} }};'
 
 def emit_cstruct( cls: CStruct ) -> str:
-	attrs: list[tuple[str,Type]]
+	attrs: list[tuple[str,Type,int|None]]
 	if cls.is_interface:
 		# $vtable is the literal first member (COM's one hard ABI
 		# requirement) - base-chain flattening mirrors emit_rcclass's own
@@ -2979,15 +3634,15 @@ def emit_cstruct( cls: CStruct ) -> str:
 		vtbl_name = _interface_vtbl_name( cls )
 		lines = [ f'struct {mangle_type(cls)} {{', f'\tconst {vtbl_name}* $vtable;' ]
 		for field_name, field_type in own_attrs:
-			lines.append( f'\t{_field_type_spelling(field_type)} {_field_name(field_name)};' )
+			lines.append( f'\t{_declarator(field_type, _field_name(field_name))};' )
 		lines.append( '};' )
 		return '\n'.join( lines )
-	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
-	return _struct_or_union_body( mangle_type( cls ), 'struct', attrs )
+	attrs = [ ( attr.stem, attr.type, attr.c_align ) for attr in cls.attributes ]
+	return _struct_or_union_body( mangle_type( cls ), 'struct', attrs, packed = cls.packed )
 
 def emit_cunion( cls: CUnion ) -> str:
-	attrs = [ ( attr.stem, attr.type ) for attr in cls.attributes ]
-	return _struct_or_union_body( mangle_type( cls ), 'union', attrs )
+	attrs = [ ( attr.stem, attr.type, attr.c_align ) for attr in cls.attributes ]
+	return _struct_or_union_body( mangle_type( cls ), 'union', attrs, packed = cls.packed )
 
 def emit_cenum( cls: CEnum ) -> str:
 	# not a real C `enum` - .value_type can be any scalar width (u32/i32 seen
@@ -3000,7 +3655,12 @@ def emit_cenum( cls: CEnum ) -> str:
 	value_ctype = c_type( cls.value_type )
 	lines = [ f'typedef {value_ctype} {name};' ]
 	for key, value in cls.members.items():
-		lines.append( f'static const {name} {name}${key} = {value};' )
+		# a member reference (OSError.FileNotFoundError) always constant-
+		# folds to a bare ir.Const at lowering time (see lowering.py's
+		# _expr_Attribute) - this symbol itself is never referenced by any
+		# compiled program, so it's unconditionally -Wunused-const-variable-
+		# eligible on GCC/Clang; see __metalpy_maybe_unused's own comment
+		lines.append( f'__metalpy_maybe_unused static const {name} {name}${key} = {value};' )
 	return '\n'.join( lines )
 
 def emit_tagged_union( union: TaggedUnion ) -> str:
@@ -3012,12 +3672,12 @@ def emit_tagged_union( union: TaggedUnion ) -> str:
 	# already populated by the time this runs: a TaggedUnion only ever
 	# becomes a real compile unit (lands in compiler.tagged_unions) via a
 	# construction or match site that already called _tagged_union_storage.
-	tag_attr = union.names.get( 'tag' )
-	data_attr = union.names.get( 'data' )
+	tag_attr = union.get_local_or_raise( 'tag' )
+	data_attr = union.get_local_or_raise( 'data' )
 	assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable ), \
 		f'{union.qualname}: _tagged_union_storage has not run yet - no real storage shape to emit'
 	name = mangle_type( union )
-	return _struct_or_union_body( name, 'struct', [ ( tag_attr.stem, tag_attr.type ), ( data_attr.stem, data_attr.type ) ] )
+	return _struct_or_union_body( name, 'struct', [ ( tag_attr.stem, tag_attr.type, None ), ( data_attr.stem, data_attr.type, None ) ] )
 
 def _is_trivial_global_init( instructions: list[ir.Instruction] ) -> bool:
 	# Lowering.lower_global always produces a real IR instruction sequence
@@ -3122,6 +3782,59 @@ def _referenced_global_qualnames( instructions: list[ir.Instruction] ) -> set[st
 			walk( getattr( instr, field.name ))
 	return found
 
+def _transitive_global_reads_by_function( compiler: Compiler ) -> dict[int,set[str]]:
+	''' id(Function) -> every OTHER module global's qualname that function's
+	body reads, either directly (_referenced_global_qualnames) or via any
+	function it calls, transitively - closing the exact gap
+	_referenced_global_qualnames itself can't (see its own docstring: it
+	only walks the instructions handed to it, and a global's own init
+	instructions are typically just `call _build_value()`, never _build_
+	value's OWN body - so `VALUE: T = _build_value()` where _build_value()
+	reads another global was invisible to _topologically_sort_globals
+	entirely, a real reachable "accepted but miscompiles" bug: the read
+	got scheduled before the write, at best silently wrong (a Scalar
+	reads its {0}-initialized zero value) and at worst a crash (an RC
+	container's own lock/refcount machinery never constructed, dereferenced
+	as if it had been - see the bug report this closes).
+	Keyed by id(Function), not qualname - Function.qualname isn't unique
+	across overloads. A worklist/fixed-point pass (not a single DFS), so
+	mutual recursion between called functions converges correctly instead
+	of a naive memo-with-recursion-guard silently dropping edges hit while
+	still on the call stack. '''
+	instructions_by_fn_id = { id( lf.function ): lf.instructions for lf in compiler.functions }
+	closure: dict[int,set[str]] = {
+		fn_id: _referenced_global_qualnames( instrs ) for fn_id, instrs in instructions_by_fn_id.items()
+	}
+	calls: dict[int,set[int]] = { fn_id: set() for fn_id in instructions_by_fn_id }
+	for fn_id, instrs in instructions_by_fn_id.items():
+		for instr in instrs:
+			if isinstance( instr, ir.Call ):
+				calls[fn_id].add( id( instr.target ))
+	changed = True
+	while changed:
+		changed = False
+		for fn_id, callee_ids in calls.items():
+			for callee_id in callee_ids:
+				callee_reads = closure.get( callee_id )
+				if not callee_reads or callee_reads <= closure[fn_id]:
+					continue
+				closure[fn_id] |= callee_reads
+				changed = True
+	return closure
+
+def _referenced_global_qualnames_transitive(
+	instructions: list[ir.Instruction], fn_closure: dict[int,set[str]],
+) -> set[str]:
+	# a global's own init instructions PLUS, for every function it calls,
+	# that function's own transitive closure (_transitive_global_reads_by_
+	# function) - see that function's docstring for why the direct-only
+	# walk above isn't enough on its own
+	found = set( _referenced_global_qualnames( instructions ))
+	for instr in instructions:
+		if isinstance( instr, ir.Call ):
+			found |= fn_closure.get( id( instr.target ), set())
+	return found
+
 def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
 	''' compiler.globals in TypeResolver's own FIFO scheduling order (first-
 	referenced-while-lowering-reachable-code) has no relationship to which
@@ -3168,8 +3881,9 @@ def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
 	# not-yet-called prerequisites b still has
 	edges: dict[str,set[str]] = { g.variable.qualname: set() for g in callable_globals }
 	indegree: dict[str,int] = { g.variable.qualname: 0 for g in callable_globals }
+	fn_closure = _transitive_global_reads_by_function( compiler )
 	for g in callable_globals:
-		for dep_qualname in _referenced_global_qualnames( g.instructions ):
+		for dep_qualname in _referenced_global_qualnames_transitive( g.instructions, fn_closure ):
 			if dep_qualname == g.variable.qualname or dep_qualname not in by_qualname:
 				continue # self-reference, or a dependency that never gets a call itself (trivial/all-zero) - no edge needed either way
 			if g.variable.qualname not in edges[dep_qualname]:
@@ -3198,10 +3912,16 @@ def _topologically_sort_globals( compiler: Compiler ) -> list[LoweredGlobal]:
 
 def _emit_global_declaration( g: LoweredGlobal ) -> str:
 	name = mangle_qualname( g.variable.qualname )
-	ctype = c_type( g.variable.type )
+	# _declarator, not a plain c_type(...) prefix - a Ptr[Callable[...]]
+	# global's name goes INSIDE the C function-pointer declarator's parens
+	# (RetType (*name)(ParamTypes)), not after a "TYPE NAME"-shaped prefix
+	# (see _declarator's own docstring); c_type() itself doesn't even try
+	# to spell a bare CallableType, so a plain f'{c_type(...)} {name}' here
+	# hits its NotImplementedError for any function-pointer-typed global.
+	declarator = _declarator( g.variable.type, name )
 	if _is_trivial_global_init( g.instructions ):
 		value = _emit_operand( g.instructions[0].src )
-		return f'{ctype} {name} = {value};'
+		return f'{declarator} = {value};'
 	# a {0} zero initializer either way for a non-trivial global - a valid
 	# C11 initializer for ANY type alike (ISO C11 6.7.9p11: a scalar
 	# initializer may be "optionally enclosed in braces"), matching the same
@@ -3209,7 +3929,7 @@ def _emit_global_declaration( g: LoweredGlobal ) -> str:
 	# _global_init_is_all_zero_value_type case (see emit_global) needs
 	# nothing MORE than this - its own init function is skipped entirely,
 	# not just left uncalled.
-	return f'{ctype} {name} = {{0}};'
+	return f'{declarator} = {{0}};'
 
 def _emit_global_init_fn( g: LoweredGlobal ) -> str|None:
 	''' the private `static void __metalpy_init_<name>(void) { ... }` body
@@ -3285,7 +4005,7 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 			# `data` field (the payload CUnion) - .attributes holds the
 			# LOGICAL members (Ok/Err/...) instead, which aren't part of
 			# the actual C struct layout at all (see emit_tagged_union)
-			data_attr = cls.names.get( 'data' )
+			data_attr = cls.get_local_or_raise( 'data' )
 			dep_types = [ data_attr.type ] if isinstance( data_attr, Variable ) else []
 		else:
 			dep_types = [ attr.type for attr in cls.attributes ]
@@ -3338,12 +4058,34 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# tag would be pure bookkeeping noise, not a needed flag - and, unlike
 	# Windows, adding it would incorrectly flip no_crt for any caller that
 	# reads compiler.extern_libs before emit_c().
-	if compiler.disco.active_target['os'] == 'windows' and any(
-		isinstance( instr, ( ir.FormatFloat, ir.ParseFloat ) ) for lf in compiler.functions for instr in lf.instructions
-	):
+	uses_format_conv = any( isinstance( instr, ir.FormatFloat ) for lf in compiler.functions for instr in lf.instructions )
+	uses_parse_conv = any( isinstance( instr, ir.ParseFloat ) for lf in compiler.functions for instr in lf.instructions )
+	if compiler.disco.active_target['os'] == 'windows' and ( uses_format_conv or uses_parse_conv ):
 		compiler.extern_libs.setdefault( 'kernel32', set() ).add( 'GetProcAddress' )
 
-	parts: list[str] = [ PROLOGUE ]
+	# selective PROLOGUE assembly - _PROLOGUE_HEADER/_PROLOGUE_ARITH are
+	# always needed (ObjectHeader/vtable typedefs, arithmetic intrinsics),
+	# but retain_object/release_object/format_f64/parse_f64 are real "static
+	# inline" FUNCTIONS that trigger -Wunused-function (clang; gcc doesn't
+	# warn on unused static inline, MSVC doesn't warn on unused static at
+	# all) whenever a program doesn't happen to need them - most commonly a
+	# trivial program with no RCClass traffic and no float formatting/
+	# parsing at all, or (format_f64/parse_f64 specifically - see their own
+	# comment) a program using only one of the two directions. Only
+	# emitting what's actually referenced avoids that instead of
+	# suppressing the warning after the fact.
+	uses_incref = any( isinstance( instr, ir.Incref ) for lf in compiler.functions for instr in lf.instructions )
+	uses_decref = any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for lf in compiler.functions for instr in lf.instructions )
+	parts: list[str] = [ _PROLOGUE_HEADER ]
+	if uses_incref:
+		parts.append( _PROLOGUE_RETAIN )
+	if uses_decref:
+		parts.append( _PROLOGUE_RELEASE )
+	parts.append( _PROLOGUE_ARITH )
+	if uses_format_conv:
+		parts.append( _PROLOGUE_FLOAT_FORMAT )
+	if uses_parse_conv:
+		parts.append( _PROLOGUE_FLOAT_PARSE )
 
 	# collect #include requirements from all modules whose symbols are
 	# compiled into this translation unit
@@ -3408,13 +4150,13 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# own (every class below it that adds nothing new reuses that same
 	# type unchanged - see CStruct.vtbl_owner) - dict used as an
 	# insertion-ordered dedup set, same convention as elsewhere in this
-	# module.
+	# module. Computed here (rather than immediately before its own
+	# emission loop below) so _vtable_slot_referenced_classlikes can walk
+	# it for the extra forward-tag pass just below.
 	vtbl_owners: dict[str,CStruct] = {}
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
 			vtbl_owners[ _interface_vtbl_name( cls ) ] = cls.vtbl_owner()
-	for owner in vtbl_owners.values():
-		parts.append( emit_interface_vtbl_struct( owner ))
 	# RCClass analog (RCClass-subclassing plan, Phase 4) - only classes
 	# that actually introduce a REAL @virtual slot need their own
 	# synthesized type at all (own_new_virtual_slots() non-empty, via
@@ -3427,6 +4169,30 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	for cls in compiler.rcclasses:
 		if not cls.type_params and cls.virtual_slots():
 			rcclass_vtbl_owners[ mangle_type( cls.vtbl_owner() )] = cls.vtbl_owner()
+	# a type reachable ONLY through a vtable slot's own signature (see
+	# _vtable_slot_referenced_classlikes) isn't guaranteed to appear in any
+	# of the four unconditional tag loops just above - typically an
+	# abstract slot whose concrete override never happens to get compiled
+	# anywhere in THIS particular program (e.g. logging.Handler.emit's own
+	# `record: LogRecord` when no concrete Handler subclass is ever
+	# constructed). Forward-tag anything the vtable owners below still
+	# reference that isn't already covered - same "cheap and always safe"
+	# reasoning the four loops above already use.
+	already_tagged = {
+		mangle_type( c )
+		for cls_list in ( compiler.rcclasses, compiler.cstructs, compiler.cunions, compiler.tagged_unions )
+		for c in cls_list if not c.type_params
+	}
+	for owner in list( vtbl_owners.values() ) + list( rcclass_vtbl_owners.values() ):
+		for referenced in _vtable_slot_referenced_classlikes( owner ):
+			name = mangle_type( referenced )
+			if name in already_tagged:
+				continue
+			already_tagged.add( name )
+			keyword = 'union' if isinstance( referenced, CUnion ) else 'struct'
+			parts.append( f'{keyword} {name};' )
+	for owner in vtbl_owners.values():
+		parts.append( emit_interface_vtbl_struct( owner ))
 	for owner in rcclass_vtbl_owners.values():
 		parts.append( emit_rcclass_vtbl_struct( owner ))
 	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
@@ -3532,23 +4298,48 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)
+	# sys._raw_argc/_raw_argv only actually get DECLARED (see the globals
+	# loop above) when compiler.py's Compiler.run() successfully force-
+	# reaches sys.argv - which no-ops for a deliberately minimal, fixture-
+	# only Discovery whose own paths= doesn't include a real lib/sys.py
+	# (see force_reachable's own docstring; several *_test.py files use
+	# exactly this shape). Emitting the capture assignment unconditionally
+	# would then reference an undeclared identifier for those - gate on
+	# whether the global is actually present in THIS program.
+	has_argv_globals = any( g.variable.qualname == 'sys._raw_argc' for g in compiler.globals )
 	for lf in compiler.functions:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:
 			src = emit_function( lf )
-			# prepend __metalpy_init() to main() on every target - not just
-			# Windows anymore, since it now also runs global initializers
-			# (PLAN_GLOBAL_INIT.md), needed everywhere, not only the
-			# Windows-specific console-codepage setup. EXCEPT when no_crt on
-			# Windows: there, mainCRTStartup (below) is the REAL entry point
-			# and already calls __metalpy_init() before calling main() itself -
-			# prepending here too would run it (and now every global
-			# initializer) TWICE. Harmless back when this only ever did
-			# SetConsoleOutputCP (idempotent); a real double-construction bug
-			# now that it also builds RCClass globals.
+			# EXCEPT when no_crt on Windows: there, mainCRTStartup (below) is
+			# the REAL entry point and already calls __metalpy_init() before
+			# calling main() itself - prepending it here too would run it
+			# (and now every global initializer) TWICE. Harmless back when
+			# this only ever did SetConsoleOutputCP (idempotent); a real
+			# double-construction bug now that it also builds RCClass globals.
 			windows_no_crt = no_crt and compiler.disco.active_target['os'] == 'windows'
-			if _is_entry_point( lf.function ) and not windows_no_crt:
-				src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
+			if _is_entry_point( lf.function ):
+				prelude = ''
+				if not lf.function.parameters and has_argv_globals:
+					# captures the real OS-provided argc/argv for sys.argv
+					# (lib/sys.py) - BEFORE __metalpy_init() below, since
+					# that's what actually builds sys.argv itself from these.
+					# Always injected, even for windows_no_crt: harmless
+					# there (mainCRTStartup calls main(0, NULL), so this just
+					# captures the same already-empty defaults).
+					prelude += (
+						f'\t{mangle_qualname( "sys._raw_argc" )} = argc;\n'
+						f'\t{mangle_qualname( "sys._raw_argv" )} = (uint8_t**)argv;\n'
+					)
+				# prepend __metalpy_init() to main() on every target - not just
+				# Windows anymore, since it now also runs global initializers
+				# (PLAN_GLOBAL_INIT.md), needed everywhere, not only the
+				# Windows-specific console-codepage setup - except
+				# windows_no_crt, per this block's own comment above.
+				if not windows_no_crt:
+					prelude += '\t__metalpy_init();\n'
+				if prelude:
+					src = src.replace( '{\n', '{\n' + prelude, 1 )
 			parts.append( src )
 
 	# custom entry point when CRT is not linked - the linker expects
@@ -3565,7 +4356,12 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 			'#ifdef _WIN32\n'
 			'void mainCRTStartup( void ) {\n'
 			'\t__metalpy_init();\n'
-			'\tint __result = main();\n'
+			# no real argc/argv at a freestanding entry point (the OS loader
+			# never hands them to WinMainCRTStartup-shaped entries the way
+			# it does the UCRT's own main()) - sys.argv (lib/sys.py) just
+			# stays empty here, a known, accepted limitation of no_crt
+			# builds specifically, not a bug.
+			'\tint __result = main( 0, (char**)0 );\n'
 			f'\t{mangle_qualname( "sys.exit" )}( (uint32_t)__result );\n'
 			'}\n'
 			'#endif'
@@ -3584,6 +4380,58 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		parts.append(
 			'#if defined(_MSC_VER) && !defined(__clang__)\n'
 			'int _fltused = 0x9875;\n'
+			'#endif'
+		)
+		# clang/gcc's own -O0 codegen lowers ANY nontrivial local zero-init
+		# (a bare `struct Foo x = {0};`-shaped compound literal, regardless
+		# of struct/array size - confirmed even an 8-byte i32[2] field) to a
+		# real `call memset`, and a by-value struct copy above a small size
+		# threshold to `call memcpy` - neither is a call MetalPy's own
+		# extern-tracking machinery ever sees (it's inserted directly by the
+		# C compiler's backend, not lowered from any ir.Call this module
+		# emits), so the `no_crt = 'c' not in compiler.extern_libs`
+		# auto-detection in mpy.py can never catch it the way an explicit
+		# crt.memset()/crt.memcpy() call would (that always flips no_crt
+		# off). Confirmed via a real LNK2019 "unresolved external symbol
+		# memset" building a @cstruct with an i32[8] field as a plain local.
+		# MSVC's own /Od codegen never referenced either symbol in testing
+		# (up to a 2KB by-value struct copy, before hitting the separate,
+		# still-open __chkstk gap - see msvc_no_crt_missing_chkstk memory) -
+		# defined unconditionally here anyway since an unreferenced extern
+		# definition is harmless, and cheaper than special-casing per
+		# compiler. Thin wrappers around sys.memset/sys.memcpy (lib/sys.py's
+		# Windows target already routes both through ntdll's RtlFillMemory/
+		# RtlCopyMemory - genuinely no_crt-safe, no CRT dependency) rather
+		# than a hand-rolled byte loop: reuses an already-vetted primitive
+		# instead of duplicating it, and - unlike a hand-rolled loop - has
+		# no risk of loop-idiom recognition folding this very definition
+		# back into a self-recursive call to itself under a --release (-O2)
+		# no_crt build, since there's no loop in the call chain at all
+		# (RtlFillMemory/RtlCopyMemory are opaque extern calls). compiler.py's
+		# Compiler.run() force-enqueues sys.memset/sys.memcpy whenever
+		# no_crt, mirroring its existing sys.exit force_reachable - so
+		# sys$memset/sys$memcpy always resolve here, same guarantee
+		# mainCRTStartup's own sys$exit call already relies on.
+		parts.append(
+			'#ifdef _WIN32\n'
+			# MSVC recognizes memset/memcpy as compiler intrinsics under
+			# optimization (a --release/-O2 build) and refuses to let a
+			# TU define a function with that exact name/signature
+			# ("error C2169: 'memset': intrinsic function, cannot be
+			# defined") - #pragma function is MSVC's own documented way
+			# to say "compile a real call here instead", same idiom
+			# freestanding/kernel-mode Windows C code already uses for
+			# this. Debug (-Od) builds never hit this, which is why it
+			# wasn't caught immediately. clang has no such restriction.
+			'#if defined(_MSC_VER) && !defined(__clang__)\n'
+			'#pragma function(memset, memcpy)\n'
+			'#endif\n'
+			f'void* memset( void* dst, int value, size_t n ) {{\n'
+			f'\treturn {mangle_qualname( "sys.memset" )}( (uint8_t*)dst, (uint8_t)value, n );\n'
+			'}\n'
+			f'void* memcpy( void* dst, const void* src, size_t n ) {{\n'
+			f'\treturn {mangle_qualname( "sys.memcpy" )}( (uint8_t*)dst, (const uint8_t*)src, n );\n'
+			'}\n'
 			'#endif'
 		)
 	return '\n\n'.join( part for part in parts if part ) + '\n'

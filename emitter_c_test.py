@@ -134,6 +134,95 @@ class CompilerTestCase( unittest.TestCase ):
 		self.compiler.import_code( code, Path( '__main__.py' ), scope = None )
 		self.compiler.run()
 
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class CFieldTests( CompilerTestCase, test_support.RealCompileMixin ):
+	''' compiler.c_field/c_field_set/c_field_addr - field access on an OPAQUE
+	compiler.c_type(...), needed for structs like POSIX's ucontext_t whose
+	layout this compiler can't know. Uses struct tm/<time.h> as the opaque
+	target since its int fields (tm_year, tm_mon) are portable across all 3
+	toolchains (MSVC ucrt, glibc, clang) without pulling in anything
+	platform-specific. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_get_set_roundtrip_on_opaque_c_type( self ) -> None:
+		self._run( '''
+import compiler
+import sys
+
+tm_t = compiler.c_type( 'struct tm', header = 'time.h' )
+
+def main() -> i32:
+	t: Ptr[tm_t] = sys.alloc[tm_t]( 1 )
+	compiler.c_field_set( t, 'tm_year', i32( 2024 ))
+	compiler.c_field_set( t, 'tm_mon', i32( 5 ))
+	y: i32 = compiler.c_field( t, 'tm_year', i32 )
+	m: i32 = compiler.c_field( t, 'tm_mon', i32 )
+	sys.free( compiler.cast( Ptr[None], t ))
+	if y == 2024 and m == 5:
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_c_field_addr_reaches_a_nested_value_field( self ) -> None:
+		# struct tm has no nested-struct field to test c_field_addr against
+		# directly, so this composes it artificially: get the address of
+		# tm_year itself (an int field, not a struct) as a Ptr[i32] via
+		# c_field_addr, then write through THAT pointer with an ordinary
+		# store - proves the address is real, not a copy, the same
+		# distinction AddrOfField's own docstring draws against GetAttr.
+		self._run( '''
+import compiler
+import sys
+
+tm_t = compiler.c_type( 'struct tm', header = 'time.h' )
+
+def main() -> i32:
+	t: Ptr[tm_t] = sys.alloc[tm_t]( 1 )
+	compiler.c_field_set( t, 'tm_year', i32( 1 ))
+	year_ptr: Ptr[i32] = compiler.c_field_addr( t, 'tm_year', Ptr[i32] )
+	year_ptr[0] = i32( 2024 )
+	y: i32 = compiler.c_field( t, 'tm_year', i32 )
+	sys.free( compiler.cast( Ptr[None], t ))
+	if y == 2024:
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_rejects_dotted_field_name( self ) -> None:
+		self._run( '''
+import compiler
+
+tm_t = compiler.c_type( 'struct tm', header = 'time.h' )
+
+def main() -> i32:
+	dummy: i32 = 0
+	t: Ptr[tm_t] = compiler.cast( Ptr[tm_t], compiler.addrof( dummy ))
+	x: i32 = compiler.c_field( t, 'a.b', i32 )
+	return 0
+''' )
+		self.assertTrue( any( 'one level of field access' in str( e ) for e in self.discovery.errors.errors ),
+			f'expected a one-level-of-field-access error, got: {self.discovery.errors.errors}' )
+
+	def test_rejects_non_c_type_pointer( self ) -> None:
+		self._run( '''
+import compiler
+
+def main() -> i32:
+	x: i32 = 5
+	p: Ptr[i32] = compiler.addrof( x )
+	y: i32 = compiler.c_field( p, 'whatever', i32 )
+	return 0
+''' )
+		self.assertTrue( any( 'compiler.c_type(...)' in str( e ) for e in self.discovery.errors.errors ),
+			f'expected a Ptr[T]-where-T-is-a-c_type error, got: {self.discovery.errors.errors}' )
+
 class EmitFunctionTests( CompilerTestCase ):
 	def test_empty_function_prototype_and_body( self ) -> None:
 		self._run( '''
@@ -144,10 +233,12 @@ def main() -> None:
 		lf = self.compiler.functions[0]
 		# 'main' is reserved by discovery.py for the entry point - bare,
 		# never module-qualified (discovery.py:994-995) - and compiles to
-		# C's own real `int main(void)`, not `void`
+		# C's own real `int main(int argc, char** argv)` (argc/argv so
+		# sys.argv, lib/sys.py, can capture the real ones - see emit_c's
+		# own entry-point prelude), not `void`
 		self.assertEqual( lf.function.qualname, 'main' )
 		src = emitter_c.emit_function( lf )
-		self.assertIn( 'int main( void ) {', src )
+		self.assertIn( 'int main( int argc, char** argv ) {', src )
 		self.assertIn( 'return 0;', src )
 		self.assertTrue( src.rstrip().endswith( '}' ))
 
@@ -158,7 +249,7 @@ def main() -> None:
 ''' )
 		lf = self.compiler.functions[0]
 		src = emitter_c.emit_function( lf, prototype_only = True )
-		self.assertEqual( src, 'int main( void );' )
+		self.assertEqual( src, 'int main( int argc, char** argv );' )
 
 	def test_non_entry_function_keeps_its_declared_return_type( self ) -> None:
 		self._run( '''
@@ -181,8 +272,8 @@ def main() -> None:
 ''' )
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn( 'ObjectHeader', src )
-		self.assertIn( 'int main( void );', src ) # forward-declared
-		self.assertIn( 'int main( void ) {', src ) # then defined
+		self.assertIn( 'int main( int argc, char** argv );', src ) # forward-declared
+		self.assertIn( 'int main( int argc, char** argv ) {', src ) # then defined
 
 # shared by every test needing Result[T,E] - matches lowering_test.py's own
 # _RESULT_FIXTURE (self-contained snippet, not a real lib/ import -
@@ -247,6 +338,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 	unreachable and removed). '''
 
 	def test_is_ok_on_concrete_result_receiver_is_monomorphized_once( self ) -> None:
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def get() -> Result[i32,OverflowError]:',
 			'\treturn Result.Ok( 1 )',
@@ -297,8 +389,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef get( self ) -> T:',
 			'\t\treturn self.v',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]',
+			'def main( b: Box[i32] ) -> None:', # a parameter, not a bare local - definitely assigned from entry, and (unlike a real Box[i32](...) construction) doesn't pull lib/sys.py's own str/builtins dependency into this import_builtins=False test
 			'\tx = b.get()',
 			'\treturn',
 		]))
@@ -331,8 +422,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef set( self, x: T ) -> None:',
 			'\t\tself.v = x',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]|Box[u32]',
+			'def main( b: Box[i32]|Box[u32] ) -> None:', # a parameter, not a bare local - see the identical comment in test_generic_rcclass_method_call_through_concrete_receiver_is_substituted
 			'\tx: i32 = 5',
 			'\tb.set( x )',
 			'\treturn',
@@ -365,8 +455,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 			'\tdef set( self, x: T ) -> None:',
 			'\t\tself.v = x',
 			'',
-			'def main() -> None:',
-			'\tb: Box[i32]|Box[i64]',
+			'def main( b: Box[i32]|Box[i64] ) -> None:', # a parameter, not a bare local - see the identical comment in test_generic_rcclass_method_call_through_concrete_receiver_is_substituted
 			'\tx: i32 = 5',
 			'\tb.set( x )',
 			'\treturn',
@@ -385,6 +474,7 @@ class GenericMethodDispatchTests( CompilerTestCase ):
 
 class EmitArithmeticTests( CompilerTestCase ):
 	def test_wrap_arithmetic_smoke_test( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -397,7 +487,14 @@ def main() -> i32:
 		self.assertNotIn( '__builtin', src ) # wrap mode must NOT use the overflow builtins
 
 	def test_default_check_mode_uses_result_and_or_return( self ) -> None:
-		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+		# real builtins.Result/OverflowError, not _RESULT_FIXTURE's local
+		# stand-in - x + 1 dispatches through i32.__add__ now, whose own
+		# Result[T,OverflowError] is always the REAL builtins one (see
+		# lowering_test.py's test_binop_check_mode_emits_or_return)
+		self.discovery.import_name( 'builtins' )
+		self._run( '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'def main() -> Result[i32,OverflowError]:',
 			'	x: i32 = 1',
 			'	y: i32 = x + 1',
@@ -425,6 +522,7 @@ _POINT_FIXTURE = '\n'.join([
 
 class EmitCStructConstructTests( CompilerTestCase ):
 	def test_construct_and_read_back( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		self._run( _POINT_FIXTURE + '\n' + '\n'.join([
 			'def main() -> i32:',
 			'	p: Point = Point.make( 1, 2 )',
@@ -475,6 +573,7 @@ _UNION_FIXTURE = '\n'.join([
 
 class EmitTaggedUnionTests( CompilerTestCase ):
 	def test_construct_and_match_round_trip( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		# mirrors lowering_test.py's own test_match_union_construction_and_
 		# extraction_round_trip - construct with one member, match takes
 		# that arm, extracts the value. No new control-flow ops needed here
@@ -490,7 +589,14 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 			'			return x',
 			'		case Foo.Baz( z ):',
 			'			with compiler.wrap_arithmetic:',
-			'				return z + 1',
+			# z: usize (Baz's own payload type) - z + 1 is usize, needs an
+			# explicit narrowing cast back to i32 for main's own return type.
+			# The dunder path types this correctly as usize (left.type, the
+			# receiver's real type) - the pre-dunder fallback used to
+			# silently mistype the AddWrap op itself as i32 (result_type =
+			# expected_type or left.type, picking the OUTER expected_type
+			# instead), masking this exact mismatch
+			'				return i32( z + 1 )',
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -515,7 +621,15 @@ class EmitTaggedUnionTests( CompilerTestCase ):
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		src = emitter_c.emit_function( main_lf )
 		self.assertIn( ').tag;', src ) # the match's case Foo.Bar(...) tag read, compared against the ordinal separately
-		self.assertIn( '== (0)', src )
+		# the tag comparison is synthesized as an ordinary ast.Compare (see
+		# discovery.py's own match-arm lowering), so it now goes through the
+		# same u8.__eq__ dunder dispatch as any other scalar `==` (see
+		# gen_scalar_dunders.py's scalar_eq[T]/__eq__ rollout) - @inline
+		# splices it rather than emitting a bare `== (0)` literal comparison
+		# the way the pre-dunder flat-Cmp fallback used to, so this checks
+		# for the spliced shape's own ordinal assignment instead
+		self.assertIn( '= 0;', src )
+		self.assertIn( ') == (', src )
 
 _CC = linker_c.detect_cc()
 
@@ -658,10 +772,7 @@ class RCClassSubclassingPhase1Tests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -904,6 +1015,994 @@ def main() -> i32:
 			if d.byte_len() != 5:
 				return 1
 			i += 1
+		return 0
+''' ),
+		] )
+
+class RCClassSubclassingNoOwnInitTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for a confirmed, silent-wrong-program bug: a
+	subclass declaring NO __init__ of its own at all (`class Bar(Real):
+	pass`) - unlike RCClassSubclassingPhase2Tests above, which is entirely
+	about a subclass that DOES declare its own __init__ and must chain to
+	its base via super().__init__(...). Two independent root causes, both
+	in lowering.py's _try_lower_construct_call / _lower_allocate_fields:
+
+	1. `target_cls.get_local_or_raise('__init__')` was a FLAT, own-class-
+	   only lookup - finding nothing for Bar, it fell through to the
+	   no-__init__ field=value construction sugar instead of inheriting
+	   and calling Real.__init__ the way Python's own "no override ->
+	   inherit" semantics require. Fixed by making this a chain lookup
+	   (mpy_types.py's InheritanceChainMixin.chain_lookup) instead.
+
+	2. Even accounting for (1), the fallback sugar path itself
+	   (_lower_allocate_fields) computed target_cls.flattened_attributes()
+	   without first resolving the ancestor chain - flattened_attributes()
+	   documents that it resolves nothing it returns, so an unresolved
+	   ancestor (Real's own class body never having run yet) silently
+	   contributed ZERO fields rather than erroring, dropping the
+	   inherited field from the allocation entirely. Confirmed via a real
+	   compile+link+run repro: `class Bar(Real): pass; b = Bar(); return
+	   b.x` returned MSVC's 0xCDCDCDCD uninitialized-heap poison pattern
+	   (3452816845) instead of Real's own `self.x = 5` - discovery.errors
+	   was empty throughout; nothing ever caught this at compile time.
+	   Fixed via InheritanceChainMixin.resolve_chain(), called before
+	   flattened_attributes() in _lower_allocate_fields.
+
+	Follow-up (found while investigating that fix's own flagged gaps):
+	the chain_lookup fix in (1) traded a silent wrong-value bug for a
+	genuine internal-compiler-error CRASH on one narrow shape - a GENERIC
+	subclass with no own __init__, inheriting a plain ancestor's, built
+	via EXPLICIT subscript syntax (`Baz[i32](...)`, not the bare
+	`Baz(...)` form). `_try_lower_construct_call`'s own `assert init.
+	resolve is None` assumed init was always already resolved by the time
+	chain_lookup finds it - true for type_resolver.py's own eager
+	construction-call pre-pass (which now resolves whatever chain_lookup
+	finds - see type_resolver.py's visit_Call) and, for a generic class's
+	OWN __init__, true as an incidental side effect of monomorphizing
+	target_cls itself. Neither covers this shape: that eager pre-pass's
+	own `_try_resolve_callable_namespace` has no Subscript-over-a-class
+	handling at all (a pre-existing, documented gap - see
+	`_try_resolve_generic_construction`'s own docstring), and the
+	inherited init belongs to a DIFFERENT, un-monomorphized ancestor
+	class, so target_cls's own monomorphization never touches it either.
+	Fixed by resolving `init` defensively right there instead of
+	asserting it must already be true - the same discipline
+	`_lower_super_init_if_required` already uses for this exact
+	"found via chain_lookup" shape. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro this class exists for: a subclass with NO
+			# body other than `pass` must still call the base's own
+			# __init__ on construction, not silently allocate zero fields
+			( 'bare_subclass_inherits_base_init', '''
+class Real:
+	x: i32
+	def __init__( self ) -> None:
+		self.x = 5
+
+class Bar( Real ):
+	pass
+
+def main() -> i32:
+	b: Bar = Bar()
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# same shape, but the base's __init__ takes real arguments -
+			# confirms the inherited __init__'s own parameter list is used
+			# for argument matching at the SUBCLASS's construction site
+			( 'bare_subclass_inherits_base_init_with_args', '''
+class Real:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Bar( Real ):
+	pass
+
+def main() -> i32:
+	b: Bar = Bar( x = 42 )
+	if b.x != 42:
+		return 1
+	return 0
+''' ),
+			# multi-level: neither Mid nor Leaf declares its own __init__ -
+			# chain_lookup must walk PAST Mid to find Root's __init__, not
+			# just one level up
+			( 'multi_level_chain_finds_ancestor_init', '''
+class Root:
+	a: i32
+	def __init__( self, a: i32 ) -> None:
+		self.a = a
+
+class Mid( Root ):
+	pass
+
+class Leaf( Mid ):
+	pass
+
+def main() -> i32:
+	leaf: Leaf = Leaf( a = 7 )
+	if leaf.a != 7:
+		return 1
+	return 0
+''' ),
+			# the OTHER root cause on its own: no __init__ ANYWHERE in the
+			# chain (genuine field=value construction sugar), but the base
+			# still contributes a real field that must survive - exercises
+			# _lower_allocate_fields's own ancestor-chain resolution
+			# directly, independent of the __init__-lookup fix above
+			( 'no_init_anywhere_field_sugar_includes_inherited_field', '''
+class Real:
+	x: i32
+
+class Bar( Real ):
+	y: i32
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b: Bar = Bar( x = 5, y = 10 )
+		if b.x != 5:
+			return 1
+		if b.y != 10:
+			return 2
+		return 0
+''' ),
+			# a subclass's own __init__ still wins over an inherited one
+			# (chain_lookup checks self before base) - construction must
+			# NOT run both; unaffected by the chain-lookup change
+			( 'own_init_still_takes_priority_over_inherited', '''
+class Real:
+	x: i32
+	def __init__( self ) -> None:
+		self.x = 5
+
+class Bar( Real ):
+	def __init__( self ) -> None:
+		super().__init__()
+		self.x = 99
+
+def main() -> i32:
+	b: Bar = Bar()
+	if b.x != 99:
+		return 1
+	return 0
+''' ),
+			# RC-lifetime stress check under repetition for the inherited-
+			# __init__ path specifically (same rigor as
+			# RCClassSubclassingPhase2Tests.test_rc_lifetime_repeated_
+			# chained_construction_no_leak) - a leak or double-free here
+			# would only show up under repeated construct/teardown, not a
+			# single iteration
+			( 'rc_lifetime_repeated_inherited_init_no_leak', '''
+class Real:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+
+class Bar( Real ):
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			b: Bar = Bar( s = 'hello'.upper() )
+			if b.s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+			# the follow-up crash: a GENERIC subclass with no own __init__,
+			# inheriting a plain (non-generic) ancestor's, constructed via
+			# EXPLICIT subscript syntax - this is the ONE call shape
+			# type_resolver.py's own eager construction-call pre-pass never
+			# reaches (no Subscript-over-a-class handling), so it depends
+			# entirely on lowering.py's own defensive resolve fix (see this
+			# class's own docstring, "Follow-up" paragraph)
+			( 'generic_subclass_explicit_subscript_inherits_base_init', '''
+class Real:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Baz[T]( Real ):
+	pass
+
+def main() -> i32:
+	b: Baz[i32] = Baz[i32]( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# same shape as the previous case, but the BARE (non-subscript)
+			# construction form - type args inferred from the surrounding
+			# annotation instead - to confirm both construction call shapes
+			# for a generic subclass with an inherited init work, not just
+			# the explicit one
+			( 'generic_subclass_bare_form_inherits_base_init', '''
+class Real:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Baz[T]( Real ):
+	pass
+
+def main() -> i32:
+	b: Baz[i32] = Baz( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# RC-lifetime stress check for the explicit-subscript generic-
+			# subclass shape specifically - same rigor as this class's own
+			# rc_lifetime_repeated_inherited_init_no_leak above
+			( 'rc_lifetime_repeated_generic_subclass_explicit_subscript_no_leak', '''
+class Real:
+	s: str
+	def __init__( self, s: str ) -> None:
+		self.s = s
+
+class Baz[T]( Real ):
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			b: Baz[i32] = Baz[i32]( s = 'hello'.upper() )
+			if b.s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
+
+class GenericBaseInheritanceTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for generic-class inheritance - a base class that
+	is ITSELF generic/parameterized (Real[T] or Real[i32]), as opposed to
+	RCClassSubclassingNoOwnInitTests above (a GENERIC subclass of a PLAIN,
+	non-generic base - already worked, fixed by ccec981/7a121a3). Before this
+	fix, generic-base inheritance was entirely unsupported:
+
+	1. `class Bar[T](Real[T]): pass` failed at the class-header line itself -
+	   "name 'T' is not defined" - discovery.py's _parse_ClassDef_RCClass
+	   parsed type_params AFTER resolving the base-class expression, so a
+	   subclass's own TypeVar was never in scope while Real[T] was visited.
+	   Fixed by parsing type_params (and pushing class_obj's own scope)
+	   BEFORE the base-resolution loop.
+
+	2. Even with (1) fixed, ANY generic base (concrete or not) was rejected
+	   outright: "Bar cannot subclass Real[...] (only plain classes ... are
+	   supported here)" - RCClass.base only ever accepted a bare RCClass, and
+	   a generic base always resolves to a Specialization instead. Fixed by
+	   widening RCClass.base to RCClass|Specialization|None, teaching
+	   InheritanceChainMixin's chain-walking methods (mpy_types.py) to
+	   unwrap a still-abstract Specialization down to its template for
+	   NAME/existence lookups, and teaching Monomorphizer.monomorphize_class
+	   (monomorphize.py) to substitute+eagerly-monomorphize a generic base
+	   parameterized by the subclass's OWN type params, the moment the
+	   subclass itself is monomorphized against a concrete instantiation.
+	   A NON-generic subclass of an ALREADY-CONCRETE generic base (class
+	   Bar(Real[i32]): pass - Bar itself never becomes a Specialization, so
+	   monomorphize_class's own substitution step never runs for it) is
+	   handled by a separate hook, Discovery.on_generic_base_resolved,
+	   installed by Compiler.__init__ - fires once, right after Bar's own
+	   body resolves, and eagerly monomorphizes an already-concrete generic
+	   base in place.
+
+	3. Two more bugs found while extending coverage to the no-__init__-
+	   anywhere field=value construction sugar: _emit_self_operand
+	   (emitter_c.py) cast an inherited call's self operand to target.cls
+	   directly, never unwrapping the Specialization a monomorphized
+	   method's own .cls always is when its genericity comes from its
+	   enclosing class - silently emitted NO cast at all for an inherited
+	   call reached through a generic ancestor, an invalid-C pointer-type
+	   mismatch that clang/MSVC accepted with a warning (still ran
+	   correctly, same base-first field layout) but gcc correctly rejected
+	   outright - exactly the kind of bug WSL gcc verification exists to
+	   catch. Separately, TypeResolver.schedule() (type_resolver.py) queues
+	   ANY Specialization wrapping a ClassLike for monomorphization with no
+	   concreteness check of its own - compiler.py's bare-RCClass branch
+	   blindly enqueued unit.base even when unit was itself still an
+	   abstract generic template (Bar[T](Real[T]): pass reaches that branch
+	   independently of any concrete Bar[i32]), whose OWN .base is
+	   legitimately still an unbound Specialization - silently building a
+	   bogus "concrete" class with a dangling-TypeVar-typed field, crashing
+	   emitter_c.py's c_type. Fixed by skipping that enqueue when .base is
+	   still a Specialization (monomorphize_class's own .base substitution
+	   step already handles the real ancestor once a genuine concrete
+	   instantiation exists). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# repro 1 from the bug report: a generic subclass whose base is
+			# the SAME generic class parameterized by the subclass's own
+			# TypeVar - bare (type-inferred) construction
+			( 'generic_subclass_of_generic_base_bare_form', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	b: Bar[i32] = Bar( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# same shape, explicit subscript construction - the call shape
+			# type_resolver.py's own eager construction-call pre-pass never
+			# reaches (see RCClassSubclassingNoOwnInitTests' own "Follow-up")
+			( 'generic_subclass_of_generic_base_explicit_subscript', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	b: Bar[i32] = Bar[i32]( x = 5 )
+	if b.x != 5:
+		return 1
+	return 0
+''' ),
+			# repro 2 from the bug report: a NON-generic subclass of a
+			# CONCRETELY-parameterized generic base
+			( 'nongeneric_subclass_of_concrete_generic_base', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar( Real[i32] ):
+	pass
+
+def main() -> i32:
+	b: Bar = Bar( x = 7 )
+	if b.x != 7:
+		return 1
+	return 0
+''' ),
+			# no __init__ ANYWHERE in the chain (genuine field=value
+			# construction sugar), through a GENERIC ancestor - exercises
+			# _lower_allocate_fields' own ancestor-chain resolution together
+			# with the generic-base substitution, and is what surfaced the
+			# two bugs described in this class's own docstring (point 3)
+			( 'no_init_anywhere_field_sugar_through_generic_base', '''
+class Real[T]:
+	x: T
+
+class Bar[T]( Real[T] ):
+	y: T
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b: Bar[i32] = Bar( x = 5, y = 6 )
+		if b.x != 5:
+			return 1
+		if b.y != 6:
+			return 2
+		return 0
+''' ),
+			# the subclass adds its OWN field alongside the inherited generic
+			# one - confirms base-first field layout still composes correctly
+			# once the base's own fields are substituted, not just a single
+			# inherited field in isolation
+			( 'generic_subclass_adds_own_field_alongside_inherited', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	y: T
+	def __init__( self, x: T, y: T ) -> None:
+		super().__init__( x )
+		self.y = y
+
+def main() -> i32:
+	b: Bar[i32] = Bar( x = 3, y = 4 )
+	if b.x != 3:
+		return 1
+	if b.y != 4:
+		return 2
+	return 0
+''' ),
+			# a DIFFERENT type argument per instantiation - confirms the
+			# substituted ancestor is per-specialization, not accidentally
+			# shared/cached across different concrete args for the same
+			# generic base
+			( 'generic_subclass_different_type_args_independent', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	a: Bar[i32] = Bar( x = 11 )
+	b: Bar[str] = Bar( x = 'hi' )
+	if a.x != 11:
+		return 1
+	if b.x.byte_len() != 2:
+		return 2
+	return 0
+''' ),
+			# three-level chain: a generic Leaf inheriting a generic Mid
+			# inheriting a generic Real, each parameterized by the same
+			# propagated TypeVar - confirms the substitution composes
+			# correctly across more than one level of generic ancestry
+			( 'three_level_generic_chain', '''
+class Real[T]:
+	x: T
+	def __init__( self, x: T ) -> None:
+		self.x = x
+
+class Mid[T]( Real[T] ):
+	pass
+
+class Leaf[T]( Mid[T] ):
+	pass
+
+def main() -> i32:
+	leaf: Leaf[i32] = Leaf( x = 9 )
+	if leaf.x != 9:
+		return 1
+	return 0
+''' ),
+			# RC-lifetime stress check under repetition, same rigor as
+			# RCClassSubclassingNoOwnInitTests' own identical checks - a leak
+			# or double-free in the substituted-ancestor's own destructor
+			# would only show up under repeated construct/teardown
+			( 'rc_lifetime_repeated_generic_base_inheritance_no_leak', '''
+class Real[T]:
+	s: T
+	def __init__( self, s: T ) -> None:
+		self.s = s
+
+class Bar[T]( Real[T] ):
+	pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			b: Bar[str] = Bar( s = 'hello'.upper() )
+			if b.s.byte_len() != 5:
+				return 1
+			i += 1
+		return 0
+''' ),
+		] )
+
+class FallibleInitConstructionRCLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for a real, confirmed double-free in fallible
+	`__init__()` construction (SYNTAX.md's "Fallible __init__() Construction"
+	- __init__ declared -> Result[None,E] makes `Foo(...)` itself yield
+	Result[Foo,E]), found by reading the emitted C directly. Two independent
+	over-release bugs lived in lowering.py's _emit_fallible_construction:
+
+	1. dest_var (the hidden local threading the synthesized Result.Ok/Err
+	   wrapping through) is a persistent Variable, not an ir.Temp - so unlike
+	   every other fresh Call/Allocate result in this file, cfg.assign()'s
+	   own "ownership transfers into dest, untrack the momentary Temp" branch
+	   never fired for it when the caller consumed the returned value (e.g.
+	   `r = Foo(...)`). dest_var stayed independently OWNED in cfg's own
+	   bookkeeping on top of whatever the caller's own binding tracked for
+	   the SAME object, so BOTH got decref'd at their own scope exit - a
+	   real double-free, confirmed via direct compile-and-run (access
+	   violation) with two fallible constructions of the same class in one
+	   function, or a single one whose Result is retained/queried
+	   (.is_ok()/.is_err()) rather than immediately match-extracted (a bare
+	   match-and-extract happened to mask it: unwrap()'s own move-out of the
+	   payload neutralizes the OUTER binding's own entry first, leaving only
+	   dest_var's spurious decref to actually fire - net correct by
+	   coincidence, not because the underlying tracking was ever right).
+	   Fixed by cfg.move()'ing dest_var (the same primitive move[T] call
+	   arguments use) right before returning it, cancelling its own pending
+	   epilogue decref once its value is handed off.
+	2. The Err branch's self_var cleanup used a bare `ir.Decref(value=
+	   self_var)` instead of the compiler.decref()-style
+	   cfg.decref()+cfg.manually_decreffed() pair - so self_var's own
+	   binding stayed OWNED in cfg's bookkeeping and got decref'd AGAIN at
+	   the function's own scope exit on top of this explicit one, double-
+	   freeing the failed instance on every Err return. Fixed by routing
+	   through cfg.decref()+manually_decreffed(), mirroring
+	   _lower_compiler_decref's own compiler.decref(x) handling exactly.
+
+	3. The Err branch's self_var cleanup (even after fix #2 above routed it
+	   through cfg.decref()+manually_decreffed() instead of a bare
+	   ir.Decref) still released self via the class's ordinary, SHARED
+	   vtable destructor - the exact same one used to destroy any fully-
+	   valid instance, which unconditionally decrefs EVERY RC-typed
+	   attribute. self is only PARTIALLY constructed on the Err path -
+	   reading an attribute this __init__ never reached an assignment for
+	   reads whatever raw, unrelated bytes sys.alloc's allocator happened to
+	   return, not a valid reference. A real, confirmed
+	   STATUS_HEAP_CORRUPTION (0xC0000374 on Windows), not just a logical
+	   bug - see fallible_construction_unassigned_rc_field_on_err_path_no_
+	   crash below. A second, subtler half of the same bug: even an
+	   attribute that WAS assigned before the failing Err path could
+	   silently stop being released by __init__'s OWN unwind the moment a
+	   LATER, textually-subsequent success-path return in the same __init__
+	   completed construction (Epilogue.cancelled is one mutable flag
+	   shared by every jump into that entry's label, not a per-jump-site
+	   snapshot - build_epilogue_ladder() bakes in the FINAL state, not the
+	   state as of each earlier jump's own time) - masked as a leak, not a
+	   crash, only because the generic-destructor fallback this fix removes
+	   happened to independently release the same attribute again on its
+	   own way out; see fallible_construction_assigned_rc_field_before_
+	   later_err_no_leak below. Fixed in two parts: _stmt_Return's own
+	   Err-path-of-a-fallible-__init__ case now always does an inline
+	   (never shared-label) unwind, so it correctly releases exactly
+	   whichever RC attributes were actually assigned along the path taken,
+	   using its own precise, path-sensitive CFG state; and
+	   _emit_fallible_construction's Err branch no longer releases self via
+	   the generic destructor at all - it frees self's raw allocation
+	   directly (sys.free), skipping both the field cascade (now entirely
+	   __init__'s own responsibility) and any user __del__ (forbidden on
+	   this path regardless, per SYNTAX.md).
+
+	Every RC-lifetime case below loops hundreds of times with a real heap
+	allocation per iteration (matching this codebase's own
+	rc_lifetime_repeated_*_no_leak convention above) rather than checking
+	just one iteration: a single double-free doesn't reliably corrupt the
+	heap badly enough to crash immediately, but repetition makes both
+	directions (double-free AND any leak from an over-corrected fix) show up
+	reliably. The fallible_construction_as_direct_match_subject case is
+	unrelated to RC lifetime - it's a compiler-crash (AssertionError)
+	regression in type_resolver.py's visit_Match, deterministic on the first
+	attempt, so it doesn't need the loop convention. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the original repro: TWO fallible constructions of the same
+			# class in one function, each only queried via is_ok() (never
+			# match-extracted) - this is exactly the shape that segfaulted
+			( 'two_fallible_constructions_one_function_ok_path', '''
+class MyError:
+	pass
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	r1: Result[Box, MyError] = Box( 5 )
+	ok1: bool = r1.is_ok()
+	r2: Result[Box, MyError] = Box( 6 )
+	ok2: bool = r2.is_ok()
+	if not ok1:
+		return 1
+	if not ok2:
+		return 2
+	return 0
+''' ),
+			# a SINGLE fallible construction per iteration, retained and only
+			# queried (never match-extracted or unwrap()'d) - dest_var's own
+			# leftover decref, unmasked by any move-out, double-frees the
+			# constructed object almost immediately under repetition
+			( 'fallible_construction_retained_and_queried_no_extraction_no_double_free', '''
+class MyError:
+	pass
+
+class Widget:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 500:
+			r: Result[Widget, MyError] = Widget( v = i )
+			if r.is_err():
+				return 1
+			i += 1
+		return 0
+''' ),
+			# the Err path specifically, repeated - targets self_var's own
+			# double-decref bug (bare ir.Decref never cancelled cfg's own
+			# pending epilogue release for it)
+			( 'fallible_construction_err_path_repeated_no_double_free', '''
+class MyError:
+	pass
+
+class Validated:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 500:
+			r: Result[Validated, MyError] = Validated( v = -1 )
+			if not r.is_err():
+				return 1
+			i += 1
+		return 0
+''' ),
+			# precise refcount accounting (not just "doesn't crash"): after a
+			# single fallible construction is unwrap()'d, EXACTLY TWO owning
+			# references should be live - self_var's own original reference
+			# (dropped from cfg's automatic, branch-unaware scope-exit
+			# tracking and released explicitly instead - see
+			# _emit_fallible_construction's own Ok-branch comment) plus
+			# unwrap()'s own retained copy (Result.unwrap's accessor takes an
+			# independent Incref'd copy rather than moving the payload out -
+			# see lib/builtins/__init__.py's Result class docstring). NOT 1:
+			# an earlier version of this fix assumed 1 and asserted it here,
+			# which was itself wrong - catches either an over-release
+			# (crashes before this check even reads a valid header) or a
+			# leak (an extra, un-decref'd reference from an over-corrected
+			# fix) in the same assertion
+			( 'fallible_construction_unwrap_leaves_exactly_two_references', '''
+class MyError:
+	pass
+
+class Gadget:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		r: Result[Gadget, MyError] = Gadget( 7 )
+		if r.is_err():
+			return 1
+		g: Gadget = r.unwrap( 'construction failed' )
+		if g.v != 7:
+			return 2
+		rc: usize = compiler.refcount( g )
+		if rc != 2:
+			return compiler.cast( i32, 3 + rc )
+		return 0
+''' ),
+			# a fallible construction that fails on its VERY FIRST attempt at
+			# a given call site (no loop needed) - dest_var gets assigned in
+			# BOTH the Ok and Err branches of _emit_fallible_construction,
+			# but cfg sees them as one flat sequence (no enter_branch()/
+			# restore() around the Ok/Err split), so it treated the Err
+			# branch's assignment as a REASSIGNMENT of an already-live
+			# dest_var, emitting a decref of dest_var's "previous value"
+			# before overwriting it - except the Ok branch never actually
+			# ran on this path, so dest_var's storage was uninitialized
+			# garbage. A real, confirmed crash (illegal instruction),
+			# distinct from the double-free bugs above and not caught by any
+			# existing test since none of them construct a class whose
+			# __init__ can actually fail
+			( 'fallible_construction_fails_on_first_attempt_no_crash', '''
+class MyError:
+	pass
+
+class Validated:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	r: Result[Validated, MyError] = Validated( -1 )
+	if not r.is_err():
+		return 1
+	return 0
+''' ),
+			# a wholly separate bug from the RC/double-free ones above: a
+			# fallible construction used DIRECTLY as a match statement's own
+			# subject (`match Box(5):`), never bound to a variable first. type_
+			# resolver.py's visit_Match built its synthesized `__match_subj_N =
+			# <subject>` assignment via generic_visit_expr(node.subject), which
+			# only visits the subject expression's own CHILDREN (ast.
+			# NodeTransformer.generic_visit's own semantics when called
+			# directly on an expr, rather than on its parent statement) - so a
+			# Call subject's own visit_Call, which is what actually resolves
+			# __init__ (sets resolved_construction / clears Function.resolve),
+			# never ran. lowering.py's _try_lower_construct_call then hit its
+			# own `assert init.resolve is None` sentinel meant to catch exactly
+			# that unresolved state - a compiler crash (AssertionError), not a
+			# runtime one. Fixed by dispatching through self.visit(node.
+			# subject) instead, matching how every other statement
+			# (visit_Assign, visit_AnnAssign, ...) already visits ITS OWN child
+			# expressions via generic_visit(self) called on the PARENT node
+			( 'fallible_construction_as_direct_match_subject', '''
+class MyError:
+	pass
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		match Box( 5 ):
+			case Result.Ok( b ):
+				return b.v - 5
+			case Result.Err( e ):
+				return 99
+''' ),
+			# a THIRD, distinct bug from the two RC/double-free ones above and
+			# the match-subject compiler crash just above: a class with an RC-
+			# typed field that ISN'T assigned along the path that returns Result.
+			# Err(...) - self is only PARTIALLY constructed on this path, but
+			# _emit_fallible_construction's own Err-branch cleanup used to release
+			# self via the class's ordinary, shared vtable destructor
+			# (release_object -> $$__destructor__), the SAME one used to destroy
+			# any fully-valid instance - which unconditionally decrefs EVERY RC-
+			# typed field, including `held` here, which was never written on this
+			# path. Reading self->held then reads whatever raw bytes sys.alloc's
+			# allocator happened to return (release builds never zero fresh
+			# allocations at all; even the debug-only fill lib/sys.py's alloc[T]
+			# applies is deliberately a nonzero poison byte, not zero - see its
+			# own comment), so release_object() dereferences/decrements a
+			# refcount through a garbage pointer - a real, confirmed
+			# STATUS_HEAP_CORRUPTION (0xC0000374) on Windows, not just a logical
+			# bug. Fixed in two parts: (1) __init__'s own Err-path return now
+			# always does an inline (never shared-label) unwind, so it correctly
+			# releases only whichever RC attributes IT actually assigned, using
+			# its own precise, path-sensitive CFG state (_stmt_Return's
+			# construction_err_path special case); (2) the call site's Err-branch
+			# release of self no longer goes through the generic destructor at
+			# all - it frees self's raw allocation directly (sys.free), skipping
+			# both the field cascade and any user __del__ (forbidden here by
+			# SYNTAX.md regardless)
+			( 'fallible_construction_unassigned_rc_field_on_err_path_no_crash', '''
+class MyError:
+	pass
+
+class Holder:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	tag: i32
+	held: Holder
+	def __init__( self, tag: i32, held: Holder ) -> Result[None, MyError]:
+		if tag < 0:
+			return Result.Err( MyError() )
+		self.tag = tag
+		self.held = held
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		h: Holder = Holder( 7 )
+		i: i32 = 0
+		while i < 500:
+			r: Result[Box, MyError] = Box( -1, h )
+			if not r.is_err():
+				return 1
+			i += 1
+		return 0
+''' ),
+			# the companion shape to the one just above: the RC-typed field IS
+			# assigned before a LATER validation fails and returns Result.
+			# Err(...) - exercises the OTHER half of the same fix.
+			# complete_construction()'s own success-path cancellation (run by a
+			# LATER, textually-subsequent Result.Ok(...) return in the same
+			# __init__) mutates a mutable Epilogue.cancelled flag shared by every
+			# jump into that entry's label - before this fix, an EARLIER Err-path
+			# return that had already committed to a shared epilogue label
+			# (while `held`'s entry was still live) silently lost its own decref
+			# of `held` the moment that LATER success path ran
+			# complete_construction(), since build_epilogue_ladder() bakes each
+			# entry's FINAL cancelled state into every jump site that shares it,
+			# not the state as of each jump's own time - a real leak, masked
+			# only by the call site's own generic-destructor fallback (removed
+			# by this same fix, for the never-assigned case above)
+			# coincidentally releasing `held` again on its way out. Checks exact
+			# refcount, not just "doesn't crash" - a leak wouldn't crash within
+			# 500 iterations either
+			( 'fallible_construction_assigned_rc_field_before_later_err_no_leak', '''
+class MyError:
+	pass
+
+class Holder:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	tag: i32
+	held: Holder
+	def __init__( self, tag: i32, held: Holder, extra: i32 ) -> Result[None, MyError]:
+		self.held = held
+		if extra < 0:
+			return Result.Err( MyError() )
+		self.tag = tag
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		h: Holder = Holder( 7 )
+		before: usize = compiler.refcount( h )
+		i: i32 = 0
+		while i < 500:
+			r: Result[Box, MyError] = Box( 3, h, -1 )
+			if not r.is_err():
+				return 1
+			i += 1
+		after: usize = compiler.refcount( h )
+		if before != after:
+			return compiler.cast( i32, 2 + after )
+		return 0
+''' ),
+			# a wholly separate, gcc-specific bug found while porting lib/
+			# mmap.py's POSIX mmap(): a fallible __init__'s Err-path return
+			# always did a full INLINE unwind of the ENTIRE stack (fix #3
+			# above), reusing defer()'s captured, already-lowered
+			# instructions AS-IS (cfg.py's Epilogue.instructions - "the
+			# already-lowered replay body, reused as-is"). Fine on its own -
+			# a defer body normally only ever gets spliced in once - but the
+			# eventual success return still went through the ORDINARY shared
+			# epilogue label, so the SAME captured instructions got spliced
+			# into the generated C a second time. When the deferred body has
+			# its own sub-expression needing an intermediate temp
+			# (compiler.cast(...) below, matching mmap.py's own `sys.free(
+			# compiler.cast(Ptr[None], buf))`), that temp's declaration is
+			# baked into the captured instructions too - so the second
+			# splice re-declares the exact same name (this codebase never
+			# emits C block scoping, so both copies land at the same flat
+			# function scope): `redeclaration of '$tN' with no linkage`.
+			# clang/MSVC silently tolerate the redeclaration; only gcc
+			# actually enforces it as the hard C error it really is, so this
+			# only ever surfaced building for the POSIX/WSL-gcc target (see
+			# wsl_gcc_real_posix_target_testing memory - this repo's own
+			# python3, not native Windows Python, is required to actually
+			# compile the `os = not 'windows'` branch below for real). Fixed
+			# by teaching current_epilogue_label_for_construction_err() to
+			# route defer/errdefer (and any other non-attribute) entries
+			# through the ordinary shared label instead of forcing every
+			# pending entry inline just because SOME of them (self.<attr>
+			# entries specifically) need to stay inline - only those are
+			# actually at risk of complete_construction()'s retroactive
+			# cancellation.
+			( 'fallible_construction_defer_replayed_at_construction_err_and_success_no_redeclaration', '''
+class MyError:
+	pass
+
+class DeferReplay:
+	v: i32
+
+	@compiler.target( os = 'windows' )
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( buf ))
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+	@compiler.target( os = not 'windows' )
+	def __init__( self, v: i32 ) -> Result[None, MyError]:
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		if v < 0:
+			return Result.Err( MyError() )
+		self.v = v
+		return Result.Ok( None )
+
+def main() -> i32:
+	bad: Result[DeferReplay, MyError] = DeferReplay( -1 )
+	if not bad.is_err():
+		return 1
+	good: Result[DeferReplay, MyError] = DeferReplay( 7 )
+	d: DeferReplay = good.unwrap( 'construction failed' )
+	if d.v != 7:
+		return 2
+	return 0
+''' ),
+			# the shape that actually matters in real code, and the one the
+			# fix above's first draft still couldn't handle: a self.<attr>
+			# entry assigned BEFORE the defer() (real-world __init__s
+			# routinely stash a caller-owned reference first, then allocate/
+			# defer-cleanup scratch state afterward - unlike mmap.py's own
+			# shape, which happens to assign no attribute until the very
+			# end). That first draft only inline-decref'd an attribute found
+			# ABOVE its chosen shared-label candidate, bailing to the old
+			# full-inline behavior otherwise - correct, but needlessly
+			# conservative: an attribute's own rung is never reachable via
+			# `goto` regardless of stack position (current_epilogue_label_
+			# for_construction_err() never hands one out as a jump target),
+			# and build_epilogue_ladder()/build_inline_scope_ladder() now
+			# skip is_construction_attr entries UNCONDITIONALLY rather than
+			# only once .cancelled happens to be set - so this works
+			# regardless of push order. Checks exact refcount (not just "no
+			# crash"), same convention as fallible_construction_assigned_
+			# rc_field_before_later_err_no_leak above - a leak or a double-
+			# free both survive a single iteration undetected
+			( 'fallible_construction_attr_before_defer_shared_label_no_leak', '''
+class MyError:
+	pass
+
+class Holder:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class DeferAfterAttr:
+	held: Holder
+
+	@compiler.target( os = 'windows' )
+	def __init__( self, held: Holder, v: i32 ) -> Result[None, MyError]:
+		self.held = held
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( buf ))
+		if v < 0:
+			return Result.Err( MyError() )
+		return Result.Ok( None )
+
+	@compiler.target( os = not 'windows' )
+	def __init__( self, held: Holder, v: i32 ) -> Result[None, MyError]:
+		self.held = held
+		buf: Ptr[u8] = sys.alloc[u8]( 4 )
+		if buf is None:
+			return Result.Err( MyError() )
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		if v < 0:
+			return Result.Err( MyError() )
+		return Result.Ok( None )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		h: Holder = Holder( 9 )
+		before: usize = compiler.refcount( h )
+		i: i32 = 0
+		while i < 500:
+			r: Result[DeferAfterAttr, MyError] = DeferAfterAttr( h, -1 )
+			if not r.is_err():
+				return 1
+			i += 1
+		after_err: usize = compiler.refcount( h )
+		if before != after_err:
+			return compiler.cast( i32, 2 + after_err )
+		good: Result[DeferAfterAttr, MyError] = DeferAfterAttr( h, 3 )
+		if good.is_err():
+			return 10
+		after_ok: usize = compiler.refcount( h )
+		if after_ok != before + 1:
+			return compiler.cast( i32, 20 + after_ok )
 		return 0
 ''' ),
 		] )
@@ -1374,8 +2473,97 @@ def main() -> i32:
 ''' ),
 		] )
 
+class VolatileLocalTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for `Volatile[T]` local declarations - the
+	fix for a --release micro-benchmark loop (`for i in range(N): pass`)
+	being dead-code-eliminated by the C compiler under -O2/-O3 (no
+	observable side effects, statically-known trip count). Confirms both
+	that the qualifier actually lands in the generated C, and that a
+	Volatile[T] local otherwise behaves exactly like a plain T everywhere
+	(arithmetic, comparisons, reuse as a for-loop target). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact shape the benchmark needs: pre-declare `i: Volatile[
+			# usize]` before a `for i in range(...)` - _bind_loop_target's
+			# existing "reuse a same-named pre-declared local" path (the
+			# same one str.concat's own `i: usize = 0` uses) picks it up
+			# with no lowering changes of its own, so the loop's induction
+			# variable keeps its is_volatile flag through every iteration
+			( 'volatile_loop_counter_reused_as_for_target', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: Volatile[usize] = 0
+		for i in range( 1000 ):
+			pass
+		if i != 1000:
+			return 1
+		return 0
+''' ),
+			# ordinary arithmetic/comparisons on a Volatile[T] local work
+			# exactly like a plain T - it's a storage qualifier on the
+			# binding, not a distinct type (unlike move[T]/copy[T])
+			( 'volatile_local_arithmetic_and_comparison', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: Volatile[i32] = 10
+		x += 5
+		if x != 15:
+			return 1
+		if not ( x > 10 ):
+			return 2
+		y: i32 = x + 1
+		if y != 16:
+			return 3
+		return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_declaration_is_qualified_volatile_in_generated_c( self ) -> None:
+		self.compiler.import_code( '''
+def main() -> None:
+	i: Volatile[usize] = 0
+	return
+''', Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		self.assertIn( 'volatile uintptr_t i', c_source )
+
+	def test_volatile_of_refcounted_type_is_rejected( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+class Box:
+	v: i32 = 0
+
+def main() -> None:
+	b: Volatile[Box] = Box()
+	return
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertTrue( any( 'Volatile[...] does not support refcounted types' in e for e in discovery.errors.errors ))
+
+
 class _ClangCompileMixin:
 	def _assert_compiles( self, c_source: str ) -> None:
+		# unlike test_support.RealCompileMixin's _compile_source (which
+		# always asserts this itself), this class's own _run() doesn't -
+		# a caller that emits+compiles C from a Discovery run that already
+		# has real errors gets whatever half-lowered C the compiler managed
+		# to produce before bailing, which can trigger arbitrary downstream
+		# C-compiler warnings/behavior that have nothing to do with real
+		# codegen quality (confirmed: 5 tests in this file were silently
+		# doing exactly this - see git history). Assert it here, once, so
+		# nothing "passes" by compiling C for a program that was never
+		# actually valid metalpy in the first place.
+		self.assertEqual( self.discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in self.discovery.errors.errors ) )
 		with tempfile.TemporaryDirectory() as tmp:
 			src_path = Path( tmp ) / 'generated.c'
 			obj_path = Path( tmp ) / 'generated.o'
@@ -1423,6 +2611,7 @@ def main() -> None:
 	def test_wrap_arithmetic_smoke_test_compiles( self ) -> None:
 		# Phase 1 milestone (a): the first real smoke test, sidesteps
 		# Result plumbing entirely
+		self.discovery.import_name( 'builtins' )
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -1445,6 +2634,7 @@ def main() -> i32:
 		# clearly in-range value like 11 to spuriously "overflow". Found by
 		# str.upper()'s own real end-to-end test (see StrUpperLowerTests)
 		# panicking on ordinary short ASCII input.
+		self.discovery.import_name( 'builtins' ) # y != 11 is now an ordinary usize.__ne__ dunder call
 		self._run( '''
 def main() -> i32:
 	x: i32 = 11
@@ -1485,15 +2675,22 @@ def main() -> i32:
 		# program never declares main() -> Result[...] (that wouldn't even
 		# make sense given main always returns int), so the Result-
 		# returning function under test is a separate, ordinary helper
-		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+		# real builtins.Result/OverflowError, not _RESULT_FIXTURE's local
+		# stand-in - see EmitArithmeticTests.test_default_check_mode_uses_
+		# result_and_or_return's own comment
+		self.discovery.import_name( 'builtins' )
+		self._run( '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'def foo() -> Result[i32,OverflowError]:',
 			'	x: i32 = 1',
 			'	y: i32 = x + 1',
 			'	return Result.Ok( y )',
 			'',
 			'def main() -> None:',
-			'	foo()',
+			"	foo().unwrap( 'foo failed' )",
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_cenum_typedef_and_member_reference_compiles( self ) -> None:
@@ -1513,6 +2710,11 @@ def main() -> i32:
 		color.values = { 0: 'Red', 1: 'Green' }
 		harness = '\n'.join([
 			'#include <stdint.h>',
+			'#if defined(_MSC_VER) && !defined(__clang__)', # mirrors the real PROLOGUE's own conditional definition exactly - see its own comment
+			'#define __metalpy_maybe_unused',
+			'#else',
+			'#define __metalpy_maybe_unused __attribute__((unused))',
+			'#endif',
 			emitter_c.emit_cenum( color ),
 			'int main( void ) {',
 			'\treturn (int)__main__$Color$Red;',
@@ -1521,6 +2723,7 @@ def main() -> i32:
 		self._assert_compiles( harness )
 
 	def test_cstruct_construct_and_read_back_compiles( self ) -> None:
+		self.discovery.import_name( 'builtins' )
 		self._run( _POINT_FIXTURE + '\n' + '\n'.join([
 			'def main() -> i32:',
 			'	p: Point = Point.make( 1, 2 )',
@@ -1530,6 +2733,7 @@ def main() -> i32:
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_addrof_getitem_setitem_compiles( self ) -> None:
+		self.discovery.import_name( 'builtins' ) # y != seven is now an ordinary u8.__ne__ dunder call
 		self._run( '''
 def main() -> None:
 	x: u8 = 5
@@ -1538,12 +2742,16 @@ def main() -> None:
 	p: Ptr[u8] = compiler.addrof( x )
 	p[i] = seven
 	y: u8 = p[i]
+	if y != seven:
+		return
 	return
 ''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_union_construct_and_match_compiles( self ) -> None:
 		# Phase 5 milestone (a): synthetic @union construct/match round trip
+		self.discovery.import_name( 'builtins' )
 		self._run( _UNION_FIXTURE + '\n' + '\n'.join([
 			'def main() -> i32:',
 			'	f: Foo = Foo.Bar( 5 )',
@@ -1552,7 +2760,14 @@ def main() -> None:
 			'			return x',
 			'		case Foo.Baz( z ):',
 			'			with compiler.wrap_arithmetic:',
-			'				return z + 1',
+			# z: usize (Baz's own payload type) - z + 1 is usize, needs an
+			# explicit narrowing cast back to i32 for main's own return type.
+			# The dunder path types this correctly as usize (left.type, the
+			# receiver's real type) - the pre-dunder fallback used to
+			# silently mistype the AddWrap op itself as i32 (result_type =
+			# expected_type or left.type, picking the OUTER expected_type
+			# instead), masking this exact mismatch
+			'				return i32( z + 1 )',
 			'	return 0',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
@@ -1560,17 +2775,24 @@ def main() -> None:
 	def test_ptr_or_none_return_and_is_none_check_compiles( self ) -> None:
 		# Phase 5 milestone (b): mirrors the real, load-bearing shape every
 		# allocation in the language ultimately runs through - lib/sys.py's
-		# own _alloc(size: usize) -> Ptr[u8]|None, consumed via `if ptr is
-		# None:`. A synthetic extern stands in for the real HeapAlloc/malloc
-		# call (same posture as every other fixture in this file - no real
-		# lib/ dependency needed to exercise this shape)
+		# own _alloc/HeapAlloc/malloc are plain @extern bindings returning a
+		# bare (possibly-null) Ptr[u8] - a union can't cross the @extern
+		# boundary at all (only a plain C value type can), so the synthetic
+		# extern here mirrors that exact shape too, not Ptr[u8]|None
+		# directly. alloc_or_none is the ordinary (non-extern) wrapper that
+		# turns the raw nullable Ptr into a real Ptr[u8]|None union return,
+		# consumed via `if p is None:` - same posture as every other
+		# fixture in this file, no real lib/ dependency needed
+		self.discovery.import_name( 'builtins' ) # `is None` on a TaggedUnion rewrites to an ordinary u8.__eq__ dunder call
 		self._run( '\n'.join([
 			"@extern( 'c', '_metalpy_test_maybe_alloc' )",
-			'def _test_maybe_alloc( size: usize ) -> Ptr[u8]|None:',
+			'def _test_maybe_alloc( size: usize ) -> Ptr[u8]:',
 			'	...',
 			'',
 			'def alloc_or_none( size: usize ) -> Ptr[u8]|None:',
 			'	ptr = _test_maybe_alloc( size )',
+			'	if ptr is None:',
+			'		return None',
 			'	return ptr',
 			'',
 			'def main() -> i32:',
@@ -1579,6 +2801,7 @@ def main() -> None:
 			'		return 0',
 			'	return 1',
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_scalar_casts_in_every_arithmetic_mode_compile( self ) -> None:
@@ -1586,17 +2809,21 @@ def main() -> None:
 		# CastWrap is already exercised end to end by the Phase 6 milestone
 		# (RealCompileTests further down), this covers the other two modes
 		# directly
+		self.discovery.import_name( 'builtins' ) # self.tag == 0/y == 0 are now ordinary u8.__eq__ dunder calls
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def foo() -> Result[u32,OverflowError]:',
 			'	x: usize = 300',
 			'	with compiler.saturate_arithmetic:',
 			'		y: u8 = u8( x )', # narrowing, out of range - clamps to 255
 			'	z: u32 = compiler.cast( u32, x )', # default Check mode
+			'	if y == 0:', # dead in practice (300 saturates to 255, never 0) - just keeps y a real, referenced value
+			'		z = 0',
 			'	return Result.Ok( z )',
 			'',
 			'def main() -> None:',
-			'	foo()',
+			'	foo().is_ok()',
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_defer_compiles( self ) -> None:
@@ -1617,6 +2844,7 @@ def main() -> None:
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_errdefer_compiles( self ) -> None:
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
 			'def cleanup() -> None:',
 			'	return',
@@ -1626,9 +2854,10 @@ def main() -> None:
 			'	return Result.Ok( 5 )',
 			'',
 			'def main() -> None:',
-			'	checked()',
+			'	checked().is_ok()',
 			'	return',
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_generic_union_method_and_construction_arg_use_substituted_types( self ) -> None:
@@ -1650,7 +2879,13 @@ def main() -> None:
 		#     own bare TypeVar instead of the concrete specialization,
 		#     corrupting the Result[T,OverflowError] the arithmetic itself
 		#     needs to build into a bogus, unsubstituted one.
-		self._run( _RESULT_FIXTURE + '\n' + '\n'.join([
+		# real builtins.Result/OverflowError, not _RESULT_FIXTURE's local
+		# stand-in - see EmitArithmeticTests.test_default_check_mode_uses_
+		# result_and_or_return's own comment
+		self.discovery.import_name( 'builtins' )
+		self._run( '\n'.join([
+			'from builtins import Result, OverflowError',
+			'',
 			'@union',
 			'class Box[T]:',
 			'\tFull: T',
@@ -1667,8 +2902,9 @@ def main() -> None:
 			'def main() -> None:',
 			'\tb = make_full( 10 )',
 			'\tv = b.unwrap_ok()',
-			'\tr = add_one( v )',
+			"\tadd_one( v ).unwrap( 'add_one failed' )",
 		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
 	def test_generic_specialization_naming_compiles( self ) -> None:
@@ -1700,6 +2936,7 @@ def main() -> None:
 		# plain ClassName(...) has its own, separate, unrelated gap (its
 		# __init__ never gets monomorphized when reached this way), not
 		# what this test is checking.
+		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
 		self._run( '\n'.join([
 			'@union',
 			'class Box[T]:',
@@ -1709,7 +2946,9 @@ def main() -> None:
 			'	def get_or( self, default: T ) -> T:',
 			'		...',
 			'	def get_or( self, default: T ) -> T:',
-			'		return self.data.v_Some',
+			'		if self.tag == 0:',
+			'			return self.data.v_Some',
+			'		return default',
 			'',
 			'def main() -> i32:',
 			'	b: Box[i32] = Box.Some( 5 )',
@@ -2284,6 +3523,8 @@ class RCClassRealCompileTests( _ClangCompileMixin, RCClassTestCase ):
 			'	foo: Foo = Foo.make( 1 )',
 			'	bar: Foo = foo',
 			'	rc: usize = compiler.refcount( bar )',
+			'	if rc == usize( 0 ):', # touch it - actually proves refcount() returns something real, not just "compiles"
+			'		return 0',
 			'	with compiler.wrap_arithmetic:',
 			'		return bar.x',
 		]))
@@ -2343,10 +3584,7 @@ class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -2394,6 +3632,8 @@ class SizeofValueArgumentRealCompileTests( RCClassTestCase ):
 			'		return 1',
 			'	if compiler.sizeof( v ) != 4:',
 			'		return 2',
+			'	if v != 0:', # a real runtime read of v - every use above is compiler.sizeof(v), which only needs v's static TYPE and folds away at compile time, never actually touching v itself
+			'		return 3',
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -2414,6 +3654,12 @@ _BUILTINS_STR_FIXTURE = '\n'.join([
 	'class str:',
 	'	__data: ConstPtr[u8]',
 	'	__byte_size: usize',
+	# mirrors real builtins.str's __char_count/__index fields (lib/builtins/
+	# __init__.py) - _emit_one_string_literal (emitter_c.py) unconditionally
+	# bakes both into every str literal it emits, so this fixture needs the
+	# same shape even though nothing in these tests reads either field.
+	'	__char_count: usize',
+	'	__index: Ptr[usize]',
 	'',
 	'	def get_data( self ) -> ConstPtr[u8]:',
 	'		return self.__data',
@@ -2565,7 +3811,7 @@ class EmitGlobalTests( CompilerTestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		g = self.compiler.globals[0]
 		src = emitter_c.emit_global( g )
-		self.assertEqual( src, 'uint32_t __main__$STD_OUTPUT_HANDLE = -11;' )
+		self.assertEqual( src, 'uint32_t __main__$STD_OUTPUT_HANDLE = (uint32_t)-11;' )
 		self.assertNotIn( '__metalpy_init', src ) # trivial - no init function needed
 
 class EmitGlobalRCClassTests( RCClassTestCase ):
@@ -2598,6 +3844,7 @@ class EmitGlobalRealCompileTests( _ClangCompileMixin, CompilerTestCase ):
 			'',
 			'def main() -> None:',
 			'	x: u32 = STD_OUTPUT_HANDLE',
+			'	x = u32( x )', # touch x - actually reads the global, not just "compiles" (same-width construct-cast, always infallible, no dunder needed - this minimal harness has no builtins imported)
 			'	return',
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
@@ -2705,7 +3952,7 @@ def main() -> i32:
 			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -2713,6 +3960,215 @@ def main() -> i32:
 
 			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
 			self.assertEqual( result.returncode, 42, f'exe exited {result.returncode}, expected 42 (stderr: {result.stderr})' )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+@unittest.skipUnless( os.name == 'nt', 'no_crt is a Windows-only concept in this codebase - on Linux the compiler always targets the host platform (see wsl_gcc_real_posix_target_testing memory) and always links glibc regardless, so this fixture legitimately pulls in libc there (no_crt is never True) rather than exercising the gap this class tests' )
+class NoCrtLocalArrayStructRealCompileTests( unittest.TestCase ):
+	# clang/gcc's own -O0 codegen lowers a local @cstruct's zero-init (any
+	# array-bearing field, regardless of size - confirmed down to 8 bytes)
+	# to a real `call memset`, and a by-value struct copy above a small
+	# size threshold to `call memcpy` - neither is a call this module's own
+	# extern-tracking machinery ever sees (inserted directly by the C
+	# compiler's backend, not lowered from any ir.Call emitter_c itself
+	# emits), so `no_crt = 'c' not in compiler.extern_libs` can't catch it
+	# the way an explicit crt.memset()/crt.memcpy() call would (that always
+	# flips no_crt off). Confirmed via a real LNK2019 "unresolved external
+	# symbol memset" building this exact shape before emit_c() started
+	# providing freestanding stand-ins for both symbols under no_crt.
+	def _compile_and_run( self, source: str, expected_exit: int ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs
+		self.assertTrue( no_crt, 'fixture unexpectedly pulled in the CRT' )
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_local_array_bearing_cstruct_zero_init( self ) -> None:
+		self._compile_and_run( '''
+@cstruct
+class Buf8:
+	items: i32[8] = 0
+
+def compute( x: i32 ) -> i32:
+	buf: Buf8 = Buf8()
+	with compiler.wrap_arithmetic:
+		i: usize = usize( 0 )
+		while i < usize( 8 ):
+			buf.items[i] = x + i32( i )
+			i += usize( 1 )
+	return buf.items[usize(0)]
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return compute( 10 ) - 10
+''', expected_exit = 0 )
+
+	def test_local_array_bearing_cstruct_by_value_copy( self ) -> None:
+		# large enough (512 bytes) to push clang past whatever inline-store
+		# threshold it uses at -O0 and actually emit `call memcpy` for the
+		# by-value struct copy (confirmed via a real compile with this fix
+		# reverted) - too small to also trip the SEPARATE, still-open
+		# __chkstk large-stack-frame gap under MSVC (see
+		# msvc_no_crt_missing_chkstk memory), which this test deliberately
+		# doesn't exercise (confirmed empirically: compute()'s own frame -
+		# its own BufMed local PLUS the by-value outgoing argument copy for
+		# touch(src) - trips __chkstk at 256 elements/1KB already, well
+		# below the single-local 4KB threshold that gap's own memory notes)
+		self._compile_and_run( '''
+@cstruct
+class BufMed:
+	items: i32[128] = 0
+
+def touch( b: BufMed ) -> i32:
+	buf: BufMed = b
+	return buf.items[0]
+
+def compute( x: i32 ) -> i32:
+	src: BufMed = BufMed()
+	with compiler.wrap_arithmetic:
+		i: usize = usize( 0 )
+		while i < usize( 128 ):
+			src.items[i] = x + i32( i )
+			i += usize( 1 )
+	return touch( src )
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return compute( 10 ) - 10
+''', expected_exit = 0 )
+
+class RequiresCrtDecoratorTests( unittest.TestCase ):
+	# @requires_crt (see mpy_types.Function.requires_crt/compiler.py's
+	# Compiler.requires_crt) - a library function marks itself, and if it's
+	# actually reachable/lowered, the whole build must link the real CRT
+	# rather than the freestanding Windows entry point (e.g. so MSVC's
+	# __chkstk is available - see msvc_no_crt_missing_chkstk memory), even
+	# though the function itself never calls a real @extern('c', ...).
+	def _compile( self, source: str ) -> tuple[Compiler, Discovery]:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		return compiler, discovery
+
+	def test_reachable_requires_crt_function_forces_no_crt_off( self ) -> None:
+		compiler, discovery = self._compile( '''
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	return needs_crt()
+''' )
+		self.assertEqual( discovery.errors.errors, [] )
+		self.assertTrue( compiler.requires_crt )
+		self.assertNotIn( 'c', compiler.extern_libs ) # no real @extern('c', ...) call anywhere - requires_crt alone is doing this
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		self.assertFalse( no_crt )
+
+	def test_unreachable_requires_crt_function_does_not_force_it( self ) -> None:
+		# same decorated function, never called from main() - reachability-
+		# gated the same way extern_lib/compiler.extern_libs already is,
+		# not "declared anywhere in an imported module"
+		compiler, discovery = self._compile( '''
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	return 0
+''' )
+		self.assertEqual( discovery.errors.errors, [] )
+		self.assertFalse( compiler.requires_crt )
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		self.assertTrue( no_crt )
+
+	def test_inline_plus_requires_crt_rejected( self ) -> None:
+		# @inline splices the body at each call site and never becomes its
+		# own lowered unit, so @requires_crt on an @inline function would
+		# silently never fire - rejected outright rather than shipping a
+		# no-op combination
+		compiler, discovery = self._compile( '''
+@inline
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	return needs_crt()
+''' )
+		self.assertTrue( any( 'cannot also be @requires_crt' in str( e ) for e in discovery.errors.errors ), discovery.errors.errors )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+@unittest.skipUnless( os.name == 'nt', 'no_crt is a Windows-only concept in this codebase (see NoCrtLocalArrayStructRealCompileTests above) - @requires_crt has no observable C-level effect on Linux, where the compiler always links glibc regardless' )
+class RequiresCrtDecoratorRealCompileTests( unittest.TestCase ):
+	def _compile_and_run( self, source: str, expected_exit: int ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_requires_crt_function_compiles_links_and_runs_crt_linked( self ) -> None:
+		self._compile_and_run( '''
+@requires_crt
+def needs_crt() -> i32:
+	return 42
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return needs_crt() - 42
+''', expected_exit = 0 )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
@@ -2813,6 +4269,91 @@ class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClass
 			'exercises the dependency-ordering fix at all' )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
+	def test_list_global_read_inside_another_globals_init_function_runs_in_dependency_order( self ) -> None:
+		# real, reachable bug: unlike test_global_initializer_reading_another_
+		# globals_value_runs_in_dependency_order above (where a's value is
+		# read DIRECTLY inside b's own init instructions - `Foo.make(a.x)`),
+		# here _DATA is read from INSIDE a separate helper function
+		# (_build_value), only ever CALLED from VALUE's own init
+		# instructions. _referenced_global_qualnames only ever walked a
+		# global's own init instructions (a bare `call _build_value()`,
+		# never _build_value's OWN body) - so this shape's dependency on
+		# _DATA was invisible to _topologically_sort_globals entirely, not
+		# just mis-ordered. _DATA is a list[i32] (an RC container - see
+		# lib/builtins/__list.py's own header comment), so instead of a
+		# quieter wrong-value failure, VALUE's own init ran against a
+		# {0}-zero-initialized list[i32] - a null/zeroed lock+refcount
+		# structure - and __getitem__ on it crashed (real SIGILL, not just
+		# a wrong number) before this was fixed.
+		self._run( '\n'.join([
+			'_DATA: list[i32] = [ 16, 17, 18 ]',
+			'',
+			'def _build_value() -> i32:',
+			'	return _DATA.__getitem__( 0 ).unwrap( "x" )',
+			'',
+			'VALUE: i32 = _build_value()',
+			'',
+			'def main() -> i32:',
+			'	if VALUE != 16:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_scalar_global_read_inside_another_globals_init_function_also_needs_dependency_order( self ) -> None:
+		# same shape as test_list_global_read_inside_another_globals_init_
+		# function_runs_in_dependency_order above, but with a plain scalar
+		# (u32) dependency instead of an RC container - proves the
+		# call-indirection gap this fixes is general (any type, any
+		# in-between helper function), not something specific to RC
+		# containers. A scalar dependency doesn't crash when read
+		# uninitialized (it just reads C's own {0} zero value), so before
+		# the fix this shape silently computed the WRONG answer (1, not
+		# 43) rather than crashing - still a real miscompile, just a
+		# quieter one.
+		self._run( '\n'.join([
+			'def _compute_base() -> u32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return u32( 40 ) + u32( 2 )',
+			'',
+			'_BASE: u32 = _compute_base()',
+			'',
+			'def _read_base() -> u32:',
+			'	with compiler.wrap_arithmetic:',
+			'		return _BASE + u32( 1 )',
+			'',
+			'VALUE: u32 = _read_base()',
+			'',
+			'def main() -> i32:',
+			'	if VALUE != 43:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_single_list_global_with_no_cross_dependency_still_works( self ) -> None:
+		# the existing "single global, no cross-global dependency" pattern
+		# (matching lib/sys.py's own `argv: list[str] = _build_argv()`,
+		# which reads no OTHER module global - just raw C-level
+		# _raw_argc/_raw_argv) must keep working for a list[T] global too,
+		# unaffected by the dependency-ordering fix above (no OTHER global
+		# in the graph at all, so _topologically_sort_globals has nothing
+		# to reorder here).
+		self._run( '\n'.join([
+			'_DATA: list[i32] = [ 16, 17, 18 ]',
+			'',
+			'def main() -> i32:',
+			'	if _DATA.__len__() != 3:',
+			'		return 1',
+			'	if _DATA.__getitem__( 0 ).unwrap( "x" ) != 16:',
+			'		return 2',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
 class GlobalInitCycleDetectionTests( RCClassTestCase ):
 	def test_circular_global_value_dependency_is_a_clean_compile_error( self ) -> None:
 		# the one shape _topologically_sort_globals can never satisfy: two
@@ -2834,6 +4375,41 @@ class GlobalInitCycleDetectionTests( RCClassTestCase ):
 			'	return 0',
 		]))
 		self.assertEqual( self.discovery.errors.errors, [] ) # the cycle itself isn't detected until emit_c - discovery/lowering never needed a full order
+		with self.assertRaises( CompileError ):
+			emitter_c.emit_c( self.compiler )
+		self.assertTrue(
+			any( 'circular global-initializer dependency' in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
+	def test_circular_global_value_dependency_mediated_by_helper_functions_is_a_clean_compile_error( self ) -> None:
+		# same fundamentally-unorderable cycle as test_circular_global_value_
+		# dependency_is_a_clean_compile_error above, but each global's read
+		# of the OTHER is hidden behind its own helper function (_read_b/
+		# _read_a) rather than inline in the global's own init instructions.
+		# Before the call-indirection fix, _referenced_global_qualnames
+		# never saw either read at all (both live inside a CALLED function's
+		# body, not the global's own instructions) - so this exact cycle
+		# went completely undetected: no edges, an arbitrary (compiler.
+		# globals-scheduling) order, both globals built against whatever the
+		# other one's {0} zero value happened to be. Must now fail with the
+		# same clean, located CompileError as the direct-reference shape.
+		self._run( '\n'.join([
+			'def _read_b() -> i32:',
+			'	return B',
+			'',
+			'A: i32 = _read_b()',
+			'',
+			'def _read_a() -> i32:',
+			'	return A',
+			'',
+			'B: i32 = _read_a()',
+			'',
+			'def main() -> i32:',
+			'	with compiler.wrap_arithmetic:', # references both A and B so the cycle is actually scheduled/lowered, not dead-code-eliminated away
+			'		return A + B',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] ) # the cycle itself isn't detected until emit_c
 		with self.assertRaises( CompileError ):
 			emitter_c.emit_c( self.compiler )
 		self.assertTrue(
@@ -2950,7 +4526,7 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		for target in ( self._WINDOWS_TARGET, self._LINUX_TARGET ):
 			with self.subTest( target = target[ 'os' ] ):
 				src = self._compiled_source( target )
-				main_start = src.index( 'int main( void ) {' )
+				main_start = src.index( 'int main( int argc, char** argv ) {' )
 				second_line = src[ main_start: ].split( '\n', 2 )[1]
 				self.assertIn( '__metalpy_init();', second_line )
 
@@ -2994,10 +4570,7 @@ class FastLockCompileRunTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -3052,10 +4625,7 @@ class StrUpperLowerTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -3273,10 +4843,7 @@ class InterfaceCStructLayoutTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -3466,6 +5033,36 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn( '(p)[((uintptr_t)1ULL)] = $t1;', src ) # real write-back, not a copy-mutate-discard
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_ptr_dot_operator_method_call_on_plain_cstruct( self ) -> None:
+		# a plain (non-interface) CStruct's self is a real by-value T, unlike
+		# an @interface CStruct's (always Ptr[T]) - calling p.method() through
+		# p: Ptr[T] used to pass the raw pointer straight through as self,
+		# producing a C compile error (passing struct T* to a parameter
+		# declared struct T). _resolve_callee's own receiver (still evaluated
+		# against p's un-redirected Ptr[T] type) now gets dereferenced first,
+		# the same GetItem `p[0]` itself uses.
+		self._run( '''
+@cstruct
+class Widget:
+	y: i32
+	def double_y( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.y * 2
+
+def main() -> i32:
+	w: Widget = Widget( y = 21 )
+	p: Ptr[Widget] = compiler.addrof( w )
+	r: i32 = p.double_y()
+	if r != 42:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = emitter_c.emit_c( self.compiler )
+		self.assertIn( '(p)[((uintptr_t)0ULL)]', src ) # real dereference before the by-value call, not the raw pointer
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -3661,9 +5258,9 @@ class ListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'list_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	if x.__len__() != 3:
@@ -3717,7 +5314,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,OverflowError] = x.append( compiler.cast( i32, i ))
+			ar: Result[None,OverflowError|BorrowError] = x.append( compiler.cast( i32, i ))
 			if ar.is_err():
 				return 9
 			i += 1
@@ -3744,14 +5341,14 @@ def main() -> i32:
 			( 'erase_at_preserves_positional_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
-	r3: Result[None,OverflowError] = x.append( 40 )
-	r4: Result[None,OverflowError] = x.append( 50 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
+	r3: Result[None,OverflowError|BorrowError] = x.append( 40 )
+	r4: Result[None,OverflowError|BorrowError] = x.append( 50 )
 	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
 		return 9
-	er: Result[None,IndexError] = x.erase_at( 2 )
+	er: Result[None,IndexError|BorrowError] = x.erase_at( 2 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -3776,12 +5373,12 @@ def main() -> i32:
 			( 'insert_shifts_tail_right_and_preserves_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
-	ir: Result[None,OverflowError] = x.insert( 1, 99 )
+	ir: Result[None,OverflowError|BorrowError] = x.insert( 1, 99 )
 	if ir.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -3805,11 +5402,11 @@ def main() -> i32:
 			( 'insert_past_end_clamps_to_append', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
 	if r0.is_err() or r1.is_err():
 		return 9
-	ir: Result[None,OverflowError] = x.insert( 100, 30 )
+	ir: Result[None,OverflowError|BorrowError] = x.insert( 100, 30 )
 	if ir.is_err():
 		return 8
 	if x.__len__() != 3:
@@ -3833,9 +5430,9 @@ def set_it( x: list[i32] ) -> Result[None,IndexError]:
 
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError] = x.append( 10 )
-	r1: Result[None,OverflowError] = x.append( 20 )
-	r2: Result[None,OverflowError] = x.append( 30 )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	sr: Result[None,IndexError] = set_it( x )
@@ -3857,8 +5454,8 @@ def main() -> i32:
 			( 'list_str_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,OverflowError] = x.append( 'hello' )
-	r1: Result[None,OverflowError] = x.append( 'world' )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 'hello' )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 'world' )
 	if r0.is_err() or r1.is_err():
 		return 9
 	if x.__len__() != 2:
@@ -3879,7 +5476,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,OverflowError] = x.append( 'item' )
+			ar: Result[None,OverflowError|BorrowError] = x.append( 'item' )
 			if ar.is_err():
 				return 9
 			i += 1
@@ -3920,7 +5517,7 @@ class Holder:
 		self.items = list[i32]()
 
 	def add( self, v: i32 ) -> None:
-		r: Result[None,OverflowError] = self.items.append( v )
+		r: Result[None,OverflowError|BorrowError] = self.items.append( v )
 		if r.is_err():
 			sys.panic( 'append failed' )
 
@@ -3977,7 +5574,7 @@ class Triple:
 
 def main() -> i32:
 	xs: list[Triple] = list[Triple]()
-	r1: Result[None,OverflowError] = xs.append( Triple( 5 ))
+	r1: Result[None,OverflowError|BorrowError] = xs.append( Triple( 5 ))
 	if r1.is_err():
 		return 1
 	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
@@ -4029,12 +5626,12 @@ def main() -> i32:
 			( 'list_str_erase_at_preserves_order_and_refcounts', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,OverflowError] = x.append( 'a' )
-	r1: Result[None,OverflowError] = x.append( 'b' )
-	r2: Result[None,OverflowError] = x.append( 'c' )
+	r0: Result[None,OverflowError|BorrowError] = x.append( 'a' )
+	r1: Result[None,OverflowError|BorrowError] = x.append( 'b' )
+	r2: Result[None,OverflowError|BorrowError] = x.append( 'c' )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
-	er: Result[None,IndexError] = x.erase_at( 1 )
+	er: Result[None,IndexError|BorrowError] = x.erase_at( 1 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 2:
@@ -4065,10 +5662,7 @@ class UnsafeListGenericTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -4089,10 +5683,7 @@ class UnsafeListGenericTests( CompilerTestCase ):
 				f'exited {run_result.returncode}, expected {expected_exit} (stderr: {run_result.stderr})' )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_construct_append_getitem_get_ptr_erase( self ) -> None:
-		# get_ptr() specifically - list[T] itself no longer exposes it (a
-		# borrowed pointer is incompatible with a type whose whole point is
-		# "safe to hand to another thread"), but UnsafeList[T] still does
+	def test_construct_append_getitem_erase( self ) -> None:
 		self._run( '''
 def main() -> i32:
 	x: UnsafeList[i32] = UnsafeList[i32]()
@@ -4104,15 +5695,12 @@ def main() -> i32:
 	v: i32 = x.__getitem__( 1 ).unwrap( 'getitem failed' )
 	if v != 2:
 		return 2
-	p: Ptr[i32] = x.get_ptr( 0 ).unwrap( 'get_ptr failed' )
-	if p[0] != 1:
-		return 3
 	x.erase_at( 0 ).unwrap( 'erase_at failed' )
 	if x.__len__() != 2:
-		return 4
+		return 3
 	v = x.__getitem__( 0 ).unwrap( 'getitem failed' )
 	if v != 2:
-		return 5
+		return 4
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -4223,7 +5811,7 @@ class Consumer:
 
 	def run( self ) -> None:
 		while self.popped < 8000:
-			r: Result[i32, IndexError] = self.source.pop()
+			r: Result[i32, IndexError|BorrowError] = self.source.pop()
 			if r.is_ok():
 				v: i32 = r.unwrap( 'checked is_ok' )
 				with compiler.wrap_arithmetic:
@@ -4317,6 +5905,207 @@ def main() -> i32:
 			i += 1
 	if l.__len__() != 0:
 		return 3
+	return 0
+''' ),
+		], timeout = 30 )
+
+
+class ThreadLocalCompileRunTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' threading.ThreadLocal[T] (lib/threading.py) - one T|None slot per OS
+	thread, built on real TLS (Windows TlsAlloc/TlsGetValue/TlsSetValue/
+	TlsFree, POSIX pthread_key_create/pthread_getspecific/pthread_
+	setspecific). T is constrained to compiler.is_rc(T) - see that class's
+	own module comment for why (get()/set() reuse list[T]'s own handle-only
+	RC-element representation, compiler.cast(T, raw)/compiler.cast(Ptr[None],
+	value)).
+
+	Two real bugs found and fixed while building this (both via a real
+	compile+run repro, one confirmed with AddressSanitizer under gcc/WSL):
+	1. A genuine, general narrowing gap: `x = generic_obj.method()` (or
+	   `GenericClass[T]()` itself) never let `if x is None: ...; x.field`
+	   narrow at all - _type_of_expr (type_resolver.py) had no ast.Subscript
+	   case at all for `_try_resolve_callable_namespace`, so an EXPLICIT
+	   generic specialization's own type (`Holder[Box]`) was never resolved
+	   by this pass, unrelated to ThreadLocal specifically - see
+	   type_resolver.py's own `_try_resolve_generic_construction` docstring,
+	   which already flagged this exact gap ("explicit-subscript
+	   construction isn't even resolvable by name lookup today").
+	2. get() returning a BORROWED (non-increfed) alias of whatever set()
+	   last stored crashes with a real heap-use-after-free the moment BOTH
+	   the original owner's local AND get()'s own return value are still
+	   live at the same time (`b = Box(...); tl.set(b); got = tl.get()` -
+	   confirmed via ASAN: `b` and `got` both alias the same object, and
+	   BOTH get their own independent release_object() call in the
+	   caller's epilogue - this compiler unconditionally treats ANY call's
+	   result as a fresh, owned value the instant it's bound to a local,
+	   regardless of what the callee's own return statement did). Fixed by
+	   having get() incref before returning - same "peek returns a
+	   genuinely new owned reference" contract list.__getitem__ already
+	   has, not specific to TLS/ThreadLocal at all. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'basic_get_set_clear_single_thread', '''
+import threading
+
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+def main() -> i32:
+	tl = threading.ThreadLocal[Box]()
+	before = tl.get()
+	if before is not None:
+		return 1
+	b = Box( 42 )
+	tl.set( b )
+	after = tl.get()
+	if after is None:
+		return 2
+	if after.n != 42:
+		return 3
+	tl.clear()
+	cleared = tl.get()
+	if cleared is not None:
+		return 4
+	return 0
+''' ),
+			# the actual point: two OS threads must see INDEPENDENT slots -
+			# each sets its own value, then both must read back exactly what
+			# THEY set, never the other thread's value. The busy-wait on
+			# `started` maximizes the chance of catching a shared (non-
+			# thread-local) slot - both threads are guaranteed to have set
+			# their own value before either one reads it back.
+			( 'independent_per_thread_slots', '''
+import threading
+import atomic
+
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+tl: threading.ThreadLocal[Box] = threading.ThreadLocal[Box]()
+
+class Worker:
+	value: i32
+	result: atomic.Atomic[i32]
+	started: atomic.Atomic[i32]
+	def __init__( self, value: i32, result: atomic.Atomic[i32], started: atomic.Atomic[i32] ) -> None:
+		self.value = value
+		self.result = result
+		self.started = started
+	def run( self ) -> None:
+		b = Box( self.value )
+		tl.set( b )
+		self.started.fetch_add( 1 )
+		while self.started.load() < 2:
+			pass
+		got = tl.get()
+		if got is None:
+			self.result.store( -1 )
+			return
+		self.result.store( got.n )
+
+def main() -> i32:
+	started = atomic.Atomic[i32]( 0 )
+	result_a = atomic.Atomic[i32]( 0 )
+	result_b = atomic.Atomic[i32]( 0 )
+	wa = Worker( 111, result_a, started )
+	wb = Worker( 222, result_b, started )
+	ta = threading.Thread( wa.run )
+	tb = threading.Thread( wb.run )
+	ta.join()
+	tb.join()
+	if result_a.load() != 111:
+		return 1
+	if result_b.load() != 222:
+		return 2
+	return 0
+''' ),
+			# real cross-thread stress test for list[T].borrow_slice()/
+			# release_borrow(): N threads hammer append() on a list while the
+			# MAIN thread holds a borrow_slice() view, then releases it - a
+			# closed-form accounting check (every attempt is EITHER blocked
+			# with BorrowError OR succeeds, counted separately, and the two
+			# counts plus the list's own final length must all agree exactly)
+			# proves the borrow genuinely serializes against real concurrent
+			# mutation attempts, not just single-threaded reasoning. The
+			# busy-wait on `started` (same pattern independent_per_thread_
+			# slots above already uses) maximizes the chance every hammering
+			# thread has actually begun racing before the main thread
+			# releases the borrow - without it, a slow thread start could let
+			# every attempt land AFTER release, proving nothing.
+			( 'borrow_slice_blocks_concurrent_mutation_from_other_threads', '''
+import threading
+import atomic
+
+class Hammerer:
+	target:  list[i32]
+	started: atomic.Atomic[i32]
+	blocked: atomic.Atomic[i32]
+	ok:      atomic.Atomic[i32]
+
+	@staticmethod
+	def make( target: list[i32], started: atomic.Atomic[i32], blocked: atomic.Atomic[i32], ok: atomic.Atomic[i32] ) -> Hammerer:
+		return Hammerer.__allocate__( target = target, started = started, blocked = blocked, ok = ok )
+
+	def run( self ) -> None:
+		self.started.fetch_add( 1 )
+		i: i32 = 0
+		while i < 500:
+			if self.target.append( 1 ).is_ok():
+				self.ok.fetch_add( 1 )
+			else:
+				self.blocked.fetch_add( 1 )
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	l: list[i32] = list[i32]()
+	started = atomic.Atomic[i32]( 0 )
+	blocked = atomic.Atomic[i32]( 0 )
+	ok      = atomic.Atomic[i32]( 0 )
+
+	view: slice[i32] = l.borrow_slice()
+
+	threads: list[threading.Thread] = list[threading.Thread]()
+	t: i32 = 0
+	while t < 4:
+		h: Hammerer = Hammerer.make( l, started, blocked, ok )
+		threads.append( threading.Thread( h.run ) ).unwrap( 'append failed' )
+		with compiler.wrap_arithmetic:
+			t += 1
+
+	while started.load() < 4:
+		pass
+
+	l.release_borrow()
+
+	i: usize = 0
+	while i < 4:
+		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			i += 1
+
+	if len( view ) != 0:
+		return 1
+	if blocked.load() == 0:
+		return 2
+	if ok.load() == 0:
+		return 3
+	with compiler.wrap_arithmetic:
+		total: i32 = blocked.load() + ok.load()
+	if total != 2000:
+		return 4
+	if l.__len__() != usize( ok.load() ):
+		return 5
 	return 0
 ''' ),
 		], timeout = 30 )
@@ -4637,6 +6426,313 @@ def main() -> i32:
 		] )
 
 
+class MatchNestedUnionMemberRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for a fixed bug in type_resolver.py's
+	_match_pattern: `case SomeUnion.Variant(x):` resolves SomeUnion PURELY
+	from the pattern's own text, with no regard for what the match
+	subject's actual type is - correct when the subject genuinely IS
+	SomeUnion directly (the common case), but SomeUnion can also be nested
+	OPAQUELY as one member of a WIDER union that's the subject's real type
+	(e.g. `e: MyError | SomeOtherType`) - the code this used to build
+	tested SomeUnion's own INTERNAL tag position (Variant's position within
+	SomeUnion) directly against the subject, which is really the OUTER
+	union's own, entirely different tag space. Confirmed via a real repro:
+	silently WRONG generated code (not a crash, not a compile error) -
+	`case MyError.Bad(_):` only matched correctly by COINCIDENCE, whenever
+	MyError happened to sort first in the outer union's own canonicalized
+	member order. Found while building PLAN_GENERATORS.md's StopIteration
+	reversal (every generator error type now includes StopIteration, which
+	- living in builtins - sorts ahead of almost any user error type,
+	making this the COMMON case for generator error handling going
+	forward, not a rare edge case) but is completely general and pre-
+	existing, unrelated to generators specifically. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'nested_union_member_sorted_first_already_worked', '''
+class ZzzMarker:
+	pass
+
+@union
+class MyError:
+	Bad: None
+
+def make( which: i32 ) -> MyError | ZzzMarker:
+	if which == 0:
+		return MyError.Bad( None )
+	return ZzzMarker()
+
+def main() -> i32:
+	v = make( 0 )
+	match v:
+		case MyError.Bad( _ ):
+			return 0
+		case _:
+			return 1
+''' ),
+			( 'nested_union_member_sorted_second_was_the_real_bug', '''
+class AaaMarker:
+	pass
+
+@union
+class MyError:
+	Bad: None
+
+def make( which: i32 ) -> AaaMarker | MyError:
+	if which == 0:
+		return MyError.Bad( None )
+	return AaaMarker()
+
+def main() -> i32:
+	v = make( 0 )
+	match v:
+		case MyError.Bad( _ ):
+			return 0
+		case _:
+			return 1
+''' ),
+		] )
+
+
+class GenericMatchTypeMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for type_resolver.py's _try_fold_match_type -
+	`match type(<Name>): case ConcreteClass(binding): ... case _: ...` over a
+	generic function's own type-parameter-typed parameter, folded to exactly
+	one arm's own statements at monomorphization time (no runtime branch left
+	behind at all - see the rewrite's own docstring, and PLAN_MATCH_TYPE_
+	MONOMORPHIZATION.md for the full design). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'match_type_selects_a_different_arm_per_instantiation', '''
+class Foo:
+	pass
+
+def describe[T]( x: T ) -> i32:
+	match type( x ):
+		case i32( n ):
+			with compiler.wrap_arithmetic:
+				return n + 100
+		case Foo( f ):
+			return 200
+		case _:
+			return 300
+
+def main() -> i32:
+	a: i32 = 5
+	if describe( a ) != 105:
+		return 1
+	if describe( Foo() ) != 200:
+		return 2
+	b: bool = True
+	if describe( b ) != 300:
+		return 3
+	return 0
+''' ),
+			( 'match_type_same_name_capture_skips_the_synthesized_rebind', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def identity[T]( other: T ) -> T:
+	match type( other ):
+		case Box( other ):
+			return other
+		case _:
+			return other
+
+def main() -> i32:
+	b: Box = Box( 42 )
+	r: Box = identity( b )
+	if r.v != 42:
+		return 1
+	x: i32 = 7
+	n: i32 = identity( x )
+	if n != 7:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class CEnumReturnCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for _stmt_Return's own CEnum<->underlying-
+	scalar coercion - "a CEnum has exactly the same runtime representation as
+	its underlying type" (see _try_lower_construct_call's own CEnum-
+	construction comment), so returning one where the other is declared is a
+	value-preserving reinterpretation in EITHER direction, mirroring
+	_check_assignable's own bidirectional exemption elsewhere. _stmt_Return
+	can't just delegate to _check_assignable (strict=False is deliberate, to
+	avoid it firing before the covered-Result-error-widening case gets a
+	chance - see that method's own comment), so it re-derives every exemption
+	_check_assignable would apply - PLAN_COMPILER_BUG_SWEEP.md's own audit
+	found this had only ever re-derived ONE of the two directions: returning
+	a CEnum value where the function declares its own underlying scalar type
+	worked, but the REVERSE (returning a raw scalar where the function
+	declares the CEnum) was wrongly rejected - confirmed via a real repro
+	before the fix ("function returns X, not Y" for a case that should be a
+	legitimate reinterpretation). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'both_cenum_underlying_return_directions_work', '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_underlying() -> i32:
+	return Color.Blue
+
+def get_red() -> Color:
+	x: i32 = 0
+	return x
+
+def main() -> i32:
+	if get_underlying() != 1:
+		return 1
+	c: Color = get_red()
+	if c != Color.Red:
+		return 2
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_genuinely_mismatched_return_type_still_rejected( self ) -> None:
+		# negative companion - a completely unrelated type (str) returned
+		# where a CEnum is declared must still be rejected, not silently
+		# accepted by an over-broadened coercion
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_wrong() -> Color:
+	s: str = 'not a color'
+	return s
+
+def main() -> i32:
+	c: Color = get_wrong()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bare_literal_via_return_and_construction( self ) -> None:
+		# _expr_Constant's own CEnum handling (distinct from _stmt_Return's
+		# coercion tested above) - a BARE integer literal, not a named local,
+		# validated/typed against the CEnum's own underlying scalar, both via
+		# a plain `return 1` and via an explicit Color(1) construction call
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_via_return() -> Color:
+	return 1
+
+def get_via_construct() -> Color:
+	return Color( 1 )
+
+def main() -> i32:
+	a: Color = get_via_return()
+	if a != Color.Blue:
+		return 1
+	b: Color = get_via_construct()
+	if b != Color.Blue:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_kind_mismatched_literal_rejected_cleanly_not_crashed( self ) -> None:
+		# _expr_Constant's own CEnum branch used to exempt EVERY CEnum
+		# expected_type from kind-validation outright (meant only for a raw
+		# INT literal's own magnitude, per the construction-call comment) -
+		# a kind-mismatched literal (a bare string, here) sailed through
+		# untyped-checked, tagging the resulting Const with the CEnum type
+		# while its own .value stayed the Python string - confirmed to crash
+		# emitter_c.py's _emit_const with an uncaught Python
+		# NotImplementedError (a raw traceback, not a compile error) rather
+		# than being cleanly rejected. Exercises the bare-literal-via-return
+		# shape directly (distinct from test_genuinely_mismatched_return_
+		# type_still_rejected above, which uses a named local of the wrong
+		# type, not a mismatched literal)
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def get_wrong() -> Color:
+	return 'not a color'
+
+def main() -> i32:
+	c: Color = get_wrong()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_kind_mismatched_construction_literal_rejected_cleanly_not_crashed( self ) -> None:
+		# same bug, the OTHER call site that reaches _expr_Constant's CEnum
+		# branch: an explicit Color(...) construction call whose own argument
+		# is a kind-mismatched literal. _try_lower_construct_call's own CEnum
+		# branch only validates an INT literal's own magnitude directly -
+		# anything else is deferred entirely to _expr_Constant, so this
+		# crashed the identical way before the fix
+		self._run( '''
+@enum( i32 )
+class Color:
+	Red = 0
+	Blue = 1
+
+def main() -> i32:
+	c: Color = Color( 'bad' )
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_out_of_range_literal_rejected( self ) -> None:
+		# the magnitude check (previously only reachable via the
+		# construction-call path's own separate, duplicate check) now also
+		# applies via the bare-literal-return path, using the CEnum's own
+		# underlying scalar's real range rather than skipping validation
+		self._run( '''
+@enum( u8 )
+class Small:
+	A = 0
+	B = 1
+
+def get_bad() -> Small:
+	return 999
+
+def main() -> i32:
+	s: Small = get_bad()
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+
 class AtomicRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for compiler.atomic_*(Ptr[T], ...)
 	(lowering.py's _lower_compiler_atomic_*, ir.py's Atomic* instructions,
@@ -4900,6 +6996,369 @@ def main() -> i32:
 		return 5
 	return 0
 ''' ),
+			# regression test for the SAME bug as CallableTests.test_optional_
+			# callable_narrowed_by_is_not_none_is_callable, hitting
+			# _try_lower_closure_call's own copy of the check instead of
+			# _try_lower_indirect_call's: a Closure[...]|None parameter,
+			# narrowed to non-None via `if x is not None:`, used to still
+			# read as the union type (name.type, ignoring cfg.py's
+			# narrowed_member()) and fail with "cannot call c"
+			( 'optional_closure_narrowed_by_is_not_none_is_callable', '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def get( self ) -> i32:
+		return self.x
+
+def maybe_call( c: Closure[[], i32]|None = None ) -> i32:
+	if c is not None:
+		return c()
+	return -1
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	c: Closure[[], i32] = w.get
+	result: i32 = maybe_call( c )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
+			# real heap-use-after-free found via list[Closure[[],None]]: a
+			# Closure stored/retrieved through a generic container (list[T])
+			# was silently under-referenced by one - Result.unwrap()'s `ok: T
+			# = self.data.v_Ok` (an ast.Attribute read of an EXISTING union
+			# payload) was misidentified as a FRESH closure construction
+			# (the same node shape `worker.run` uses) purely because its
+			# type happened to be ClosureType, skipping the Incref an
+			# aliasing capture-into-local needs. append()/pop()/unwrap()
+			# all round-trip through exactly this path
+			( 'list_of_closures_round_trips_refcount_correctly', '''
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+	def bump( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.n = self.n + 1
+
+def main() -> i32:
+	counter = Counter()
+	c: Closure[[], None] = counter.bump
+	rc0: usize = compiler.refcount( c )
+
+	lst = list[Closure[[], None]]()
+	lst.append( c ).unwrap( 'append failed' )
+	rc1: usize = compiler.refcount( c )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+
+	# pop() removes the list's own slot reference but hands back a new
+	# one via its Result.Ok payload - net unchanged from rc1 (c's own
+	# reference is untouched throughout, still live here)
+	popped: Closure[[], None] = lst.pop().unwrap( 'pop failed' )
+	rc2: usize = compiler.refcount( popped )
+	if rc2 != rc1:
+		return 2
+
+	popped()
+	if counter.n != 1:
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class CapturingClosureRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for CAPTURING closures - a lambda or
+	nested def that references a local/parameter of its own enclosing
+	function, generalizing ClosureRealCompileTests' bound-method-only
+	Closure[...] to a synthesized captured-env RCClass (see the closures
+	plan). Confirms the generated code actually reads the right captured
+	value AND manages the captured RC value's refcount correctly - the
+	same posture ClosureRealCompileTests' own
+	refcount_incremented_once_on_construction_and_calls_are_neutral takes,
+	applied here to a captured local instead of a bound-method receiver. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'nested_def_capturing_scalar_local_and_called_directly', '''
+def make_adder( n: i32 ) -> i32:
+	def add( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + n
+	return add( 10 )
+
+def main() -> i32:
+	result: i32 = make_adder( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 15
+	return diff
+''' ),
+			( 'lambda_capturing_scalar_local_passed_to_a_closure_parameter', '''
+def call_it( f: Closure[[i32],i32], v: i32 ) -> i32:
+	return f( v )
+
+def outer( y: i32 ) -> i32:
+	return call_it( lambda x: y, 5 )
+
+def main() -> i32:
+	result: i32 = outer( 41 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 41
+	return diff
+''' ),
+			# mixed scalar + RC capture - correct per-field decref (via
+			# type_resolver.py's own _synthesize_rcclass_destructor/
+			# _build_field_teardown_ast, unmodified) on the env's own
+			# teardown, no leak/double-free. A second, unrelated Box instance
+			# untouched by the closure confirms nothing else's refcount moved
+			( 'nested_def_capturing_mixed_scalar_and_rc_locals', '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Box:
+		return Box.__allocate__( v = v )
+
+def outer( n: i32, b: Box ) -> i32:
+	def combine() -> i32:
+		with compiler.wrap_arithmetic:
+			return n + b.v
+	return combine()
+
+def main() -> i32:
+	b: Box = Box.make( 100 )
+	other: Box = Box.make( 999 )
+	rc0: usize = compiler.refcount( b )
+	other_rc0: usize = compiler.refcount( other )
+	result: i32 = outer( 41, b )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 141
+	if diff != 0:
+		return 1
+	rc1: usize = compiler.refcount( b )
+	if rc1 != rc0:
+		return 2
+	other_rc1: usize = compiler.refcount( other )
+	if other_rc1 != other_rc0:
+		return 3
+	return 0
+''' ),
+			# construction increfs the captured RC local exactly once, 200
+			# repeated calls through the closure touch its refcount not at
+			# all, teardown releases exactly that one reference - direct
+			# analogue of ClosureRealCompileTests' own bound-method version,
+			# defending the AST-rewrite's inline-cast-per-occurrence design
+			# (never a prologue-materialized local) against reintroducing
+			# per-call refcount churn
+			( 'refcount_incremented_once_on_capture_and_calls_are_neutral', '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Box:
+		return Box.__allocate__( v = v )
+
+def outer( b: Box, n: i32 ) -> i32:
+	rc0: usize = compiler.refcount( b )
+
+	def inner( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + n + b.v
+
+	rc1: usize = compiler.refcount( b )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+
+	i: i32 = 0
+	result: i32 = 0
+	with compiler.wrap_arithmetic:
+		while i < 200:
+			result = inner( 1 )
+			i += 1
+
+	rc_after_calls: usize = compiler.refcount( b )
+	if rc_after_calls != rc1:
+		return 2
+
+	with compiler.wrap_arithmetic:
+		expected: i32 = n + 1 + b.v
+	if result != expected:
+		return 3
+
+	return 0
+
+def main() -> i32:
+	b: Box = Box.make( 100 )
+	rc_before: usize = compiler.refcount( b )
+	code: i32 = outer( b, 41 )
+	if code != 0:
+		return code
+	rc_after: usize = compiler.refcount( b )
+	if rc_after != rc_before:
+		return 10
+	return 0
+''' ),
+			# `d = c` aliasing an EXISTING capturing closure increfs the
+			# CLOSURE object itself once, not the captured value again -
+			# direct analogue of ClosureRealCompileTests' own
+			# shared_closure_across_multiple_owners
+			( 'shared_capturing_closure_across_multiple_owners', '''
+class Box:
+	v: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Box:
+		return Box.__allocate__( v = v )
+
+def outer( b: Box ) -> i32:
+	rc0: usize = compiler.refcount( b )
+
+	def get() -> i32:
+		return b.v
+
+	rc1: usize = compiler.refcount( b )
+	with compiler.wrap_arithmetic:
+		if rc1 != rc0 + 1:
+			return 1
+
+	other: Closure[[], i32] = get
+	closure_rc: usize = compiler.refcount( get )
+	if closure_rc != 2:
+		return 2
+	if get() != 100 or other() != 100:
+		return 3
+
+	compiler.decref( get )
+	rc_mid: usize = compiler.refcount( b )
+	if rc_mid != rc1:
+		return 4
+	compiler.decref( other )
+	rc2: usize = compiler.refcount( b )
+	if rc2 != rc0:
+		return 5
+	return 0
+
+def main() -> i32:
+	b: Box = Box.make( 100 )
+	return outer( b )
+''' ),
+			# a nested def inside a LOOP correctly rebuilds a fresh env +
+			# closure each iteration ("closure creation happens when the def
+			# statement executes", matching Python's own semantics) - each
+			# closure independently captures its own loop-iteration value,
+			# not a shared/aliased one
+			( 'nested_def_capturing_inside_loop_rebuilds_per_iteration', '''
+def make_closures_summed( n: i32 ) -> i32:
+	total: i32 = 0
+	i: i32 = 0
+	with compiler.wrap_arithmetic:
+		while i < n:
+			def get_i() -> i32:
+				return i
+			total += get_i()
+			i += 1
+	return total
+
+def main() -> i32:
+	result: i32 = make_closures_summed( 5 ) # 0+1+2+3+4
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 10
+	return diff
+''' ),
+		] )
+
+
+class PropertyRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for @property (lowering.py's _expr_
+	Attribute is_property branch) - unlike the IR-shape assertions in
+	lowering_test.py, these confirm the generated code actually calls the
+	getter and produces the right value, and (for an RC-typed property)
+	doesn't leak or double-free the returned value across repeated reads. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			# obj.attr (no call parens) actually calls the getter - a plain
+			# GetAttr would find no real field named 'doubled' and fail to
+			# compile at all, so a successful compile+correct value together
+			# confirm the Call-based dispatch is really happening
+			( 'scalar_property_computed_from_field', '''
+class Box:
+	x: i32
+
+	@property
+	def doubled( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x * 2
+
+def main() -> i32:
+	b: Box = Box( x = 21 )
+	if b.doubled != 42:
+		return 1
+	return 0
+''' ),
+			# the property's result participates in an ordinary expression
+			# exactly like a real field would - not just a bare read
+			( 'property_used_in_expression', '''
+class Box:
+	x: i32
+
+	@property
+	def doubled( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x * 2
+
+def main() -> i32:
+	b: Box = Box( x = 5 )
+	with compiler.wrap_arithmetic:
+		y: i32 = b.doubled + 1
+	if y != 11:
+		return 1
+	return 0
+''' ),
+			# an RC-typed property (returns a fresh str each read) read
+			# repeatedly in a loop - a missing/wrong incref or decref on the
+			# Call's own result would leak or double-free, and 200
+			# iterations is enough for that to reliably surface
+			( 'rc_typed_property_read_in_a_loop', '''
+class Greeter:
+	name: str
+
+	@property
+	def greeting( self ) -> str:
+		return "hello " + self.name
+
+def main() -> i32:
+	g: Greeter = Greeter( name = "world" )
+	i: i32 = 0
+	while i < 200:
+		if len( g.greeting ) != 11:
+			return 1
+		with compiler.wrap_arithmetic:
+			i += 1
+	return 0
+''' ),
 		] )
 
 
@@ -4987,6 +7446,42 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# the direct end-to-end proof a REAL capturing closure (not a
+			# bound method) survives the exact same foreign-C-callback round
+			# trip Thread already proves for bound methods: incref -> cast
+			# to Ptr[None] -> CreateThread/pthread_create's own userdata
+			# slot -> _thread_entry casts back -> call(). Needs ZERO new
+			# compiler code to pass (per the closures plan's own "Precedent
+			# reused" section) - Thread/_thread_entry only ever treat
+			# Closure[[],None] as opaque, regardless of what it captures.
+			# write_captured captures TWO locals of different kinds (r: an
+			# RC receiver used to hand a result back across the thread
+			# boundary, and n: a plain scalar) - the spawned thread reading
+			# back the correct scalar CONFIRMS the env's own field read
+			# survived the round trip, not just that SOME thread ran
+			( 'capturing_closure_survives_thread_round_trip', '''
+import threading
+
+class Result:
+	value: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Result:
+		return Result.__allocate__( value = v )
+
+def main() -> i32:
+	r: Result = Result.make( 0 )
+	n: i32 = 777
+
+	def write_captured() -> None:
+		r.value = n
+
+	t: threading.Thread = threading.Thread( write_captured )
+	t.join()
+	if r.value != 777:
+		return 1
+	return 0
+''' ),
 		], timeout = 30 )
 
 
@@ -5012,26 +7507,32 @@ class StrFindIndexSplitTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'find_and_index', '''
 def main() -> i32:
 	s: str = 'deadbeef-dead-beef-dead-beefdeadbeef'
-	r0: Result[usize,IndexError] = s.find( '-' )
-	if r0.is_err() or r0.unwrap( 'x' ) != 8:
+	r0: isize = s.find( '-' )
+	if r0 != isize( 8 ):
 		return 1
-	r1: Result[usize,IndexError] = s.find( 'zzz' )
-	if r1.is_ok():
+	r1: isize = s.find( 'zzz' )
+	if r1 != isize( -1 ):
 		return 2
-	r2: Result[usize,IndexError] = s.find( '' )
-	if r2.is_err() or r2.unwrap( 'x' ) != 0:
+	r2: isize = s.find( '' )
+	if r2 != isize( 0 ):
 		return 3
-	if s.index( 'beef' ) != 4:
+	i0: Result[usize,IndexError] = s.index( 'beef' )
+	if i0.is_err() or i0.unwrap( 'x' ) != 4:
 		return 4
-	if s.find( s ).unwrap( 'x' ) != 0:
+	if s.find( s ) != isize( 0 ):
 		return 5
-	r3: Result[usize,IndexError] = s.find( 'toolongtoolongtoolongtoolongtoolongtoolong' )
-	if r3.is_ok():
+	r3: isize = s.find( 'toolongtoolongtoolongtoolongtoolongtoolong' )
+	if r3 != isize( -1 ):
 		return 6
 	# find() with an explicit start offset - resumes past the first match
-	r4: Result[usize,IndexError] = s.find( '-', 9 )
-	if r4.is_err() or r4.unwrap( 'x' ) != 13:
+	r4: isize = s.find( '-', 9 )
+	if r4 != isize( 13 ):
 		return 7
+	# index() on a missing substring returns Result.Err, never panics -
+	# the corrected (was: backwards/panicking) index()/find() convention
+	i1: Result[usize,IndexError] = s.index( 'zzz' )
+	if i1.is_ok():
+		return 8
 	return 0
 ''' ),
 			# the exact motivating case from PLAN_SUBCLASSING_VTABLES_COM.md's
@@ -5168,16 +7669,22 @@ def main() -> i32:
 ''' ),
 			( 'rfind_rindex', '''
 def main() -> i32:
-	r1: Result[usize,IndexError] = 'abcabc'.rfind( 'abc' )
-	if r1.unwrap( 'x' ) != 3:
+	r1: isize = 'abcabc'.rfind( 'abc' )
+	if r1 != isize( 3 ):
 		return 1
-	r2: Result[usize,IndexError] = 'abcabc'.rfind( 'nope' )
-	if r2.is_ok():
+	r2: isize = 'abcabc'.rfind( 'nope' )
+	if r2 != isize( -1 ):
 		return 2
-	if 'abcabc'.rindex( 'bc' ) != 4:
+	i1: Result[usize,IndexError] = 'abcabc'.rindex( 'bc' )
+	if i1.is_err() or i1.unwrap( 'x' ) != 4:
 		return 3
-	if 'abcabc'.rfind( '' ).unwrap( 'x' ) != 6:
+	if 'abcabc'.rfind( '' ) != isize( 6 ):
 		return 4
+	# rindex() on a missing substring returns Result.Err, never panics -
+	# the corrected (was: backwards/panicking) rindex()/rfind() convention
+	i2: Result[usize,IndexError] = 'abcabc'.rindex( 'nope' )
+	if i2.is_ok():
+		return 5
 	return 0
 ''' ),
 			( 'replace', '''
@@ -5247,14 +7754,213 @@ def main() -> i32:
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
-	def test_rindex_panics_when_not_found( self ) -> None:
+	def test_rindex_returns_err_and_never_panics_when_not_found( self ) -> None:
+		''' rindex()/index() no longer panic on a missing substring - that
+		was the old (backwards) behavior this method now explicitly
+		guards against regressing to. A clean exit 0 here (not a panic
+		exit code) is the actual assertion. '''
 		self._run( '''
 def main() -> i32:
-	'abc'.rindex( 'nope' )
-	return 0
+	match 'abc'.rindex( 'nope' ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
-		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+
+class StrLenGetitemIndexTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' O(1) str.__len__() (__char_count) and the new codepoint-indexed
+	str.__getitem__() (sparse __index, one entry per 256 codepoints) - both
+	computed for free during _from_owned_cstr's existing mandatory UTF-8
+	validation scan (lib/builtins/__init__.py). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'empty_string', '''
+def main() -> i32:
+	s: str = ''
+	if len( s ) != 0:
+		return 1
+	r: Result[str,IndexError] = s.__getitem__( 0 )
+	if r.is_ok():
+		return 2
+	return 0
+''' ),
+			( 'single_ascii_char', '''
+def main() -> i32:
+	s: str = 'x'
+	if len( s ) != 1:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'x':
+		return 2
+	r: Result[str,IndexError] = s.__getitem__( 1 )
+	if r.is_ok():
+		return 3
+	return 0
+''' ),
+			( 'exactly_256_codepoints', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	s: str = run_of_a( 256 )
+	if len( s ) != 256:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'a':
+		return 2
+	if s.__getitem__( 255 ).unwrap( 'x' ) != 'a':
+		return 3
+	r: Result[str,IndexError] = s.__getitem__( 256 )
+	if r.is_ok():
+		return 4
+	return 0
+''' ),
+			( '257_codepoints_crosses_index_boundary', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	s: str = run_of_a( 256 ) + 'b'
+	if len( s ) != 257:
+		return 1
+	if s.__getitem__( 255 ).unwrap( 'x' ) != 'a':
+		return 2
+	if s.__getitem__( 256 ).unwrap( 'x' ) != 'b':
+		return 3
+	return 0
+''' ),
+			( 'multibyte_codepoint_index_ne_byte_offset', '''
+def main() -> i32:
+	s: str = 'héllo'
+	if len( s ) != 5:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'x' ) != 'h':
+		return 2
+	if s.__getitem__( 1 ).unwrap( 'x' ) != 'é':
+		return 3
+	if s.__getitem__( 2 ).unwrap( 'x' ) != 'l':
+		return 4
+	if s.__getitem__( 4 ).unwrap( 'x' ) != 'o':
+		return 5
+	if s.byte_len() != 6: # 4 ascii + 2-byte 'é'
+		return 6
+	return 0
+''' ),
+			( 'out_of_range_index_is_err', '''
+def main() -> i32:
+	s: str = 'abc'
+	r: Result[str,IndexError] = s.__getitem__( 3 )
+	if r.is_ok():
+		return 1
+	r2: Result[str,IndexError] = s.__getitem__( 1000000 )
+	if r2.is_ok():
+		return 2
+	return 0
+''' ),
+			( 'group_boundary_string_still_readable_after_construction', '''
+def run_of_a( count: usize ) -> str:
+	s: str = ''
+	i: usize = 0
+	while i < count:
+		s += 'a'
+		with compiler.wrap_arithmetic:
+			i += 1
+	return s
+
+def main() -> i32:
+	original: str = run_of_a( 256 ) + 'zb'
+	if original.__getitem__( 256 ).unwrap( 'x' ) != 'z':
+		return 1
+	if len( original ) != 258:
+		return 2
+	return 0
+''' ),
+		])
+
+
+class CallDunderConstructDispatchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' T(...) dispatches to a static T.__call__(...) instead of construction
+	when one is defined - lowering.py's _rewrite_call_dunder_call. str's own
+	__call__(x: str) -> str (lib/builtins/__init__.py) is the concrete
+	motivating case: str is immutable, so str(x) just reuses x, no copy. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'str_call_is_identity_not_a_copy', '''
+def main() -> i32:
+	s: str = 'hello'.lstrip() # forces a real, non-immortal-literal allocation
+	if compiler.refcount( s ) != 1:
+		return 1
+	t: str = str( s )
+	if t != s:
+		return 2
+	if compiler.refcount( s ) != 2:
+		return 3
+	if compiler.refcount( t ) != 2:
+		return 4
+	return 0
+''' ),
+			( 'str_call_generic_fallback_uses_own_str_dunder', '''
+def main() -> i32:
+	pi: f64
+	with compiler.wrap_arithmetic:
+		pi = 3.5
+	s: str
+	with compiler.wrap_arithmetic:
+		s = str( pi )
+	if s == '':
+		return 1
+	return 0
+''' ),
+			( 'user_defined_static_call_dunder', '''
+class Converter:
+	@staticmethod
+	def __call__( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x + 1
+
+def main() -> i32:
+	if Converter( 41 ) != 42:
+		return 1
+	return 0
+''' ),
+			( 'ordinary_construction_unaffected_without_call_dunder', '''
+class Point:
+	x: i32
+	y: i32
+
+def main() -> i32:
+	p: Point = Point( x = 1, y = 2 )
+	if p.x != 1 or p.y != 2:
+		return 1
+	return 0
+''' ),
+		])
 
 
 class StrPhase2PaddingTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -5803,6 +8509,137 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 
+class DeferAsLastStatementOfNonTerminatingIfBranchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' regression tests for a real compile error in lowering.py's
+	_stmt_diverges: `defer(...)`/`errdefer(...)` used as the LAST statement
+	of an if-branch that doesn't itself terminate (no return/break/continue,
+	just falls through to whatever comes after the if) failed to compile
+	with "name 'defer' is not defined".
+
+	_stmt_If calls _stmt_diverges on a branch's last statement to decide
+	whether that branch's own ending state can reach the if's join point at
+	all (used for narrowing/bindings merge - see _stmt_diverges' own
+	docstring). _stmt_diverges recognizes a bare call-expression statement
+	and tries to resolve its callee to check for a -> NoReturn return type
+	(catching sys.panic()-shaped branches) - but defer/errdefer are never
+	real, resolvable callables; they're recognized purely by AST shape
+	(_stmt_Expr, before ordinary call resolution ever runs - see this
+	file's own module docstring on defer/errdefer). _stmt_diverges didn't
+	share that recognition, so `defer(expr)`/`errdefer(expr)` as a branch's
+	own last statement fell through to _resolve_callee_target, which tried
+	to look up the bare name 'defer' as an ordinary function and failed
+	outright.
+
+	Found via lib/builtins/__str.py's case_map (POSIX target): `if loc is
+	not None: defer(freelocale(loc))` is the only defer call in the whole
+	codebase shaped exactly this way - every other call site either sits at
+	a function's top level or right after an early-return guard clause
+	(`if loc is None: return False` then an UNCONDITIONAL defer below it),
+	never as an if-branch's own last statement - which is why this went
+	unnoticed until real POSIX-target compilation (WSL/gcc, not just
+	Windows/clang/MSVC) actually exercised that code path for the first
+	time. Fixed by having _stmt_diverges recognize the defer/errdefer AST
+	shape (the same check _stmt_Expr already uses) and treat it as non-
+	diverging - defer/errdefer always falls through (arms a flag, never
+	itself returns/panics), never NoReturn-shaped. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_defer_as_only_statement_of_non_terminating_if_branch( self ) -> None:
+		# proves the fix is real, not just "compiles": bump() must actually
+		# run when the defer was armed (should_arm=True), and must NOT run
+		# a second time when it wasn't (should_arm=False) - a Ptr[i32]
+		# out-param makes the deferred call's own side effect directly
+		# observable from main()
+		self._run( '''
+def bump( counter: Ptr[i32] ) -> None:
+	with compiler.wrap_arithmetic:
+		counter[0] = counter[0] + 1
+
+def maybe_defer( should_arm: bool, counter: Ptr[i32] ) -> None:
+	if should_arm:
+		defer( bump( counter ))
+	return
+
+def main() -> i32:
+	n: i32 = 0
+	maybe_defer( True, compiler.addrof( n ))
+	if n != 1:
+		return 1
+	maybe_defer( False, compiler.addrof( n ))
+	if n != 1:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_errdefer_as_only_statement_of_non_terminating_if_branch( self ) -> None:
+		self._run( _RESULT_FIXTURE + '\n' + '''
+def bump( counter: Ptr[i32] ) -> None:
+	with compiler.wrap_arithmetic:
+		counter[0] = counter[0] + 1
+
+def maybe_errdefer( should_arm: bool, fail: bool, counter: Ptr[i32] ) -> Result[i32,OverflowError]:
+	if should_arm:
+		errdefer( bump( counter ))
+	if fail:
+		return Result.Err( OverflowError() )
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	n: i32 = 0
+	r1: Result[i32,OverflowError] = maybe_errdefer( True, True, compiler.addrof( n ))
+	if not r1.is_err():
+		return 1
+	if n != 1:
+		return 2
+	r2: Result[i32,OverflowError] = maybe_errdefer( True, False, compiler.addrof( n ))
+	if not r2.is_ok():
+		return 3
+	if n != 1:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_str_upper_matches_the_exact_reported_shape( self ) -> None:
+		# the ACTUAL originally-failing code (lib/builtins/__str.py's
+		# case_map, minus the POSIX-only towupper_l plumbing this test
+		# doesn't need): `if loc is not None: defer(freelocale(loc))` -
+		# same "if <cond>: defer(...)" shape with nothing after the if,
+		# confirming the fix covers the real repro, not just a synthetic
+		# stand-in
+		self._run( '''
+def maybe_release( loc: Ptr[None], counter: Ptr[i32] ) -> None:
+	if loc is not None:
+		defer( bump( counter ))
+	return
+
+def bump( counter: Ptr[i32] ) -> None:
+	with compiler.wrap_arithmetic:
+		counter[0] = counter[0] + 1
+
+def main() -> i32:
+	n: i32 = 0
+	sentinel: i32 = 0
+	maybe_release( compiler.addrof( sentinel ), compiler.addrof( n ))
+	if n != 1:
+		return 1
+	maybe_release( None, compiler.addrof( n ))
+	if n != 1:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+
 class GUIDTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/guid.py's GUID type - PLAN_SUBCLASSING_VTABLES_COM.md's Phase 3
 	(COM specifics). Needs import_builtins=True (str.split, list[str]). '''
@@ -5828,9 +8665,9 @@ def main() -> i32:
 		return 2
 	if g.data3 != 0xbeef:
 		return 3
-	if g.data4_0 != 0xde or g.data4_1 != 0xad:
+	if g.data4[0] != 0xde or g.data4[1] != 0xad:
 		return 4
-	if g.data4_2 != 0xbe or g.data4_3 != 0xef or g.data4_4 != 0xde or g.data4_5 != 0xad or g.data4_6 != 0xbe or g.data4_7 != 0xef:
+	if g.data4[2] != 0xbe or g.data4[3] != 0xef or g.data4[4] != 0xde or g.data4[5] != 0xad or g.data4[6] != 0xbe or g.data4[7] != 0xef:
 		return 5
 	return 0
 ''' ),
@@ -5948,11 +8785,11 @@ def main() -> i32:
 	j: usize = 0
 	with compiler.wrap_arithmetic:
 		while j < 50:
-			key: i32 = compiler.cast( i32, j )
-			r: Result[i32,KeyError] = d.__getitem__( key )
+			lookup_key: i32 = compiler.cast( i32, j )
+			r: Result[i32,KeyError] = d.__getitem__( lookup_key )
 			if r.is_err():
 				return 2
-			if r.unwrap( 'x' ) != key * 2:
+			if r.unwrap( 'x' ) != lookup_key * 2:
 				return 3
 			j += 1
 	return 0
@@ -6633,6 +9470,127 @@ def main() -> i32:
 		], timeout = 30 )
 
 
+class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' lib/bisect.py's bisect_left/bisect_right (direct T-vs-T comparison)
+	and bisect_left_by_key/bisect_right_by_key (key: Ptr[Callable[[T],K]]
+	extractor, T and K allowed to differ) - and UnsafeList[T].as_slice(),
+	the slice[T] view bridge these need arr: slice[T] parameters from.
+	Never compiled/run anywhere before this - lib/builtins/__RawDict.py used
+	to hand-roll its own binary search specifically because bisect.py's
+	key= couldn't be made to work (no Callable[...] support, then no
+	slice[T] construction path); RawDict._lower_bound now calls
+	bisect_left_by_key for real (see DictTests). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'as_slice_over_value_typed_elements', '''
+def main() -> i32:
+	arr: UnsafeList[i32] = UnsafeList[i32]()
+	arr.append( 10 ).unwrap( 'append' )
+	arr.append( 20 ).unwrap( 'append' )
+	arr.append( 30 ).unwrap( 'append' )
+	s: slice[i32] = arr.as_slice()
+	if len( s ) != 3:
+		return 1
+	if s.get_unchecked( 0 ) != 10 or s.get_unchecked( 1 ) != 20 or s.get_unchecked( 2 ) != 30:
+		return 2
+	return 0
+''' ),
+			# as_slice() over an EMPTY list - _slot_ptr(0) is deliberately not
+			# bounds-checked against __len for exactly this case (see its own
+			# docstring); a zero-length slice must still be constructible and
+			# safe (nothing can read through it - every real read goes
+			# through an index < len() check first)
+			( 'as_slice_over_empty_list', '''
+def main() -> i32:
+	arr: UnsafeList[i32] = UnsafeList[i32]()
+	s: slice[i32] = arr.as_slice()
+	if len( s ) != 0:
+		return 1
+	return 0
+''' ),
+			# as_slice() over an RC element type (str) - slice[T]'s own _ptr is
+			# untyped (ConstPtr[None]) and get_unchecked already does the
+			# compiler.is_rc(T) handle-vs-value branch - confirms the two
+			# containers' buffer layouts genuinely agree for RC T too
+			( 'as_slice_over_rc_elements', '''
+def main() -> i32:
+	arr: UnsafeList[str] = UnsafeList[str]()
+	arr.append( 'apple' ).unwrap( 'append' )
+	arr.append( 'banana' ).unwrap( 'append' )
+	arr.append( 'cherry' ).unwrap( 'append' )
+	s: slice[str] = arr.as_slice()
+	if s.get_unchecked( 0 ) != 'apple':
+		return 1
+	if s.get_unchecked( 1 ) != 'banana':
+		return 2
+	if s.get_unchecked( 2 ) != 'cherry':
+		return 3
+	return 0
+''' ),
+			( 'bisect_left_and_right_direct_comparison', '''
+import bisect
+
+def main() -> i32:
+	arr: UnsafeList[i32] = UnsafeList[i32]()
+	arr.append( 1 ).unwrap( 'append' )
+	arr.append( 3 ).unwrap( 'append' )
+	arr.append( 3 ).unwrap( 'append' )
+	arr.append( 5 ).unwrap( 'append' )
+	arr.append( 7 ).unwrap( 'append' )
+	s: slice[i32] = arr.as_slice()
+	if bisect.bisect_left( s, 3 ) != 1:
+		return 1
+	if bisect.bisect_right( s, 3 ) != 3:
+		return 2
+	if bisect.bisect_left( s, 0 ) != 0:
+		return 3
+	if bisect.bisect_right( s, 100 ) != 5:
+		return 4
+	empty: UnsafeList[i32] = UnsafeList[i32]()
+	if bisect.bisect_left( empty.as_slice(), 5 ) != 0:
+		return 5
+	return 0
+''' ),
+			# T != K: the exact shape a plain Optional key= parameter can't
+			# support (see lib/bisect.py's own module docstring) - a struct
+			# array searched by one numeric field, RawDict's own real usage
+			( 'bisect_by_key_with_differing_element_and_key_types', '''
+import bisect
+
+@cstruct
+class Node:
+	hash: u64
+	payload: usize
+
+def hash_of( n: Node ) -> u64:
+	return n.hash
+
+def main() -> i32:
+	arr: UnsafeList[Node] = UnsafeList[Node]()
+	arr.append( Node( hash = 1, payload = 0 )).unwrap( 'append' )
+	arr.append( Node( hash = 3, payload = 1 )).unwrap( 'append' )
+	arr.append( Node( hash = 3, payload = 2 )).unwrap( 'append' )
+	arr.append( Node( hash = 5, payload = 3 )).unwrap( 'append' )
+	key: Ptr[Callable[[Node],u64]] = hash_of
+	s: slice[Node] = arr.as_slice()
+	if bisect.bisect_left_by_key( s, u64( 3 ), key ) != 1:
+		return 1
+	if bisect.bisect_right_by_key( s, u64( 3 ), key ) != 3:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class TupleTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' tuple[T0, T1, ...] (tuple_storage.py's TupleStorage, discovery.py's
 	tuple[...] recognition, lowering.py's _expr_Tuple/_expr_Subscript) end-
@@ -6754,6 +9712,301 @@ def main() -> i32:
 	second: tuple[str,str] = entries.__getitem__( 1 ).unwrap( 'idx' )
 	if second[0] != "X-Test" or second[1] != "1":
 		return 3
+	return 0
+''' ),
+			# regression test: a tuple whose ELEMENT type is itself a union
+			# (tuple[str|None, i32], not the tuple as a whole being optional) -
+			# lib/http/client.py's _encode_body() hit this exact shape
+			# (tuple[bytes|None, str|None]) and had to work around it with a
+			# dedicated class instead (see that file's own comment). Before the
+			# fix, _expr_Tuple lowered each element with expected_type=None,
+			# so a leaf value never got coerced into the declared union - the
+			# tuple type inferred from the elements' own NATURAL types then
+			# differed from the annotation's tuple[str|None,i32], leaving the
+			# real (annotated) backing class's own allocator function
+			# unscheduled ("call to undeclared function ...") and each field
+			# assignment storing a raw leaf into what the emitter declared as
+			# a tagged-union-typed field ("assigning to ... from incompatible
+			# type"). Both the None and non-None leaf both need checking, on
+			# both an unannotated inline construction and a separately
+			# annotated local.
+			( 'tuple_element_union_none_and_value_cases', '''
+def main() -> i32:
+	none_first: tuple[str|None, i32] = ( None, 5 )
+	# bind the constant-index read to a named local, then extract the leaf
+	# via match - same pattern union_coercion_rc_test.py's own passing
+	# tests already use. `x is None` narrowing (type_resolver.py's
+	# _type_of_expr) has no ast.Subscript case, and comparing a still-
+	# union-typed value directly against a literal (`x != "hi"`) has no
+	# dunder/flat-Cmp support either - both pre-existing, unrelated gaps
+	# (neither specific to tuples: they'd reproduce on any bare str|None
+	# local too), sidestepped here rather than fixed, to keep this
+	# regression test scoped to the tuple-construction bug alone
+	first_none: str|None = none_first[0]
+	match first_none:
+		case str( unexpected ):
+			return 1
+		case None:
+			pass
+	if none_first[1] != 5:
+		return 2
+	value_first: tuple[str|None, i32] = ( "hi", 6 )
+	first_value: str|None = value_first[0]
+	match first_value:
+		case str( got ):
+			if got != "hi":
+				return 3
+		case None:
+			return 4
+	if value_first[1] != 6:
+		return 5
+	return 0
+''' ),
+			# TWO independent union elements in the same tuple - the exact
+			# arity/shape of the real _encode_body() bug (tuple[bytes|None,
+			# str|None]), using str for both since bytes literals aren't
+			# needed to exercise the same coercion code path
+			( 'tuple_two_independent_union_elements', '''
+def main() -> i32:
+	t: tuple[str|None, str|None] = ( "body", None )
+	first: str|None = t[0]
+	match first:
+		case str( got ):
+			if got != "body":
+				return 1
+		case None:
+			return 2
+	second: str|None = t[1]
+	match second:
+		case str( unexpected ):
+			return 3
+		case None:
+			pass
+	return 0
+''' ),
+			# tuple destructuring - plain assignment: (a, b) = t and bare
+			# a, b = t both parse to the same AST shape
+			( 'tuple_unpack_plain_assignment', '''
+def main() -> i32:
+	t: tuple[i32, str] = ( 10, "hi" )
+	( a, b ) = t
+	if a != 10:
+		return 1
+	if b != "hi":
+		return 2
+	c, d = t
+	if c != 10 or d != "hi":
+		return 3
+	return 0
+''' ),
+			# reassigning EXISTING locals via unpacking, not fresh declarations
+			( 'tuple_unpack_reassigns_existing_local', '''
+def main() -> i32:
+	a: i32 = 0
+	b: str = "unset"
+	t: tuple[i32, str] = ( 42, "set" )
+	( a, b ) = t
+	if a != 42:
+		return 1
+	if b != "set":
+		return 2
+	return 0
+''' ),
+			# an RC element (str) destructured out then dropped - exercises the
+			# per-element incref (into the fresh local) plus the tuple's own
+			# eventual destructor cascade decref-ing its OWN _0/_1 fields, both
+			# firing without a crash (no ASan integration in this file - a
+			# clean exit code 0 is the same signal every other RC test here
+			# relies on)
+			( 'tuple_unpack_rc_element_dropped_without_crashing', '''
+def main() -> i32:
+	t: tuple[str, i32] = ( "owned", 5 )
+	( s, n ) = t
+	if n != 5:
+		return 1
+	return 0
+''' ),
+			# match-case tuple pattern - case Result.Ok((a, b)): on a real
+			# Result[tuple[...], ...], the actual motivating shape
+			# (sock.accept().or_return()-adjacent) from the webchat exercise
+			( 'tuple_unpack_via_match_case', '''
+class PairError:
+	pass
+
+def make_pair() -> Result[tuple[i32, str], PairError]:
+	return Result.Ok(( 7, "pair" ))
+
+def main() -> i32:
+	match make_pair():
+		case Result.Ok(( a, b )):
+			if a != 7:
+				return 1
+			if b != "pair":
+				return 2
+		case Result.Err( _ ):
+			return 3
+	return 0
+''' ),
+			# bare `case (a, b):` (not nested in a class pattern) against a
+			# plain tuple-typed subject
+			( 'tuple_unpack_bare_sequence_pattern', '''
+def main() -> i32:
+	t: tuple[i32, i32] = ( 3, 4 )
+	match t:
+		case ( a, b ):
+			if a != 3 or b != 4:
+				return 1
+		case _:
+			return 2
+	return 0
+''' ),
+			# RC-regression: before/after compiler.refcount() proves the
+			# destructuring incref fires exactly once - not zero (the bug this
+			# guards against: a raw GetAttr borrow skipped without its own
+			# incref, the same class of use-after-free _expr_Subscript's own
+			# tuple-index read already had and fixed), not twice
+			( 'tuple_unpack_rc_refcount_increments_exactly_once', '''
+class Box:
+	value: i32
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		t: tuple[Box, i32] = ( Box( value = 42 ), 7 )
+		before: usize = compiler.refcount( t[0] )
+		( a, n ) = t
+		after: usize = compiler.refcount( t[0] )
+		if after != before + 1:
+			return 1
+	if a.value != 42 or n != 7:
+		return 2
+	return 0
+''' ),
+		] )
+
+	def test_tuple_unpack_arity_mismatch_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32] = ( 1, 2 )',
+			'	( a, b, c ) = t',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'unpacking target has 3 name', errors[0] )
+
+	def test_tuple_unpack_non_tuple_value_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 5',
+			'	( a, b ) = x',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'cannot unpack a non-tuple value', errors[0] )
+
+	def test_tuple_unpack_starred_target_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	( a, *rest ) = t',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'starred unpacking targets are not supported', errors[0] )
+
+	def test_tuple_unpack_nested_tuple_target_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[tuple[i32,i32], i32] = ((1, 2), 3)',
+			'	( ( a, b ), c ) = t',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'nested tuple targets are not supported', errors[0] )
+
+	def test_match_sequence_pattern_arity_mismatch_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32] = ( 1, 2 )',
+			'	match t:',
+			'		case ( a, b, c ):',
+			'			return 1',
+			'		case _:',
+			'			return 0',
+		]))
+		errors = self.discovery.errors.errors
+		# a _match_pattern failure inside visit_Match cascades into a second,
+		# generic "unsupported statement: match ..." fallback error - a
+		# pre-existing behavior, not specific to sequence patterns (the same
+		# happens for e.g. an existing MatchClass arity failure, "match
+		# patterns support exactly one positional sub-pattern") - so this
+		# checks the SPECIFIC message is present, not an exact error count.
+		self.assertGreaterEqual( len( errors ), 1 )
+		self.assertIn( 'sequence pattern has 3 element', errors[0] )
+
+	def test_match_sequence_pattern_non_tuple_subject_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	x: i32 = 5',
+			'	match x:',
+			'		case ( a, b ):',
+			'			return 1',
+			'		case _:',
+			'			return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertGreaterEqual( len( errors ), 1 ) # see arity-mismatch test's own comment on the cascade
+		self.assertIn( 'sequence pattern requires a tuple-typed subject', errors[0] )
+
+	def test_match_sequence_starred_pattern_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	match t:',
+			'		case ( a, *rest ):',
+			'			return 1',
+			'		case _:',
+			'			return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertGreaterEqual( len( errors ), 1 ) # see arity-mismatch test's own comment on the cascade
+		self.assertIn( 'starred sequence patterns are not supported', errors[0] )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class TupleUnionElementRCTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' RC-correctness regression test for the tuple[T|None,...] fix above -
+	construction must incref an aliasing leaf EXACTLY once (going through
+	_coerce_into_union's own constructor Incref, same as any other union-
+	typed field/local - see union_coercion_rc_test.py) and the tuple's own
+	scope-exit teardown must release it back down again, not leak or double-
+	free it. 'held'.upper() (not a literal) forces a real heap allocation -
+	an immortal string literal can't tell a leak/over-release apart from
+	doing nothing. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'union_element_construction_increfs_once_and_releases_on_scope_exit', '''
+def during_refcount( s: str ) -> usize:
+	t: tuple[str|None, i32] = ( s, 1 )
+	return compiler.refcount( s )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		s: str = 'held'.upper()
+		before: usize = compiler.refcount( s )
+		during: usize = during_refcount( s )
+		if during != before + 1:
+			return 1
+		after: usize = compiler.refcount( s )
+		if after != before:
+			return 2
 	return 0
 ''' ),
 		] )
@@ -6903,6 +10156,545 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# regression test: a TUPLE leaf (not a plain RCClass/str leaf like
+			# every case above) flowing into a T|None-typed slot - found via
+			# real lib/http/client.py Session work (auth: tuple[str,str]|None).
+			# lowering.py's _expr_Tuple used to trust `expected_type` blindly
+			# for its own dest's type, even when expected_type was this outer
+			# union (a coercion HINT meant for _coerce_or_check_operand to act
+			# on afterward, not a description of the tuple itself) - so dest
+			# ended up typed as the union's own TaggedUnion (a value struct,
+			# never an RCClass) instead of the tuple's real backing RCClass,
+			# crashing emitter_c.py's Allocate emission outright with `assert
+			# isinstance(concrete_cls, RCClass)` before ever reaching
+			# _coerce_into_union. Covers both a real tuple value and None
+			# flowing through the same parameter, plus a repeated-call
+			# refcount check (mirrors rc_leaf_refcount_correct_after_repeated_
+			# calls above) since the tuple's own str elements are RC and a
+			# double-incref/masked-decref in the coercion path wouldn't show
+			# up as a crash, just a drifting refcount.
+			( 'tuple_leaf_coerces_into_union', '''
+def creds( x: tuple[str,str]|None = None ) -> i32:
+	if x is None:
+		return 0
+	t: tuple[str,str] = x
+	if t[0] != 'user':
+		return 1
+	if t[1] != 'pass':
+		return 2
+	return 3
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		if creds() != 0:
+			return 1
+		if creds( ( 'user', 'pass' ) ) != 3:
+			return 2
+		i: i32 = 0
+		while i < 1000:
+			u: str = 'user'.upper().lower()
+			if compiler.refcount( u ) != 1:
+				return 3
+			if creds( ( u, 'pass' ) ) != 3:
+				return 4
+			if compiler.refcount( u ) != 1:
+				return 5
+			i += 1
+	return 0
+''' ),
+			# `t[0] is None`/`is not None` narrowing directly on a tuple
+			# constant-index Subscript, with no intermediate named local -
+			# type_resolver.py's _type_of_expr had no ast.Subscript case at
+			# all, so this used to fall through to _lower_is_comparison's own
+			# flat-Cmp fallback and emit invalid C comparing a union STRUCT
+			# against a bare int/another struct
+			( 'tuple_subscript_is_none_narrowing_without_a_local', '''
+def main() -> i32:
+	t: tuple[str|None, i32] = ( None, 5 )
+	if t[0] is not None:
+		return 1
+	if t[1] != 5:
+		return 2
+	u: tuple[str|None, i32] = ( "hi", 6 )
+	if u[0] is None:
+		return 3
+	if u[1] != 6:
+		return 4
+	return 0
+''' ),
+			# `expr.field.method(...) is None`/`is not None` - the receiver of
+			# the union-returning call is a chained field access (Attribute of
+			# an Attribute), not a bare local. type_resolver.py's _type_of_expr
+			# ast.Attribute branch resolved the OWNER class (via
+			# ensure_resolved) but then read the found field Variable's .type
+			# straight off without forcing ITS OWN separate .resolve first - a
+			# field's type is populated lazily exactly like a global's (see
+			# the ast.Name branch's own established fix for that), so
+			# `o.inner`'s type came back None here, `_type_of_expr` gave up on
+			# the whole `o.inner.get(...)` call, and `_is_none_narrowing_shape`
+			# silently declined the tag-check rewrite - falling through to
+			# _lower_is_comparison's flat Cmp, which cannot compare a
+			# TaggedUnion struct against None. Staging `o.inner` into a named
+			# local first used to be the only way to dodge this, since a
+			# local's type is always eagerly resolved by the time it lands in
+			# self.locals.
+			( 'chained_field_access_call_is_none_narrowing_without_a_local', '''
+class Inner:
+	stored: str|None
+	def get( self, key: str ) -> str|None:
+		if key == 'present':
+			return self.stored
+		return None
+
+class Outer:
+	inner: Inner
+
+def main() -> i32:
+	o: Outer = Outer( inner = Inner( stored = "hi" ) )
+	if o.inner.get( 'present' ) is None:
+		return 1
+	if o.inner.get( 'missing' ) is not None:
+		return 2
+	o2: Outer = Outer( inner = Inner( stored = None ) )
+	if o2.inner.get( 'present' ) is not None:
+		return 3
+	return 0
+''' ),
+			# `obj.prop is None`/`is not None` directly on a @property getter's
+			# result - the idiomatic spelling, not staged into a local first.
+			# type_resolver.py's _type_of_expr ast.Attribute branch only ever
+			# recognized a plain field (a Variable in the owner's .names dict);
+			# a property getter is a Function there instead (is_property=True),
+			# so `isinstance(found, Variable)` failed, _type_of_expr gave up on
+			# the whole `f.val` expression, and _is_none_narrowing_shape
+			# silently declined - same flat-Cmp-comparing-a-union-struct
+			# failure as the chained-field case above, but from a totally
+			# different gap (a missing property case, not a laziness bug) -
+			# staging `f.val` into a named local first (`x: usize|None = f.val`)
+			# dodged it, since a local's tracked type comes from the Assign
+			# branch, not this one. Also covers the same shape on a PLAIN
+			# (non-property) method call returning T|None used directly, to
+			# confirm that path was never broken - it wasn't (Call is a
+			# distinct _type_of_expr branch, already resolving return_type
+			# correctly), included here as a differential control case
+			( 'property_and_method_call_is_none_narrowing_without_a_local', '''
+class Foo:
+	@property
+	def val( self ) -> usize|None:
+		return None
+
+	@property
+	def some( self ) -> usize|None:
+		return usize( 7 )
+
+	def get_val( self ) -> usize|None:
+		return None
+
+	def get_some( self ) -> usize|None:
+		return usize( 7 )
+
+def main() -> i32:
+	f: Foo = Foo()
+	if f.val is None:
+		pass
+	else:
+		return 1
+	if f.val is not None:
+		return 2
+	if f.some is None:
+		return 3
+	if f.some is not None:
+		pass
+	else:
+		return 4
+	if f.get_val() is None:
+		pass
+	else:
+		return 5
+	if f.get_val() is not None:
+		return 6
+	if f.get_some() is None:
+		return 7
+	if f.get_some() is not None:
+		pass
+	else:
+		return 8
+	return 0
+''' ),
+			# `self.field is not None: ... self.field.method(...)` - narrowing
+			# a single-level FIELD (not a bare local) so a virtual method call
+			# on the narrowed payload actually resolves. The comparison itself
+			# already compiled fine (chained_field/property_and_method fixes
+			# above), but visit_If's own body-narrowing (the mechanism that
+			# lets a later `.method()` call dispatch against the concrete
+			# leaf instead of the whole union) only ever recognized a bare
+			# ast.Name subject - an ast.Attribute subject silently fell
+			# through to "not narrowed", so the method call inside the branch
+			# still saw the full T|None union and failed with `'method' is
+			# not callable on intrinsics.NoneType`. Also exercises a second,
+			# independent bug found while isolating this one: a freshly-
+			# constructed subclass instance upcast into a base-typed local/
+			# field (`o: Ops = RealOps()`) was released() immediately after
+			# construction (the RCClass-upcast CastWrap coercion left the
+			# ORIGINAL pre-cast temp registered as a pending obligation, which
+			# the end-of-statement flush then decref'd out from under the
+			# still-live cast alias) - a real use-after-free/segfault, not
+			# just a compile error, confirmed via a real crash before the fix
+			( 'field_is_not_none_narrowing_enables_virtual_dispatch', '''
+class Ops:
+	@abstractmethod
+	def do_read( self, v: i32 ) -> i32:
+		...
+
+class RealOps( Ops ):
+	@virtual
+	def do_read( self, v: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return v + 1
+
+class OtherOps( Ops ):
+	@virtual
+	def do_read( self, v: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return v + 100
+
+class Holder:
+	fd: i32
+	aio: Ops|None
+	def __init__( self, fd: i32 ) -> None:
+		self.fd = fd
+		self.aio = None
+	def set_aio( self, aio: Ops ) -> None:
+		self.aio = aio
+	def read( self ) -> i32:
+		if self.aio is not None:
+			with compiler.wrap_arithmetic:
+				return self.aio.do_read( self.fd )
+		return 0
+	def read_elif( self, flag: bool ) -> i32:
+		if flag:
+			return -1
+		elif self.aio is not None:
+			with compiler.wrap_arithmetic:
+				return self.aio.do_read( self.fd )
+		return 0
+	def read_is_none_early_return( self ) -> i32:
+		if self.aio is None:
+			return -2
+		with compiler.wrap_arithmetic:
+			return self.aio.do_read( self.fd )
+	def read_reassign( self, other: Ops ) -> i32:
+		if self.aio is not None:
+			self.aio = other
+			if self.aio is not None:
+				with compiler.wrap_arithmetic:
+					return self.aio.do_read( self.fd )
+		return 0
+
+def main() -> i32:
+	# upcast-construction RC bug: a fresh subclass instance assigned into a
+	# base-typed local used to be released() (refcount 1 -> 0, freed) right
+	# after construction
+	o: Ops = RealOps()
+	if compiler.refcount( o ) != 1:
+		return 1
+	h = Holder( 5 )
+	h.set_aio( o )
+	if compiler.refcount( o ) != 2:
+		return 2
+	if h.read() != 6:
+		return 3
+	if h.read_elif( False ) != 6:
+		return 4
+	if h.read_is_none_early_return() != 6:
+		return 5
+	if h.read_reassign( OtherOps() ) != 105:
+		return 6
+	# read_reassign left aio pointing at the OtherOps instance now
+	if h.read() != 105:
+		return 7
+	return 0
+''' ),
+			# `union_val == leaf` / `!=` - comparing a still-union-typed value
+			# directly against a leaf, with no match-based extraction needed
+			# first. Used to fall through to the plain dunder-or-flat-Cmp path,
+			# which either called a leaf's dunder with a UNION-typed argument
+			# (a real type mismatch in the generated C) or compared two union
+			# STRUCTS directly (C rejects this outright) - see
+			# _lower_union_eq_against_leaf. Covers an RC leaf (str), a scalar
+			# leaf (i32), the None member via == / != (not is/is not, which
+			# already worked), and negation of each
+			( 'union_leaf_equality_str_and_scalar_and_none', '''
+def main() -> i32:
+	x: str|None = "hi"
+	if x != "hi":
+		return 1
+	if x == "bye":
+		return 2
+	y: str|None = None
+	if y == "hi":
+		return 3
+	if not ( y != "hi" ):
+		return 4
+	if not ( y == None ):
+		return 5
+	if y != None:
+		return 6
+	n: i32|None = 42
+	if n != 42:
+		return 7
+	if n == 7:
+		return 8
+	m: i32|None = None
+	if m == 42:
+		return 9
+	return 0
+''' ),
+			# a real RC-lifetime check for the new payload-comparison path -
+			# _build_union_leaf_eq's own narrowed/payload_dest/tag_dest
+			# temps are all bare GetAttr borrows (never fresh_temp()-registered,
+			# same as _lower_union_receiver_call's identical extraction), so
+			# none of them should need - or get - any incref/decref of their
+			# own; this repeats the comparison 1000x and checks the RC leaf's
+			# own refcount never drifts
+			( 'union_leaf_equality_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			if compiler.refcount( s ) != 1:
+				return 1
+			x: str|None = s
+			if compiler.refcount( s ) != 2: # the union now holds a reference too
+				return 2
+			if x != "HELLO":
+				return 3
+			if compiler.refcount( s ) != 2: # comparing must not have changed it
+				return 4
+			i += 1
+	return 0
+''' ),
+			# `leaf == union_val` / `!=` - union on the RIGHT, the mirror
+			# image of union_leaf_equality_str_and_scalar_and_none above.
+			# Covers an RC leaf (str), a scalar leaf (i32), and the None
+			# member via a BARE `None` literal specifically - NoneType has
+			# no __eq__/__ne__ of its own at all (unlike str/i32, which at
+			# least have a real dunder to look up and reject), so `None ==
+			# x` never even reached a dunder lookup before this fix; only
+			# _lower_eq_or_ne's own unconditional (regardless of left being
+			# Scalar) entry point for Eq/NotEq can see both operands
+			# together and recognize the shape
+			( 'union_leaf_equality_leaf_on_left_str_scalar_and_none', '''
+def main() -> i32:
+	x: str|None = "hi"
+	if "hi" != x:
+		return 1
+	if "bye" == x:
+		return 2
+	y: str|None = None
+	if "hi" == y:
+		return 3
+	if not ( "hi" != y ):
+		return 4
+	if not ( None == y ):
+		return 5
+	if None == x:
+		return 6
+	n: i32|None = 42
+	if 42 != n:
+		return 7
+	if 7 == n:
+		return 8
+	m: i32|None = None
+	if 5 == m:
+		return 9
+	return 0
+''' ),
+			# scalar widening (i32 -> i64, ...) must still apply for a
+			# PLAIN scalar == / != comparison with no union on either side -
+			# _lower_eq_or_ne's own strict=False lowering skips
+			# _coerce_or_check_operand's built-in widening coercion
+			# specifically so the union checks can run first, so this must
+			# be reinstated manually (see its own docstring) or an ordinary
+			# `i64 == i32` comparison - which used to auto-widen the i32
+			# side before comparing, exactly like `_lower_binop_values` -
+			# would regress into a spurious compile error
+			( 'plain_scalar_widening_still_applies_no_union_involved', '''
+def main() -> i32:
+	a: i64 = 5
+	b: i32 = 5
+	if a != b:
+		return 1
+	c: i32 = 6
+	if a == c:
+		return 2
+	return 0
+''' ),
+			# a real RC-lifetime check for the union-on-the-RIGHT direction -
+			# same shape as union_leaf_equality_rc_no_leak_under_repetition
+			# above, just with the leaf/union operands swapped
+			( 'union_leaf_equality_leaf_on_left_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			s: str = 'hello'.upper()
+			if compiler.refcount( s ) != 1:
+				return 1
+			x: str|None = s
+			if compiler.refcount( s ) != 2:
+				return 2
+			if "HELLO" != x:
+				return 3
+			if compiler.refcount( s ) != 2:
+				return 4
+			i += 1
+	return 0
+''' ),
+			# union-vs-union - both operands independently union-typed, the
+			# one shape _build_union_leaf_eq's own predecessor explicitly
+			# refused ("comparing two DIFFERENT union values structurally is
+			# not yet supported"). Same-shaped (str|None vs str|None) here -
+			# covers all 4 leaf-pair combinations (str/str-same, str/str-
+			# different, str/None, None/str, None/None already covered
+			# above via the union-on-one-side tests) for both == and != -
+			# must be INFALLIBLE (no Result involved at all - assigning the
+			# comparison's own result straight to a bool local, not
+			# Result[bool,TypeError], is itself part of what's being tested:
+			# it would be a compile error if this were fallible)
+			( 'union_union_equality_same_shape_all_leaf_pairs', '''
+def main() -> i32:
+	x: str|None = "hi"
+	y: str|None = "hi"
+	same: bool = x == y
+	if not same:
+		return 1
+	if x != y:
+		return 2
+	z: str|None = None
+	diff: bool = x == z
+	if diff:
+		return 3
+	if not ( z != y ):
+		return 4
+	w: str|None = None
+	both_none: bool = w == z
+	if not both_none:
+		return 5
+	if w != z:
+		return 6
+	a: str|None = "bye"
+	if x == a:
+		return 7
+	if not ( x != a ):
+		return 8
+	return 0
+''' ),
+			# differently-shaped unions, mirroring the exact worked example
+			# used to design this feature (i32|str vs i32|str|None) - covers
+			# a genuine 'error' cell (i32 vs str, no dunder connects them,
+			# TypeError) alongside valid cells (same-type, and the None row/
+			# column, which is well-defined regardless of the OTHER side's
+			# own declared member set). The comparison's own result here IS
+			# Result[bool,TypeError] - consumed explicitly via match/
+			# unwrap_or, proving it behaves exactly like any other real
+			# Result value, no special machinery needed to use it
+			( 'union_union_equality_differently_shaped_with_type_error_cell', '''
+def compare( a: i32|str, b: i32|str|None ) -> Result[bool,TypeError]:
+	return a == b
+
+def main() -> i32:
+	match compare( 5, 5 ):
+		case Result.Ok( v ):
+			if not v:
+				return 1
+		case Result.Err( e ):
+			return 2
+	match compare( "hi", "bye" ):
+		case Result.Ok( v ):
+			if v:
+				return 3
+		case Result.Err( e ):
+			return 4
+	match compare( 5, "hi" ):
+		case Result.Ok( v ):
+			return 5
+		case Result.Err( e ):
+			pass
+	match compare( "hi", None ):
+		case Result.Ok( v ):
+			if v:
+				return 6
+		case Result.Err( e ):
+			return 7
+	match compare( 5, None ):
+		case Result.Ok( v ):
+			if v:
+				return 8
+		case Result.Err( e ):
+			return 9
+	if compare( 5, "hi" ).unwrap_or( True ) != True:
+		return 10
+	return 0
+''' ),
+			# a real RC-lifetime check for the fallible path specifically -
+			# genuinely new territory: _build_type_error_instance is the
+			# first internal (non-AST-driven) construction site for a
+			# trivial marker-error class anywhere in this file. Repeats both
+			# a pure-TypeError comparison AND an infallible comparison
+			# involving a real RC leaf (str) 1000x, checking the RC leaf's
+			# own refcount never drifts - this is what actually caught two
+			# real bugs during development (a SEGV from decref'ing an
+			# uninitialized branch-local TypeError() temp, then a leak from
+			# over-correcting it to never decref at all), confirmed clean
+			# only via a real gcc -fsanitize=address run, not just this
+			# real-compile-and-run check alone
+			( 'union_union_equality_fallible_path_rc_no_leak_under_repetition', '''
+def compare( a: i32|str, b: i32|str|None ) -> Result[bool,TypeError]:
+	return a == b
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			match compare( 5, "hi" ):
+				case Result.Ok( v ):
+					return 1
+				case Result.Err( e ):
+					pass
+			s: str = 'hello'.upper()
+			if compiler.refcount( s ) != 1:
+				return 2
+			match compare( 5, s ):
+				case Result.Ok( v ):
+					return 3
+				case Result.Err( e ):
+					pass
+			if compiler.refcount( s ) != 1:
+				return 4
+			i += 1
+	return 0
+''' ),
+			# regression guard: a union WITHOUT a None member compared
+			# against a bare None literal used to hard-fail ("i32 is not a
+			# member of str|i32") under the narrower predecessor of this
+			# dispatch. Under the generalized per-leaf-pair grid, this is
+			# now a well-defined, always-not-equal comparison instead (rule
+			# 2 - exactly one leaf is NoneType - never required the OTHER
+			# side to actually declare None as a possible member) - a real,
+			# intentional correctness improvement, not a regression, so this
+			# tests the NEW correct behavior rather than asserting the old
+			# hard-fail persists
+			( 'union_without_none_member_compared_against_none_is_well_defined', '''
+def main() -> i32:
+	x: str|i32 = "hi"
+	if x == None:
+		return 1
+	if not ( x != None ):
+		return 2
+	return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -6918,6 +10710,586 @@ def main() -> i32:
 	return 0
 ''' )
 		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_non_leaf_type_on_the_right_is_a_compile_error( self ) -> None:
+		# same as test_non_leaf_type_is_a_compile_error above, but with the
+		# union on the RIGHT of the comparison (_lower_eq_or_ne's own
+		# "union on the right" branch) - a genuine mismatch there must stay
+		# a real compile error too, not silently pass a union-typed value
+		# where int.__eq__'s own leaf parameter expects a plain int
+		self._run( '''
+def main() -> i32:
+	x: str|None = "hi"
+	if 5 == x:
+		return 1
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_plain_non_nullable_type_against_bare_none_is_still_a_compile_error( self ) -> None:
+		# regression guard, unaffected by the union-union dispatch work: a
+		# PLAIN (non-union) str compared against a bare None literal never
+		# reaches _lower_eq_dispatch at all - _expr_Compare's own right_hint
+		# stays left.type=str (left isn't a union), so the None literal gets
+		# hinted toward str and _expr_Constant's own pre-existing guard
+		# ("None cannot be used where builtins.str is expected") rejects it
+		# before any union-comparison code ever runs. Must stay exactly this
+		# - a non-nullable value can never actually BE None, so allowing the
+		# comparison at all (even as a well-defined "always False") would
+		# hide what's very likely a real bug at the call site
+		self._run( '''
+def main() -> i32:
+	s: str = "hi"
+	if s == None:
+		return 1
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fallible_comparison_result_never_requires_enclosing_return_type( self ) -> None:
+		# a fallible union-union comparison (Result[bool,TypeError]) is
+		# deliberately NOT auto-consumed via arithmetic's/subscript's own
+		# _maybe_consume_result mechanism (no new "compiler binop mode"
+		# concept) - so, unlike checked arithmetic, using one should NEVER
+		# require the ENCLOSING function to itself return a covering
+		# Result[_,TypeError]. main() here returns plain i32 and explicitly
+		# consumes the fallible comparison via .unwrap_or(...) - if this
+		# were wrongly wired through the arithmetic-style auto-consumption
+		# path instead, it would fail to compile with a
+		# "requires the enclosing function to return Result[_,TypeError]"
+		# error the same way an un-wrapped checked-arithmetic op would
+		self._run( '''
+def compare( a: i32|str, b: i32|str|None ) -> Result[bool,TypeError]:
+	return a == b
+
+def main() -> i32:
+	if compare( 5, "hi" ).unwrap_or( False ):
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_result_returning_call_assigned_to_mismatched_local_type_is_rejected( self ) -> None:
+		# FIXED (was a real, pre-existing bug, entirely unrelated to this
+		# feature - reproduces identically with an ordinary, already-shipped
+		# Result[i32,OverflowError]-returning function, zero union-union
+		# comparison involved): assigning a Result-returning call's value
+		# directly to a mismatched declared local type used to pass
+		# discovery with zero errors, then the EMITTER produced C a real
+		# compiler rejected outright ("assigning to 'int32_t' from
+		# incompatible type 'struct Result...'"). Root cause was in
+		# _lower_call's own dest-typing for an ordinary (non-generic,
+		# non-union-widening) call: it typed `dest` as `expected_type`
+		# whenever one was given, even when expected_type was a genuinely
+		# DIFFERENT type from the callee's own real return type - not just a
+		# different Specialization representation of the same instantiation
+		# - which fooled _coerce_or_check_operand's own mismatch check into
+		# never seeing a mismatch at all (operand.type already equalled
+		# expected_type by construction). Now dest stays typed as the
+		# callee's real return type whenever expected_type isn't actually
+		# the same type, so the ordinary coercion-or-rejection tail gets an
+		# honest look and correctly rejects this.
+		self._run( '''
+def maybe_get() -> Result[i32,OverflowError]:
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	x: i32 = maybe_get()
+	return 0
+''' )
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'expected intrinsics.i32', errors[0] )
+		self.assertIn( 'got builtins.Result', errors[0] )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_result_returning_call_assigned_to_matching_result_type_still_compiles( self ) -> None:
+		# no-regression companion to the rejection test above: a Result-
+		# returning call assigned to an already-matching Result[T,E]-typed
+		# local (the ordinary, correct usage) must keep compiling and
+		# running exactly as before this fix - dest is still typed via the
+		# "same type, different representation" branch, not force-rejected
+		self._run( '''
+def maybe_get() -> Result[i32,OverflowError]:
+	return Result.Ok( 5 )
+
+def main() -> i32:
+	x: Result[i32,OverflowError] = maybe_get()
+	if x.unwrap_or( 0 ) != 5:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ) )
+
+
+class OverloadedDunderComparisonTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `_classify_leaf_pair_eq`'s 'cross_dunder' rule (see
+	`_lower_eq_dispatch`'s own docstring) needs a class to declare TWO
+	`__eq__`/`__ne__` signatures - one matching its own type (the ordinary
+	case), one matching the OTHER concrete type it's being compared
+	against (e.g. `int.__eq__(other: i32)` alongside the pre-existing
+	`int.__eq__(other: int)`) - which registers as a real `Overload`
+	(`mpy_types.Overload`, "stands in for a Function when multiple defs
+	share a name"), not a plain `Function`.
+
+	This is a REAL, confirmed regression class, not a hypothetical: a bare
+	`_find_method` returns `None` for anything that isn't a `Function`
+	(`isinstance(found, Function)`), so it silently treats a whole
+	Overload group as "no such method" - before `_find_eq_method_for_arg`
+	was added (see its own docstring in `lowering.py`), adding a SECOND
+	`__eq__` overload to `int` silently broke the ALREADY-correct,
+	pre-existing `int == int` comparison too (it fell through to comparing
+	by raw pointer identity instead of calling `__eq__` at all - confirmed
+	via the generated C directly: `$t2 = (a) == (b);` comparing two
+	`struct builtins$int*` values, not a real value comparison), on top of
+	`int == i32` never finding the cross-dunder overload at all (both
+	landing on `_classify_leaf_pair_eq`'s `'error'`/`TypeError` path
+	instead). `_find_eq_method_for_arg` fixes both by picking the ONE
+	implementation whose own declared parameter matches the wanted type,
+	for a plain `Function` too, not just an `Overload` (an actual second
+	bug caught mid-fix: the first version of this helper validated the
+	parameter match for the `Overload` branch but returned a plain
+	`Function` unconditionally, un-checked - confirmed via a real
+	regression: `str.__eq__(other: str)` got silently misapplied to an
+	`i32` argument during a DIFFERENT comparison this exact class's own
+	member `int` was mixed into, generating a real "incompatible integer
+	to pointer conversion" C error).
+
+	lib/builtins/__int.py's `int` gained a real
+	`__eq__( self, other: i32 ) -> bool` overload (alongside its
+	pre-existing `__eq__( self, other: int ) -> bool`) specifically to
+	exercise this - "an int and an i32 CAN be equal but are technically
+	different types" is a real, intentional use case for the
+	`'cross_dunder'` rule, not just a synthetic test fixture. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'int_eq_int_overload_group_still_uses_real_comparison', '''
+def main() -> i32:
+	a: int = int( 5 )
+	b: int = int( 5 )
+	if not ( a == b ):
+		return 1
+	c: int = int( 6 )
+	if a == c:
+		return 2
+	if not ( a != c ):
+		return 3
+	if a != b:
+		return 4
+	return 0
+''' ),
+			( 'int_eq_i32_cross_dunder_both_directions', '''
+def main() -> i32:
+	a: int = int( 5 )
+	d: i32 = 5
+	if not ( a == d ):
+		return 1
+	if not ( d == a ):
+		return 2
+	e: i32 = 6
+	if a == e:
+		return 3
+	if e == a:
+		return 4
+	if not ( a != e ):
+		return 5
+	if not ( e != a ):
+		return 6
+	return 0
+''' ),
+			# a real RC-lifetime check - the cross-dunder Call itself
+			# constructs a fresh `int` (via `int(other)` inside
+			# `__eq__`'s own body) purely to reuse `compare()`; confirms
+			# no leak/double-free under repetition
+			( 'int_eq_i32_cross_dunder_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			a: int = int( 5 )
+			d: i32 = 5
+			if not ( a == d ):
+				return 1
+			i += 1
+	return 0
+''' ),
+		] )
+
+
+class ReflectedAndOverloadedBinopDunderTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `_lower_binop_values`'s dunder-dispatch tries, in order: (1) a
+	forward dunder (`str.__add__`, ...) on `left.type`, Overload-aware via
+	`_find_dunder_for_arg` (same mechanism `OverloadedDunderComparisonTests`
+	exercises for `==`/`!=`); (2) if that doesn't apply - including when
+	`left.type` is `Scalar` and so has no dunder mechanism of its own at
+	all, e.g. `5 + some_vector` - the REFLECTED, differently-named dunder
+	(`str.__radd__`, ...) on `right.type` (mirrors Python's real protocol:
+	unlike `==`/`!=`, which reflects onto the SAME method name with
+	receiver/argument swapped, every genuinely asymmetric binop gets its
+	own distinctly-named reflected method, since e.g. `a - b` and `b - a`
+	are never interchangeable the way `a == b`/`b == a` are).
+
+	This surfaced a second real gap while developing: `_lower_binary_
+	operands` (which hints a bare literal toward the OTHER operand's own
+	type, so e.g. an untyped int literal added to an f64 infers f64) used
+	to hint UNCONDITIONALLY, including toward a non-scalar CLASS target
+	(`5 + some_vector` hinted `5` toward `Vector`) - hitting `_expr_
+	Constant`'s own literal-compatibility check ("an int literal cannot be
+	used where Vector is expected") before this dispatch was ever reached.
+	Fixed by only hinting toward an actual `Scalar` target (or the
+	existing Ptr-offset special case), leaving a literal to infer its own
+	natural type otherwise - exactly what the reflected-dunder lookup
+	needs to find e.g. `Vector.__radd__(other: i32)`. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'binop_forward_overload_and_reflected_dunder', '''
+class Vector:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __add__( self, other: Vector ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other.x )
+	def __add__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+	def __radd__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+	def __sub__( self, other: Vector ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x - other.x )
+	# __rsub__'s own contract (matching Python's real protocol) is
+	# "return other - self", NOT "self - other" - asymmetric, easy to
+	# get backwards, exactly what this case is checking
+	def __rsub__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( other - self.x )
+
+def main() -> i32:
+	v: Vector = Vector( 3 )
+	w: Vector = Vector( 4 )
+	# forward, same-class overload (Vector-typed operand)
+	r1: Vector = v + w
+	if r1.x != 7:
+		return 1
+	# forward, Overload-aware cross-type (i32-typed operand -
+	# picks Vector's OWN __add__(other: i32) overload)
+	r2: Vector = v + 10
+	if r2.x != 13:
+		return 2
+	# reflected: i32 (Scalar) has no forward dunder of its own,
+	# so this must find Vector.__radd__ on the RIGHT operand
+	r3: Vector = 5 + v
+	if r3.x != 8:
+		return 3
+	# asymmetric operator, forward
+	r4: Vector = v - w
+	if r4.x != -1:
+		return 4
+	# asymmetric operator, reflected - MUST compute "10 - v.x",
+	# not "v.x - 10" (the exact mistake a naive reflected-call
+	# implementation could make)
+	r5: Vector = 10 - v
+	if r5.x != 7:
+		return 5
+	return 0
+''' ),
+			# a real RC-lifetime check - every dunder here constructs a
+			# fresh Vector (a real RCClass); confirms no leak/double-free
+			# under repetition for both the forward-overload and the
+			# reflected paths
+			( 'binop_reflected_dunder_rc_no_leak_under_repetition', '''
+class Vector:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __radd__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			v: Vector = Vector( 3 )
+			r: Vector = 5 + v
+			if r.x != 8:
+				return 1
+			i += 1
+	return 0
+''' ),
+		] )
+
+
+class UnionBinopDispatchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `_lower_binop_dispatch`'s own union-vs-union +-*//%|&^ dispatch -
+	the arithmetic counterpart of the union-vs-union ==/!= dispatch
+	(UnionLeafCoercionTests), reusing the SAME 2-level tag-dispatch shape
+	but adding two things equality never needed: leaf pairs can produce
+	genuinely DIFFERENT result types (synthesized into a fresh union,
+	collapsing to a single plain type when every reachable pair agrees),
+	and error sources fold into ONE synthesized error union - a leaf pair
+	with no valid operation (TypeError), or a resolved dunder's own
+	declared Result[T,E] return type.
+
+	No separate "scalar" classification anymore - a Scalar operand's own
+	arithmetic is just another dunder lookup now (mode-qualified, exactly
+	like the non-union path: i32.__add__/__wrapped_add__/__saturated_add__,
+	see lib/builtins/__scalar_dunders.py), found via the SAME
+	_find_dunder_for_arg/_mode_qualified_dunder_names machinery - one
+	source of truth, not two independent reimplementations (see
+	[[binop_fallback_eliminated]]/[[fallible_arithmetic_decorator_and_int_division_fix]]
+	for how the non-union path itself got here). A cell whose method is
+	`is_fallible_arithmetic` (a scalar-registered arithmetic dunder, or
+	int.__floordiv__/__mod__) is ALWAYS consumed via the ambient
+	arithmetic mode at emission time - even reached from deep inside this
+	union grid - exactly like it already behaves in the non-union path,
+	never folded into this expression's own aggregate error union. Only a
+	REGULAR dunder's own declared Result[T,E] (int.__add__, or a
+	hand-declared multi-member anonymous error union) folds in.
+
+	Found (not caused) while developing: `_lower_binary_operands` hinted
+	an operand's own lowering with the OUTER expected_type/the OTHER
+	operand's own type whenever neither side was a literal, even when
+	that hint was ITSELF (or resolved to) a union - silently wrapping a
+	plain leaf operand into that union via _coerce_or_check_operand's
+	union-wrap coercion before this dispatch ever saw it (e.g. `r:
+	Result[i32|int,E] = x + y` wrapped x itself into Result[...]; `Boxed|
+	int + Boxed` wrapped the right, non-union Boxed operand into Boxed|int
+	too, inventing a grid cell the source never expressed). Fixed by
+	guarding every such hint against the target being (or resolving to,
+	via _tagged_union_shape) a union - same principle _lower_eq_or_ne
+	already established for its own right_hint, just via two different
+	cascade paths this feature was the first to actually exercise.
+
+	Also found: a nominal @union error type (e.g. int's own IntError,
+	which has its own real variants like DivideByZero) is just as much an
+	opaque LEAF as any plain marker class - the nested-error-unwrap logic
+	(for a REGULAR dunder's own genuine multi-member ANONYMOUS error
+	union, e.g. a hand-declared `-> Result[T, ErrorA|ErrorB]`) must never
+	try to decompose a nominal union's OWN variants the same way; gated on
+	`file is None` (the same "synthesized, not really declared" marker
+	discovery._get_or_create_union's own flattening logic already uses). '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'union_binop_scalar_and_dunder_dispatch', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		# infallible (i32,i32) scalar cell reached at runtime, but the
+		# expression's OWN static type is still fallible (int|i32 cross
+		# pairs have no dunder connecting them, int.__add__(int) is
+		# itself fallible) - confirms the dispatch doesn't silently
+		# generate invalid C for the union operands (the original bug:
+		# raw structs added directly), and that wrap_arithmetic mode is
+		# still respected per-cell (no OverflowError contributed here)
+		x: i32|int = 3
+		y: i32|int = 4
+		r1: Result[i32|int,IntError|TypeError] = x + y
+		if r1.is_err():
+			return 1
+
+		# (int,int) dunder-fallible cell - int.__add__(int) itself
+		# returns Result[int,IntError]; its own E must fold into the
+		# aggregate error union, not be used as-is
+		a: i32|int = int( 10 )
+		b: i32|int = int( 20 )
+		r2: Result[i32|int,IntError|TypeError] = a + b
+		if r2.is_err():
+			return 2
+
+		# both mismatch directions -> TypeError, no valid dunder either way
+		c: i32|int = 5
+		d: i32|int = int( 6 )
+		r3: Result[i32|int,IntError|TypeError] = c + d
+		if not r3.is_err():
+			return 3
+
+		e: i32|int = int( 7 )
+		f: i32|int = 8
+		r4: Result[i32|int,IntError|TypeError] = e + f
+		if not r4.is_err():
+			return 4
+	return 0
+''' ),
+			( 'union_binop_collapse_to_single_type', '''
+class Vector:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __add__( self, other: Vector ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other.x )
+	def __radd__( self, other: i32 ) -> Vector:
+		with compiler.wrap_arithmetic:
+			return Vector( self.x + other )
+
+def main() -> i32:
+	# every reachable leaf pair produces plain Vector - the result must
+	# be bound directly as Vector, NOT wrapped in a degenerate 1-member
+	# union (Vector.__add__(Vector) and Vector.__radd__(i32) both
+	# declared to return plain Vector)
+	p: Vector|i32 = Vector( 3 )
+	q: Vector = Vector( 4 )
+	r1: Vector = p + q
+	if r1.x != 7:
+		return 1
+
+	p2: Vector|i32 = 5
+	r2: Vector = p2 + q
+	if r2.x != 9:
+		return 2
+
+	# AugAssign with a union-typed target - shares _lower_binop_values,
+	# picks up the same dispatch with no special-casing needed. The
+	# collapsed plain-Vector result must coerce back into p3's own
+	# declared Vector|i32 union type (the SAME general assignment-
+	# coercion machinery an ordinary `p3: Vector|i32 = some_vector`
+	# already uses, not anything new to this dispatch). Compiling and
+	# running successfully IS the assertion here - Vector has no __eq__
+	# of its own, so a value-comparison check would just compare
+	# pointers, not x; r1/r2 above already prove the underlying
+	# arithmetic itself is correct
+	p3: Vector|i32 = Vector( 3 )
+	p3 += q
+	return 0
+''' ),
+			( 'union_binop_scalar_cell_respects_ambient_mode', '''
+class NoFloorDiv:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+def main() -> i32:
+	# i32.__floordiv__ is @fallible_arithmetic - reached from a union
+	# grid cell (i32,i32), it must STILL auto-consume via the ambient
+	# mode (here panic_arithmetic, which needs no enclosing Result
+	# coverage at all - _require_result_return is skipped whenever the
+	# mode's own `extra` is set) exactly like the non-union path
+	# already does, rather than folding ZeroDivisionError/OverflowError
+	# into this expression's own aggregate. The (i32,NoFloorDiv)/
+	# (NoFloorDiv,i32) mismatch cells still contribute TypeError as
+	# their own, separate, genuinely-aggregated error
+	with compiler.panic_arithmetic( 'unexpected div failure' ):
+		a: i32|NoFloorDiv = 10
+		b: i32|NoFloorDiv = 5
+		r1: Result[i32,TypeError] = a // b
+		if r1.is_err():
+			return 1
+
+		c: i32|NoFloorDiv = 20
+		d: i32|NoFloorDiv = NoFloorDiv( 4 )
+		r2: Result[i32,TypeError] = c // d
+		if not r2.is_err():
+			return 2
+	return 0
+''' ),
+			( 'union_binop_nested_multi_error_unwrap', '''
+class ErrorA:
+	pass
+class ErrorB:
+	pass
+
+class Dicey:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+	def __floordiv__( self, other: Dicey ) -> Result[Dicey,ErrorA|ErrorB]:
+		if other.x == 0:
+			return Result.Err( ErrorA() )
+		if self.x < 0:
+			return Result.Err( ErrorB() )
+		# zero already ruled out above, but i32.__floordiv__ is itself
+		# @fallible_arithmetic and needs ITS OWN ambient mode regardless
+		# of the guard already having ruled the failure case out -
+		# panic_arithmetic is the one mode that needs no enclosing
+		# Result[_,ZeroDivisionError] coverage at all, and is genuinely
+		# unreachable here given the guard above
+		with compiler.panic_arithmetic( 'unreachable: other.x == 0 already ruled out' ):
+			return Result.Ok( Dicey( self.x // other.x ) )
+
+class NoFloorDiv2:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+def main() -> i32:
+	# Dicey.__floordiv__ is a REGULAR (not @fallible_arithmetic) dunder
+	# declaring a genuine multi-member ANONYMOUS error union directly in
+	# its own return type - exercises the bounded extra nested-unwrap
+	# level (_emit_nested_error_unwrap), alongside a separate TypeError
+	# contributed by the (Dicey,NoFloorDiv2)/(NoFloorDiv2,Dicey)
+	# mismatch cells - all three must land as distinct members of ONE
+	# aggregate error union
+	a: Dicey|NoFloorDiv2 = Dicey( 10 )
+	b: Dicey|NoFloorDiv2 = Dicey( 0 )
+	r1: Result[Dicey,ErrorA|ErrorB|TypeError] = a // b
+	if not r1.is_err():
+		return 1
+
+	c: Dicey|NoFloorDiv2 = Dicey( -10 )
+	d: Dicey|NoFloorDiv2 = Dicey( 4 )
+	r2: Result[Dicey,ErrorA|ErrorB|TypeError] = c // d
+	if not r2.is_err():
+		return 2
+
+	e: Dicey|NoFloorDiv2 = Dicey( 20 )
+	f: Dicey|NoFloorDiv2 = Dicey( 4 )
+	r3: Result[Dicey,ErrorA|ErrorB|TypeError] = e // f
+	if r3.is_err():
+		return 3
+
+	g: Dicey|NoFloorDiv2 = NoFloorDiv2( 1 )
+	h: Dicey|NoFloorDiv2 = Dicey( 2 )
+	r4: Result[Dicey,ErrorA|ErrorB|TypeError] = g // h
+	if not r4.is_err():
+		return 4
+	return 0
+''' ),
+			# RC-lifetime check under repetition - every cell kind that
+			# carries a real RC value (dunder-fallible Ok/Err, both TypeError
+			# 'error' cells) exercised 1000x. Verified separately under
+			# gcc -fsanitize=address before adding this (clean - no leak/UAF)
+			( 'union_binop_rc_no_leak_under_repetition', '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 1000:
+			a: i32|int = int( 3 )
+			b: i32|int = int( 4 )
+			r1: Result[i32|int,IntError|TypeError] = a + b
+			if r1.is_err():
+				return 1
+
+			c: i32|int = 5
+			d: i32|int = int( 6 )
+			r2: Result[i32|int,IntError|TypeError] = c + d
+			if not r2.is_err():
+				return 2
+
+			i += 1
+	return 0
+''' ),
+		] )
 
 
 class UnionReceiverDispatchCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -7190,7 +11562,11 @@ def main() -> i32:
 			( 'str_slice_from_computed_find_offset', '''
 def main() -> i32:
 	target_path: str = "/usr/share/zoneinfo/America/New_York"
-	idx: usize = target_path.find( "zoneinfo/" ).unwrap( "expected match" )
+	found: isize = target_path.find( "zoneinfo/" )
+	if found == isize( -1 ):
+		return 2
+	with compiler.panic_arithmetic( 'bounded by target_path length, cannot overflow' ):
+		idx: usize = usize( found )
 	with compiler.wrap_arithmetic:
 		tz: str = target_path[idx+9:]
 	if tz != "America/New_York":
@@ -7472,6 +11848,363 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# a concrete overload sharing a name with a generic `[T]` one -
+			# real gap: overload_resolution.py's own box-subtraction matching
+			# treated a TypeVar-typed candidate's required leaves ([itself],
+			# per Type.leaves()' own base case) as structurally unmatchable
+			# against any real argument type, so the generic candidate could
+			# never be selected at all ("no matching overload" for the
+			# non-str call below). Fixed via _Candidate.wildcard (a bare-
+			# TypeVar slot matches everything, at lowest priority regardless
+			# of declaration order) plus lowering.py's _lower_overload_
+			# generic_call/_finish_generic_call (monomorphizing the winning
+			# generic candidate the same way a bare generic-function call
+			# already does - the emitter crashed on the still-abstract
+			# TypeVar parameter before that existed).
+			( 'concrete_overload_beats_generic_typevar_fallback', '''
+class Box:
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+	def get( self, x: str ) -> str:
+		return x
+
+def main() -> i32:
+	b: Box = Box()
+	if b.get( 'hi' ) != 'hi':
+		return 1
+	n: i32 = 42
+	if b.get( n ) != 'generic':
+		return 2
+	return 0
+''' ),
+			# a generic `[T]` candidate as one branch (or the trailing
+			# default) of a runtime-dispatched Overload call - a UNION-typed
+			# argument (unlike the concrete-argument case above) can force
+			# overload_resolution.resolve_call to return a real
+			# ConditionalDispatch, whose branches _lower_conditional_dispatch
+			# schedules as concrete, callable C symbols. Two real gaps fixed
+			# together here: (1) whichever single leaf still reaches a
+			# generic branch/default at compile time (only i32 can ever
+			# reach get[T] once str is claimed by the concrete overload) is
+			# now monomorphized in place instead of being rejected outright
+			# (see lowering.py's _monomorphize_dispatch_target) - a call
+			# whose argument is CONCRETE already worked (the case just
+			# above); this is the same feature for a UNION-typed argument.
+			# (2) _lower_conditional_dispatch/_emit_dispatch_call always
+			# hardcoded receiver=None, silently dropping `self` for any
+			# runtime-dispatched METHOD call (every prior real-compile
+			# exercise of this machinery - see OverloadGenericSubstitution
+			# MatchingRealCompileTests - only ever used receiver-less free
+			# functions, so this was never caught): confirmed via a real
+			# repro, the C compiler itself rejected the generated call
+			# ("too few arguments to function call") before this fix.
+			# Exercises the generic candidate landing as BOTH the trailing
+			# default (str|i32 - str claimed, i32 falls through) and a
+			# proper conditioned branch (i32|str - order flipped).
+			( 'generic_typevar_fallback_through_runtime_dispatch', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick_str_first( flag: bool ) -> str|i32:
+	if flag:
+		return 'hi'
+	return 42
+
+def pick_i32_first( flag: bool ) -> i32|str:
+	if flag:
+		return 42
+	return 'hi'
+
+def main() -> i32:
+	b: Box = Box()
+	u1: str|i32 = pick_str_first( True )
+	u2: str|i32 = pick_str_first( False )
+	if b.get( u1 ) != 'hi':
+		return 1
+	if b.get( u2 ) != 'generic':
+		return 2
+	u3: i32|str = pick_i32_first( True )
+	u4: i32|str = pick_i32_first( False )
+	if b.get( u3 ) != 'generic':
+		return 3
+	if b.get( u4 ) != 'hi':
+		return 4
+	return 0
+''' ),
+		] )
+
+
+class MultiLeafGenericDispatchRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' companion to OverloadRealCompileTests' own
+	generic_typevar_fallback_through_runtime_dispatch case: that one covers
+	the EASY sub-case of a generic branch/default of a runtime
+	ConditionalDispatch (exactly one leaf can still reach it, so T is
+	statically knowable). This is the genuinely harder sub-case: a 3+-leaf
+	union where 2 or more DISTINCT leaves both fall through to the SAME
+	generic branch - each needs its own distinct monomorphization, selected
+	by a runtime tag no single Call target can express (this compiler has
+	no vtable/runtime-polymorphic dispatch mechanism anywhere). Fixed by
+	lowering.py's _expand_dispatch_target: splits that ONE ambiguous branch
+	into one new, individually-concrete, individually-monomorphized branch
+	PER leaf, each with its own runtime tag check - a real per-tag dispatch
+	table synthesized at compile time, not just a shortcut for the
+	single-leaf case. Exercises: the generic default covering 2 of 3 leaves
+	(str claimed by a concrete overload, i32+bool both fall through), the
+	generic default covering 2 of 4 leaves (2 concrete overloads, i32+f64
+	fall through), and the SAME 3-leaf shape with the union's leaf order
+	flipped so the generic branch ISN'T the trailing default (a real,
+	explicitly-conditioned middle branch instead) - confirming
+	_expand_dispatch_target's own splicing works whichever position the
+	ambiguous branch started in. Each case actually CALLS every leaf and
+	checks the RIGHT monomorphization ran, not just that it compiles. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'generic_default_spans_two_of_three_leaves', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick( flag: i32 ) -> str|i32|bool:
+	if flag == 0:
+		return 'hi'
+	if flag == 1:
+		return 42
+	return True
+
+def main() -> i32:
+	b: Box = Box()
+	u0: str|i32|bool = pick( 0 )
+	u1: str|i32|bool = pick( 1 )
+	u2: str|i32|bool = pick( 2 )
+	if b.get( u0 ) != 'hi':
+		return 1
+	if b.get( u1 ) != 'generic':
+		return 2
+	if b.get( u2 ) != 'generic':
+		return 3
+	return 0
+''' ),
+			( 'generic_default_spans_two_of_four_leaves', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get( self, x: f64 ) -> str:
+		return 'float!'
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick( flag: i32 ) -> str|i32|bool|f64:
+	if flag == 0:
+		return 'hi'
+	if flag == 1:
+		return 42
+	if flag == 2:
+		return True
+	return 3.5
+
+def main() -> i32:
+	b: Box = Box()
+	u0: str|i32|bool|f64 = pick( 0 )
+	u1: str|i32|bool|f64 = pick( 1 )
+	u2: str|i32|bool|f64 = pick( 2 )
+	u3: str|i32|bool|f64 = pick( 3 )
+	if b.get( u0 ) != 'hi':
+		return 1
+	if b.get( u1 ) != 'generic':
+		return 2
+	if b.get( u2 ) != 'generic':
+		return 3
+	if b.get( u3 ) != 'float!':
+		return 4
+	return 0
+''' ),
+			# same 3-leaf shape as the first case, but the union's own leaf
+			# order is flipped (i32|bool|str instead of str|i32|bool) - the
+			# generic candidate no longer ends up as resolve_call's trailing
+			# default (see overload_resolution.py's own combo-ordering,
+			# which follows the union's leaf order, not any concrete-vs-
+			# generic priority) - it lands as a real, explicitly-conditioned
+			# middle branch instead, confirming _expand_dispatch_target's
+			# splicing works there too, not just for the default slot
+			( 'generic_multi_leaf_branch_not_the_trailing_default', '''
+class Box:
+	def get( self, x: str ) -> str:
+		return x
+
+	def get[T]( self, x: T ) -> str:
+		return 'generic'
+
+def pick( flag: i32 ) -> i32|bool|str:
+	if flag == 0:
+		return 42
+	if flag == 1:
+		return True
+	return 'hi'
+
+def main() -> i32:
+	b: Box = Box()
+	u0: i32|bool|str = pick( 0 )
+	u1: i32|bool|str = pick( 1 )
+	u2: i32|bool|str = pick( 2 )
+	if b.get( u0 ) != 'generic':
+		return 1
+	if b.get( u1 ) != 'generic':
+		return 2
+	if b.get( u2 ) != 'hi':
+		return 3
+	return 0
+''' ),
+		] )
+
+
+class OverloadGenericSubstitutionMatchingRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' overload_resolution.py's own _contains/_intersect/_subtract used a raw
+	`is` identity check to decide whether a call-site argument's type matches
+	an @overload candidate's own declared parameter type - _leaf_is_accepted's
+	own claimed invariant ("the existing dedup caches already guarantee 'same
+	type' is the same object") turned out not to hold in general: a generic
+	function's own list[T], specialized to list[i32], is a DIFFERENT
+	Specialization object than an @overload candidate's own freshly-annotated
+	list[i32] parameter - the exact same duality TypeResolver._same_type
+	exists to handle elsewhere in this compiler. Before the fix, calling
+	through a generic function into an @overload group with a generic-
+	substituted argument type raised "no matching overload" for a call that
+	should resolve cleanly - confirmed via a real repro
+	(PLAN_COMPILER_BUG_SWEEP.md). Fixed by threading a caller-supplied
+	`same_type` predicate (TypeResolver._same_type) through resolve_call/
+	stub_covers_call, defaulting to plain `is` so overload_resolution_test.
+	py's own isolated unit tests (which never exercise this duality) stay
+	unchanged. This also unblocks two OTHER, previously-unconfirmed fixes
+	(lowering.py's _lower_dispatch_tests/_maybe_unwrap_union_arg, fixed in an
+	earlier pass but gated behind this same upstream bug) - the runtime
+	conditional-dispatch shape below genuinely exercises both. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'generic_substituted_argument_matches_overload_candidate', '''
+@overload
+def handle( x: list[i32] ) -> i32:
+	return 1
+
+@overload
+def handle( x: str ) -> i32:
+	return 2
+
+def dispatch[T]( v: list[T]|str ) -> i32:
+	return handle( v )
+
+def main() -> i32:
+	if dispatch[i32]( list[i32]() ) != 1:
+		return 1
+	if dispatch[i32]( 'hi' ) != 2:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class OverloadedDunderComparisonExtraSitesRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' companion to OverloadedDunderComparisonTests (int.__eq__/__ne__(i32)
+	above): that fix landed FunctionLowering._find_eq_method_for_arg,
+	scoped to _lower_eq_or_ne's same-type fast path and
+	_classify_leaf_pair_eq's cross-type classification (==/!= only). Two
+	OTHER call sites had the exact same _find_method-returns-None-for-an-
+	Overload gap (found separately, then reconciled with the above fix on
+	merge): _expr_Compare's general </>/<=/>= dunder dispatch, and
+	_lower_operand_compare (the union-leaf-pair equality helper used once a
+	leaf pairing is classified 'same_type'). Both are now fixed the same
+	way, reusing _find_eq_method_for_arg (every caller here already knows
+	the argument's own concrete type - strict=True lowering forces it to
+	match the receiver's type, or a union leaf's own narrowed payload type,
+	before dispatch is even reached, so no real runtime ambiguity is
+	possible the way an ordinary call's overload resolution has to handle). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# _expr_Compare's general </>/<=/>= dunder dispatch: an Overload
+			# group for __lt__ (needed to trigger the gap at all) must still
+			# find and call the real Box-vs-Box implementation, not silently
+			# fall back to flat pointer comparison
+			( 'overloaded_lt_still_dispatches_to_real_dunder', '''
+class Box:
+	value: i32
+
+	def __init__( self, value: i32 ):
+		self.value = value
+
+	@overload
+	def __lt__( self, other: Box ) -> bool:
+		return self.value < other.value
+
+	@overload
+	def __lt__( self, other: i32 ) -> bool:
+		return self.value < other
+
+def main() -> i32:
+	a: Box = Box( 5 )
+	b: Box = Box( 6 )
+	if not ( a < b ):
+		return 1
+	if b < a:
+		return 2
+	return 0
+''' ),
+			# _lower_operand_compare, reached via _classify_leaf_pair_eq's
+			# 'same_type' cell: comparing a union (Box|None) against a plain
+			# Box narrows to a same-type Box-vs-Box pairing internally, which
+			# _emit_leaf_pair_eq_value routes through _lower_operand_compare
+			# rather than _lower_eq_or_ne's own AST-driven fast path
+			( 'overloaded_eq_via_union_leaf_still_dispatches_to_real_dunder', '''
+class Box:
+	value: i32
+
+	def __init__( self, value: i32 ):
+		self.value = value
+
+	@overload
+	def __eq__( self, other: Box ) -> bool:
+		return self.value == other.value
+
+	@overload
+	def __eq__( self, other: i32 ) -> bool:
+		return self.value == other
+
+def main() -> i32:
+	a: Box|None = Box( 5 )
+	b: Box = Box( 5 )
+	c: Box = Box( 6 )
+	if not ( a == b ):
+		return 1
+	if a == c:
+		return 2
+	return 0
+''' ),
 		] )
 
 
@@ -7565,6 +12298,30 @@ def main() -> i32:
 	bs: bytes = bytes( b )
 	if decode_it( bs ) != "abc":
 		return 2
+	return 0
+''' ),
+			# a bare bytes literal passed directly where the declared
+			# parameter type is a bytes|bytearray union - regression test
+			# for _expr_Constant's literal self-typing chain missing a
+			# `bytes` branch (str/int/float/bool/None already had one)
+			( 'decode_bytes_literal_into_union_param', '''
+from codecs.utf8 import utf8
+
+def decode_it( x: bytes|bytearray ) -> str:
+	return utf8.decode( x ).unwrap( 'decode failed' )
+
+def main() -> i32:
+	if decode_it( b'abc' ) != "abc":
+		return 1
+	return 0
+''' ),
+			# a bare bytes literal used directly as a method-call receiver -
+			# same root cause as above, but hit via receiver-type
+			# resolution (_resolve_callee) instead of call-argument lowering
+			( 'bytes_literal_as_receiver', '''
+def main() -> i32:
+	if b'abc'.decode().unwrap( 'decode failed' ) != "abc":
+		return 1
 	return 0
 ''' ),
 			# mirrors the real forcing case: fs.py:24's
@@ -8079,6 +12836,7 @@ def helper( r: Result[str,MyError], r2: Result[str,MyError] ) -> i32:
 					junk = x.byte_len()
 				case Result.Err( e ):
 					junk = 0
+			if junk != usize( 0 ): pass
 			with compiler.wrap_arithmetic:
 				outcome = i32( r.byte_len() )
 		case Result.Err( e ):
@@ -8897,7 +13655,6 @@ def main() -> i32:
 			( 'no_explicit_else_still_narrows', '''
 def describe( x: i32|str ) -> usize:
 	with compiler.wrap_arithmetic:
-		result: usize = 0
 		if type( x ) is i32:
 			return 999
 		return x.byte_len()
@@ -9114,6 +13871,34 @@ def use( ok: bool ) -> None:
 
 def main() -> i32:
 	use( True )
+	return 0
+''' ),
+			# len(x) after `if x is None: return` - unlike the byte_len()/
+			# ordinary-method-call cases above (already correct even before
+			# this fix, since lowering.py's own cfg-based narrowing already
+			# handled post-if survival), len(x) is a BARE call to a builtin
+			# GENERIC function (`def len[T](t: T) -> usize: return
+			# t.__len__()`) - T is inferred from the argument's type by an
+			# EARLIER, separate static pass (type_resolver.py's
+			# _try_resolve_generic_call/_infer_generic_args), which has its
+			# own, separate _narrowed tracker that previously did NOT survive
+			# past a terminating if-branch. That eagerly (and wrongly)
+			# monomorphized len[str|None] instead of len[str], crashing while
+			# resolving `t.__len__()` against the union's own None leaf -
+			# confirmed real repro, not just the type_resolver_test.py-level
+			# unit tests (test_generic_call_after_terminating_is_none_branch_
+			# infers_narrowed_type) covering the same root cause
+			( 'len_after_terminating_is_none_branch_infers_narrowed_type', '''
+def describe_len( xs: str|None ) -> usize:
+	if xs is None:
+		return 0
+	return len( xs )
+
+def main() -> i32:
+	if describe_len( "hello" ) != 5:
+		return 1
+	if describe_len( None ) != 0:
+		return 2
 	return 0
 ''' ),
 		] )
@@ -9430,10 +14215,7 @@ class ReturnStatementTempLifetimeTests( CompilerTestCase ):
 		for lib in sorted( self.compiler.extern_libs ):
 			if lib == 'c':
 				continue
-			if _CC is not None and _CC.name == 'cl':
-				flags.append( f'{lib}.lib' )
-			else:
-				flags.append( f'-l{lib}' )
+			flags.append( linker_c.resolve_lib_ldflag( _CC, lib, self.compiler.extern_libs[lib] ) )
 		return ' '.join( flags )
 
 	def _assert_compiles_and_runs( self, c_source: str, expected_exit: int = 0 ) -> None:
@@ -9567,14 +14349,30 @@ class IfExpTempLifetimeTests( test_support.RealCompileMixin, CompilerTestCase ):
 		# reasoning for why a bare single-shot check isn't enough to catch
 		# a leak (as opposed to the double-free, which a single shot alone
 		# already reliably reproduced).
+		# dash/plus + '' (not bare '-'.lstrip()/'+'.lstrip() directly in the
+		# ternary): a BARE method-call receiver on a str LITERAL, used as
+		# BOTH ternary branches, was found (while adapting this test off the
+		# now-removed str copy-constructor) to hit a SEPARATE, still-open
+		# double-free in _expr_IfExp - confirmed independent of this fix's
+		# own __char_count/__index change (repros identically with plain
+		# int(1) if cond else int(2)-shaped construct calls being FINE, but
+		# two fresh ORDINARY METHOD calls merged via a ternary crashing
+		# under MSVC's debug heap regardless of receiver - literal or a
+		# bound local - every time; task flagged separately, not fixed
+		# here). dash/plus + '' still produces two genuinely fresh,
+		# independently-owned allocations each iteration (str.__add__ always
+		# allocates - see __init__.py), it just does it via a BinOp instead
+		# of a bare method Call, which doesn't hit the open bug.
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		i: i32 = 0
 		cond: bool = True
+		dash: str = '-'
+		plus: str = '+'
 		while i < 1000:
-			x: str = str( '-' ) if cond else str( '+' )
-			expected: str = str( '-' ) if cond else str( '+' )
+			x: str = ( dash + '' ) if cond else ( plus + '' )
+			expected: str = ( dash + '' ) if cond else ( plus + '' )
 			if x != expected:
 				return 1
 			if compiler.refcount( x ) != 1:
@@ -9596,17 +14394,17 @@ def main() -> i32:
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		a: str = str( 'A' )
-		b: str = str( 'B' )
+		a: str = 'A'.lstrip()
+		b: str = 'B'.lstrip()
 		cond: bool = True
 		z: str = a if cond else b
-		if z != str( 'A' ):
+		if z != 'A':
 			return 1
 		if compiler.refcount( a ) != 2:
 			return 2
 		if compiler.refcount( z ) != 2:
 			return 3
-		if a != str( 'A' ) or b != str( 'B' ):
+		if a != 'A' or b != 'B':
 			return 4
 		return 0
 ''' )
@@ -9621,19 +14419,154 @@ def main() -> i32:
 		self._run( '''
 def main() -> i32:
 	with compiler.wrap_arithmetic:
-		existing: str = str( 'lower' )
+		existing: str = 'lower'.lstrip()
 		cond: bool = False
 		result: str = existing.upper() if cond else existing
-		if result != str( 'lower' ):
+		if result != 'lower':
 			return 1
 		if compiler.refcount( existing ) != 2:
 			return 2
 		cond2: bool = True
 		result2: str = existing.upper() if cond2 else existing
-		if result2 != str( 'LOWER' ):
+		if result2 != 'LOWER':
 			return 3
 		if compiler.refcount( result2 ) != 1:
 			return 4
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_inside_their_own_branch( self ) -> None:
+		# regression for a SEPARATE, later bug in this same method: unlike
+		# the fresh-vs-aliasing cases above (where the branch's own FINAL
+		# value is the only temp involved), `prefix + str('.') + k` chains
+		# TWO str.__add__ calls, each DeclareTemp-ing its own INTERMEDIATE
+		# temp (the '.' literal-wrap, and the first __add__'s own result,
+		# consumed as the second __add__'s receiver) that this method never
+		# untrack_temp()'s or increfs at all - it only ever handles the
+		# branch's own final value. Left in lowering.py's per-STATEMENT
+		# _pending_temps list, those intermediate temps survived past
+		# end_label and got unconditionally decref'd by the ENCLOSING
+		# statement's own flush - including in the branch that never ran,
+		# releasing an uninitialized C local. Confirmed as a real, 100%
+		# reproducible STACK OVERFLOW at runtime (Windows exit 3221225501 /
+		# 0xC00000FD - release_object() on stack garbage jumping through a
+		# garbage vtable pointer), not a leak/UAF - the compiled program
+		# crashed on every run, before this fix. Found while implementing
+		# lib/json.py's flatten(), building dotted/bracketed path strings
+		# for nested JSON keys via exactly this ternary shape.
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return k if prefix.byte_len() == 0 else prefix + '.' + k
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( '', 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_when_concat_is_the_true_branch( self ) -> None:
+		# same bug, concatenation on the OTHER side of the ternary (the
+		# TRUE branch instead of the false one) - confirms the fix isn't
+		# accidentally specific to which branch runs the chained __add__s
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return prefix + '.' + k if prefix.byte_len() != 0 else k
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( '', 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_in_both_branches( self ) -> None:
+		# BOTH branches chain a concatenation (no bare-Name branch at all) -
+		# each branch's own intermediate temps must be flushed independently
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	return ( prefix + '!' ) if prefix.byte_len() == 0 else ( prefix + '.' + k )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( '', 'a' )
+		if p1 != '!':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_intermediate_temps_flushed_when_result_bound_to_a_local_first( self ) -> None:
+		# the ternary's own result is bound to a named local before being
+		# returned/used, rather than consumed directly at the call site -
+		# confirmed not specific to a bare `return <ternary>`
+		self._run( '''
+def build_path( prefix: str, k: str ) -> str:
+	result: str = k if prefix.byte_len() == 0 else prefix + '.' + k
+	return result
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		p1: str = build_path( '', 'a' )
+		if p1 != 'a':
+			return 1
+		p2: str = build_path( 'a', 'b' )
+		if p2 != 'a.b':
+			return 2
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_fresh_ordinary_method_call_branches_no_double_free( self ) -> None:
+		# _flush_ifexp_branch_temps (see its own comment) was written to fix
+		# a chained-concat intermediate-temp leak, but the SAME leak shape
+		# also happens for an ordinary METHOD call with a defaulted union-
+		# typed argument: str.lstrip()'s `chars: str|None = None` default
+		# materializes via its own Call, DeclareTemp-ing a temp that is
+		# neither branch's own true_val/false_val. Before the fix, that temp
+		# leaked into the enclosing statement's shared _pending_temps and got
+		# unconditionally decref'd for BOTH branches after end_label,
+		# including whichever branch never ran - reading/releasing an
+		# uninitialized C local. Crashed under MSVC's debug heap (0x80000003)
+		# after ~hundreds of iterations; did NOT crash under clang, and did
+		# NOT reproduce with construct calls (str(...)) or a BinOp/dunder
+		# call instead - only two fresh ordinary-method-Call-shaped branches
+		# trigger it. Confirmed via direct testing, not just reasoning.
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		cond: bool = True
+		while i < 1000:
+			x: str = '-'.lstrip() if cond else '+'.lstrip()
+			if compiler.refcount( x ) != 1:
+				return 2
+			cond = not cond
+			i += 1
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -9687,13 +14620,6 @@ def main() -> i32:
 			# the exact shape dict[K,V]'s own comparator/hasher helpers will
 			# use: a @staticmethod referenced bare from a sibling method of the
 			# same class, stored in a local, called indirectly from there.
-			# NOTE: deliberately does NOT return the Ptr[Callable[...]] value
-			# from a function - that's a real, separate gap (a function
-			# RETURNING a function pointer is C's gnarliest declarator shape,
-			# `RetType (*name(Params))(InnerParams)` - _declarator only covers
-			# parameter/local declarations, per PLAN_CALLABLE.md's own scope).
-			# Not needed here: dict[K,V] only ever passes a callback as a
-			# parameter, never returns one.
 			( 'staticmethod_reference_called_indirectly', '''
 class Ops:
 	@staticmethod
@@ -9752,6 +14678,292 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 5
 	return diff
+''' ),
+			# regression test: a MODULE-LEVEL Ptr[Callable[...]] global used to
+			# crash emit_c() entirely (NotImplementedError: c_type: unsupported
+			# type <CallableType ...>) - _emit_global_declaration spelled the
+			# global's declaration as a plain c_type(...)-prefixed "TYPE NAME"
+			# string instead of routing through _declarator (which every
+			# parameter/local/field declaration already does), and C's
+			# function-pointer declarator syntax puts the name INSIDE the
+			# parens, not after a type prefix. This exercises the non-trivial
+			# ({0} + separate init-function-call) declaration path: the
+			# initializer is a real function reference, not a constant.
+			( 'module_level_function_pointer_global_assigned_function_reference', '''
+def double( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 2
+
+_dispatch: Ptr[Callable[[i32],i32]] = double
+
+def main() -> i32:
+	result: i32 = _dispatch( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
+			# same underlying gap as the test above, but through the OTHER
+			# _emit_global_declaration branch: a trivial bare-Const initializer
+			# (the exact `_SIG_DFL: Ptr[Callable[...]] = 0` null-sentinel shape
+			# that motivated this - see lib/signal.py). This also exercises a
+			# companion gap in _emit_const, which cast pointer-typed constants
+			# via a bare c_type(...) call that likewise can't spell a function-
+			# pointer type. Mirrors EmitGlobalTests' own STD_OUTPUT_HANDLE
+			# convention: read the global into a local to prove it's really
+			# emitted and readable, not just that emit_c() doesn't crash.
+			( 'module_level_function_pointer_global_null_sentinel', '''
+_sig_dfl: Ptr[Callable[[i32],i32]] = 0
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = _sig_dfl
+	return 0
+''' ),
+			# regression test: a function RETURNING a Ptr[Callable[...]] value
+			# used to crash emit_c() (NotImplementedError: c_type: unsupported
+			# type <CallableType ...>) - flagged as an explicit, deferred gap
+			# by PLAN_CALLABLE.md ("not needed by dict[K,V] - it only ever
+			# passes a callback as a parameter, never returns one") since a
+			# function returning a function pointer is C's gnarliest
+			# declarator shape: `RetType (*name(Params))(InnerParams)` - the
+			# one case where even the OUTER function's own name+params nest
+			# INSIDE the return type's own declarator. Fixed by reusing
+			# _declarator exactly as-is: passing "name( params )" as ITS OWN
+			# `name` argument makes the two declarator layers nest correctly.
+			( 'function_returning_function_pointer_called_indirectly', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def get_handler() -> Ptr[Callable[[i32],i32]]:
+	return add_one
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = get_handler()
+	result: i32 = f( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# same gap, through a METHOD (self is always the FIRST outer
+			# parameter, ahead of the return type's own declarator nesting -
+			# confirmed this doesn't disturb the self/params ordering).
+			( 'method_returning_function_pointer_called_indirectly', '''
+class Ops:
+	@staticmethod
+	def double( x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x * 2
+
+	def get_op( self, v: i32 ) -> Ptr[Callable[[i32],i32]]:
+		return double
+
+def main() -> i32:
+	o: Ops = Ops()
+	f: Ptr[Callable[[i32],i32]] = o.get_op( 0 )
+	result: i32 = f( 21 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' ),
+			# same gap, through a GENERIC function monomorphized with
+			# K = Ptr[Callable[[i32],i32]] - confirms the declarator fix
+			# applies after substitute_type_params resolves K, not just to a
+			# return type spelled directly in source.
+			( 'generic_function_returning_function_pointer', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def identity[T]( x: T ) -> T:
+	return x
+
+def main() -> i32:
+	f: Ptr[Callable[[i32],i32]] = identity( add_one )
+	result: i32 = f( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# regression test: obj.field(...) - a call DIRECTLY through an
+			# attribute-access expression whose FIELD type is Ptr[Callable[...]]
+			# - used to be a clean compile error ("'field' is not callable on
+			# ...") since _try_lower_indirect_call was scoped to a bare Name
+			# callee only (PLAN_CALLABLE.md's own deferred item; reading the
+			# field into a local first and calling THAT already worked, so
+			# this was purely a call-site recognition gap, not a storage or
+			# codegen bug). Fixed by extending _try_lower_indirect_call to
+			# also recognize an Attribute callee, using a purely STATIC type
+			# lookup (_static_type_of_value_expr, no IR emitted) to decide
+			# whether this shape even applies BEFORE ever lowering the
+			# receiver - critical because _resolve_callee's own Attribute
+			# fallback lowers the receiver again on any non-match, so trying
+			# and abandoning a real lowering here would double-evaluate a
+			# receiver with side effects.
+			( 'cstruct_field_called_directly_as_attribute_expression', '''
+@cstruct
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	o: Ops = Ops( handler = add_one )
+	result: i32 = o.handler( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# same fix, through an RCClass field instead of a @cstruct one -
+			# both emit_rcclass and _struct_or_union_body already routed field
+			# DECLARATIONS through _declarator; this confirms the new call-site
+			# recognizer works identically for either field-storage kind.
+			( 'rcclass_field_called_directly_as_attribute_expression', '''
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	o: Ops = Ops( handler = add_one )
+	result: i32 = o.handler( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# a NESTED field chain (outer.inner.handler(...)) - confirms
+			# _static_type_of_value_expr's own recursive Attribute handling
+			# threads through correctly, not just a single obj.field(...) hop.
+			( 'nested_field_chain_called_directly', '''
+@cstruct
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+@cstruct
+class Outer:
+	inner: Ops
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	outer: Outer = Outer( inner = Ops( handler = add_one ))
+	result: i32 = outer.inner.handler( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# regression guard: an ORDINARY method call through the exact same
+			# dotted-attribute callee shape must still dispatch normally, not
+			# get misrouted into the new field-call recognizer (which must
+			# bail via the non-failing _find_method check before ever trying
+			# _find_field).
+			( 'ordinary_method_call_not_misrouted_by_field_call_recognizer', '''
+@cstruct
+class Ops:
+	handler: Ptr[Callable[[i32],i32]]
+
+	def real_method( self, x: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return x * 10
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	o: Ops = Ops( handler = add_one )
+	result: i32 = o.real_method( 3 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 30
+	return diff
+''' ),
+			# regression test: calling THROUGH THE RESULT OF A CALL
+			# (get_callback()(...)) used to be a hard "cannot call ..." error
+			# - _resolve_callee only ever attempts an Attribute or a resolved
+			# namespace Name, failing immediately (no evaluation at all) for
+			# any other node.func shape. _try_lower_indirect_call's general
+			# fallback branch now evaluates node.func once and checks the
+			# REAL operand's type, since nothing downstream gets a second
+			# chance to evaluate it either way.
+			( 'call_result_used_directly_as_callee', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def get_callback() -> Ptr[Callable[[i32],i32]]:
+	return add_one
+
+def main() -> i32:
+	result: i32 = get_callback()( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# same fix, through a SUBSCRIPT result instead of a bare call -
+			# t[0](...) where __getitem__ returns Ptr[Callable[...]]. Uses a
+			# custom __getitem__ rather than a generic container specifically
+			# to isolate this call-site fix from whatever separate, unrelated
+			# gaps a generic container's OWN internals might still have
+			# storing a Ptr[Callable[...]] element - see the NEXT test for
+			# that other, separate gap (since found and fixed).
+			( 'subscript_result_used_directly_as_callee', '''
+@cstruct
+class Table:
+	def __getitem__( self, i: i32 ) -> Ptr[Callable[[i32],i32]]:
+		return add_one
+
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def main() -> i32:
+	t: Table = Table()
+	result: i32 = t[0]( 5 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 6
+	return diff
+''' ),
+			# regression test: a REAL generic container storing
+			# Ptr[Callable[...]] elements (list[Ptr[Callable[...]]], as
+			# opposed to the custom __getitem__ above) used to crash emit_c()
+			# with the SAME NotImplementedError as every earlier bug in this
+			# area, but ONE LEVEL DEEPER - list.__getitem__'s own
+			# Result[Ptr[Callable[...]],IndexError] return type indirects its
+			# Ok-leaf through an EXTRA pointer (UnionStorage's own payload
+			# representation), producing Ptr[Ptr[Callable[...]]] - a shape
+			# _callable_ptr_type only ever recognized at exactly one
+			# indirection level. Fixed by generalizing it to report the
+			# indirection DEPTH (not just yes/no), and threading that through
+			# every caller's own star count - C's function-pointer declarator
+			# generalizes to N levels via N stars INSIDE the parens
+			# (RetType (**name)(Params) for N=2), unlike an ordinary object
+			# pointer chain's trailing stars.
+			( 'generic_container_storing_callable_elements', '''
+def add_one( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 1
+
+def add_two( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x + 2
+
+def main() -> i32:
+	arr: list[Ptr[Callable[[i32],i32]]] = list[Ptr[Callable[[i32],i32]]]()
+	arr.append( add_one ).unwrap( 'append' )
+	arr.append( add_two ).unwrap( 'append' )
+	f: Ptr[Callable[[i32],i32]] = arr.__getitem__( 0 ).unwrap( 'getitem' )
+	result0: i32 = f( 5 )
+	result1: i32 = arr.__getitem__( 1 ).unwrap( 'getitem' )( 5 )
+	with compiler.wrap_arithmetic:
+		diff0: i32 = result0 - 6
+		diff1: i32 = result1 - 7
+		total: i32 = diff0 + diff1
+	return total
 ''' ),
 		] )
 
@@ -9826,6 +15038,135 @@ def main() -> i32:
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 42 )
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_optional_callable_field_storage( self ) -> None:
+		# regression test: a Ptr[Callable[...]]|None-typed parameter (needed
+		# by lib/bisect.py's own key= parameter, and lib/http/client.py's
+		# logging sink) forces the union payload machinery to store a real
+		# Ptr[Callable[...]] member - emitter_c.py's _struct_or_union_body
+		# used to call _field_type_spelling/c_type on the bare CallableType
+		# unwrapped from Ptr[...], which has no c_type() branch at all
+		# (NotImplementedError: c_type: unsupported type <CallableType ...>).
+		# Fixed by routing struct/union field emission through the SAME
+		# _declarator helper parameter/local declarations already use, which
+		# special-cases Ptr[Callable[...]]'s function-pointer declarator
+		# shape. This alone (no call through the narrowed value) is enough to
+		# trigger emission of the TaggedUnion's own backing CUnion - see
+		# test_optional_callable_narrowed_by_is_not_none_is_callable below
+		# for the companion "narrowed value can actually be called" bug.
+		self._run( '''
+def sink( text: str ) -> None:
+	pass
+
+def maybe_log( text: str, log: Ptr[Callable[[str],None]]|None = None ) -> None:
+	pass
+
+def main() -> i32:
+	f: Ptr[Callable[[str],None]] = sink
+	maybe_log( 'hello', f )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_optional_callable_narrowed_by_is_not_none_is_callable( self ) -> None:
+		# regression test: lowering.py's _try_lower_indirect_call checked the
+		# callee Name's raw DECLARED type (name.type) for a Ptr[Callable[...]]
+		# shape, ignoring cfg.py's narrowed_member() - so a Ptr[Callable[...]]
+		# |None parameter, narrowed to non-None via `if x is not None:`,
+		# still read as the union type and failed to match, falling through
+		# to _resolve_callee's generic path with a hard "cannot call log"
+		# compile error even though the identical non-Optional shape (log:
+		# Ptr[Callable[[str],None]] with no |None) always worked. Fixed via
+		# a shared _narrowed_type_of_name helper mirroring _expr_Name's own
+		# narrowed_member lookup.
+		self._run( '''
+class Recorder:
+	got: str
+
+recorder: Recorder = Recorder( got = '' )
+
+def sink( text: str ) -> None:
+	recorder.got = text
+
+def maybe_log( text: str, log: Ptr[Callable[[str],None]]|None = None ) -> None:
+	if log is not None:
+		log( text )
+
+def main() -> i32:
+	f: Ptr[Callable[[str],None]] = sink
+	maybe_log( 'hello', f )
+	if recorder.got != 'hello':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_optional_callable_narrowed_by_match_is_callable( self ) -> None:
+		# same bug/fix as test_optional_callable_narrowed_by_is_not_none_is_
+		# callable above, narrowed via `match`/`case _:` instead of `if x is
+		# not None:` - the original bug report tried both narrowing
+		# mechanisms and got the identical "cannot call log" failure from
+		# both, so both get their own regression coverage.
+		self._run( '''
+class Recorder:
+	got: str
+
+recorder: Recorder = Recorder( got = '' )
+
+def sink( text: str ) -> None:
+	recorder.got = text
+
+def maybe_log( text: str, log: Ptr[Callable[[str],None]]|None = None ) -> None:
+	match log:
+		case None:
+			pass
+		case _:
+			log( text )
+
+def main() -> i32:
+	f: Ptr[Callable[[str],None]] = sink
+	maybe_log( 'hello', f )
+	if recorder.got != 'hello':
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_optional_callable_narrowed_and_called( self ) -> None:
+		# same bug as the two tests above, exercised through a GENERIC
+		# function - the exact shape lib/bisect.py's own bisect_right/
+		# bisect_left[T,K](key: Ptr[Callable[[T],K]]|None = None) uses, which
+		# per PLAN_COMPILER_BUG_SWEEP.md-style history is exactly where a
+		# Specialization-vs-monomorphized-type gap would most likely hide (a
+		# generic parameter's declared type stays an unresolved
+		# Specialization until substituted) - confirmed working end to end
+		# with a real substituted i32/i32 call.
+		self._run( '''
+def apply_or_default[T,K]( x: T, key: Ptr[Callable[[T],K]]|None, default: K ) -> K:
+	if key is not None:
+		return key( x )
+	return default
+
+def double( x: i32 ) -> i32:
+	with compiler.wrap_arithmetic:
+		return x * 2
+
+def main() -> i32:
+	k: Ptr[Callable[[i32],i32]] = double
+	result: i32 = apply_or_default( 21, k, 0 )
+	with compiler.wrap_arithmetic:
+		diff: i32 = result - 42
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
 class NestedFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -10048,6 +15389,1637 @@ def main() -> i32:
 		] )
 
 
+class CEnumConstructionArgumentShapeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real bug: `EnumName(value)` (CEnum construction,
+	e.g. `OSError(rc)`) was rejected with a confusing "expected EnumName, got
+	<value's own type>" whenever `value` was a bare `ast.Name` (a local
+	variable or parameter reference), while the IDENTICAL underlying value
+	via a Call or BinOp argument (`OSError(get_rc())`, `OSError(rc + 0)`)
+	compiled fine - an inconsistency across argument AST SHAPE, not a real
+	difference in what was being constructed.
+
+	Root cause: `_try_lower_construct_call`'s CEnum branch used to pass
+	target_cls (the enum type ITSELF) as `_lower_expr`'s `expected_type` for
+	the argument, for every argument shape. A bare `ast.Name` operand
+	(`_expr_Name`) ignores `expected_type` and keeps its own declared type,
+	so the later `_check_assignable` correctly (if confusingly-worded)
+	rejected a genuine underlying-type mismatch - `OSError`'s value_type is
+	u32, and a plain `i32` local doesn't automatically become one. But an
+	ordinary Call/BinOp argument's own result-typing tail (`_lower_call`'s
+	final dest allocation, `expected_type or target_return_type`) SILENTLY
+	relabeled the destination temp's type to target_cls directly, with no
+	check that the callee's real return type was even compatible - so those
+	shapes "worked" by accident, not because they were validated.
+
+	Fixed: every non-literal argument shape now lowers against value_type
+	(the underlying scalar, the argument's real natural type space) and is
+	explicitly relabeled onto the enum type via CastWrap - the same zero-
+	cost, well-defined C reinterpret cast an explicit T(x) scalar cast uses,
+	consistent across every argument shape, and permissive of genuine
+	cross-signedness reinterpretation (OSError's own construction is
+	documented as "a plain cast to the enum's underlying type", the same
+	promise an explicit u32(-11)-style WinAPI cast makes). A literal integer
+	argument keeps its own pre-existing fast path (a plain ir.Const, no
+	runtime cast) unchanged. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro shape: a bare local variable argument to a
+			# CEnum constructor, feeding straight into Result.Err(...) -
+			# used to be rejected outright
+			( 'bare_name_argument_to_enum_constructor_compiles_and_runs', '''
+def f() -> Result[None, OSError]:
+	rc: i32 = -5
+	return Result.Err( OSError( rc ))
+
+def main() -> i32:
+	r = f()
+	if r.is_err():
+		return 0
+	return 1
+''' ),
+			# consistency check: bare Name / Call / BinOp / literal argument
+			# shapes must all produce the SAME bit-exact underlying value for
+			# the identical logical error code, and a plain assignment back
+			# to the enum's own value_type (already-established, unrelated
+			# CEnum<->value_type duality) must read that same value back out.
+			# OSError's own value_type is platform-dependent (lib/builtins/
+			# __errors.py: u32 on Windows, i32 on Linux) - a fixed `v_name:
+			# u32` readback only type-checks on the Windows build, so this is
+			# gated the same way OSError's OWN declaration is (two
+			# @compiler.target(os=...)-filtered variants of one function,
+			# only one of which is ever actually compiled for a given
+			# target), rather than hardcoding one platform's width and
+			# silently only ever exercising this consistency check there.
+			( 'enum_constructor_argument_shapes_agree_bit_exactly', '''
+import compiler
+
+def get_rc() -> i32:
+	return -5
+
+@compiler.target( os = 'windows' )
+def check_argument_shapes() -> i32:
+	rc: i32 = -5
+	e_name: OSError = OSError( rc )
+	e_call: OSError = OSError( get_rc() )
+	with compiler.wrap_arithmetic:
+		e_binop: OSError = OSError( rc + 0 )
+	e_member: OSError = OSError.FileNotFoundError
+
+	v_name: u32 = e_name
+	v_call: u32 = e_call
+	v_binop: u32 = e_binop
+	expected: u32 = u32( -5 )
+
+	if v_name != expected:
+		return 1
+	if v_call != expected:
+		return 2
+	if v_binop != expected:
+		return 3
+	if e_member != OSError.FileNotFoundError:
+		return 4
+	return 0
+
+@compiler.target( os = not 'windows' )
+def check_argument_shapes() -> i32:
+	rc: i32 = -5
+	e_name: OSError = OSError( rc )
+	e_call: OSError = OSError( get_rc() )
+	with compiler.wrap_arithmetic:
+		e_binop: OSError = OSError( rc + 0 )
+	e_member: OSError = OSError.FileNotFoundError
+
+	v_name: i32 = e_name
+	v_call: i32 = e_call
+	v_binop: i32 = e_binop
+	expected: i32 = -5
+
+	if v_name != expected:
+		return 1
+	if v_call != expected:
+		return 2
+	if v_binop != expected:
+		return 3
+	if e_member != OSError.FileNotFoundError:
+		return 4
+	return 0
+
+def main() -> i32:
+	return check_argument_shapes()
+''' ),
+			# a routed-through-a-parameter shape (not just a local) - the
+			# task's own report specifically called out that this ALSO
+			# failed identically (not a locals-vs-parameters distinction).
+			# Same platform-dependent value_type split as the case above -
+			# OSError's value_type is u32 on Windows, i32 on Linux.
+			( 'bare_name_parameter_argument_to_enum_constructor_compiles_and_runs', '''
+import compiler
+
+def mk( code: i32 ) -> OSError:
+	return OSError( code )
+
+@compiler.target( os = 'windows' )
+def check_parameter_shape() -> i32:
+	e: OSError = mk( -5 )
+	v: u32 = e
+	if v != u32( -5 ):
+		return 1
+	return 0
+
+@compiler.target( os = not 'windows' )
+def check_parameter_shape() -> i32:
+	e: OSError = mk( -5 )
+	v: i32 = e
+	if v != -5:
+		return 1
+	return 0
+
+def main() -> i32:
+	return check_parameter_shape()
+''' ),
+			# the literal fast path (unaffected by this fix) - still folds to
+			# a plain constant and still range-checks correctly
+			( 'literal_argument_to_enum_constructor_still_works', '''
+def main() -> i32:
+	e: OSError = OSError( 2 )
+	if e != OSError.FileNotFoundError:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_out_of_range_literal_still_rejected( self ) -> None:
+		# negative check: the pre-existing literal magnitude/range validation
+		# (unrelated to and unchanged by this fix) must still reject a
+		# genuinely out-of-range literal argument, not just silently accept
+		# everything now that non-literal shapes are more permissive
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	e: OSError = OSError( 99999999999 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+
+class FixedSizeArrayFieldTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for SYNTAX.md's documented-but-unimplemented
+	"Fixed-Size Inline Array (inside @struct): u16[32], u8[8]" - a bare
+	`ElemType[N]` field annotation used to fail outright at annotation-
+	resolution time ("intrinsics.u8 is not generic, cannot subscript it" -
+	visit_Subscript's generic-subscript path unconditionally rejected any
+	non-generic base). lib/guid.py's own GUID class already documented
+	hitting this exact gap for its `Data4[8]` field and worked around it by
+	unrolling into 8 separate `data4_0..data4_7: u8` fields instead.
+
+	Fixed via a new mpy_types.FixedArrayType, recognized in discovery.py's
+	visit_Subscript (a non-generic base subscripted by a bare positive int
+	constant, as opposed to a real generic type argument - which always
+	uses a TYPE expression as its slice, never a bare int, so this can
+	never misfire against a genuine generic instantiation) and given a real
+	C array declarator in struct/union body emission (`TYPE NAME[N];`,
+	special-cased in _struct_or_union_body the same way _declarator already
+	special-cases a function-pointer field's own discontinuous C syntax).
+
+	Deliberately scoped, not a general-purpose value type: a bare C array
+	is not assignable via `=` at all (only a whole containing struct/union
+	is), so this fix only supports (1) declaring the field, inside a plain
+	@cstruct/@cunion only - rejected everywhere else (parameters, return
+	types, module/class-level variables, RCClass/@interface fields) - and
+	(2) a `= 0` field default / explicit `ClassName(field=0)` construction
+	argument, meaning "zero-fill the whole array" (the one shape a C
+	designated initializer can express, `.field = {0}`). Reading a
+	FixedArrayType field back out as a WHOLE value, or assigning one as a
+	whole value after construction, is still explicitly rejected with a
+	clean error rather than reaching emission and producing invalid C.
+
+	Element-level indexed access (`f.arr[i]` read/write, both a literal and
+	a runtime index) is now implemented, via a new pair of IR instructions,
+	ir.GetAttrIndex/ir.SetAttrIndex (see their own docstrings) - obj+attr,
+	like AddrOfField, rather than composing GetAttr+GetItem, since a real C
+	array member is never itself a loadable VALUE to compose from (the
+	restriction just above). Emission spells one flat `(obj)OP field[index]`
+	C expression, targeting the field's REAL storage in place, the same
+	"addressable in place, not a copy" property AddrOfField's own fix cared
+	about. A literal constant index out of [0, count) is rejected at compile
+	time (mirrors tuple's own compile-time-constant-index bounds check); a
+	runtime index is otherwise unchecked, matching Ptr[T]/ConstPtr[T]'s own
+	GetItem convention - this stays a raw inline C array, not a general-
+	purpose bounds-checked container. Recognized only when the field access
+	is rooted at a plain Name/Attribute chain (lowering.py's
+	_static_field_type_or_none) - a deeper/Call-rooted root (e.g.
+	`make().arr[i]`) simply isn't recognized and falls through to the
+	ordinary whole-value-read rejection above, unchanged.
+
+	compiler.sizeof(x.arr) also now folds to the field's own real byte
+	size (elem_type.sizeof * count) when the element type has a plain-int
+	sizeof (every real FixedArrayType field in this codebase - a
+	hypothetical non-scalar element type, e.g. a struct[N] field, falls
+	through to the ordinary "not supported yet" error every other
+	unsupported compiler.sizeof(...) target already gets, not a crash).
+	Lets a caller derive an array field's element count as
+	compiler.sizeof(x.arr) // compiler.sizeof(ElemType) instead of hand-
+	copying it into a separate constant that could drift out of sync with
+	the field's own declared count - see lib/windows/kernel32.py's
+	_TZNAME_SIZE/_TZKEYNAME_SIZE, now computed this way instead of
+	hardcoded. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact SYNTAX.md-documented shape - a real @cstruct with a
+			# fixed-size inline array field, zero-filled by default,
+			# constructed bare, real sizeof() confirms correct C layout (no
+			# silent size-0/opaque-type fallback)
+			( 'fixed_array_field_declares_and_zero_fill_constructs', '''
+import compiler
+
+@cstruct
+class Foo:
+	a: u16 = 0
+	b: u8[8] = 0
+
+def main() -> i32:
+	f = Foo()
+	sz: usize = compiler.sizeof( Foo )
+	if sz != usize( 10 ):
+		return 1
+	if f.a != u16( 0 ): # actually verify the "zero-fill" this case is named for
+		return 2
+	if f.b[0] != 0 or f.b[7] != 0:
+		return 3
+	return 0
+''' ),
+			# explicit ClassName(field=0) construction argument (not just the
+			# class-body default) - same zero-fill path, different call site
+			( 'fixed_array_field_explicit_zero_construction_argument', '''
+@cstruct
+class Foo:
+	a: u16 = 0
+	b: u8[8] = 0
+
+def main() -> i32:
+	f = Foo( a = 5, b = 0 )
+	if f.a != 5:
+		return 1
+	return 0
+''' ),
+			# multiple array fields of different element types/counts in one
+			# struct, interleaved with scalar fields - mirrors SYNTAX.md's own
+			# DynamicTimeZoneInformation worked example almost verbatim
+			( 'multiple_fixed_array_fields_interleaved_with_scalars', '''
+@cstruct
+class Multi:
+	bias: i32 = 0
+	name: u16[32] = 0
+	date: u16[8] = 0
+	flag: u8 = 0
+	pad: u8[3] = 0
+
+def main() -> i32:
+	m = Multi( bias = 7 )
+	if m.bias != 7:
+		return 1
+	return 0
+''' ),
+			# element-level indexed write then indexed read round-trips
+			# correctly, AND writing one index doesn't corrupt an ADJACENT
+			# index or an adjacent scalar struct field - a real "does this
+			# write actually target the right byte, not spill into its
+			# neighbors" proof, not just "compiles" (mirrors AddrofFieldAccess
+			# RealCompileTests' own "writes through to the real struct field,
+			# leaves the OTHER field untouched" shape)
+			( 'fixed_array_indexed_write_then_read_roundtrips_without_corrupting_neighbors', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	b: u8[8] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	f = Foo()
+	f.b[0] = 65
+	f.b[7] = 200
+	if f.b[0] != 65:
+		return 1
+	if f.b[7] != 200:
+		return 2
+	if f.b[1] != 0: # adjacent index untouched
+		return 3
+	if f.b[6] != 0: # adjacent index untouched
+		return 4
+	if f.a != u32( 0 ): # adjacent scalar field untouched
+		return 5
+	if f.c != u32( 0 ): # adjacent scalar field untouched
+		return 6
+	return 0
+''' ),
+			# a RUNTIME index variable (not just a literal) - the shape
+			# GUID.from_str needs (data4[i] = value for a loop-computed i,
+			# not hardcoded indices)
+			( 'fixed_array_indexed_access_with_a_runtime_index_variable', '''
+import compiler
+
+@cstruct
+class Foo:
+	b: u8[8] = 0
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		f = Foo()
+		i: usize = usize( 0 )
+		while i < usize( 8 ):
+			f.b[i] = u8( i )
+			i = i + usize( 1 )
+		j: usize = usize( 0 )
+		while j < usize( 8 ):
+			if f.b[j] != u8( j ):
+				return 1
+			j = j + usize( 1 )
+	return 0
+''' ),
+			# compiler.sizeof(x.arr) - the field's own real byte size
+			# (elem_type.sizeof * count), not the whole containing struct's
+			# size. Also confirms the classic sizeof(arr)//sizeof(elem)
+			# element-count idiom works, since neither piece is hardcoded -
+			# this is what a caller needing "how many elements does this
+			# array field have" (e.g. a bounded string-decode scan length)
+			# should compute instead of a hand-copied constant.
+			( 'sizeof_of_fixed_array_field_is_its_own_byte_size', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	arr: u16[32] = 0
+	small: u8[8] = 0
+
+def main() -> i32:
+	f = Foo()
+	if compiler.sizeof( f.arr ) != usize( 64 ):
+		return 1
+	if compiler.sizeof( f.small ) != usize( 8 ):
+		return 2
+	with compiler.panic_arithmetic( 'compile-time constants, never zero divisor' ):
+		count: usize = compiler.sizeof( f.arr ) // compiler.sizeof( u16 )
+	if count != usize( 32 ):
+		return 3
+	if f.a != u32( 0 ): # a real runtime read of f - every use above is compiler.sizeof(f.<field>), which only needs f's static TYPE and folds away at compile time, never actually touching f itself
+		return 4
+	return 0
+''' ),
+		] )
+
+	def test_fixed_array_indexed_write_literal_index_out_of_range_is_rejected_at_compile_time( self ) -> None:
+		# free bounds checking available ONLY for a literal constant index
+		# (the count is always known at compile time) - mirrors tuple's own
+		# compile-time-constant-index bounds check
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	f.b[8] = 1', # count is 8, valid indices are 0..7
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_indexed_read_literal_index_out_of_range_is_rejected_at_compile_time( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	x = f.b[8]',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_assigning_fixed_array_field_as_a_whole_value_after_construction_is_still_rejected( self ) -> None:
+		# indexed access is new; whole-value assignment (no subscript at
+		# all) must still be rejected exactly as before - this fix only
+		# ever ADDS the f.b[i] = ... shape, never loosens the plain
+		# f.b = ... rejection
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	f.b = 0',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be assigned after construction', self.discovery.errors.errors[0] )
+
+	def test_out_of_range_field_annotation_type_still_rejects_generic_subscript_errors( self ) -> None:
+		# negative check: an actually-invalid subscript (a real, non-generic,
+		# non-array-shaped misuse) must still be rejected the same way it
+		# always was - this fix only ever WIDENS what's accepted (a non-
+		# generic base + a bare positive int constant slice), never narrows
+		# the existing "not generic, cannot subscript it" rejection for
+		# every other shape
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	x: bool[i32] = None', # bool is non-generic, i32 is a TYPE not an int constant - still invalid
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'not generic', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_field_rejected_as_parameter_type( self ) -> None:
+		self._run( '\n'.join([
+			'def f( x: u8[8] ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	f( 0 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_fixed_array_field_rejected_as_module_global( self ) -> None:
+		self._run( '\n'.join([
+			'g: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	x = g',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_reading_fixed_array_field_as_a_whole_value_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	b: u8[8] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	x = f.b',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be read as a whole value', self.discovery.errors.errors[0] )
+
+	def test_sizeof_of_fixed_array_field_with_non_scalar_element_type_still_rejected( self ) -> None:
+		# compiler.sizeof(x.arr) only folds to a compile-time constant when
+		# the element type itself has a plain-int sizeof (every real
+		# FixedArrayType field in this codebase - u8[N]/u16[N]/etc). A
+		# hypothetical array-of-struct field falls through to the same
+		# "not supported yet" error class-like types already get, rather
+		# than crashing or silently computing a wrong size.
+		self._run( '\n'.join([
+			'import sys',
+			'@cstruct',
+			'class Inner:',
+			'	x: u32 = 0',
+			'',
+			'@cstruct',
+			'class Foo:',
+			'	arr: Inner[3]',
+			'',
+			'def main() -> None:',
+			# a raw pointer cast - no construction attempted at all, since
+			# Inner[3] has no "= 0" zero-fill sugar (that only applies to
+			# scalar element types) - the point here is purely whether
+			# compiler.sizeof(f.arr) itself is rejected cleanly
+			'	f = compiler.cast( Ptr[Foo], sys.alloc[u8]( 64 ))',
+			'	compiler.sizeof( f.arr )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
+
+
+class CStructPackingAndFieldAlignmentTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' @cstruct(packed=True)/@cunion(packed=True) (whole-struct #pragma
+	pack(push,1)/pop) and a field declared Aligned[N, T] (a per-field C
+	alignment override) - added after a real, confirmed data-corruption bug:
+	lib/windows/kernel32.py's WIN32_FIND_DATAA modeled each embedded Win32
+	FILETIME (a real two-DWORD C struct, 4-byte natural alignment) as a bare
+	u64 field (byte-content-identical to FILETIME on its own, matching an
+	existing GetSystemTimeAsFileTime LPFILETIME-as-Ptr[u64] precedent) -
+	correct for a STANDALONE pointer parameter, but wrong once nested inside
+	a larger struct with neighbors: u64's own NATURAL 8-byte alignment
+	forced 4 bytes of compiler-inserted padding the real ABI doesn't have,
+	silently shifting every later field (including the filename buffer) -
+	FindFirstFileA results came back truncated ("alpha.txt" read as
+	"a.txt"), a silent wrong-data bug, not a compile error or a crash.
+
+	Aligned[N, T] works in EITHER direction - N may shrink or grow the
+	field's own alignment relative to T's natural one (e.g. Aligned[16,
+	u32] on a naturally-4-aligned field). Both mechanisms were verified
+	empirically against all three compilers this codebase supports (real
+	MSVC via cl.exe, clang, gcc via WSL) before being implemented this way -
+	several real, non-obvious portability traps were found and are worth
+	recording here, not just in commit history:
+
+	1. A bare mid-struct `#pragma pack(push,N)/pop` bracketing just one
+	   field is NOT portable: MSVC honors it per-field, but clang/gcc
+	   silently keep the struct's own natural alignment instead (only a
+	   pack directive wrapping the ENTIRE aggregate is portable on
+	   clang/gcc) - see _struct_or_union_body's own comment.
+
+	2. `#pragma pack(push,N)/pop` and `__declspec(align(N))` are each only
+	   HALF-portable in ONE direction on real MSVC: pack is a ceiling (can
+	   shrink alignment below natural, never grow it); declspec is a floor
+	   (can grow alignment above natural, confirmed via a real repro that
+	   declspec(align(4)) on a natural-8-aligned u64 field is silently a
+	   no-op, still offset 8). LAYERING both together on the same field
+	   (pack(push,N) + declspec(align(N)) + pack(pop)) covers both
+	   directions - confirmed empirically to reproduce the pack-alone
+	   result when shrinking and the declspec-alone result when growing.
+	   clang/gcc need no such layering: the single GNU
+	   __attribute__((packed,aligned(N))) field attribute already covers
+	   both directions on its own.
+
+	3. `#if defined(_MSC_VER)` alone is NOT a valid MSVC/clang discriminator
+	   on Windows: clang targeting x86_64-pc-windows-msvc (this repo's own
+	   dev-machine clang) DEFINES _MSC_VER too, for MSVC-header
+	   compatibility - so a bare `defined(_MSC_VER)` guard silently routed
+	   clang down the real-MSVC branch as well, where clang's own
+	   pragma-pack semantics (trap #1 above) do NOT match real MSVC,
+	   reproducing the exact wrong-size bug this feature exists to prevent.
+	   The guard must additionally exclude __clang__.
+
+	Combining whole-struct packed=True with a field's own Aligned[N,...] on
+	the SAME struct is a fourth, separate confirmed divergence (MSVC: one
+	byte count; clang/gcc: a different one) - rejected as a compile error
+	instead (compiler.py's _validate_packed_field_alignment_conflict) -
+	see test_packed_and_aligned_combination_on_same_struct_rejected below. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# @cstruct(packed=True): NO compiler-inserted padding anywhere -
+			# u8 + u64 + u32 packs to exactly 1+8+4=13 bytes on every
+			# compiler, vs 24 bytes under ordinary natural alignment (see
+			# the natural-alignment case below for the same fields unpacked)
+			( 'packed_struct_has_no_implicit_padding', '''
+@cstruct( packed = True )
+class PackedMixed:
+	a: u8 = 0
+	b: u64 = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( PackedMixed )
+	if sz != usize( 13 ):
+		return 1
+	return 0
+''' ),
+			# @cunion(packed=True) - same mechanism, the union keyword path
+			( 'packed_union_has_no_implicit_padding', '''
+@cunion( packed = True )
+class PackedUnionMixed:
+	a: u8 = 0
+	b: u64 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( PackedUnionMixed )
+	if sz != usize( 8 ):
+		return 1
+	return 0
+''' ),
+			# Aligned[4, u64]: only THIS field's own alignment is overridden
+			# (forced down from its natural 8 to 4) - the rest of the struct
+			# keeps ordinary natural alignment. a(4,offset0) + b(8,offset4,
+			# no leading pad since 4-aligned now suffices) + c(4,offset12) =
+			# 16 total, no trailing pad - this is the exact WIN32_FIND_DATAA
+			# shape (a FILETIME-as-u64 field sandwiched between u32 fields)
+			( 'aligned_field_overrides_only_that_field', '''
+@cstruct
+class AlignedMixed:
+	a: u32 = 0
+	b: Aligned[4, u64] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( AlignedMixed )
+	if sz != usize( 16 ):
+		return 1
+	return 0
+''' ),
+			# same field set with NO alignment override - confirms 16 above
+			# is really the aligned field doing something, not a coincidence
+			# of these particular field sizes (ordinary natural alignment
+			# pads b up to an 8-byte boundary: a(4)+pad(4)+b(8)+c(4)+pad(4)=24)
+			( 'unaligned_control_case_gets_natural_padding', '''
+@cstruct
+class NaturalMixed:
+	a: u32 = 0
+	b: u64 = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( NaturalMixed )
+	if sz != usize( 24 ):
+		return 1
+	return 0
+''' ),
+			# an Aligned[...] field still round-trips real values correctly -
+			# not just a sizeof()-only smoke test
+			( 'aligned_field_reads_and_writes_correctly', '''
+@cstruct
+class AlignedMixed2:
+	a: u32 = 0
+	b: Aligned[4, u64] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	x = AlignedMixed2( a = 1, b = u64( 0xdeadbeefcafe ), c = 2 )
+	if x.a != 1 or x.b != u64( 0xdeadbeefcafe ) or x.c != 2:
+		return 1
+	return 0
+''' ),
+			# Aligned[...] growing a field's alignment ABOVE its natural one -
+			# the opposite direction from every case above. a(1,offset0) +
+			# pad(15) + b(4,offset16,forced) + c(1,offset20) = 32 total (the
+			# whole struct's own alignment also grows to 16, adding trailing
+			# pad up to the next 16-byte boundary)
+			( 'aligned_field_can_grow_above_natural_alignment', '''
+@cstruct
+class GrownField:
+	a: u8 = 0
+	b: Aligned[16, u32] = 0
+	c: u8 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( GrownField )
+	if sz != usize( 32 ):
+		return 1
+	g = GrownField( a = 1, b = u32( 0xdeadbeef ), c = 2 )
+	if g.a != 1 or g.b != u32( 0xdeadbeef ) or g.c != 2:
+		return 2
+	return 0
+''' ),
+			# Aligned[N, T] where N already equals T's own natural alignment -
+			# a harmless no-op on every compiler, same layout as the plain
+			# unaligned field would have gotten anyway
+			( 'aligned_field_matching_natural_alignment_is_a_no_op', '''
+@cstruct
+class NoOpAligned:
+	a: u32 = 0
+	b: Aligned[4, u32] = 0
+	c: u32 = 0
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( NoOpAligned )
+	if sz != usize( 12 ):
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_aligned_rejected_on_module_global( self ) -> None:
+		self._run( '\n'.join([
+			'g: Aligned[4, u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = g',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only allowed as a plain @cstruct/@cunion field', self.discovery.errors.errors[0] )
+
+	def test_aligned_rejected_on_function_parameter( self ) -> None:
+		self._run( '\n'.join([
+			'def f( x: Aligned[4, u64] ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	f( u64( 0 ))',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+
+	def test_aligned_rejects_non_power_of_two_n( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	a: u32 = 0',
+			'	b: Aligned[3, u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'power-of-two', self.discovery.errors.errors[0] )
+
+	def test_aligned_rejects_non_constant_n( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	a: u32 = 0',
+			'	b: Aligned[compiler.sizeof( u32 ), u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+
+	def test_packed_decorator_rejects_unknown_keyword( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct( bogus = True )',
+			'class Foo:',
+			'	a: u32 = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'unsupported @cstruct/@cunion keyword argument', self.discovery.errors.errors[0] )
+
+	def test_packed_and_aligned_combination_on_same_struct_rejected( self ) -> None:
+		# confirmed via a real empirical repro (not just theorized): MSVC and
+		# clang/gcc disagree on the resulting byte layout when a struct-wide
+		# #pragma pack(push,1)/pop wraps a field that ALSO has its own
+		# __attribute__((packed,aligned(N)))/mid-struct pack override -
+		# rejecting the combination outright is safer than emitting C with a
+		# silently compiler-dependent layout
+		self._run( '\n'.join([
+			'@cstruct( packed = True )',
+			'class Foo:',
+			'	a: u8 = 0',
+			'	b: Aligned[4, u64] = 0',
+			'',
+			'def main() -> None:',
+			'	x = Foo()',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot combine Aligned[...]', self.discovery.errors.errors[0] )
+
+
+class AddrofFieldAccessRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real, confirmed gap: `compiler.addrof(x)`
+	rejected any argument that wasn't a bare local-variable Name outright
+	("compiler.addrof(...) argument must be a bare local variable, not
+	compiler.addrof(f.a)"), even a single level of plain field access on an
+	already-stable local (`compiler.addrof(f.a)`) - a very common C idiom
+	needed by any FFI code that fills one field of a stack struct via an
+	out-parameter (e.g. inet_pton(af, str, &addr.sin_addr)), forcing
+	callers to stage the value through an extra local first.
+
+	Investigated and confirmed safe to widen for exactly this shape: a bare
+	Name's own operand is always a genuine, stable-lifetime Variable (never
+	a Temp), and requiring the field-access chain's ROOT to be one too
+	preserves that same guarantee one level deeper (a field of an already-
+	stable object is itself just as addressable - C's own well-defined
+	`&x.field`/`&x->field`). Deliberately NOT widened further: a Call-
+	rooted argument (`compiler.addrof(make().field)`) is a real, not just
+	theoretical, dangling-pointer risk (the call's own result is a
+	TEMPORARY with no guaranteed lifetime past the current statement under
+	this compiler's RC discipline) and a multi-level chain
+	(`compiler.addrof(a.b.c)`) is unneeded, unanalyzed extra scope - both
+	still rejected with a clear message.
+
+	Fixed via a new ir.AddrOfField instruction (distinct from
+	AddrOf(GetAttr(...)) - GetAttr loads a COPY of the field's value into a
+	fresh temp, whose address would be the copy's, not the real field's,
+	defeating the entire point of the FFI out-parameter idiom this exists
+	for) - emits one flat `&(obj)OP field` C expression, obj always the
+	chain's root object.
+
+	Later widened again for a FixedArrayType field specifically
+	(`compiler.addrof(x.arr)` where arr is `ElemType[N]`) - real motivating
+	case: lib/windows/kernel32.py's DynamicTimeZoneInformation.
+	TimeZoneKeyName, needing a Ptr[u16] at its own start for a bulk string
+	decode (see lib/windows/time.py's get_local_timezone_name()). Fixed via
+	a new ir.ArrayFieldPtr instruction - deliberately NOT AddrOfField's own
+	`&(obj)OP field` emission, which would yield a pointer TO the array
+	(ElemType(*)[N]) rather than a pointer to its first ELEMENT
+	(ElemType*) - a real C type mismatch against the declared
+	Ptr[ElemType] destination even though the address value is identical.
+	ArrayFieldPtr instead emits the bare `(obj)OP field` decay expression,
+	relying on C's own array-to-pointer decay.
+
+	Widened once more for a SPECIFIC element (`compiler.addrof(x.arr[i])`,
+	as opposed to `compiler.addrof(x.arr)`'s always-element-0 decay) - a
+	real, well-defined C operation with no decay ambiguity (indexing then
+	&-ing gives ElemType* directly). Fixed via a new ir.AddrOfArrayIndex
+	instruction, reusing lowering.py's existing `_fixed_array_index_target`
+	helper (already used by ordinary f.arr[i] read/write) for field
+	resolution and literal-index bounds checking - the same root-must-be-
+	a-bare-local safety check as every other addrof shape here is applied
+	explicitly, since that helper's own callers (GetAttrIndex/SetAttrIndex)
+	don't need that guarantee the way addrof does. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# write-through proof, not just "compiles": a callee writes
+			# through the pointer into ONE field of a caller's stack
+			# struct, and the OTHER field must stay untouched - confirms
+			# the address genuinely targets the real field's own storage
+			# inside the original struct, not some throwaway copy
+			( 'addrof_field_writes_through_to_the_real_struct_field', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	b: u32 = 0
+
+def write_via_ptr( p: Ptr[u32] ) -> None:
+	p[0] = u32( 42 )
+	return
+
+def main() -> i32:
+	f = Foo()
+	write_via_ptr( compiler.addrof( f.b ))
+	if f.b != u32( 42 ):
+		return 1
+	if f.a != u32( 0 ):
+		return 2
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@unittest.skipUnless( os.name == 'nt', 'needs a real Winsock DLL to call (ws2_32.dll)' )
+	def test_real_ffi_out_parameter_shape_compiles_and_runs( self ) -> None:
+		# the exact motivating shape from the task report: a real Win32 FFI
+		# call filling ONE field of a stack struct via compiler.addrof on
+		# that field directly (inet_pton's own real, documented contract),
+		# not staged through an extra local first
+		self.assert_programs_run([
+			( 'inet_pton_writes_into_a_nested_struct_field_via_addrof', '''
+import compiler
+import sys
+
+@cstruct
+class InAddr:
+	s_addr: u32 = 0
+
+@cstruct
+class SockAddrIn:
+	sin_family: i16 = 0
+	sin_port: u16 = 0
+	sin_addr: InAddr
+	sin_zero0: u32 = 0
+	sin_zero1: u32 = 0
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_pton' )
+def inet_pton( family: i32, pszAddrString: ConstPtr[u8], pAddrBuf: Ptr[None] ) -> i32: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr: SockAddrIn = SockAddrIn( sin_addr = InAddr() )
+	rc: i32 = inet_pton( 2, '127.0.0.1'.get_cstr(), compiler.cast( Ptr[None], compiler.addrof( addr.sin_addr )))
+	if rc != 1:
+		return 1
+	if addr.sin_addr.s_addr != u32( 0x0100007F ):
+		return 2
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_array_field_addrof_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# write-through-the-pointer proof (not just "compiles"): an
+			# index written via the returned Ptr[u16], read back both
+			# through the pointer AND through ordinary f.arr[i] indexed
+			# access, plus an untouched adjacent index - confirms the
+			# address genuinely targets the array's real storage at
+			# element 0, not a copy or a wrong offset
+			( 'array_field_addrof_plain_value_receiver_writes_through', '''
+@cstruct
+class Foo:
+	a: u32 = 0
+	arr: u16[4] = 0
+
+def main() -> i32:
+	f = Foo()
+	p: Ptr[u16] = compiler.addrof( f.arr )
+	p[1] = 42
+	if f.arr[1] != 42:
+		return 1
+	if f.arr[0] != 0 or f.arr[2] != 0:
+		return 2
+	if p[0] != 0:
+		return 3
+	return 0
+''' ),
+			# the exact motivating shape: addrof on an array field reached
+			# through a Ptr[Struct] receiver (obj->field, not obj.field) -
+			# what a heap-allocated struct filled by a real Win32/FFI call
+			# (e.g. GetDynamicTimeZoneInformation) always looks like
+			( 'array_field_addrof_pointer_receiver_writes_through', '''
+import sys
+
+@cstruct
+class Foo:
+	a: u32 = 0
+	arr: u16[4] = 0
+
+def main() -> i32:
+	raw: Ptr[u8] = sys.alloc[u8]( compiler.sizeof( Foo ))
+	sys.memzero( raw, compiler.sizeof( Foo ))
+	pf = compiler.cast( Ptr[Foo], raw )
+	pf.arr[3] = 77
+	p: Ptr[u16] = compiler.addrof( pf.arr )
+	if p[3] != 77:
+		return 1
+	if p[0] != 0 or p[1] != 0 or p[2] != 0:
+		return 2
+	sys.free( raw )
+	return 0
+''' ),
+		] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_array_field_indexed_addrof_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# compiler.addrof(x.field[i]) - a SPECIFIC element's address, not
+			# just element 0 the way bare compiler.addrof(x.field) gives.
+			# Confirms both directions through the pointer, and that
+			# neighboring elements are untouched (same "real storage, not a
+			# copy or wrong offset" proof as the whole-array case above)
+			( 'indexed_array_field_addrof_plain_value_receiver_writes_through', '''
+@cstruct
+class Foo:
+	arr: u16[4] = 0
+
+def main() -> i32:
+	f = Foo()
+	f.arr[1] = 11
+	p: Ptr[u16] = compiler.addrof( f.arr[2] )
+	if p[0] != 0:
+		return 1
+	p[0] = 99
+	if f.arr[2] != 99:
+		return 2
+	if f.arr[1] != 11:
+		return 3
+	if f.arr[0] != 0 or f.arr[3] != 0:
+		return 4
+	return 0
+''' ),
+			# same, through a Ptr[Struct] receiver - the shape lib/windows/
+			# time.py's get_local_timezone_name() would use if it ever
+			# needed one specific slot rather than a whole-array decode
+			( 'indexed_array_field_addrof_pointer_receiver_writes_through', '''
+import sys
+
+@cstruct
+class Foo:
+	arr: u16[4] = 0
+
+def main() -> i32:
+	raw: Ptr[u8] = sys.alloc[u8]( compiler.sizeof( Foo ))
+	sys.memzero( raw, compiler.sizeof( Foo ))
+	pf = compiler.cast( Ptr[Foo], raw )
+	p: Ptr[u16] = compiler.addrof( pf.arr[3] )
+	p[0] = 55
+	if pf.arr[3] != 55:
+		return 1
+	if pf.arr[0] != 0 or pf.arr[1] != 0 or pf.arr[2] != 0:
+		return 2
+	sys.free( raw )
+	return 0
+''' ),
+		] )
+
+	def test_indexed_addrof_rejects_literal_index_out_of_range( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	arr: u16[4] = 0',
+			'',
+			'def main() -> None:',
+			'	f = Foo()',
+			'	compiler.addrof( f.arr[10] )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	def test_indexed_addrof_rejects_call_rooted_field_access( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	arr: u16[4] = 0',
+			'',
+			'def make() -> Foo:',
+			'	return Foo()',
+			'',
+			'def main() -> None:',
+			'	compiler.addrof( make().arr[1] )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'must be rooted at a bare local variable', self.discovery.errors.errors[0] )
+
+	def test_addrof_rejects_multi_level_field_chain( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Inner:',
+			'	x: u32 = 0',
+			'',
+			'@cstruct',
+			'class Outer:',
+			'	inner: Inner',
+			'	y: u32 = 0',
+			'',
+			'def main() -> None:',
+			'	o = Outer( inner = Inner() )',
+			'	compiler.addrof( o.inner.x )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'only one level of field access is supported', self.discovery.errors.errors[0] )
+
+	def test_addrof_rejects_call_rooted_field_access( self ) -> None:
+		self._run( '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	a: u32 = 0',
+			'',
+			'def make() -> Foo:',
+			'	return Foo()',
+			'',
+			'def main() -> None:',
+			'	compiler.addrof( make().a )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'must be rooted at a bare local variable', self.discovery.errors.errors[0] )
+
+
+class ByteArrayScalarIndexingRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real gap: bytearray had no scalar
+	__getitem__/__setitem__ (only slice syntax via get_ptr()/get_const_ptr()/
+	_byte_slice) - `buf[0] = 65`/`x: u8 = buf[0]` failed at C-compile time
+	with e.g. "assigning to 'struct builtins$bytearray' from incompatible
+	type 'uint8_t'" (the generated C treated buf[0] as indexing the WHOLE
+	struct rather than dispatching through __getitem__/__setitem__, since
+	neither existed to dispatch through). bytes/bytearray fully support
+	buf[i]/buf[i] = x in real Python. lib/socket.py's own real code worked
+	around this throughout by always going through .get_ptr()[i]/
+	.get_const_ptr()[i] (raw pointer indexing, which already worked) instead.
+
+	Fixed by adding real __getitem__(self, index: usize) ->
+	Result[u8,IndexError] / __setitem__(self, index: usize, value: u8) ->
+	None methods to bytearray in lib/builtins/__init__.py, following the
+	existing UnsafeList/dict __getitem__/__setitem__ patterns already in
+	that file, and matching bytearray's own debug-mode BYTEARRAY_INVALID-
+	after-release assertion style already used by its other methods (plus a
+	debug-mode index-in-range assertion for __setitem__, which has no
+	Result to report an out-of-range write through, matching its own bare
+	`-> None` signature). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact repro shape from the task report - buf[0] = ...
+			# (bare subscript assignment) and x: u8 = buf[0] (bare
+			# subscript read) both used to fail at C-compile time
+			( 'bytearray_scalar_getitem_setitem_bare_subscript_syntax', '''
+def helper() -> Result[i32, IndexError]:
+	buf: bytearray = bytearray( 4 )
+	buf[0] = 65
+	x: u8 = buf[0]
+	if x != 65:
+		return Result.Ok( 1 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match helper():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 2
+''' ),
+			# explicit .__getitem__()/.__setitem__() calls (not just the
+			# bare subscript sugar), and an out-of-range __getitem__
+			# correctly reports Err rather than reading out of bounds
+			( 'bytearray_explicit_getitem_setitem_calls_and_out_of_range_getitem', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 4 )
+	buf.__setitem__( 0, 65 )
+	buf.__setitem__( 3, 99 )
+	v0: u8 = buf.__getitem__( 0 ).unwrap( 'index 0 in range' )
+	v3: u8 = buf.__getitem__( 3 ).unwrap( 'index 3 in range' )
+	if v0 != 65:
+		return 1
+	if v3 != 99:
+		return 2
+	match buf.__getitem__( 4 ): # one past the end - out of range
+		case Result.Ok( _ ):
+			return 3
+		case Result.Err( _ ):
+			pass
+	return 0
+''' ),
+		] )
+
+
+class BytesByteArrayFindSplitStartswithEndswithTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' find()/split()/startswith()/endswith() for bytes and bytearray
+	(lib/builtins/__init__.py) - missing gap surfaced by hand-writing an
+	HTTP request-line parser against raw socket-received bytes (there was
+	no way to find(b'\\r\\n')/split(b' ')/startswith(b'GET') on bytes at
+	all before this). Mirrors str's own find()/split()/startswith()/
+	endswith(), with the corrected isize/-1-sentinel find() convention
+	from the start (bytes has no Result-returning history to fix). bytes
+	has no __eq__, so content checks decode() to str first.
+
+	needle/prefix/suffix/sep parameters are bytes|bytearray, and bare
+	literal receivers/arguments are used directly throughout - both now
+	work because _expr_Constant's literal self-typing chain gained a
+	bytes branch (previously bytes literals could not infer their type
+	either as a union member or as a bare method-call receiver; see
+	[[bytes_literal_type_inference_gaps_fixed]]). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'bytes_find_found_and_not_found', '''
+def main() -> i32:
+	data: bytes = b'deadbeef-dead-beef-dead-beefdeadbeef'
+	if data.find( b'-' ) != isize( 8 ):
+		return 1
+	if data.find( b'zzz' ) != isize( -1 ):
+		return 2
+	if data.find( b'' ) != isize( 0 ):
+		return 3
+	# explicit start offset - resumes past the first match
+	if data.find( b'-', 9 ) != isize( 13 ):
+		return 4
+	if data.find( b'toolongtoolongtoolongtoolongtoolongtoolong' ) != isize( -1 ):
+		return 5
+	return 0
+''' ),
+			( 'bytes_split_http_request_line', '''
+def main() -> i32:
+	line: bytes = b'GET / HTTP/1.1'
+	parts: list[bytes] = line.split( b' ' )
+	if parts.__len__() != 3:
+		return 1
+	p0: bytes = parts.__getitem__( 0 ).unwrap( 'x' )
+	p1: bytes = parts.__getitem__( 1 ).unwrap( 'x' )
+	p2: bytes = parts.__getitem__( 2 ).unwrap( 'x' )
+	if p0.decode().unwrap( 'x' ) != 'GET':
+		return 2
+	if p1.decode().unwrap( 'x' ) != '/':
+		return 3
+	if p2.decode().unwrap( 'x' ) != 'HTTP/1.1':
+		return 4
+	return 0
+''' ),
+			# a bare bytes literal receiver throughout - no typed-local
+			# workaround needed now that literal receivers self-type
+			( 'bytes_split_edge_cases', '''
+def main() -> i32:
+	empty: list[bytes] = b''.split( b',' )
+	if empty.__len__() != 1:
+		return 1
+	e0: bytes = empty.__getitem__( 0 ).unwrap( 'x' )
+	if e0.decode().unwrap( 'x' ) != '':
+		return 2
+
+	leading: list[bytes] = b',a,b'.split( b',' )
+	if leading.__len__() != 3:
+		return 3
+	l0: bytes = leading.__getitem__( 0 ).unwrap( 'x' )
+	if l0.decode().unwrap( 'x' ) != '':
+		return 4
+
+	no_sep: list[bytes] = b'abc'.split( b',' )
+	if no_sep.__len__() != 1:
+		return 5
+	n0: bytes = no_sep.__getitem__( 0 ).unwrap( 'x' )
+	if n0.decode().unwrap( 'x' ) != 'abc':
+		return 6
+
+	consecutive: list[bytes] = b'a,,b'.split( b',' )
+	if consecutive.__len__() != 3:
+		return 7
+	c1: bytes = consecutive.__getitem__( 1 ).unwrap( 'x' )
+	if c1.decode().unwrap( 'x' ) != '':
+		return 8
+	return 0
+''' ),
+			( 'bytes_startswith_endswith', '''
+def main() -> i32:
+	data: bytes = b'GET / HTTP/1.1'
+	if not data.startswith( b'GET' ):
+		return 1
+	if data.startswith( b'POST' ):
+		return 2
+	if not data.endswith( b'HTTP/1.1' ):
+		return 3
+	if data.endswith( b'GET' ):
+		return 4
+	if not data.startswith( b'' ):
+		return 5
+	if not data.endswith( b'' ):
+		return 6
+	if data.startswith( b'toolongtoolongtoolongtoolongtoolongtoolong' ):
+		return 7
+	# explicit start offset
+	if not data.startswith( b'/', 4 ):
+		return 8
+	return 0
+''' ),
+			( 'bytearray_find_split_startswith_endswith', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 5 )
+	buf[0] = 104 # h
+	buf[1] = 101 # e
+	buf[2] = 108 # l
+	buf[3] = 108 # l
+	buf[4] = 111 # o
+	if buf.find( b'llo' ) != isize( 2 ):
+		return 1
+	if buf.find( b'zzz' ) != isize( -1 ):
+		return 2
+	if not buf.startswith( b'he' ):
+		return 3
+	if not buf.endswith( b'llo' ):
+		return 4
+
+	parts: list[bytearray] = buf.split( b'l' )
+	if parts.__len__() != 3:
+		return 5
+	p0: bytearray = parts.__getitem__( 0 ).unwrap( 'x' )
+	p2: bytearray = parts.__getitem__( 2 ).unwrap( 'x' )
+	if p0.decode().unwrap( 'x' ) != 'he':
+		return 6
+	if p2.decode().unwrap( 'x' ) != 'o':
+		return 7
+	# each split piece is independently owned - mutating one must not
+	# affect the source buffer or its siblings
+	p0[0] = 90 # 'Z' - was 'h'
+	if buf.__getitem__( 0 ).unwrap( 'x' ) != 104:
+		return 8
+	if p2.decode().unwrap( 'x' ) != 'o':
+		return 9
+	return 0
+''' ),
+			# find()/startswith()/endswith()/split()'s needle/sep parameter
+			# is bytes|bytearray - a bytearray needle now works directly
+			# against a bytes haystack, and vice versa, with no bytes(...)/
+			# bytearray(...) conversion needed on either side
+			( 'bytes_bytearray_cross_type_needle_haystack', '''
+def main() -> i32:
+	needle_ba: bytearray = bytearray( 5 )
+	needle_ba[0] = 119 # w
+	needle_ba[1] = 111 # o
+	needle_ba[2] = 114 # r
+	needle_ba[3] = 108 # l
+	needle_ba[4] = 100 # d
+	haystack: bytes = b'hello world'
+	if haystack.find( needle_ba ) != isize( 6 ):
+		return 1
+	if not haystack.endswith( needle_ba ):
+		return 2
+
+	haystack_ba: bytearray = bytearray( 11 )
+	src: bytes = b'hello world'
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 11:
+			haystack_ba[i] = src.get_const_ptr()[i]
+			i += 1
+	# bare bytes literal needle directly against a bytearray haystack
+	if haystack_ba.find( b'world' ) != isize( 6 ):
+		return 3
+	if not haystack_ba.startswith( b'hello' ):
+		return 4
+	return 0
+''' ),
+			# the actual data[:received]-then-parse shape a hand-rolled HTTP
+			# server needs: bytearray slicing (already supported) combined
+			# with find()/split()/startswith() on the trimmed result
+			( 'bytearray_slice_then_parse_request_line', '''
+def main() -> i32:
+	buf: bytearray = bytearray( 128 )
+	src: bytes = b'GET /hello HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n'
+	received: usize = src.__len__()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < received:
+			buf[i] = src.get_const_ptr()[i]
+			i += 1
+	trimmed: bytearray = buf[:received]
+	line_end: isize = trimmed.find( b'\\r\\n' )
+	if line_end == isize( -1 ):
+		return 1
+	with compiler.panic_arithmetic( 'bounded by trimmed length' ):
+		line_end_u: usize = usize( line_end )
+	line: bytearray = trimmed[:line_end_u]
+	if not line.startswith( b'GET' ):
+		return 2
+	parts: list[bytearray] = line.split( b' ' )
+	if parts.__len__() != 3:
+		return 3
+	path: bytearray = parts.__getitem__( 1 ).unwrap( 'x' )
+	if path.decode().unwrap( 'x' ) != '/hello':
+		return 4
+	return 0
+''' ),
+		] )
+
+
+class ByteArrayResizeTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' bytearray.resize(n) - grow or shrink in place, zero-filling any
+	newly exposed bytes (matches __init__'s own zero-init convention, even
+	when regrowing within a capacity a prior shrink left behind - see
+	resize()'s own docstring, lib/builtins/__init__.py, for why this is
+	deliberately stricter than CPython's own "may retain stale bytes
+	there" behavior). Missing gap surfaced porting a real-world zip-file
+	search tool (grap.mpy) that reuses one growable buffer across
+	differently-sized zip entries (`if len(buffer) < entry_size:
+	buffer.resize(entry_size)`) rather than reallocating fresh every time. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'grow_past_capacity_reallocates_and_zero_fills', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	b.resize( 6 )
+	if len( b ) != 6:
+		return 1
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[0] != 1 or p2[1] != 2 or p2[2] != 3:
+		return 2
+	if p2[3] != 0 or p2[4] != 0 or p2[5] != 0:
+		return 3
+	return 0
+''' ),
+			( 'shrink_then_regrow_within_capacity_re_zeroes_not_stale', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	b.resize( 6 )  # grow past capacity: __cap becomes 6
+	p: Ptr[u8] = b.get_ptr()
+	p[3] = 9
+	p[4] = 8
+	p[5] = 7
+	b.resize( 3 )  # shrink: __cap stays 6, __len becomes 3
+	if len( b ) != 3:
+		return 1
+	b.resize( 6 )  # regrow within __cap - no reallocation, but re-zeroed
+	if len( b ) != 6:
+		return 2
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[3] != 0 or p2[4] != 0 or p2[5] != 0:
+		return 3
+	return 0
+''' ),
+			( 'resize_to_same_size_is_a_no_op', '''
+def main() -> i32:
+	b: bytearray = bytearray( 4 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 5
+	b.resize( 4 )
+	if len( b ) != 4:
+		return 1
+	p2: Ptr[u8] = b.get_ptr()
+	if p2[0] != 5:
+		return 2
+	return 0
+''' ),
+		] )
+
+
+class ExternNullablePointerReturnRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for a real, confirmed silent-data-corruption bug:
+	an `@extern` function declared with a `T|None` return type where T is a
+	pointer (Ptr[T]/ConstPtr[T]) got its C prototype declared as returning
+	the FULL tagged-union struct BY VALUE (plain c_type(function.return_type))
+	- but the real foreign symbol's actual ABI just returns a bare, possibly-
+	null pointer in a single register. The mismatched calling convention
+	silently corrupted the returned pointer VALUE (not a crash, not a
+	null-vs-non-null confusion - the wrong bit pattern, non-null but
+	incorrect). Confirmed via ws2_32's real inet_ntop, whose documented
+	contract is "returns pStringBuf on success": before the original fix,
+	the returned pointer compared unequal to pStringBuf even on success.
+
+	That original fix bridged the union at the extern call site (auto-
+	wrapping a raw pointer result back into a tagged union, picking the tag
+	at runtime from the pointer's own null-ness) - a workaround, not a real
+	fix, and one that only covered RETURN types (the identical shape on an
+	extern PARAMETER was never fixed at all). Superseded: `T|None` (and any
+	other TaggedUnion, and RCClass) is now a compile-time error on any
+	`@extern` parameter or return type (see
+	Discovery._reject_non_c_type_on_extern_signature) - there is no longer
+	any bridging to test. What's left worth testing for real, against the
+	real DLL: the CORRECT idiom this compiler already supports natively -
+	a bare, inherently-nullable `Ptr[T]`/`ConstPtr[T]` return, checked with
+	`is None` (exactly what lib/windows/ws2_32.py's own inet_ntop, and
+	lib/socket.py's real caller of it, already do) - still needs to
+	round-trip the real pointer VALUE correctly, not just null-vs-non-null,
+	against the actual foreign ABI. RejectionTests below covers the new
+	compile-time ban itself. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@unittest.skipUnless( os.name == 'nt', 'needs a real Winsock DLL to call (ws2_32.dll)' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the exact shape that demonstrated the bug: inet_ntop's real,
+			# documented contract is "returns pStringBuf on success" - a
+			# pointer EQUALITY check against a buffer this program itself
+			# passed in, not just a null/non-null check, so a corrupted (but
+			# still non-null) return value is caught, not just a crash
+			( 'nullable_pointer_extern_return_roundtrips_correctly', '''
+import compiler
+import sys
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_ntop' )
+def inet_ntop_nullable( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr_val: u32 = u32( 0x0100007F ) # 127.0.0.1
+	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
+	sys.memzero( strbuf, usize( 16 ))
+	res = inet_ntop_nullable( 2, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 ))
+	if res is None:
+		sys.free( strbuf )
+		return 1 # real failure - AF_INET should never actually fail here
+	if res != strbuf: # pre-fix (on the return-type bridging hack): fired - the returned pointer VALUE was wrong
+		sys.free( strbuf )
+		return 2
+	sys.free( strbuf )
+	return 0
+''' ),
+			# the null branch: an invalid address family makes inet_ntop
+			# return NULL for real - confirms a bare nullable pointer's own
+			# `is None` still correctly recognizes it, with no tag/union
+			# machinery involved at all
+			( 'nullable_pointer_extern_return_null_case_still_recognized_as_none', '''
+import compiler
+import sys
+
+@extern( 'ws2_32', 'WSAStartup' )
+def WSAStartup( wVersionRequested: u16, lpWSAData: Ptr[None] ) -> i32: ...
+
+@extern( 'ws2_32', 'inet_ntop' )
+def inet_ntop_nullable( family: i32, pAddr: Ptr[None], pStringBuf: Ptr[u8], StringBufSize: usize ) -> ConstPtr[u8]: ...
+
+def main() -> i32:
+	wsadata: Ptr[u8] = sys.alloc[u8]( 512 )
+	WSAStartup( 0x0202, compiler.cast( Ptr[None], wsadata ))
+	sys.free( compiler.cast( Ptr[None], wsadata ))
+
+	addr_val: u32 = u32( 0x0100007F )
+	strbuf: Ptr[u8] = sys.alloc[u8]( 16 )
+	sys.memzero( strbuf, usize( 16 ))
+	res = inet_ntop_nullable( 999, compiler.cast( Ptr[None], compiler.addrof( addr_val )), strbuf, usize( 16 )) # invalid family -> real NULL
+	if res is None:
+		sys.free( strbuf )
+		return 0
+	sys.free( strbuf )
+	return 1
+''' ),
+		] )
+
+
+class ExternNonCTypeSignatureRejectionTests( CompilerTestCase ):
+	''' Discovery._reject_non_c_type_on_extern_signature: an `@extern`
+	function's foreign C symbol has no notion of this compiler's own
+	RC-managed objects or synthesized tagged unions - only a genuine plain C
+	value (a Scalar, a @cstruct/@cunion, a raw CType, a CEnum, a function
+	pointer, or Ptr[T]/ConstPtr[T] to one of those) crosses that boundary
+	correctly. Covers both halves of what the old auto-bridging hack
+	(3e0e325f, removed) left exposed: a TaggedUnion on a PARAMETER (never
+	fixed at all, since the hack only ever special-cased RETURN types) and a
+	TaggedUnion on a RETURN (previously silently bridged instead of
+	rejected) - plus RCClass, which the old hack never considered either
+	way. Each fixture calls the offending @extern function from main() -
+	an @extern function's own parameter/return types are only resolved (and
+	only then can this check ever fire) once something actually schedules
+	it, mirroring how every other Function's signature resolution is lazy
+	in this compiler (see discovery.py's _make_function_resolver). '''
+
+	def _assert_rejected( self, code: str, expected_substring: str ) -> None:
+		self._run( code )
+		self.assertTrue(
+			any( expected_substring in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
+	def test_extern_parameter_tagged_union_rejected( self ) -> None:
+		# the previously-unexercised, never-fixed twin of the return-side bug:
+		# _lower_call_args -> _coerce_into_union would have built a full
+		# tag+payload struct for this argument and handed it to a foreign
+		# symbol expecting a bare pointer register - now a compile error
+		# instead of a silent ABI mismatch
+		self._assert_rejected( '''
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn( p: ConstPtr[u8]|None ) -> i32: ...
+
+def main() -> i32:
+	some_extern_fn( None )
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+	def test_extern_return_tagged_union_rejected( self ) -> None:
+		# the exact shape 3e0e325f's now-removed auto-bridging hack used to
+		# paper over instead of rejecting outright
+		self._assert_rejected( '''
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn() -> ConstPtr[u8]|None: ...
+
+def main() -> i32:
+	some_extern_fn()
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+	def test_extern_parameter_rcclass_rejected( self ) -> None:
+		# an RCClass reference already happens to be pointer-shaped in the
+		# generated C, but it points at THIS compiler's own ObjectHeader-
+		# prefixed layout, not a plain C value any foreign library was
+		# compiled to understand or refcount correctly
+		self._assert_rejected( '''
+class Foo:
+	x: i32
+
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn( f: Foo ) -> i32: ...
+
+def main() -> i32:
+	some_extern_fn( Foo( x = 1 ) )
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+	def test_extern_return_rcclass_rejected( self ) -> None:
+		self._assert_rejected( '''
+class Foo:
+	x: i32
+
+@extern( 'c', 'some_extern_fn' )
+def some_extern_fn() -> Foo: ...
+
+def main() -> i32:
+	some_extern_fn()
+	return 0
+''', 'cannot cross an @extern boundary' )
+
+
 class LocalImportAnnotationResolutionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' A function-body-local `from X import Y` immediately followed by a
 	same-function annotation using Y (`h: Y = ...`) previously failed to
@@ -10196,7 +17168,7 @@ def main() -> i32:
 ''' ),
 			# runs the N-part runtime path many times over - a real stress
 			# check for the UnsafeList[str] scratch buffer's own lifecycle
-			# (construction, N appends, get_ptr, destruction) - matches this
+			# (construction, N appends, destruction) - matches this
 			# codebase's own "repeat-run stress test, not just reasoning"
 			# verification convention (see ListThreadSafetyTests)
 			( 'repeated_fstring_construction_does_not_leak_or_double_free', '''
@@ -10870,7 +17842,7 @@ class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	def test_programs_compile_and_run( self ) -> None:
 		self.assert_programs_run([
 			( 'multi_yield_state_transitions_and_exhaustion', '''
-def counter() -> Iterator[i32]:
+def counter() -> Iterator[Result[i32, StopIteration]]:
 	x: i32 = 1
 	yield x
 	x = 2
@@ -10882,21 +17854,33 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter()
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'calling_the_generator_function_runs_no_body_code', '''
-def only_yields_if_called() -> Iterator[i32]:
+def only_yields_if_called() -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 
 def main() -> i32:
@@ -10910,13 +17894,14 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[i32]:
+def gen( b: Box ) -> Iterator[Result[i32, StopIteration]]:
 	yield b.v
 	yield b.v
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
-	first = g.__next__() # only one of the two yields is ever consumed
+	first = g.__next__().is_ok() # only one of the two yields is ever consumed
+	if first: pass
 	# g goes out of scope here, still mid-iteration - PLAN_GENERATORS.md's
 	# own point: dropping it must still decref its captured Box parameter,
 	# via the ordinary, unmodified $$__destructor__ cascade every other
@@ -10941,7 +17926,7 @@ def main() -> i32:
 			# _is_range_call). See _build_while_unit_guard's own docstring
 			# for the resumable-loop restructuring this compiles down to.
 			( 'while_loop_resumable_across_next_calls', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield i
@@ -10952,17 +17937,29 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter( 3 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'while_loop_dropped_mid_iteration_decrefs_captured_parameter', '''
@@ -10971,7 +17968,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
@@ -10980,8 +17977,9 @@ def gen( b: Box ) -> Iterator[usize]:
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b )
-	first = g.__next__()
-	second = g.__next__() # b.v is 10 - only 2 of 10 iterations consumed
+	first = g.__next__().is_ok()
+	second = g.__next__().is_ok() # b.v is 10 - only 2 of 10 iterations consumed
+	if first and second: pass
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -10994,7 +17992,7 @@ def main() -> i32:
 		return 0
 ''' ),
 			( 'bare_yield_and_while_unit_mixed_in_one_generator', '''
-def mixed( count: usize ) -> Iterator[usize]:
+def mixed( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	hundred: usize = 100
 	yield hundred
 	i: usize = 0
@@ -11009,20 +18007,35 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = mixed( 2 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		e = g.__next__()
-		if e is not None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 5
 		return 0
 ''' ),
 			# --- Phase 3: `for x in <generator call>:` consumption
@@ -11036,7 +18049,7 @@ def main() -> i32:
 			# just "is None" correct (see PLAN_GENERATORS.md's own STATUS
 			# section on why this couldn't be checked directly until now).
 			( 'for_loop_consumes_a_while_unit_generator', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield i
@@ -11062,7 +18075,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
@@ -11094,7 +18107,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
@@ -11126,7 +18139,7 @@ def main() -> i32:
 			# (same $t-numbered instructions, same __gen_resuming_0 local)
 			# by inspecting the emitted C directly during development.
 			( 'for_loop_over_range_containing_yield', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	for i in range( count ):
 		yield i
 
@@ -11134,23 +18147,41 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter( 5 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		e = g.__next__()
-		if e is None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( _ ):
+				pass
 		f = g.__next__()
-		if f is not None:
-			return 6
+		match f:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 6
 		return 0
 ''' ),
 			( 'for_loop_over_range_composes_with_for_loop_consumption', '''
@@ -11159,7 +18190,7 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def gen( b: Box ) -> Iterator[usize]:
+def gen( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	for i in range( b.v ):
 		yield i
 
@@ -11182,13 +18213,13 @@ def main() -> i32:
 			# --- Phase 1: `for x in <expr>:` inside a generator body, over
 			# a non-range() iterable - both the indexable shape (__len__/
 			# __getitem__, e.g. list[T]) and the iterator shape (__next__()
-			# -> T|None, i.e. one generator consuming another). Unblocked by
+			# -> Result[T,E], i.e. one generator consuming another). Unblocked by
 			# type_resolver.py's _resolve_expr_type_for_desugar, reusing
 			# _ReferenceResolver._type_of_expr (already proven for match-
 			# statement subjects) to resolve the iterated expression's type
 			# entirely from AST, before any real lowering exists.
 			( 'for_loop_over_list_inside_generator', '''
-def double_all( xs: list[i32] ) -> Iterator[i32]:
+def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 	for x in xs:
 		doubled: i32 = 0
 		with compiler.wrap_arithmetic:
@@ -11203,21 +18234,33 @@ def main() -> i32:
 		xs.append( 3 ).unwrap( 'append failed' )
 		g = double_all( xs )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'for_loop_over_list_releases_it_and_its_captured_parameter', '''
-def double_all( xs: list[i32] ) -> Iterator[i32]:
+def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 	for x in xs:
 		doubled: i32 = 0
 		with compiler.wrap_arithmetic:
@@ -11226,7 +18269,8 @@ def double_all( xs: list[i32] ) -> Iterator[i32]:
 
 def make_and_partially_consume( xs: list[i32] ) -> None:
 	g = double_all( xs )
-	first = g.__next__()
+	first = g.__next__().is_ok()
+	if first: pass
 	# g goes out of scope here, mid-iteration - g's own __for_obj_N field
 	# holds a SEPARATE reference to xs, must also be released
 
@@ -11244,14 +18288,14 @@ def main() -> i32:
 		return 0
 ''' ),
 			( 'for_loop_consumes_another_generator_inside_a_generator', '''
-def counter( count: usize ) -> Iterator[usize]:
+def counter( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield i
 		with compiler.wrap_arithmetic:
 			i += 1
 
-def doubled( count: usize ) -> Iterator[usize]:
+def doubled( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	for x in counter( count ):
 		y: usize = 0
 		with compiler.wrap_arithmetic:
@@ -11262,17 +18306,29 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = doubled( 3 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 			( 'for_loop_over_nested_generator_releases_both_levels', '''
@@ -11281,14 +18337,14 @@ class Box:
 	def __init__( self, v: usize ) -> None:
 		self.v = v
 
-def counter( b: Box ) -> Iterator[usize]:
+def counter( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < b.v:
 		yield i
 		with compiler.wrap_arithmetic:
 			i += 1
 
-def doubled( b: Box ) -> Iterator[usize]:
+def doubled( b: Box ) -> Iterator[Result[usize, StopIteration]]:
 	for x in counter( b ):
 		y: usize = 0
 		with compiler.wrap_arithmetic:
@@ -11297,7 +18353,8 @@ def doubled( b: Box ) -> Iterator[usize]:
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = doubled( b )
-	first = g.__next__()
+	first = g.__next__().is_ok()
+	if first: pass
 	# g's own __for_obj_N field holds the inner counter(b) generator,
 	# which ITSELF holds b as its own captured parameter - both levels
 	# must release correctly when g is dropped mid-iteration
@@ -11323,7 +18380,7 @@ def main() -> i32:
 		# in the yielding branch (the `resuming` flag's own body),
 		# falling through to a shared tail unit after the if/else.
 		( 'if_else_yield_resumes_correct_branch_and_falls_through', '''
-def alternator( flag: bool ) -> Iterator[i32]:
+def alternator( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	if flag:
 		one: i32 = 1
 		yield one
@@ -11340,25 +18397,43 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = alternator( True )
 		a = g.__next__() # if-branch
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__() # resumes if-branch post-yield code, falls through to tail
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__() # exhausted
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 
 		g2 = alternator( False )
 		d = g2.__next__() # else-branch
-		if d is None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		e = g2.__next__() # falls through to tail
-		if e is None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( _ ):
+				pass
 		f = g2.__next__() # exhausted
-		if f is not None:
-			return 6
+		match f:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 6
 		return 0
 ''' ),
 		# --- Phase 2b: `with compiler.wrap_arithmetic/saturate_arithmetic/
@@ -11367,7 +18442,7 @@ def main() -> i32:
 		# (_yield_with_wrapper), no new unit kind. Confirms the mode
 		# is still correctly scoped when the segment is lowered.
 		( 'with_wrapped_yield_units', '''
-def counter( start: i32 ) -> Iterator[i32]:
+def counter( start: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	x: i32 = start
 	with compiler.wrap_arithmetic:
 		yield x
@@ -11380,18 +18455,27 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = counter( 10 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__()
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 		return 0
 ''' ),
 		# --- Phase 3: generic generator functions (`def gen[T](x: T) ->
-		# Iterator[T]:`) - both an explicit instantiation (`gen[i32](...)`)
+		# Iterator[Result[T, StopIteration]]:`) - both an explicit instantiation (`gen[i32](...)`)
 		# and an inferred one (`gen(seven)`, T inferred from the
 		# argument's own static type - a bare int LITERAL argument hits a
 		# pre-existing, generator-unrelated inference gap in this
@@ -11408,48 +18492,66 @@ def main() -> i32:
 		# generic function's ABSTRACT base, never the concrete copy - see
 		# each fix's own comment for the specific gap it closes).
 		( 'generic_generator_explicit_and_inferred_instantiation', '''
-def gen[T]( x: T ) -> Iterator[T]:
+def gen[T]( x: T ) -> Iterator[Result[T, StopIteration]]:
 	yield x
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g1 = gen[i32]( 5 ) # explicit instantiation
 		a = g1.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g1.__next__()
-		if b is not None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 2
 
 		seven: i32 = 7
 		g2 = gen( seven ) # inferred instantiation
 		c = g2.__next__()
-		if c is None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( _ ):
+				pass
 		d = g2.__next__()
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		return 0
 ''' ),
 		( 'generic_generator_two_instantiations_coexist_independently', '''
-def gen[T]( x: T ) -> Iterator[T]:
+def gen[T]( x: T ) -> Iterator[Result[T, StopIteration]]:
 	yield x
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g1 = gen[i32]( 5 )
 		a = g1.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 
 		g2 = gen[usize]( 9 ) # a DIFFERENT instantiation - independent backing class
 		b = g2.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		return 0
 ''' ),
 		( 'generic_generator_consumed_via_for_loop', '''
-def gen[T]( x: T, count: usize ) -> Iterator[T]:
+def gen[T]( x: T, count: usize ) -> Iterator[Result[T, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield x
@@ -11469,9 +18571,10 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
-		# --- Phase 4: fallible generators (`Generator[T,E]`, TODO.txt's
-		# original open question). __next__ returns Result[elem_type|None,
-		# E] instead of the bare union - or_return() inside the body
+		# --- Phase 4: fallible generators (`Generator[T, E | StopIteration]`, TODO.txt's
+		# original open question). __next__ returns Result[elem_type,E]
+		# unconditionally (StopIteration reversal - see PLAN_GENERATORS.md)
+		# - or_return() inside the body
 		# engages the EXISTING checked-arithmetic/_require_result_return
 		# machinery for free (no special generator-side flag - purely a
 		# consequence of __next__'s own declared return type, same as any
@@ -11493,7 +18596,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def counter( limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def counter( limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	i: usize = 0
 	while i < limit:
 		v: usize = maybe_bad( i, boom_at ).or_return()
@@ -11525,18 +18628,26 @@ def main() -> i32:
 				return 3
 		if not errored:
 			return 4
-		r3 = g.__next__() # permanently done - Ok(None), not a re-run of the failing code
+		r3 = g.__next__() # permanently done - Err(StopIteration()), not a re-run of the failing code
 		match r3:
 			case Result.Err( e ):
-				return 5
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 5
 			case Result.Ok( d ):
-				pass
+				return 5
 		r4 = g.__next__() # still permanently done, still no crash
 		match r4:
 			case Result.Err( e ):
-				return 6
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 6
 			case Result.Ok( f ):
-				pass
+				return 6
 		return 0
 ''' ),
 		( 'fallible_generator_or_return_error_releases_captured_parameter', '''
@@ -11554,7 +18665,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	i: usize = 0
 	while i < limit:
 		v: usize = maybe_bad( i, boom_at ).or_return()
@@ -11611,7 +18722,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def make_boxes( count: usize ) -> Iterator[Box]:
+def make_boxes( count: usize ) -> Iterator[Result[Box, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		b: Box = Box( v = 100 )
@@ -11624,14 +18735,14 @@ def consume_fully( count: usize ) -> None:
 		n: usize = 0
 		while True:
 			match make_boxes( count ).__next__():
-				case Box( x ):
+				case Result.Ok( x ):
 					if x.v != 100:
 						return
 					n += 1
-				case None:
+				case Result.Err( _ ):
 					break
 
-def gen_from_box( b: Box, count: usize ) -> Iterator[Box]:
+def gen_from_box( b: Box, count: usize ) -> Iterator[Result[Box, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		yield b
@@ -11641,9 +18752,9 @@ def gen_from_box( b: Box, count: usize ) -> Iterator[Box]:
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen_from_box( b, 5 )
 	match g.__next__():
-		case Box( first ):
+		case Result.Ok( first ):
 			pass
-		case None:
+		case Result.Err( _ ):
 			pass
 	# g goes out of scope here, still mid-iteration (only 1 of 5 yields
 	# consumed) - dropping it must decref the captured parameter b,
@@ -11668,7 +18779,7 @@ def main() -> i32:
 		# 048af0f regression guard: a yielded RC value now returns straight
 		# through with no intermediate temp routing (see the comment above
 		# this section's own list) - `yield b` compiles to a bare `return
-		# self.b` against __next__'s own elem_type|None return type,
+		# self.b` against __next__'s own Result[elem_type,error_type] return type,
 		# exactly the shape union_coercion_rc_test.py's own
 		# _UNION_COERCE_FIELD_READ proves increfs exactly once for a plain
 		# (non-generator) field read. Mirrors that test's own before/after-
@@ -11685,7 +18796,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def yield_param_directly( b: Box ) -> Iterator[Box]:
+def yield_param_directly( b: Box ) -> Iterator[Result[Box, StopIteration]]:
 	yield b
 
 def main() -> i32:
@@ -11694,15 +18805,16 @@ def main() -> i32:
 		g1 = yield_param_directly( p )
 		before: usize = compiler.refcount( p ) # p itself + g1's own captured field
 		r = g1.__next__()
+		r.is_ok() # satisfies the must-inspect check on the early-return path below too - the real value check is the match further down
 		after: usize = compiler.refcount( p )
 		if after != before + 1:
 			return 1
 		del g1
 		match r:
-			case Box( got ):
+			case Result.Ok( got ):
 				if got.v != 1:
 					return 2
-			case None:
+			case Result.Err( _ ):
 				return 3
 		return 0
 ''' ),
@@ -11712,7 +18824,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def double_all( xs: list[Box] ) -> Iterator[Box]:
+def double_all( xs: list[Box] ) -> Iterator[Result[Box, StopIteration]]:
 	for x in xs:
 		yield x
 
@@ -11746,7 +18858,7 @@ def main() -> i32:
 			# previously-untested gap (_reject_generator_value_return only ever
 			# rejected a VALUE return, nothing rewrote a bare one)
 			( 'bare_return_nested_in_while_unit_loop_body_ends_iteration_permanently', '''
-def gen( limit: i32 ) -> Iterator[i32]:
+def gen( limit: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	x: i32 = 0
 	while x < limit:
 		if x == 2:
@@ -11759,24 +18871,39 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen( 5 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__()
-		if b is None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		c = g.__next__() # x becomes 2 here, hits the bare `return` before yielding again
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 		d = g.__next__() # must stay permanently None, not resume mid-loop
-		if d is not None:
-			return 4
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		e = g.__next__()
-		if e is not None:
-			return 5
+		match e:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 5
 		return 0
 ''' ),
 			( 'bare_return_in_tail_after_yield_ends_iteration_permanently', '''
-def gen( flag: bool ) -> Iterator[i32]:
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	yield 1
 	if flag:
 		return
@@ -11786,14 +18913,23 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		g = gen( True )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		b = g.__next__() # the tail's `if flag: return` fires here
-		if b is not None:
-			return 2
+		match b:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 2
 		c = g.__next__() # must stay None - not fall through to the second yield
-		if c is not None:
-			return 3
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 3
 		return 0
 ''' ),
 			# --- defer/errdefer in generators (PLAN_GENERATORS.md) - Mechanism
@@ -11811,7 +18947,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -11827,21 +18963,33 @@ def main() -> i32:
 		if compiler.refcount( b ) != 2: # caller + generator's own captured param
 			return 1
 		a = g.__next__()
-		if a is None:
-			return 2
+		match a:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		if compiler.refcount( b ) != 2: # defer must not have fired yet
 			return 3
 		c = g.__next__()
-		if c is None:
-			return 4
+		match c:
+			case Result.Err( _ ):
+				return 4
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__() # exhausts here - tail's own exit replays the armed defer
-		if d is not None:
-			return 5
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 5
 		if compiler.refcount( b ) != 3: # defer fired exactly once
 			return 6
 		e = g.__next__() # already done - must not re-fire
-		if e is not None:
-			return 7
+		match e:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 7
 		if compiler.refcount( b ) != 3:
 			return 8
 		return 0
@@ -11852,7 +19000,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, limit: usize ) -> Iterator[usize]:
+def gen( b: Box, limit: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -11870,13 +19018,19 @@ def main() -> i32:
 		if compiler.refcount( b ) != 2:
 			return 1
 		a = g.__next__() # i=0, yields 0
-		if a is None:
-			return 2
+		match a:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( _ ):
+				pass
 		if compiler.refcount( b ) != 2: # defer must not have fired yet
 			return 3
 		c = g.__next__() # i becomes 1, hits the bare `return` inside the loop - defer fires
-		if c is not None:
-			return 4
+		match c:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 4
 		if compiler.refcount( b ) != 3:
 			return 5
 		return 0
@@ -11887,7 +19041,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -11898,7 +19052,8 @@ def gen( b: Box, count: usize ) -> Iterator[usize]:
 
 def make_and_partially_consume( b: Box ) -> None:
 	g = gen( b, 5 )
-	first = g.__next__() # only 1 of 5 iterations consumed
+	first = g.__next__().is_ok() # only 1 of 5 iterations consumed
+	if first: pass
 	# g goes out of scope here, still mid-iteration - abandonment must still
 	# replay the armed defer, via the destructor, before its own ordinary
 	# captured-parameter teardown
@@ -11919,7 +19074,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, c: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, c: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -11936,11 +19091,17 @@ def main() -> i32:
 		c = Box( v = 2 )
 		g = gen( b, c, 1 )
 		a = g.__next__()
-		if a is None:
-			return 1
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( _ ):
+				pass
 		d = g.__next__() # exhausts - both defers replay LIFO: c's own first, then b's
-		if d is not None:
-			return 2
+		match d:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 2
 		if compiler.refcount( b ) != 3: # captured param + b's own armed defer
 			return 3
 		if compiler.refcount( c ) != 3: # captured param + c's own armed defer
@@ -11968,7 +19129,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def gen( b: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	with errdefer:
 		compiler.incref( b )
 	i: usize = 0
@@ -12006,12 +19167,16 @@ def main() -> i32:
 				return 5
 		if compiler.refcount( b ) != 3: # errdefer fired exactly once
 			return 6
-		r3 = g.__next__() # permanently done - Ok(None), errdefer must not re-fire
+		r3 = g.__next__() # permanently done - Err(StopIteration()), errdefer must not re-fire
 		match r3:
 			case Result.Err( e ):
-				return 7
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 7
 			case Result.Ok( a ):
-				pass
+				return 7
 		if compiler.refcount( b ) != 3:
 			return 9
 		return 0
@@ -12031,7 +19196,7 @@ def maybe_bad( i: usize, boom_at: usize ) -> Result[usize, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( i )
 
-def gen( b: Box, c: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError]:
+def gen( b: Box, c: Box, limit: usize, boom_at: usize ) -> Generator[usize, BoomError | StopIteration]:
 	with defer:
 		compiler.incref( b )
 	with errdefer:
@@ -12072,7 +19237,7 @@ class Box:
 	def __init__( self, v: i32 ) -> None:
 		self.v = v
 
-def gen( b: Box, count: usize ) -> Iterator[usize]:
+def gen( b: Box, count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		compiler.incref( b )
@@ -12085,10 +19250,12 @@ def drain_fully( b: Box, count: usize ) -> None:
 	g = gen( b, count )
 	i: usize = 0
 	while i < count:
-		v = g.__next__()
+		v = g.__next__().is_ok()
+		if v: pass
 		with compiler.wrap_arithmetic:
 			i += 1
-	last = g.__next__() # natural exhaustion - tail replay fires the defer, unsets its own flag
+	last = g.__next__().is_ok() # natural exhaustion - tail replay fires the defer, unsets its own flag
+	if last: pass
 	# g goes out of scope HERE - $$__destructor__ must see the flag already
 	# unset and must NOT replay the same defer body a second time
 
@@ -12112,7 +19279,7 @@ def main() -> i32:
 class NotIterable:
 	pass
 
-def gen( x: NotIterable ) -> Iterator[i32]:
+def gen( x: NotIterable ) -> Iterator[Result[i32, StopIteration]]:
 	for y in x:
 		yield 1
 
@@ -12123,11 +19290,11 @@ def main() -> None:
 		self.assertIn( '__len__', str( self.discovery.errors.errors[0] ))
 
 	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
-		# a __next__() that returns something other than T|None - real, not
-		# a generator's own (compiler-synthesized __next__ always has the
-		# right shape) - must be a clear compile error, not a miscompile.
-		# Not generator-specific: any user class implementing __next__ by
-		# hand hits the same check.
+		# a __next__() that returns something other than Result[T,E] (E
+		# including StopIteration) - real, not a generator's own (compiler-
+		# synthesized __next__ always has the right shape) - must be a
+		# clear compile error, not a miscompile. Not generator-specific:
+		# any user class implementing __next__ by hand hits the same check.
 		self._run( '''
 class NotReallyAnIterator:
 	def __next__( self ) -> i32:
@@ -12139,57 +19306,131 @@ def main() -> None:
 		pass
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'T|None', str( self.discovery.errors.errors[0] ))
+		self.assertIn( 'Result[T,E]', str( self.discovery.errors.errors[0] ))
 
-	def test_yield_nested_in_if_is_rejected( self ) -> None:
-		# Phase 2 only recognizes a bare top-level yield or a single-yield
-		# top-level while loop as valid units - a yield nested one level
-		# deeper (inside an if inside the loop) must be a clear compile
-		# error, not a silently wrong state machine
-		self._run( '''
-def gen( flag: bool ) -> Iterator[i32]:
+	# PLAN_GENERATORS.md Phase F - the AST-synthesis unit-matcher these five
+	# rejection tests originally covered is gone; the real IR-level yield
+	# dispatch it was replaced with has no such structural restrictions -
+	# each shape below is now an ordinary compile-and-run case instead
+	# (Phase F's own regression bar - see FunctionLowering._emit_generator_
+	# dispatch_prologue/TypeResolver._assign_generator_yield_dispatch).
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_previously_rejected_shapes_now_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'yield_nested_in_if_inside_while_true', '''
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	while True:
 		if flag:
 			yield 1
+		else:
+			break
 
-def main() -> None:
+def main() -> i32:
 	g = gen( True )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'PLAN_GENERATORS.md', str( self.discovery.errors.errors[0] ))
+	a = g.__next__()
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 1:
+				return 1
+	b = g.__next__()
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 1:
+				return 2
+	g2 = gen( False )
+	c = g2.__next__()
+	match c:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 3
+	return 0
+''' ),
+			( 'while_loop_with_two_yields', '''
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: i32 = 0
+	with compiler.wrap_arithmetic:
+		while i < 3:
+			yield i
+			yield i + 100
+			i += 1
 
-	def test_while_loop_with_two_yields_is_rejected( self ) -> None:
-		self._run( '''
-def gen() -> Iterator[i32]:
-	while True:
-		yield 1
-		yield 2
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		idx: usize = 0
+		while idx < 6:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					return i32( 1 + idx )
+				case Result.Ok( v ):
+					pass
+			e: i32 = 0
+			if idx == 0: e = 0
+			elif idx == 1: e = 100
+			elif idx == 2: e = 1
+			elif idx == 3: e = 101
+			elif idx == 4: e = 2
+			else: e = 102
+			if v != e:
+				return i32( 10 + idx )
+			idx += 1
+		last = g.__next__()
+		match last:
+			case Result.Err( _ ):
+				pass
+			case Result.Ok( _ ):
+				return 20
+		return 0
+''' ),
+			( 'break_inside_yielding_while_loop', '''
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			yield i
+			if i == 2:
+				break
+			i += 1
 
-def main() -> None:
+def main() -> i32:
 	g = gen()
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'exactly one yield', str( self.discovery.errors.errors[0] ))
-
-	def test_break_inside_yielding_while_loop_is_rejected( self ) -> None:
-		self._run( '''
-def gen() -> Iterator[i32]:
-	while True:
-		yield 1
-		break
-
-def main() -> None:
-	g = gen()
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'break/continue', str( self.discovery.errors.errors[0] ))
-
-	def test_if_elif_chain_with_yield_is_rejected( self ) -> None:
-		# Phase 2a only recognizes a single if/else - an elif chain
-		# generalizes the same branch-stable-resume idea but multiplies the
-		# state/testing surface, deliberately deferred (PLAN_GENERATORS.md)
-		self._run( '''
-def gen( flag: i32 ) -> Iterator[i32]:
+	a = g.__next__()
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 0:
+				return 1
+	b = g.__next__()
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 1:
+				return 2
+	c = g.__next__()
+	match c:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( c ):
+			if c != 2:
+				return 3
+	d = g.__next__()
+	match d:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 4
+	return 0
+''' ),
+			( 'if_elif_chain_with_yield', '''
+def gen( flag: i32 ) -> Iterator[Result[i32, StopIteration]]:
 	if flag == 0:
 		yield 1
 	elif flag == 1:
@@ -12197,33 +19438,87 @@ def gen( flag: i32 ) -> Iterator[i32]:
 	else:
 		yield 3
 
-def main() -> None:
-	g = gen( 0 )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'elif', str( self.discovery.errors.errors[0] ))
-
-	def test_if_else_with_two_yields_in_one_branch_is_rejected( self ) -> None:
-		self._run( '''
-def gen( flag: bool ) -> Iterator[i32]:
+def main() -> i32:
+	g0 = gen( 0 )
+	a = g0.__next__()
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 1:
+				return 1
+	g1 = gen( 1 )
+	b = g1.__next__()
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 2:
+				return 2
+	g2 = gen( 2 )
+	c = g2.__next__()
+	match c:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( c ):
+			if c != 3:
+				return 3
+	return 0
+''' ),
+			( 'if_else_with_two_yields_in_one_branch', '''
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	if flag:
 		yield 1
 		yield 2
 	else:
 		yield 3
 
-def main() -> None:
-	g = gen( True )
-''' )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'at most one yield per branch', str( self.discovery.errors.errors[0] ))
+def main() -> i32:
+	g0 = gen( True )
+	a = g0.__next__()
+	match a:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( a ):
+			if a != 1:
+				return 1
+	b = g0.__next__()
+	match b:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( b ):
+			if b != 2:
+				return 2
+	c = g0.__next__()
+	match c:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 3
+	g1 = gen( False )
+	d = g1.__next__()
+	match d:
+		case Result.Err( _ ):
+			return 4
+		case Result.Ok( d ):
+			if d != 3:
+				return 4
+	e = g1.__next__()
+	match e:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 5
+	return 0
+''' ),
+		])
 
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
 		# level statement (preamble/tail) is supported for now, same start-
 		# narrow posture as break/continue inside a yield-containing loop
 		self._run( '''
-def gen( count: usize ) -> Iterator[usize]:
+def gen( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	while i < count:
 		with defer:
@@ -12240,7 +19535,7 @@ def main() -> None:
 
 	def test_errdefer_inside_if_unit_branch_is_rejected( self ) -> None:
 		self._run( '''
-def gen( flag: bool ) -> Generator[i32,str]:
+def gen( flag: bool ) -> Generator[i32, str | StopIteration]:
 	if flag:
 		with errdefer:
 			pass
@@ -12264,7 +19559,7 @@ def main() -> None:
 		# never fires here since a generator's own defer body never routes
 		# through _register_defer_block at all
 		self._run( '''
-def gen( count: usize ) -> Iterator[usize]:
+def gen( count: usize ) -> Iterator[Result[usize, StopIteration]]:
 	i: usize = 0
 	with defer:
 		return
@@ -12284,7 +19579,7 @@ def main() -> None:
 		# level deeper (inside an if) - confirms the whole-body walk
 		# catches a nested return too, not just a direct top-level one
 		self._run( '''
-def gen( flag: bool ) -> Generator[i32,str]:
+def gen( flag: bool ) -> Generator[i32, str | StopIteration]:
 	with errdefer:
 		if flag:
 			return
@@ -12310,7 +19605,7 @@ def main() -> None:
 def identity[T]( v: T ) -> T:
 	return v
 
-def gen[T]( x: T ) -> Iterator[T]:
+def gen[T]( x: T ) -> Iterator[Result[T, StopIteration]]:
 	y: T = identity( x )
 	yield y
 
@@ -12322,13 +19617,17 @@ def main() -> None:
 
 	def test_or_return_inside_infallible_iterator_is_rejected( self ) -> None:
 		# Phase 4 (roadmap Phase 4) - or_return() stays rejected inside a
-		# plain Iterator[T] (infallible) generator, exactly as before this
-		# phase - unchanged, since it's purely a consequence of __next__'s
-		# own declared return type (elem_type|None, not Result-shaped),
-		# same _require_result_return check every other non-Result-
-		# returning function already hits. Generator[T,E] is what lifts
-		# this - see test_programs_compile_and_run's own fallible_generator_
-		# ... test cases.
+		# plain Iterator[Result[T,StopIteration]] ("infallible" beyond
+		# exhaustion) generator: __next__'s own declared error type
+		# (StopIteration alone) doesn't COVER BoomError, same
+		# _require_result_return leaves-containment check every other
+		# fallible propagation site already hits - purely a consequence of
+		# the declared error type, same as before the StopIteration
+		# reversal, just with a real Result-shaped (not bare T|None)
+		# __next__ underneath now. Generator[T, E|StopIteration] (E
+		# actually covering BoomError) is what lifts this - see
+		# test_programs_compile_and_run's own fallible_generator_... test
+		# cases.
 		self._run( '''
 @union
 class BoomError:
@@ -12339,7 +19638,7 @@ def maybe_bad( flag: bool ) -> Result[i32, BoomError]:
 		return Result.Err( BoomError.Boom( None ))
 	return Result.Ok( 1 )
 
-def gen( flag: bool ) -> Iterator[i32]:
+def gen( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
 	v: i32 = maybe_bad( flag ).or_return()
 	yield v
 
@@ -12348,6 +19647,627 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
+
+	# PLAN_GENERATORS.md Phase C - `.send()`. Generator[T, SendType, E | StopIteration] (3-
+	# arg form) makes `(yield expr)` usable as a captured EXPRESSION,
+	# evaluating to plain SendType, delivered via .send(v) - see this
+	# doc's own "Phase C design" section (describes the ORIGINAL,
+	# now-superseded branch's internals; the real current mechanism is
+	# type_resolver.py's _build_generator_send_wrappers/_hoist_yield_
+	# from_rc_reassignment and lowering.py's _expr_Yield).
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_send_before_first_yield_panics( self ) -> None:
+		# a real panic (sys.panic -> exit(1)) can't share a merged multi-
+		# case binary with assert_programs_run's other cases - it would
+		# abort the WHOLE process before any later case ever ran. Own
+		# standalone compile+run, same pattern as e.g. test_ord_on_empty_
+		# string_panics above.
+		self._run( '''
+@union
+class NoError:
+	Never: None
+
+def gen() -> Generator[i32, i32, NoError | StopIteration]:
+	x: i32 = yield 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		r = g.send( 5 ).unwrap( 'unexpected error' )
+		if r != 0: pass # touch it - the panic above means this never actually runs
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bare_next_at_captured_yield_panics( self ) -> None:
+		self._run( '''
+@union
+class NoError:
+	Never: None
+
+def gen() -> Generator[i32, i32, NoError | StopIteration]:
+	x: i32 = yield 1
+	x2: i32 = yield x
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		r0 = g.__next__().unwrap( 'unexpected error' )
+		if r0 != 0: pass # touch it - the panic below means this never actually runs
+		r1 = g.__next__().unwrap( 'unexpected error' ) # resumes the captured yield without sending - must panic, not silently deliver garbage
+		if r1 != 0: pass # touch it - the panic above means this never actually runs
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 1 )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_send_scalar_and_rc_values( self ) -> None:
+		self.assert_programs_run([
+			( 'send_scalar_accumulator', '''
+@union
+class NoError:
+	Never: None
+
+def accumulator() -> Generator[i32, i32, NoError | StopIteration]:
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			received: i32 = yield total
+			total += received
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = accumulator()
+		r0 = g.__next__().unwrap( 'unexpected error' )
+		if r0 != 0:
+			return 1
+		r1 = g.send( 5 ).unwrap( 'unexpected error' )
+		if r1 != 5:
+			return 2
+		r2 = g.send( 10 ).unwrap( 'unexpected error' )
+		if r2 != 15:
+			return 3
+		return 0
+''' ),
+			( 'send_rc_value_refcount_correct_across_repeated_sends', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+@union
+class NoError:
+	Never: None
+
+def collector() -> Generator[i32, Box, NoError | StopIteration]:
+	i: i32 = 0
+	held: Box = Box( v = 0 )
+	with compiler.wrap_arithmetic:
+		while i < 3:
+			held = yield held.v
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b1 = Box( v = 10 )
+		if compiler.refcount( b1 ) != 1:
+			return 1
+		g = collector()
+		r0 = g.__next__().unwrap( 'e' )
+		if r0 != 0:
+			return 2
+		r1 = g.send( b1 ).unwrap( 'e' )
+		if r1 != 10:
+			return 3
+		# THREE independent owners: the caller's own b1, __send_slot
+		# (never cleared by consumption - only overwritten by a LATER
+		# send), and held (the promoted local __gen_send_capture_N
+		# relayed into)
+		if compiler.refcount( b1 ) != 3:
+			return 4
+		b2 = Box( v = 20 )
+		r2 = g.send( b2 ).unwrap( 'e' )
+		if r2 != 20:
+			return 5
+		if compiler.refcount( b1 ) != 1: # dropped back to just the caller's own binding
+			return 6
+		if compiler.refcount( b2 ) != 3: # caller's own b2 + __send_slot + held now
+			return 7
+		return 0
+''' ),
+			( 'dropping_generator_mid_iteration_releases_send_slot_and_captured_local', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+@union
+class NoError:
+	Never: None
+
+def collector() -> Generator[i32, Box, NoError | StopIteration]:
+	i: i32 = 0
+	held: Box = Box( v = 0 )
+	with compiler.wrap_arithmetic:
+		while i < 3:
+			held = yield held.v
+			i += 1
+
+def make_send_and_drop( b: Box ) -> None:
+	g = collector()
+	r0 = g.__next__().unwrap( 'e' )
+	if r0 != 0: pass # touch it - deliberately never otherwise read
+	r1 = g.send( b ).unwrap( 'e' )
+	if r1 != 0: pass # touch it - deliberately never otherwise read
+	# g abandoned here mid-iteration - both held and __send_slot still
+	# hold their own reference to b, must both be released by the
+	# generator's own destructor
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 5 )
+		if compiler.refcount( b ) != 1:
+			return 1
+		make_send_and_drop( b )
+		if compiler.refcount( b ) != 1:
+			return 2
+		return 0
+''' ),
+		])
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_yield_from_basic_and_nesting( self ) -> None:
+		# PLAN_GENERATORS.md A.4a - `yield from <expr>` desugars into `for
+		# __yield_from_N in <expr>: yield __yield_from_N`, sharing the same
+		# for-loop-over-iterator desugaring (_desugar_iterator_for) any
+		# user-written `for x in some_generator(): yield x` already goes
+		# through
+		self.assert_programs_run([
+			( 'yield_from_top_level_forwards_every_value_in_order', '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+	yield 2
+	yield 3
+
+def outer() -> Iterator[Result[i32, StopIteration]]:
+	yield from inner()
+
+def main() -> i32:
+	g = outer()
+	r0 = g.__next__()
+	match r0:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( r0 ):
+			if r0 != 1:
+				return 1
+	r1 = g.__next__()
+	match r1:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( r1 ):
+			if r1 != 2:
+				return 2
+	r2 = g.__next__()
+	match r2:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( r2 ):
+			if r2 != 3:
+				return 3
+	r3 = g.__next__()
+	match r3:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 4
+	return 0
+''' ),
+			( 'yield_from_nested_in_if_still_forwards_correctly', '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 10
+	yield 20
+
+def outer( flag: bool ) -> Iterator[Result[i32, StopIteration]]:
+	if flag:
+		yield from inner()
+	else:
+		yield 99
+
+def main() -> i32:
+	g = outer( True )
+	r0 = g.__next__()
+	match r0:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( r0 ):
+			if r0 != 10:
+				return 1
+	r1 = g.__next__()
+	match r1:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( r1 ):
+			if r1 != 20:
+				return 2
+	g2 = outer( False )
+	r2 = g2.__next__()
+	match r2:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( r2 ):
+			if r2 != 99:
+				return 3
+	return 0
+''' ),
+			( 'yield_from_forwards_rc_values_with_correct_refcounts', '''
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+def inner( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
+	yield b1
+	yield b2
+
+def outer( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
+	yield from inner( b1, b2 )
+
+def consume_fully( b1: Box, b2: Box ) -> None:
+	g = outer( b1, b2 )
+	x = g.__next__().is_ok()
+	y = g.__next__().is_ok()
+	z = g.__next__().is_ok()
+	if x and y and z: pass
+
+def main() -> i32:
+	b1 = Box( n = 1 )
+	b2 = Box( n = 2 )
+	consume_fully( b1, b2 )
+	# every intermediate owner (g.b1/b2, inner_gen.b1/b2, the promoted
+	# __for_next_N/__yield_from_N fields, x/y/z) has gone out of scope by
+	# here - only the caller's own b1/b2 bindings remain
+	if compiler.refcount( b1 ) != 1:
+		return 1
+	if compiler.refcount( b2 ) != 1:
+		return 2
+	return 0
+''' ),
+			( 'yield_from_dropped_mid_iteration_releases_every_forwarded_reference', '''
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+def inner( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
+	yield b1
+	yield b2
+
+def outer( b1: Box, b2: Box ) -> Iterator[Result[Box, StopIteration]]:
+	yield from inner( b1, b2 )
+
+def make_and_abandon( b1: Box, b2: Box ) -> None:
+	g = outer( b1, b2 )
+	first = g.__next__().is_ok()
+	if first: pass
+	# g (and first, and inner's own generator) all go out of scope here,
+	# still mid-iteration on b1 - the generator's own destructor must
+	# still release every live promoted field it's holding
+
+def main() -> i32:
+	b1 = Box( n = 1 )
+	b2 = Box( n = 2 )
+	make_and_abandon( b1, b2 )
+	if compiler.refcount( b1 ) != 1:
+		return 1
+	if compiler.refcount( b2 ) != 1:
+		return 2
+	return 0
+''' ),
+		])
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_yield_from_nested_inside_reenterable_loop_forwards_correctly( self ) -> None:
+		# PLAN_GENERATORS.md's own A.4a note - this shape used to be a
+		# compile-time rejection: __for_obj_N (the iterated expression a
+		# for-loop-with-yield/yield-from needs) was constructed exactly
+		# once, eagerly, at the OUTER generator's own construction time -
+		# reusing the same already-exhausted object on every re-entry
+		# instead of freshly reconstructing it, a silent WRONG-OUTPUT bug,
+		# not a merely-unsupported restriction. Fixed by making __for_obj_N
+		# an ordinary, re-derived-per-loop-entry promoted local instead
+		# (_new_for_obj_field) - real, compile-and-run verified behavior
+		# now, not just "no longer rejected."
+		self.assert_programs_run([
+			( 'yield_from_nested_inside_while_forwards_fresh_values_each_pass', '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+	yield 2
+
+def outer( count: usize ) -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	while i < count:
+		yield from inner()
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	g = outer( 3 )
+	total: i32 = 0
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( v ):
+					pass
+			total += v
+			count += 1
+	# 3 outer passes, each forwarding inner()'s own 2 values (1, 2) - a
+	# stale, already-exhausted inner() reused across passes would only
+	# ever produce the FIRST pass's own values (count=2, total=3)
+	if count != 6:
+		return 1
+	if total != 9:
+		return 2
+	return 0
+''' ),
+			( 'yield_from_nested_inside_for_forwards_fresh_values_each_element', '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+
+def outer( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
+	for _x in xs:
+		yield from inner()
+
+def main() -> i32:
+	g = outer( [10, 20, 30] )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( _ ):
+					pass
+			count += 1
+	if count != 3:
+		return 1
+	return 0
+''' ),
+			( 'for_loop_with_yield_directly_nested_inside_another_forwards_correctly', '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+
+def outer( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
+	for _x in xs:
+		for y in inner():
+			yield y
+
+def main() -> i32:
+	g = outer( [10, 20, 30] )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( _ ):
+					pass
+			count += 1
+	# _desugar_indexable_for's own generated while-loop splices the
+	# original for-loop's body in verbatim, WITHOUT re-scanning it for a
+	# further nested for-loop-with-yield of its own - confirmed via a
+	# real repro to leave the inner one un-desugared, falling through to
+	# lowering.py's ordinary (non-generator-aware) for-loop lowering
+	# instead: compiled clean, but crashed at runtime under MSVC (debug:
+	# heap-corruption breakpoint; release: access violation) - clang/gcc's
+	# own codegen happened not to visibly corrupt anything for the same
+	# wrong IR, masking it completely. _recurse_desugar_for_loops now
+	# recurses into a for-loop-with-yield's own desugared output too, not
+	# just plain if/while/for/with bodies.
+	if count != 3:
+		return 1
+	return 0
+''' ),
+		])
+
+	def test_yield_wrong_element_type_is_rejected( self ) -> None:
+		# found while testing A.4a's own yield-from forwarding, but
+		# generator-unrelated and pre-existing: _emit_generator_yield_
+		# suspend's strict=False coercion had no follow-up type check, so
+		# `yield <usize>` into a declared Iterator[Result[i32,StopIteration]]
+		# silently produced invalid C instead of a clean compile error.
+		# Since the StopIteration reversal, _wrap_generator_next_returns_
+		# in_ok wraps every yielded value in Result.Ok(...) uniformly - the
+		# type mismatch is now caught there, as an ordinary generic-
+		# inference disagreement (T inferred as both the declared elem_type
+		# and the yielded value's own actual type), rather than by the
+		# original dedicated check.
+		self._run( '''
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	x: usize = 10
+	yield x
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( "type parameter 'T' is inferred as both", str( self.discovery.errors.errors[0] ))
+
+
+class DelRedeclareRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' del x fully removes x from the enclosing function's own scope
+	(lowering.py's _stmt_Delete: "Removing it from fn.names is enough on
+	its own to make a later reference fail") - a later `x = ...` then finds
+	no existing declaration at all and takes the FRESH-binding path. This
+	is the real compile-and-run confirmation that it isn't just
+	discovery.errors==[] (see this project's own "verify, don't trust
+	IR-level success" convention): the REUSED name's new value is read
+	back correctly, proving the second binding is real and independent,
+	not silently aliasing the first.
+
+	Includes the genuinely-different-type case (i32 then str), which used
+	to be a real, confirmed emitter bug: emitter_c.py's own local-
+	declaration tracking was keyed by the C name alone, with no way to
+	tell "already declared, same Variable" apart from "already declared, a
+	DIFFERENT Variable object that happens to share the same source-level
+	name" (exactly what del-then-redeclare-with-a-different-type produces)
+	- the second binding silently reused the FIRST binding's own C
+	variable instead of getting a fresh, distinctly-named one, producing
+	genuinely invalid C (a struct pointer assigned into an int32_t). FIXED
+	via Variable.needs_uid_suffix/uid (mpy_types.py) - emitter_c.py now
+	detects the type/volatility mismatch and gives the second binding its
+	own '$uid'-suffixed C identifier, while a SAME-type redeclaration (the
+	overwhelmingly common case - e.g. the same `x: u32 = ...` repeated
+	once per arm of a plain if/elif/else chain, see lib/builtins/
+	__File.py's own `creation` local) still shares one piece of C storage
+	exactly as before. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'del_then_redeclare_with_same_type', '''
+def main() -> i32:
+	x: i32 = 1
+	del x
+	x: i32 = 42
+	if x != 42:
+		return 1
+	return 0
+''' ),
+			# the genuinely-different-type case - see this class's own
+			# docstring for the real emitter bug this used to hit (the two
+			# bindings' C variables colliding); del between them must give
+			# the second one (str) its own storage, independent of the
+			# first (i32) - both reads below must see the CORRECT value
+			( 'del_then_redeclare_with_different_type', '''
+def main() -> i32:
+	x: i32 = 7
+	if x != 7:
+		return 1
+	del x
+	x: str = 'hello'
+	if x != 'hello':
+		return 2
+	return 0
+''' ),
+			# ties directly to the match-arm-binding-reuse diagnostic: del e
+			# between two match statements is the real, working escape hatch
+			# for reusing a binding name across match arms - same UNION type
+			# both times here (see this class's own docstring for why a
+			# genuinely different type isn't attempted yet)
+			( 'del_between_match_statements_allows_reuse', '''
+def get_a() -> Result[i32, OverflowError|IndexError]:
+	return Result.Err( OverflowError() )
+
+def get_b() -> Result[i32, OverflowError|IndexError]:
+	return Result.Ok( 7 )
+
+def main() -> i32:
+	match get_a():
+		case Result.Err( e ):
+			pass
+		case Result.Ok( _ ):
+			return 1
+	del e
+	match get_b():
+		case Result.Err( e ):
+			return 2
+		case Result.Ok( v ):
+			if v != 7:
+				return 3
+	return 0
+''' ),
+		] )
+
+
+class AnnotatedLocalRedeclaredAcrossBranchesRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' a variable's explicit type annotation (`x: T = ...`) is only ever
+	given ONCE per function - even a same-type redeclaration once per arm
+	of a plain if/elif/else chain, with no del in between, is a genuine
+	compile error now (see lowering.py's _stmt_AnnAssign and
+	test_annotated_redeclaration_across_branches_is_a_compile_error in
+	lowering_test.py for the direct diagnostic check). The VALID way to
+	get a value out of an if/elif/else chain is what lib/builtins/
+	__File.py's own `creation` local actually does: declare the local
+	BARE once, before the chain, then a plain (un-annotated) `result =
+	...` per arm - INFERRED-type reassignment, not a second declaration,
+	so it's allowed to repeat across branches (see _stmt_Assign's own
+	"reuse existing" path). This class exercises exactly that corrected
+	pattern as a real compile-and-run check: each arm below is reached
+	via a DIFFERENT runtime condition, so this only passes if the merged
+	control flow really does share one piece of storage across all three
+	arms - a naive "give every local its own storage" fix would instead
+	read back whichever arm's OWN uninitialized storage happened to
+	follow it in memory. '''
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'first_arm', '''
+def classify( n: i32 ) -> i32:
+	result: i32
+	if n < 0:
+		result = -1
+	elif n == 0:
+		result = 0
+	else:
+		result = 1
+	return result
+
+def main() -> i32:
+	if classify( -5 ) != -1:
+		return 1
+	return 0
+''' ),
+			( 'second_arm', '''
+def classify( n: i32 ) -> i32:
+	result: i32
+	if n < 0:
+		result = -1
+	elif n == 0:
+		result = 0
+	else:
+		result = 1
+	return result
+
+def main() -> i32:
+	if classify( 0 ) != 0:
+		return 1
+	return 0
+''' ),
+			( 'third_arm', '''
+def classify( n: i32 ) -> i32:
+	result: i32
+	if n < 0:
+		result = -1
+	elif n == 0:
+		result = 0
+	else:
+		result = 1
+	return result
+
+def main() -> i32:
+	if classify( 5 ) != 1:
+		return 1
+	return 0
+''' ),
+		] )
 
 
 class OverloadWithDefaultParameterRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -12417,6 +20337,587 @@ def main() -> i32:
 	return 0
 ''' ),
 		] )
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class WithStatementContextManagerTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `with EXPR [as NAME]: BODY` for a user-defined context manager (a
+	type supplying __enter__(self)/__exit__(self)) - previously always a
+	clean "unsupported with statement" rejection; only the special-cased
+	defer/errdefer/compiler.*_arithmetic shapes worked. See lowering.py's
+	_lower_with_context_manager for the full design writeup - summary:
+	desugars to `ctx = EXPR; [NAME =] ctx.__enter__(); <registers ctx.
+	__exit__() as a defer, for early-return/break/continue from inside
+	BODY>; BODY`, then - only if BODY can actually fall through to its own
+	natural end - explicitly disarms that defer and calls __exit__()
+	directly right there, so __exit__ runs exactly where THIS BLOCK ends,
+	not "whenever the function eventually returns" (defer's own, much
+	broader contract). ctx/NAME are also scoped to just this block via the
+	same branch-confinement machinery _stmt_If already uses (cfg.py's
+	merge_if) - confirmed via a real refcount repro that without this,
+	both leaked one reference for the rest of the enclosing function. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_basic_as_binding_and_enter_exit_ordering( self ) -> None:
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> i32:
+		self.log.append( 1 ).unwrap( 'overflow' )
+		return 42
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t as v:
+		log.append( v ).unwrap( 'overflow' )
+	if log.__len__() != 3:
+		return 1
+	if log.__getitem__( 0 ).unwrap( 'idx' ) != 1:
+		return 2
+	if log.__getitem__( 1 ).unwrap( 'idx' ) != 42:
+		return 3
+	if log.__getitem__( 2 ).unwrap( 'idx' ) != 2:
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_no_as_binding( self ) -> None:
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t:
+		log.append( 99 ).unwrap( 'overflow' )
+	if log.__len__() != 3:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_exit_runs_on_early_return_from_inside_body( self ) -> None:
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		self.log.append( 7 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t:
+		log.append( 1 ).unwrap( 'overflow' )
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_exit_does_not_run_twice_on_natural_fallthrough( self ) -> None:
+		# regression test for the FIRST implementation attempt: reusing
+		# _register_defer_block's own function-scoped replay unmodified
+		# made __exit__ fire once at the with-block's own natural end (via
+		# an explicit call) AND a second time later, wherever the function
+		# actually returned - confirmed via a real compile+run repro
+		# (list.append() call counts, and __exit__'s own side effects
+		# observably running out of order relative to code textually AFTER
+		# the with-block). The fix disarms the deferred replay once the
+		# direct, natural-fallthrough call has already happened.
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	t = Trace( log )
+	with t:
+		log.append( 99 ).unwrap( 'overflow' )
+	log.append( 3 ).unwrap( 'overflow' )
+	if log.__len__() != 4:
+		return 1
+	if log.__getitem__( 3 ).unwrap( 'idx' ) != 3:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_ctx_and_bound_value_refcounts_correct( self ) -> None:
+		# ctx/NAME are ORDINARY, function-scoped locals (see
+		# _lower_with_context_manager's own docstring) - `bound`'s own
+		# binding still takes exactly the incref an ordinary Call-bound
+		# local always does (rc_inside == rc_before + 1), but it is NOT
+		# torn down early at the with-statement's own textual end (an
+		# earlier implementation attempt DID scope it there, reusing
+		# _stmt_If's own branch-confinement machinery - reverted: it also
+		# incorrectly scoped every OTHER local the with-block's BODY itself
+		# declares, since a with-block, unlike an if-branch, always
+		# executes exactly once when reached - see
+		# test_local_declared_inside_body_survives_after_the_block below).
+		# So rc_after (measured right after the block, well before main()
+		# itself returns) is STILL rc_before + 1, matching every other
+		# local variable's own function-scoped lifetime in this language.
+		self._run( '''
+import compiler
+
+class Payload:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+class Ctx:
+	payload: Payload
+	def __init__( self, payload: Payload ) -> None:
+		self.payload = payload
+	def __enter__( self ) -> Payload:
+		return self.payload
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	payload = Payload( 7 )
+	c = Ctx( payload )
+	rc_before: usize = compiler.refcount( payload )
+	with c as bound:
+		rc_inside: usize = compiler.refcount( payload )
+		with compiler.wrap_arithmetic:
+			if rc_inside != rc_before + 1:
+				return 1
+		if bound.n != 7:
+			return 2
+	rc_after: usize = compiler.refcount( payload )
+	with compiler.wrap_arithmetic:
+		if rc_after != rc_before + 1:
+			return 3
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_local_declared_inside_body_survives_after_the_block( self ) -> None:
+		# regression test for a real bug found post-merge (reported against
+		# the branch-confined implementation): a with-block's own BODY,
+		# unlike an if-branch's body, always executes exactly once when
+		# reached - ANY local it declares must survive past the with-
+		# statement's own end exactly like it would with no with-statement
+		# wrapping it at all. The branch-confined version wrongly reported
+		# "'x' is not initialized on all code branches" here, since
+		# merge_if's confinement applied to EVERY binding newly introduced
+		# inside its window, not just __with_ctx_N/NAME.
+		self._run( '''
+class Ctx:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with Ctx():
+		x: i32 = 5
+	if x != 5:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_with_on_an_existing_object_not_a_fresh_construction( self ) -> None:
+		# `with x:` where x is an ALREADY-EXISTING object, not a fresh
+		# constructor call - __with_ctx_N aliases x (a bare Name read), but
+		# ordinary aliasing assignment in this language still takes its own
+		# independent Incref (same as any plain `y = x`), so x itself stays
+		# perfectly valid and correctly valued both during and after the
+		# with-block regardless of what __with_ctx_N's own lifetime is.
+		self._run( '''
+import compiler
+
+class Resource:
+	n: i32
+	entered: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+		self.entered = 0
+	def __enter__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.entered = self.entered + 1
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	r = Resource( 7 )
+	with r:
+		if r.entered != 1:
+			return 1
+	if r.n != 7:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_exit_runs_exactly_once_with_nested_arithmetic_mode( self ) -> None:
+		self._run( '''
+import compiler
+
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+
+class Ctx:
+	counter: Counter
+	def __init__( self, counter: Counter ) -> None:
+		self.counter = counter
+	def __enter__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.counter.n = self.counter.n + 1
+	def __exit__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.counter.n = self.counter.n + 10
+
+def main() -> i32:
+	counter = Counter()
+	with Ctx( counter ):
+		with compiler.wrap_arithmetic:
+			counter.n = counter.n + 100
+	if counter.n != 111:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_nested_with_statements( self ) -> None:
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	tag: i32
+	def __init__( self, log: list[i32], tag: i32 ) -> None:
+		self.log = log
+		self.tag = tag
+	def __enter__( self ) -> None:
+		self.log.append( self.tag ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		with compiler.wrap_arithmetic:
+			self.log.append( self.tag + 100 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	with Trace( log, 1 ):
+		with Trace( log, 2 ):
+			log.append( 0 ).unwrap( 'overflow' )
+	if log.__len__() != 5:
+		return 1
+	expected: list[i32] = [ 1, 2, 0, 102, 101 ]
+	i: usize = 0
+	while i < 5:
+		got = log.__getitem__( i ).unwrap( 'idx' )
+		want = expected.__getitem__( i ).unwrap( 'idx' )
+		if got != want:
+			return 2
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_only_true_branch_of_if_runs_exit_once( self ) -> None:
+		# a with-statement nested inside an if-branch that's only sometimes
+		# taken - no interaction between the with-statement's OWN internal
+		# branch-confinement bookkeeping and the enclosing if's
+		self._run( '''
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	log = list[i32]()
+	flag = True
+	if flag:
+		with Trace( log ):
+			pass
+	if log.__len__() != 1:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_unsupported_type_is_a_clean_rejection( self ) -> None:
+		self._run( '''
+class NotAContextManager:
+	pass
+
+def main() -> i32:
+	with NotAContextManager():
+		pass
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'define both __enter__(self) and __exit__(self)', str( self.discovery.errors.errors[0] ))
+
+	def test_allowed_inside_a_loop_when_body_always_falls_through( self ) -> None:
+		# narrower than the original loop-restriction (see lowering.py's
+		# _body_may_exit_early): a with-statement whose body always falls
+		# through to its own natural end calls __exit__() directly, once per
+		# iteration, right where written - no "single armed slot, only ever
+		# replayed once" hazard the way defer/errdefer itself has (see that
+		# restriction's own comment), so this case doesn't need rejecting.
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 1 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		self.log.append( 2 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		log = list[i32]()
+		i: usize = 0
+		while i < 3:
+			with Trace( log ):
+				pass
+			i = i + 1
+		if log.__len__() != 6:
+			return 1
+		k: usize = 0
+		while k < 3:
+			if log.__getitem__( k * 2 ).unwrap( 'idx' ) != 1:
+				return 2
+			if log.__getitem__( k * 2 + 1 ).unwrap( 'idx' ) != 2:
+				return 3
+			k = k + 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_allowed_inside_a_loop_when_body_returns( self ) -> None:
+		# unlike break/continue, Return terminates the whole function
+		# immediately - there's no "next iteration" to lose track of, so
+		# this is safe even though __exit__ only runs via the with-
+		# statement's own defer registration here, not the direct call (see
+		# _body_may_exit_early - Return isn't loop-relative the way
+		# Break/Continue are).
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		self.log.append( 7 ).unwrap( 'overflow' )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		log = list[i32]()
+		i: usize = 0
+		while i < 3:
+			with Trace( log ):
+				if i == 1:
+					return 0
+			i = i + 1
+		return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_allowed_when_break_continue_target_a_nested_loop_inside_body( self ) -> None:
+		# the Continue below targets the inner while-loop the with-block's
+		# own BODY introduces, not the outer loop this with-statement sits
+		# inside - _body_may_exit_early tracks that distinction
+		# (in_nested_loop) so this is correctly NOT flagged as an early exit
+		# from the with-block itself.
+		self._run( '''
+import compiler
+
+class Trace:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		i: usize = 0
+		while i < 2:
+			with Trace():
+				j: usize = 0
+				while j < 3:
+					if j == 1:
+						j = j + 1
+						continue
+					total = total + 1
+					j = j + 1
+			i = i + 1
+		if total != 4:
+			return 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_rejected_inside_a_loop_when_body_can_continue( self ) -> None:
+		self._run( '''
+import compiler
+
+class Trace:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < 3:
+			with Trace():
+				if i == 1:
+					continue
+			i = i + 1
+		return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'not allowed inside a loop', str( self.discovery.errors.errors[0] ))
+
+	def test_rejected_inside_a_loop_when_body_can_break( self ) -> None:
+		self._run( '''
+import compiler
+
+class Trace:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < 3:
+			with Trace():
+				if i == 1:
+					break
+			i = i + 1
+		return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'not allowed inside a loop', str( self.discovery.errors.errors[0] ))
+
+	def test_with_after_a_loop_not_inside_it_is_allowed( self ) -> None:
+		# the with-statement itself is NOT inside the loop (comes after it,
+		# same function, loop_depth back to 0 by the time it's lowered)
+		self._run( '''
+import compiler
+
+class Trace:
+	log: list[i32]
+	def __init__( self, log: list[i32] ) -> None:
+		self.log = log
+	def __enter__( self ) -> None:
+		self.log.append( 99 ).unwrap( 'overflow' )
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	log = list[i32]()
+	i: usize = 0
+	while i < 3:
+		with compiler.wrap_arithmetic:
+			log.append( i32( i )).unwrap( 'overflow' )
+			i = i + 1
+	with Trace( log ):
+		pass
+	if log.__len__() != 4:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_bound_value_usable_after_with_block( self ) -> None:
+		# `with EXPR as NAME:` does NOT introduce a new lifetime scope
+		# (matches real Python's own with-statement, which doesn't either -
+		# NAME stays bound and alive for the rest of the enclosing scope
+		# there too) - NAME must remain readable, with its correct value,
+		# after the with-block ends, same as any other ordinary local.
+		self._run( '''
+class Ctx:
+	def __enter__( self ) -> i32:
+		return 1
+	def __exit__( self ) -> None:
+		pass
+
+def main() -> i32:
+	with Ctx() as bound:
+		pass
+	if bound != 1:
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	def test_broken_context_expression_does_not_corrupt_later_lowering( self ) -> None:
+		# a failure while lowering the with-statement itself (unresolvable
+		# context expression) must leave self._instructions/self._cfg
+		# exactly as found, so lowering can still proceed correctly for
+		# the rest of the function - regression test for an exception-
+		# safety gap in the first version of the branch-confinement fix
+		# (see _lower_with_context_manager's own except CompileError:
+		# restore-then-reraise block).
+		self._run( '''
+def main() -> i32:
+	with this_name_does_not_exist():
+		pass
+	x: i32 = 5
+	return x
+''' )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'this_name_does_not_exist' is not defined", str( self.discovery.errors.errors[0] ))
 
 if __name__ == '__main__':
 	unittest.main()

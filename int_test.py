@@ -72,7 +72,7 @@ class IntBehaviorTests( unittest.TestCase ):
 			for lib in sorted( compiler.extern_libs ):
 				if lib == 'c':
 					continue
-				flag = f'{lib}.lib' if _CC.name == 'cl' else f'-l{lib}'
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 
 			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
@@ -258,16 +258,23 @@ def main() -> i32:
 	# --- divmod, floordiv/mod operators, divide-by-zero ---------------------
 
 	def test_divmod_and_operators( self ) -> None:
+		# __floordiv__/__mod__ are @fallible_arithmetic (see lib/builtins/__int.py) -
+		# under panic_arithmetic they auto-unwrap to a plain int (no
+		# .unwrap() needed), exactly like a bare scalar `/` already does;
+		# .divmod() itself is a plain method call, never affected by
+		# @fallible_arithmetic (only real BinOp operator syntax is), so the explicit-
+		# call assertions below (including the divide-by-zero one, which
+		# deliberately wants Err rather than a panic) are untouched.
 		checks = [
 			'17 divmod 5 == (3, 2)',
-			'17 // 5 == 3 (operator dispatches to __floordiv__)',
+			'17 // 5 == 3 (operator dispatches to __floordiv__, auto-unwraps under panic_arithmetic)',
 			'17 % 5 == 2 (operator dispatches to __mod__)',
 			'-7 // 2 == -3 (truncating, matches C)',
 			"-7 % 2 == -1 (remainder takes dividend's sign, matches C)",
 			'7 // -2 == -3',
 			'7 % -2 == 1',
 			'123 // 10 == 12 and 123 % 10 == 3',
-			'divide by zero returns Err, does not crash',
+			'divide by zero returns Err via explicit .divmod(), does not crash',
 			'1 divmod 1 == (1, 0) (regression: smallest case, once corrupted the heap)',
 		]
 		self._assert_program_succeeds( '''
@@ -275,22 +282,31 @@ def main() -> i32:
 	dm1: tuple[int,int] = int(17).divmod(int(5)).unwrap('x')
 	if dm1[0] != int(3) or dm1[1] != int(2):
 		return 1
-	if ( int(17) // int(5) ).unwrap('x') != int(3):
-		return 2
-	if ( int(17) % int(5) ).unwrap('x') != int(2):
-		return 3
-	if ( int(-7) // int(2) ).unwrap('x') != int(-3):
-		return 4
-	if ( int(-7) % int(2) ).unwrap('x') != int(-1):
-		return 5
-	if ( int(7) // int(-2) ).unwrap('x') != int(-3):
-		return 6
-	if ( int(7) % int(-2) ).unwrap('x') != int(1):
-		return 7
-	if ( int(123) // int(10) ).unwrap('x') != int(12):
-		return 8
-	if ( int(123) % int(10) ).unwrap('x') != int(3):
-		return 8
+	with compiler.panic_arithmetic('unexpected division failure'):
+		q1: int = int(17) // int(5)
+		if q1 != int(3):
+			return 2
+		m1: int = int(17) % int(5)
+		if m1 != int(2):
+			return 3
+		q2: int = int(-7) // int(2)
+		if q2 != int(-3):
+			return 4
+		m2: int = int(-7) % int(2)
+		if m2 != int(-1):
+			return 5
+		q3: int = int(7) // int(-2)
+		if q3 != int(-3):
+			return 6
+		m3: int = int(7) % int(-2)
+		if m3 != int(1):
+			return 7
+		q4: int = int(123) // int(10)
+		if q4 != int(12):
+			return 8
+		m4: int = int(123) % int(10)
+		if m4 != int(3):
+			return 8
 	if not int(5).divmod(int(0)).is_err():
 		return 9
 	dm2: tuple[int,int] = int(1).divmod(int(1)).unwrap('x')
@@ -298,6 +314,31 @@ def main() -> i32:
 		return 10
 	return 0
 ''', checks )
+
+	def test_floordiv_mod_operator_default_mode_propagates_and_panic_mode_panics( self ) -> None:
+		# new coverage (not present before @fallible_arithmetic): default (checked)
+		# mode auto-propagates a real ZeroDivisionError through the
+		# enclosing function's own Result return type, exactly like a bare
+		# checked scalar `/` already does; panic_arithmetic auto-panics
+		# (nonzero exit) on a real divide-by-zero, rather than returning an
+		# Err the caller must explicitly unwrap.
+		self._assert_program_succeeds( '''
+def div_it( a: int, b: int ) -> Result[int, IntError|ZeroDivisionError]:
+	c = a // b
+	return Result.Ok( c )
+
+def main() -> i32:
+	ok = div_it( int(17), int(5) )
+	if ok.is_err() or ok.unwrap('x') != int(3):
+		return 1
+	failed = div_it( int(5), int(0) )
+	if failed.is_ok():
+		return 2
+	return 0
+''', [
+			'default mode: no failure - ordinary Result.Ok',
+			'default mode: divide by zero auto-propagates as Err, not a panic/crash',
+		] )
 
 	# --- from_str parsing, incl. edge cases -----------------------------
 

@@ -1,5 +1,11 @@
 # Working in this repo
 
+## Always consult your memory
+
+The user's primary development machine has access to 3 compilers — 2 on
+Windows and 1 on Linux via WSL. Check memory for how to invoke each one so
+code changes can be tested thoroughly.
+
 ## Always use a fresh worktree
 
 For any work beyond a trivial read-only question, create a **new** worktree
@@ -31,8 +37,9 @@ only in the shared one.
 The shared checkout is where `master` (and possibly other long-lived
 branches) live, since git only allows one worktree per branch — there's no
 way to get a second checkout of `master` to merge into. When the user
-explicitly asks to merge a finished branch into master, it's fine to `cd`
-into the shared checkout and run the merge there, e.g.:
+explicitly asks to merge a finished branch into master, it's fine to exit
+your worktree and `cd` into the shared checkout and run the merge there,
+e.g.:
 
 ```
 cd C:\cvs\metalpy
@@ -46,3 +53,24 @@ unrelated conflicts by rewriting code. If `git status` shows anything
 uncommitted or in-progress that isn't yours, stop and flag it rather than
 merging over it. If the merge is a clean fast-forward, prefer that over a
 merge commit.
+
+## Working a task
+
+MetalPy is still under active development. It is not uncommon to come across
+missing features that block the task at hand. Strongly prefer fixing bugs or
+missing features immediately (in a separate session or background task if
+necessary) instead of working around them.
+
+## Comments
+
+Comments should be as concise as possible and not explain things that should
+be obvious to a reasonably qualified reader. History lessons aren't needed in
+comments, just the lessons learned from them if necessary, e.g. "asserting
+instead of calling resolve here because all objects are supposed to be resolved
+by now" instead of a verbose multiline explanation of a bug that had to be
+hunted down to this point.
+
+## Finishing a task
+
+When summarizing a finished task, always include a list of any unresolved issues
+such as bugs or gaps discovered or anything that deserves the user's attention.

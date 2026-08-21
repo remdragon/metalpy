@@ -1,4 +1,5 @@
 # stdlib imports:
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 import queue
@@ -6,7 +7,7 @@ import queue
 # local imports:
 import ir
 from discovery import Discovery, is_stub_body
-from errors import CompileError
+from errors import CompileError, RedundantCompilationError
 from lowering import Lowering
 from mpy_types import Module, Function, Overload, Variable, ClassLike, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Specialization, by_value_dependency
 from type_resolver import TypeResolver
@@ -59,8 +60,24 @@ class Compiler:
 		# ever being scheduled onto the work queue for later - see
 		# _expr_Lambda's eager return-type inference (PLAN_LAMBDA.md)
 		self.lowering._compile_now = self._lower
+		# see Discovery.on_generic_base_resolved's own docstring - discovery.py
+		# can't call into Monomorphizer directly (monomorphize.py depends on
+		# Discovery, not the other way around), so this bridges the gap: a
+		# non-generic class whose own base is an ALREADY-CONCRETE generic
+		# Specialization (class Bar(Real[i32]): pass - Bar never becomes a
+		# Specialization itself, so monomorphize_class's own .base-substitution
+		# step never runs for it) gets that base eagerly monomorphized in
+		# place, right when it's first safe to do so (immediately after Bar's
+		# own body resolves).
+		self.disco.on_generic_base_resolved = self._normalize_generic_base
 
 		self.functions: list[LoweredFunction] = []
+		# id(Function) -> its own already-built LoweredFunction - guards
+		# against the SAME underlying Function object being lowered+
+		# emitted twice through two different schedule()-tracked unit
+		# shapes (a Specialization wrapper vs the bare, already-
+		# monomorphized Function) - see _lower's own comment on this
+		self._lowered_functions: dict[int,LoweredFunction] = {}
 		self.rcclasses: list[RCClass] = []
 		self.cstructs: list[CStruct] = []
 		self.cunions: list[CUnion] = []
@@ -74,9 +91,53 @@ class Compiler:
 		# mpy_types.Function.extern_lib) - a future emitter/linker's call
 		# on what to do with that, not this registry's
 		self.extern_libs: dict[str,set[str]] = {}
+		# runtime DLLs declared via @extern(..., dll='<name>'|[...]),
+		# registered the same way and at the same point as extern_libs
+		# above - only ever populated from functions that were actually
+		# reached/lowered, never a static/declared-anywhere set, so a
+		# program that never calls into a given vendored library doesn't
+		# get its DLL bundled. Bare filenames (e.g. 'tcl86t.dll'), not
+		# paths - mpy.py's post-link bundling step is what turns this into
+		# actual file copies. See mpy_types.Function.extern_dlls's own
+		# comment for why this is independent from extern_lib (different
+		# directories on a real machine, in general) and deliberately not
+		# auto-derived from scanning a DLL's own import table.
+		self.extern_dlls: set[str] = set()
+		# 3rd-party license notice identifiers declared via
+		# @extern(..., notice='<name>'|[...]) - same reachability-gated
+		# collection point as extern_libs/extern_dlls above. A short
+		# identifier (e.g. 'TCL', 'ZLIB'), not a path - mpy.py's post-link
+		# step resolves each against licenses/<name>.txt and combines them
+		# into one dist/THIRD-PARTY-LICENSES file. Deliberately independent
+		# of extern_dlls (see mpy_types.Function.extern_notices's own
+		# comment): a notice can be shared across multiple, otherwise
+		# unrelated DLL dependencies.
+		self.extern_notices: set[str] = set()
+		# @requires_crt - set True the moment ANY reachable/lowered function
+		# carries the flag (see mpy_types.Function.requires_crt's own
+		# comment) - same reachability-gated shape as extern_libs above,
+		# just a bare bool instead of a dict, since "does this build need
+		# the CRT at all" is all any caller (mpy.py, Compiler.run's own
+		# no_crt computation below) ever asks of it.
+		self.requires_crt: bool = False
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
-		module = self.disco.import_code( code, filename, scope )
+		# pass the entry module's own eventual qualname through as `package` so
+		# disco.import_code registers it in disco.modules BEFORE scanning its
+		# body, same as any nested `import X`/`from X import Y` reaches
+		# (discovery.py's own import_code comment on the `package is not None`
+		# branch) - without this, a self-import inside the entry module itself
+		# (`import foo` written in foo.py, the file being compiled) can't find
+		# itself here yet, falls through to a fresh file-system lookup, and
+		# re-parses the same source as an independent second Module - real
+		# "already defined" collisions for every top-level name, further
+		# masked into a mismatched-Module-identity cascade downstream
+		# (type_resolver.py's _find_module_for) by self.paths' own unresolved
+		# relative '.' entry not matching this file's already-absolute path.
+		# Mirrors discovery.py's own non-folding qualname formula - an entry
+		# file is never a folding (__init__.py-style) module in practice
+		package = f'{scope}.{filename.stem}' if scope else filename.stem
+		module = self.disco.import_code( code, filename, scope, package = package )
 		# entry modules aren't registered in disco.modules on their own (that's
 		# keyed by import package name, for nested imports reached via `import
 		# X`) - stage 2 needs to be able to find any module by file (see
@@ -85,7 +146,8 @@ class Compiler:
 		return module
 
 	def import_file( self, filename: Path, scope: str|None = None ) -> Module:
-		module = self.disco.import_file( filename, scope )
+		package = f'{scope}.{filename.stem}' if scope else filename.stem
+		module = self.disco.import_file( filename, scope, package = package )
 		self.disco.modules[module.qualname] = module
 		return module
 
@@ -120,6 +182,18 @@ class Compiler:
 		# docstring
 		self.type_resolver.schedule( unit )
 
+	def _normalize_generic_base( self, cls: RCClass ) -> None:
+		''' installed as Discovery.on_generic_base_resolved - see its own
+		docstring. Only acts when cls.base is a Specialization that's ALREADY
+		fully concrete (no bare TypeVar anywhere in it) - a generic class's
+		own base parameterized by ITS OWN still-unbound type params (class
+		Bar[T](Real[T]): pass) is deliberately left alone here; that case is
+		handled instead by Monomorphizer.monomorphize_class's own .base
+		substitution step, once Bar[T] itself is monomorphized against a
+		concrete instantiation. '''
+		if isinstance( cls.base, Specialization ) and self.type_resolver.monomorphizer._is_concrete( cls.base ):
+			cls.base = self.lowering.monomorphize_class( cls.base )
+
 	def run( self ) -> None:
 		if self.disco.main is None:
 			self.disco.errors.error( 'no main() found', file = None, line = None )
@@ -127,15 +201,16 @@ class Compiler:
 		self._enqueue( self.disco.main )
 		self._drain()
 		if self.disco.active_target['os'] == 'windows':
-			# 'c' not in self.extern_libs mirrors mpy.py's own no_crt
-			# computation ('c' not in compiler.extern_libs) - captured HERE,
-			# right after the user's own program has fully drained (above),
-			# before any of the forcing below runs, so it reflects exactly
-			# what the user's own program needs. Neither force_reachable
-			# call below ever touches the 'c' extern either way (Windows
-			# console-codepage/exit both live in kernel32), so this doesn't
-			# need to be recomputed between them.
-			no_crt = 'c' not in self.extern_libs
+			# mirrors mpy.py's own no_crt computation ('c' not in
+			# compiler.extern_libs and not compiler.requires_crt) - captured
+			# HERE, right after the user's own program has fully drained
+			# (above), before any of the forcing below runs, so it reflects
+			# exactly what the user's own program needs. Neither
+			# force_reachable call below ever touches the 'c' extern or
+			# requires_crt either way (Windows console-codepage/exit both
+			# live in kernel32), so this doesn't need to be recomputed
+			# between them.
+			no_crt = 'c' not in self.extern_libs and not self.requires_crt
 			# force windows._console's _console_init global to be reachable on
 			# EVERY Windows build - nothing in the user's own program
 			# necessarily references it, but its own initializer
@@ -160,6 +235,19 @@ class Compiler:
 				# all), so it's gated separately rather than being forced
 				# unconditionally on every Windows target.
 				self.force_reachable( 'sys', 'exit' )
+				# clang/gcc's own -O0 codegen implicitly calls the raw libc
+				# memset()/memcpy() symbols for local struct zero-init and
+				# by-value struct copies, regardless of whether the user's
+				# own program ever calls either - see emitter_c.py's own
+				# no_crt memset/memcpy PROLOGUE stand-ins (local_cstruct_
+				# array_zero_init_memset_bug memory). Those stand-ins are
+				# thin wrappers around sys.memset/sys.memcpy (Windows'
+				# RtlFillMemory/RtlCopyMemory - no CRT dependency, and no
+				# hand-rolled loop for a compiler to fold back into a
+				# self-recursive memset/memcpy call), so those two must be
+				# forced reachable here too, same as sys.exit above.
+				self.force_reachable( 'sys', 'memset' )
+				self.force_reachable( 'sys', 'memcpy' )
 
 	def force_reachable( self, module_qualname: str, attr_name: str ) -> None:
 		''' resolves module_qualname.attr_name (a Function or global
@@ -181,8 +269,8 @@ class Compiler:
 			mod = self.disco.import_name( module_qualname )
 		except FileNotFoundError:
 			return
-		unit = mod.names.get( attr_name )
-		if unit is None:
+		unit = mod.get_local( attr_name )
+		if unit is None or unit.broken:
 			return
 		self._enqueue( unit )
 		self._drain()
@@ -202,25 +290,89 @@ class Compiler:
 			except CompileError:
 				continue
 
+	def _module_context_for( self, unit: ClassLike ):
+		# a synthesized anonymous union's own payload CUnion (UnionStorage's
+		# $data CUnion) inherits the union's own file=None (by design - see
+		# union_storage.py's build_member_constructor docstring) - there is
+		# no real module to attribute it to, and its own attributes are
+		# never themselves a FRESH by-value dependency needing union member
+		# synthesis, so module_context is simply unneeded here; falling
+		# back to _find_module_for would hard-fail on the very file=None
+		# this method exists to route around
+		if unit.file is None:
+			return nullcontext()
+		return self.disco.module_context( self.lowering._find_module_for( unit ))
+
 	def _lower( self, unit: CompileUnit ) -> CompiledUnit:
 		if isinstance( unit, Specialization ) and isinstance( unit.base, Function ):
 			if unit.base.resolve is not None:
 				unit.base.resolve()
 			self.type_resolver.resolve_function_body( unit.base ) # rewrites 1/2 against the abstract, shared-until-now body - see resolve_function_body's own docstring
 			monomorphized = self.type_resolver.ensure_resolved( unit ) # swaps the Specialization for its real, substituted Function - own deep-copied body (see Monomorphizer.monomorphized_function)
+			# a monomorphized generic method can be reached through TWO
+			# different unit "shapes" that schedule() (type_resolver.py)
+			# tracks as unrelated units - this Specialization wrapper
+			# (id(unit), scheduled by e.g. lowering.py's own generic-
+			# construction inference) AND the bare, already-monomorphized
+			# Function itself (id(monomorphized), scheduled by ordinary
+			# method-call lowering against an already-concrete receiver -
+			# e.g. a synthesized $$__new__ body calling self.__init__(...)
+			# once self's own type is already the concrete monomorphized
+			# class, no Specialization needed). schedule()'s own _seen
+			# dedup is id-based, so it can't catch this - both make it
+			# through independently. Guard on the ACTUAL underlying Function
+			# object (id(monomorphized), the thing that would actually get
+			# lowered+emitted) rather than id(unit), so either shape
+			# reaching here first "wins" and the other is a cheap no-op -
+			# confirmed by a real repro: a monomorphized RCClass's own
+			# __init__ emitted twice (duplicate C symbol) once a
+			# synthesized $$__new__ started calling it via an ordinary
+			# self.__init__(...) AST statement instead of raw IR
+			cached = self._lowered_functions.get( id( monomorphized ))
+			if cached is not None:
+				assert isinstance( cached, LoweredFunction )
+				return cached
 			self.type_resolver.resolve_function_body( monomorphized ) # rewrite 3 (generic-call resolution) against THIS copy's own body, now that its own type params are concretely bound
 			instructions = self.lowering.lower_function( monomorphized )
 			lf = LoweredFunction( function = monomorphized, instructions = instructions )
 			self.functions.append( lf )
+			self._lowered_functions[ id( monomorphized ) ] = lf
 			return lf
 		elif isinstance( unit, Specialization ) and isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
-			monomorphized = self.lowering.monomorphize_class( unit )
+			# monomorphize_class (and, for an RCClass, _synthesize_rcclass_
+			# destructor below) can need to synthesize a union member
+			# constructor for a field type touched here for the FIRST time
+			# (e.g. a by-value-embedded anonymous union) - UnionStorage.get()
+			# stamps that constructor's own file from "whichever module is
+			# currently active" (module_stack[-1]), which is otherwise NOT
+			# the case here: this branch is reached directly from the work
+			# queue, with no module_context of its own (unlike an ordinary
+			# function body - FunctionLowering.run always pushes one first).
+			# unit.base (the abstract, generic template) always has a real
+			# file, whether or not unit itself does.
+			with self.disco.module_context( self.lowering._find_module_for( unit.base )):
+				monomorphized = self.lowering.monomorphize_class( unit )
 			if isinstance( monomorphized, RCClass ):
 				if monomorphized.base is not None:
 					self._enqueue( monomorphized.base )
 				if monomorphized not in self.rcclasses:
 					self.rcclasses.append( monomorphized )
 				self.type_resolver._synthesize_rcclass_destructor( monomorphized )
+				# NOT _synthesize_rcclass_constructor here - unlike the
+				# destructor (needed for EVERY RCClass, since any instance,
+				# however constructed, might need releasing), $$__new__ is
+				# only ever looked up from _try_lower_construct_call's own
+				# eager, self-sufficient call (lowering.py), which already
+				# guarantees its own availability - triggering it here too,
+				# unconditionally for every registered class, synthesizes
+				# (and thus references - the header.vtable assignment
+				# inside it) a constructor for classes NEVER actually
+				# constructed by any reachable user code, e.g. an abstract
+				# base only ever used polymorphically through a subclass -
+				# confirmed by a real regression: it made emitter_c.py
+				# start emitting that abstract base's own vtable instance
+				# (a real static object, referenced by the unwanted $$__new__),
+				# which a dedicated test asserts must never be emitted
 				self._validate_interface_vtable( monomorphized )
 				self._schedule_rcclass_vtable_impls( monomorphized )
 			elif isinstance( monomorphized, CStruct ):
@@ -239,76 +391,128 @@ class Compiler:
 					self.tagged_unions.append( monomorphized )
 			return monomorphized
 		elif isinstance( unit, Function ):
+			# same cross-shape dedup as the Specialization+Function branch
+			# above - a bare Function reached here may be the identical
+			# underlying object a Specialization wrapper already lowered
+			cached = self._lowered_functions.get( id( unit ))
+			if cached is not None:
+				assert isinstance( cached, LoweredFunction )
+				return cached
 			if unit.resolve is not None:
 				unit.resolve()
 			self.type_resolver.resolve_function_body( unit )
 			instructions = self.lowering.lower_function( unit )
 			if unit.extern_lib is not None:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
+				self.extern_dlls.update( unit.extern_dlls )
+				self.extern_notices.update( unit.extern_notices )
+			if unit.requires_crt:
+				self.requires_crt = True
 			lf = LoweredFunction( function = unit, instructions = instructions )
 			self.functions.append( lf )
+			self._lowered_functions[ id( unit ) ] = lf
 			return lf
 		elif isinstance( unit, RCClass ):
 			if unit.resolve is not None:
 				unit.resolve()
 			for attr in unit.attributes: # each field's own .type is lazily resolved, separate from the class itself - same as Lowering._lower_allocate_fields's identical loop; monomorphize_class already does this for the Specialization branch above, but a bare (non-generic) class landing here directly never went through that
 				self.lowering._ensure_resolved( attr )
-			if unit.base is not None:
+			if unit.base is not None and not isinstance( unit.base, Specialization ):
+				# a bare RCClass reaching here directly may ITSELF still be
+				# an unresolved-args generic template (unit.type_params
+				# still set - e.g. the abstract class Bar[T](Real[T]): pass
+				# itself, which reaches this same branch independently of
+				# any concrete Bar[i32] Specialization) - its own .base can
+				# legitimately still be an ABSTRACT Specialization (Real[T],
+				# T not yet bound to anything concrete - see discovery.py's
+				# _parse_ClassDef_RCClass/mpy_types.py's InheritanceChainMixin).
+				# TypeResolver.schedule() has no concreteness check of its
+				# own - queueing it here would let it reach Monomorphizer.
+				# monomorphize_class while still abstract, silently building
+				# a bogus "concrete" class whose own fields are still typed
+				# with dangling TypeVars (confirmed via a real repro: a
+				# no-__init__-anywhere generic subclass of a generic base
+				# produced exactly this - a spurious compiler.rcclasses
+				# entry with type_params already cleared but an attribute
+				# still typed <TypeVar 'Bar.T'>, crashing emitter_c.py's
+				# c_type). A non-generic class's own already-concrete
+				# generic base is never still a Specialization by the time
+				# .resolve() above returns - see Discovery.
+				# on_generic_base_resolved, which normalizes that case
+				# eagerly - so skipping here only ever skips the genuinely
+				# abstract case, which monomorphize_class's own .base
+				# substitution step already handles correctly once a REAL
+				# concrete instantiation of this same class is monomorphized.
 				self._enqueue( unit.base )
 			if unit not in self.rcclasses:
 				self.rcclasses.append( unit )
 				self.type_resolver._synthesize_rcclass_destructor( unit )
+				# NOT _synthesize_rcclass_constructor here - see the
+				# identical comment on the Specialization+RCClass branch
+				# above
 			self._validate_interface_vtable( unit )
 			self._schedule_rcclass_vtable_impls( unit )
 			return unit
 		elif isinstance( unit, CStruct ):
 			if unit.resolve is not None:
 				unit.resolve()
-			for attr in unit.attributes:
-				self.lowering._ensure_resolved( attr )
-				# a by-value-embedded field (e.g. SYSTEMTIME nested inside a
-				# larger cstruct) is only reachable THROUGH this attribute -
-				# unlike a Function/global Variable, merely resolving attr's
-				# own .type never schedules attr.type itself (schedule()
-				# ignores class-attribute Variables, is_global=False - see its
-				# own comment), so a field type referenced ONLY as another
-				# struct's own member, never independently constructed/sized/
-				# pointed-to anywhere else in the reachable program, would
-				# otherwise never land in compiler.cstructs/cunions/
-				# tagged_unions at all. _emit_value_type_bodies's topological
-				# sort then has nothing to order it against - not a wrong
-				# order, a MISSING definition entirely (confirmed directly: a
-				# real clang "field has incomplete type" error, task_421ed8be)
-				dep = by_value_dependency( attr.type )
-				if dep is not None:
-					self.lowering._ensure_resolved( attr.type )
+			# module_context: a by-value dependency touched for the first
+			# time below (e.g. a field typed as an anonymous X|Y never
+			# otherwise constructed) can need UnionStorage.get() to
+			# synthesize a fresh union member constructor, which stamps
+			# that constructor's own file from module_stack[-1] - see the
+			# identical reasoning on the Specialization+ClassLike branch
+			# above.
+			with self._module_context_for( unit ):
+				for attr in unit.attributes:
+					self.lowering._ensure_resolved( attr )
+					# a by-value-embedded field (e.g. SYSTEMTIME nested inside a
+					# larger cstruct) is only reachable THROUGH this attribute -
+					# unlike a Function/global Variable, merely resolving attr's
+					# own .type never schedules attr.type itself (schedule()
+					# ignores class-attribute Variables, is_global=False - see its
+					# own comment), so a field type referenced ONLY as another
+					# struct's own member, never independently constructed/sized/
+					# pointed-to anywhere else in the reachable program, would
+					# otherwise never land in compiler.cstructs/cunions/
+					# tagged_unions at all. _emit_value_type_bodies's topological
+					# sort then has nothing to order it against - not a wrong
+					# order, a MISSING definition entirely (confirmed directly: a
+					# real clang "field has incomplete type" error, task_421ed8be)
+					dep = by_value_dependency( attr.type )
+					if dep is not None:
+						self.lowering._ensure_resolved( attr.type )
 			if unit.base is not None: # @interface subclass - base interface needs to be a real compile unit too (its Vtbl type is what $vtable actually points to), same as RCClass.base above
 				self._enqueue( unit.base )
 			if unit.is_interface:
 				self._validate_interface_vtable( unit )
 				self._schedule_interface_vtable_impls( unit )
+			self._validate_packed_field_alignment_conflict( unit )
 			if unit not in self.cstructs:
 				self.cstructs.append( unit )
 			return unit
 		elif isinstance( unit, CUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
-			for attr in unit.attributes:
-				self.lowering._ensure_resolved( attr )
-				dep = by_value_dependency( attr.type ) # see the identical CStruct branch above for why this is needed
-				if dep is not None:
-					self.lowering._ensure_resolved( attr.type )
+			with self._module_context_for( unit ): # see the identical CStruct branch above for why this is needed
+				for attr in unit.attributes:
+					self.lowering._ensure_resolved( attr )
+					dep = by_value_dependency( attr.type )
+					if dep is not None:
+						self.lowering._ensure_resolved( attr.type )
+			self._validate_packed_field_alignment_conflict( unit )
 			if unit not in self.cunions:
 				self.cunions.append( unit )
 			return unit
 		elif isinstance( unit, TaggedUnion ):
 			if unit.resolve is not None:
 				unit.resolve()
-			for attr in unit.attributes:
-				self.lowering._ensure_resolved( attr )
-				dep = by_value_dependency( attr.type ) # see the identical CStruct branch above for why this is needed
-				if dep is not None:
-					self.lowering._ensure_resolved( attr.type )
+			with self._module_context_for( unit ): # see the identical CStruct branch above for why this is needed
+				for attr in unit.attributes:
+					self.lowering._ensure_resolved( attr )
+					dep = by_value_dependency( attr.type )
+					if dep is not None:
+						self.lowering._ensure_resolved( attr.type )
 			if unit not in self.tagged_unions:
 				self.tagged_unions.append( unit )
 			return unit
@@ -320,6 +524,16 @@ class Compiler:
 		elif isinstance( unit, Variable ):
 			if unit.resolve is not None:
 				unit.resolve()
+			if unit.broken:
+				# unit's own type-resolution (discovery.py's _make_value_
+				# resolver) already failed and recorded the error once -
+				# resolve_global_init/lower_global below would independently
+				# re-visit the SAME init expression and report the identical
+				# failure a second time (see resolve_global_init's own
+				# comment, which already silences its OWN half of this exact
+				# duplicate but explicitly documents lower_global producing
+				# the other half)
+				raise RedundantCompilationError()
 			# a global's init expression needs the same construction-call
 			# pre-resolution an ordinary function body gets from resolve_
 			# function_body (below, Function branch) before lowering ever
@@ -335,6 +549,33 @@ class Compiler:
 			return lg
 		else:
 			assert False, f'unsupported compile unit: {unit!r}'
+
+	def _validate_packed_field_alignment_conflict( self, cls: CStruct|CUnion ) -> None:
+		''' @cstruct(packed=True)/@cunion(packed=True) and a field's own
+		Aligned[N,...] override are each independently portable (verified
+		identical layout across MSVC/clang/gcc), but COMBINING them on the
+		same struct is not: MSVC's #pragma pack(push,N)/pop still honors a
+		per-field override inside an ambient pack(1) struct, while clang/gcc
+		give the field's own __attribute__((packed,aligned(N))) LOWER
+		priority than the ambient #pragma pack(1) wrapping the whole struct -
+		confirmed empirically with a real repro (MSVC: 9-byte layout,
+		gcc/clang: 6-byte layout for the identical field set). Rather than
+		emit silently-divergent C, reject the combination outright. Runs
+		here (compiler.py's own unit-scheduling pass), not discovery.py -
+		needs every attribute's own .c_align already resolved (set by
+		discovery.py's _apply_aligned_annotation, itself deferred until
+		Variable.resolve() runs), which _lower's CStruct/CUnion branches
+		just above guarantee by forcing attr resolution first. '''
+		if not cls.packed:
+			return
+		for attr in cls.attributes:
+			if attr.c_align is not None:
+				self.disco.fail_loc(
+					f'{cls.qualname}: {attr.qualname} cannot combine Aligned[...] with the owning '
+					f'@cstruct/@cunion(packed=True) - confirmed to produce different layouts on '
+					f'MSVC vs clang/gcc; use one mechanism or the other for this struct',
+					attr.file, attr.line,
+				)
 
 	def _validate_interface_vtable( self, cls: RCClass|CStruct ) -> None:
 		''' every @virtual method on an @interface CStruct (or, generalized
@@ -371,7 +612,18 @@ class Compiler:
 		sibling def would never even be SEEN here, let alone resolved,
 		silently skipping both the override-collision check below and the
 		single-signature check inside its own resolver. '''
-		ancestor_slots = { m.stem: m for m in cls.base.virtual_slots() } if cls.base is not None else {}
+		# cls.base may be a still-abstract Specialization here (a GENERIC
+		# class's own base parameterized by its own not-yet-bound type
+		# params, e.g. class Bar[T](Real[T]): pass, reached here as the bare
+		# abstract Bar itself, not a concrete instantiation of it - see
+		# discovery.py's _parse_ClassDef_RCClass/mpy_types.py's
+		# InheritanceChainMixin) - unwrap to the underlying template first;
+		# virtual_slots() only needs @virtual method NAMES, never a
+		# substituted type, so discarding the Specialization's own .args
+		# here is always correct (same reasoning as mpy_types.py's own
+		# _next_chain_node)
+		base = cls.base.base if isinstance( cls.base, Specialization ) else cls.base
+		ancestor_slots = { m.stem: m for m in base.virtual_slots() } if base is not None else {}
 		members: list[Function] = []
 		for m in cls.methods:
 			if isinstance( m, Function ):
@@ -397,13 +649,25 @@ class Compiler:
 				)
 
 	def _virtual_signatures_match( self, a: Function, b: Function ) -> bool:
-		if a.return_type is not b.return_type:
+		# _same_type, not raw `is` - an override's own declared type and its
+		# base method's own declared type can be two different objects for
+		# the identical type (one eagerly monomorphized via some OTHER call
+		# reference resolving it first, the other still a bare
+		# Specialization) - same duality TypeResolver._same_type exists to
+		# handle elsewhere. Confirmed via a real repro: TypeResolver.
+		# resolve_declared_types eagerly monomorphizing a plain declared
+		# parameter/return type wherever a Function gets resolved for a
+		# real call made an @virtual override's own signature-match check
+		# here start seeing false positives, since only ONE side of the
+		# comparison (whichever method something else happened to call
+		# first) had been through that path by the time this runs.
+		if not self.type_resolver._same_type( a.return_type, b.return_type ):
 			return False
 		a_params = a.parameters or []
 		b_params = b.parameters or []
 		if len( a_params ) != len( b_params ):
 			return False
-		return all( ap.type is bp.type for ap, bp in zip( a_params, b_params ))
+		return all( self.type_resolver._same_type( ap.type, bp.type ) for ap, bp in zip( a_params, b_params ))
 
 	def _schedule_interface_vtable_impls( self, cls: CStruct ) -> None:
 		# every slot's ACTUAL implementing Function (found by walking cls's

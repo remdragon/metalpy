@@ -51,12 +51,39 @@ from typing import Callable
 # local imports:
 import fstring_format_spec
 
+def _c_floordiv( a: object, b: object ) -> int:
+	''' C-style truncating division (quotient rounds toward zero) - this
+	compiler's runtime // does NOT match Python's own floor-based
+	operator.floordiv (see lib/math.py's floordiv_i64 comment on the
+	distinction); folding must reproduce whatever the runtime opcode would
+	compute, or program behavior would silently depend on whether an
+	expression happened to be constant-foldable. '''
+	if not isinstance( a, int ) or not isinstance( b, int ):
+		raise TypeError( 'truncating // only defined for int operands' )
+	q, r = divmod( a, b ) # Python: floor quotient, remainder sign matches b
+	if r != 0 and ( a < 0 ) != ( b < 0 ):
+		q += 1
+	return q
+
+
+def _c_mod( a: object, b: object ) -> int:
+	''' C-style truncating modulo (remainder sign matches the dividend) -
+	see _c_floordiv above; same Python-floor-vs-C-truncating distinction,
+	just the remainder half of the same divmod. '''
+	if not isinstance( a, int ) or not isinstance( b, int ):
+		raise TypeError( 'truncating % only defined for int operands' )
+	r = a % b
+	if r != 0 and ( a < 0 ) != ( b < 0 ):
+		r -= b
+	return r
+
+
 _BINOP_FNS: dict[type,object] = {
 	ast.Add: operator.add,
 	ast.Sub: operator.sub,
 	ast.Mult: operator.mul,
-	ast.FloorDiv: operator.floordiv,
-	ast.Mod: operator.mod,
+	ast.FloorDiv: _c_floordiv,
+	ast.Mod: _c_mod,
 	ast.BitAnd: operator.and_,
 	ast.BitOr: operator.or_,
 	ast.BitXor: operator.xor,

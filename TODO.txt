@@ -545,18 +545,9 @@ emitter:
 			attempts: a missing sys.alloc[T] forward declaration, Result[_,
 			ZeroDivisionError] not being scheduled for panic-wrapped division,
 			and a missing argument in lib/sys.py's WriteFile call.
-		- overload resolution: a narrowing @overload stub's own declared
-			return type (T) and the underlying plain implementation actually
-			called (whose real declared return type is the wider T|None, e.g.
-			builtins.Result[T,E].unwrap_or) can disagree, and nothing
-			reconciles a call site's own dest type against the real target's
-			return type in that case. Confirmed unrelated to candidate
-			matching itself (reproduces with the stub/impl declaring the
-			exact same return type removed from the picture).
 		- a generic class's own __init__ is never monomorphized when reached
 			through plain ClassName(...) construction inside a helper
-			function (confirmed via a non-Result generic RCClass repro,
-			separate from the overload-resolution gap above).
+			function (confirmed via a non-Result generic RCClass repro).
 
 finish building ZoneInfo class
 	import https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
@@ -715,13 +706,11 @@ f-string support
 File class
 
 io interfaces ( stdin, stdout, stderr )
-	sys.stdout: minimal Windows-only write() exists (lib/sys.py's _Stdout),
-	enough for print(). Still missing: a real stream object (buffering, flush,
-	read), stdin, stderr (panic() currently bypasses a real stderr stream
-	entirely - see lib/sys.py's panic() comment), and the POSIX side of all of
-	the above (only @compiler.target(os='windows') is implemented).
-
-socket class
+	sys.stdout/sys.stderr: minimal write() exists for both (lib/sys.py's
+	_Stdout/_Stderr), enough for print() and lib/logging.py's StreamHandler.
+	Still missing: a real stream object (buffering, flush, read), stdin, and
+	panic() still bypasses sys.stderr and writes directly via its own
+	private _write_stderr_cstr (see lib/sys.py's panic() comment).
 
 threading
 

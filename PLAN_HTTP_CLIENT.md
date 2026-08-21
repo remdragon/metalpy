@@ -76,41 +76,65 @@ Current state of prerequisites
     Recommend treating `.json()`/`json=` as deferred until a json library exists,
     while `.content`/`.text`/`data=` (raw bytes/str) work from day one.
 
-  URL parsing / form encoding / base64: none exist (no urllib, no percent-encoding
-    helper, no base64 anywhere in lib/). All three are pure string/byte transforms
-    with zero I/O dependency — str already has split/find/index/strip
-    (lib/builtins/__init__.py) to build a minimal scheme://host:port/path?query
-    splitter and a percent-encoder on top of. These are cheap, buildable today, and
-    needed for `params=`, form-encoded `data=`, and `auth=` (HTTP Basic → base64).
+  URL parsing / form encoding / base64: written when none of this existed yet —
+    since landed as real, general-purpose modules, and http.client migrated onto
+    both: lib/base64.py (see the base64_encode note elsewhere in this doc) and
+    lib/urllib/parse.py (quote/unquote, urlencode/parse_qsl, urlsplit/urlunsplit,
+    urljoin — commit 23baa97). http.client's own hand-rolled ParsedURL/
+    _parse_url/_merge_query_params/_form_encode were replaced with thin wrappers
+    around urlsplit()/parse_qsl()/urlencode() — see "urllib.parse migration"
+    further down for what that changed, including a real feature gain (relative
+    redirect Location headers, via urljoin(), previously unsupported).
 
-  Error codes: lib/posix/errors.py's PosixError already defines
-    ConnectionRefused = 111 (ECONNREFUSED) — staged in advance for this. lib/builtins/
-    __errors.py's OSError (both @compiler.target variants) has no network-specific
-    variants yet. The socket library will need to add ConnectionReset, TimedOut,
-    HostUnreachable, and NameResolutionFailed equivalents on both platforms.
+  Error codes: written when none of this existed yet - since landed. lib/builtins/
+    __errors.py's OSError (both @compiler.target variants) now has ConnectionRefused,
+    ConnectionReset, TimedOut, AddressInUse, WouldBlock, and NameResolutionFailed,
+    added alongside lib/socket.py itself. HTTPConnection.connect() distinguishes
+    HTTPError.NameResolutionFailed from every other connect() failure (which still
+    collapses to HTTPError.Other()) - see "Socket-facing OSError" note further down.
 
-Minimal socket surface required (handoff contract for the socket-planning session)
+Socket surface — what actually landed (lib/socket.py, commit 863bfc8)
 
-http.client only needs blocking, synchronous TCP stream sockets — no UDP, no
-async/select. Concretely:
+The handoff contract below is superseded by this section - kept for history,
+not as the current source of truth. lib/socket.py landed with a slightly
+different shape than requested, close enough to build on directly:
 
-  Socket.connect(host: str, port: u16, timeout_ms: u32|None = None)
-      -> Result[Socket, SocketError]
-    Must resolve hostnames (DNS), not just accept literal IPs.
+  Socket.tcp( family: i32 = AF_INET ) -> Result[Socket, OSError]
+    Two-step construction (create, then connect), not a single
+    Socket.connect(host,port) factory.
+  socket.connect( host: str, port: u16 ) -> Result[None, OSError]
+  socket.send( buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]
+  socket.recv( buf: Ptr[u8], count: usize ) -> Result[usize, OSError]
+  socket.close(), __del__ auto-close — same idiom as BinaryReader/BinaryWriter.
 
-  socket.send(buf: ConstPtr[u8], count: usize) -> Result[usize, SocketError]
-  socket.recv(buf: Ptr[u8], count: usize) -> Result[usize, SocketError]
-    Same shape as fs.py's write_raw/read_raw. recv returning 0 means peer closed.
+Two real gaps versus what was asked for, both accepted as-is rather than
+reworked, for the reasons below:
 
-  socket.close(), and __del__ auto-closing — same idiom as BinaryReader/BinaryWriter
-    in lib/builtins/__File.py.
-
-  A SocketError @enum (Windows/POSIX @compiler.target pair, same pattern as OSError)
-    with at least: ConnectionRefused, ConnectionReset, TimedOut, HostUnreachable,
-    NameResolutionFailed, Other.
-
-Anything beyond this (SO_REUSEADDR, non-blocking mode, UDP, raw sockets) is not
-needed by http.client v1.
+  - No SocketError - errors are plain OSError, same as lib/fs.py. STALE as of
+    lib/socket.py's own later growth: OSError gained ConnectionRefused,
+    ConnectionReset, TimedOut, AddressInUse, WouldBlock, and
+    NameResolutionFailed variants (added alongside lib/socket.py itself, not
+    part of its original landing). http.client itself still collapses every
+    connect() failure to HTTPError.Other() EXCEPT NameResolutionFailed, which
+    HTTPConnection.connect() distinguishes explicitly (`os_err ==
+    OSError.NameResolutionFailed` - confirmed this comparison against a
+    caught, non-bare-reference OSError value works via a real compile,
+    untested territory before this) - the one case a caller is likely to
+    want to handle differently (retry vs. give up on a typo'd hostname).
+    Further granularity (refused vs. reset vs. timed out) remains
+    unexposed - not needed by anything built here yet, easy to add the same
+    way if a real caller needs it.
+  - No timeout_ms parameter at all (blocking-only, no timeout support
+    anywhere in lib/socket.py yet). http.client's own timeout_ms= parameter
+    (see the Session.request() sketch below) stays reserved/no-op until
+    lib/socket.py itself grows timeout support - not blocking on it now.
+  - No DNS/getaddrinfo - lib/socket.py's own header comment states this
+    outright: "host a pre-resolved IPv4/IPv6 literal ... a self-contained
+    follow-up." Real hostnames (not IP literals) don't work yet. Flagged as
+    its own follow-up task (see task_a8b4e7c3 / "Add DNS/getaddrinfo
+    resolution to lib/socket.py"). Not a blocker for building/testing
+    HTTPConnection today: loopback testing against 127.0.0.1 (a literal)
+    works fine without it - only real-hostname support is blocked.
 
 Header representation — skip email.message for v1
 
@@ -121,6 +145,36 @@ in lib/http/client.py — an ordered, case-insensitive string multimap, matching
 everything an HTTP client needs without pulling in MIME semantics. If a real
 email.message ever lands for the smtp/email-parsing stdlib goals, http.client can
 be revisited to reuse it, but shouldn't block on that landing first.
+
+HTTPConnection/Response (Phase 3a — this is the layer actually being implemented
+now that Phase 1/2 are unblocked; not in the original sketch below, which jumped
+straight to Session):
+
+  class HTTPConnection:
+      __sock: Socket
+      __host: str
+      __port: u16
+
+      def __del__( self ) -> None: ...
+      @staticmethod
+      def connect( host: str, port: u16 = 80 ) -> Result[HTTPConnection, OSError]: ...
+      def request( self, method: str, path: str, headers: HTTPHeaders|None = None,
+          body: bytes|None = None ) -> Result[None, OSError]: ...
+      def getresponse( self ) -> Result[Response, HTTPError]: ...
+      def close( self ) -> None: ...
+
+  class Response:
+      status_code: u16
+      reason: str
+      headers: HTTPHeaders
+      content: bytes
+      def text( self ) -> Result[str, CodecError]: ...
+      def ok( self ) -> bool: ...
+
+Body reading (inside getresponse()) picks Content-Length, chunked (via Phase 0's
+decode_chunked), or read-until-close, matching HTTP/1.1 semantics for how a
+response body's own length is determined. host is an IP literal only for now
+(see "Socket surface" above) - real hostnames wait on task_a8b4e7c3.
 
 Draft API sketch (lib/http/client.py — NOT compilable yet, pins the surface only)
 
@@ -212,21 +266,322 @@ set — unlike CPython's stdlib http.client (which leaves that to urllib), match
 
 Implementation plan (phased, for once this moves from scoping to real work)
 
-  Phase 0 — pure functions, zero prerequisites, buildable NOW: HTTP status-line
-    parsing, header-line parsing into HTTPHeaders, chunked transfer-encoding
-    decode, request-line/header serialization, minimal URL splitting +
-    percent-encoding (for params=/form data=), base64 (for auth=).
+  Phase 0 — landed: HTTPError, HTTPHeaders, status-line/header-line parsing,
+    percent-encoding, base64 encoding (now a thin wrapper around lib/base64.py,
+    which landed after this file's own hand-rolled version - see that module),
+    chunked transfer-encoding decode. Covered by http_client_test.py's
+    HTTPClientPhase0Tests.
 
-  Phase 1 — blocked on socket library landing (parallel session, contract above).
+  Phase 1 — landed: lib/socket.py (commit 863bfc8). IP-literal-only (no DNS yet -
+    see "Socket surface" above and task_a8b4e7c3), sufficient for loopback testing.
 
-  Phase 2 — small private buffered-read helper over a raw socket (peek/read-exact/
-    read-until-chunk-boundary), local to lib/http/client.py.
+  Phase 2 — landed: _GrowableBuffer, a private doubling byte buffer local to
+    lib/http/client.py that accumulates recv() output across multiple calls
+    (find_double_crlf/slice_bytes/slice_str). Folded into Phase 3a below rather
+    than landing separately - the two were implemented and tested together.
 
-  Phase 3 — wire Phase 0 + 1 + 2 into Session.request()/Response, including the
-    cookie jar and redirect-following loop.
+  Phase 3a — landed: HTTPConnection (connect/request/getresponse/close) and
+    Response (status_code, reason, headers, content, text(), ok()). Wires
+    Phase 0 + 1 + 2 together; body reading picks Content-Length, chunked, or
+    read-until-close per RFC 7230. Every public method returns a bare
+    Result[_, HTTPError] (see "A real compiler gap found while landing Phase
+    3a" below - OSError from lib/socket.py collapses into HTTPError.Other()
+    rather than being part of the public error type). Does NOT include
+    Session's own ergonomics (params=/data=/json=/cookies=/auth=/redirects,
+    module-level get/post/...) - see Phase 3b. Covered by http_client_test.py's
+    HTTPConnectionLoopbackTests: a real loopback TCP round trip (background
+    thread plays a minimal server via lib/socket.py directly) for both a
+    Content-Length body and a chunked body, plus a connection-refused error
+    path. host is still an IP literal only (see Phase 1).
 
-  Phase 4 (deferred/future plan doc) — HTTPSConnection/TLS, `json=`/`.json()` once
-    a json library exists, multipart `files=`, connection reuse.
+  Phase 3b — landed: Session (cookie jar, redirect-following loop with a
+    10-redirect cap, params=/form=/auth= encoding) and module-level get()/
+    post()/put()/patch()/delete()/head()/options()/request(), each a one-off
+    Session() underneath. One API deviation from the original sketch below:
+    `data=` is bytes|str|None only - a separate `form=` dict[str,str]
+    parameter handles application/x-www-form-urlencoded bodies, instead of
+    one requests-style bytes|str|dict|None union (a real compiler gap made
+    `form=` a required workaround at the time - see "Four real compiler
+    gaps" below; `auth=` hit an analogous gap and was temporarily a
+    BasicAuth(user, password) class instead of a bare tuple, since reverted
+    back to `tuple[str,str]|None` once that gap was fixed - `form=` was kept
+    as its own parameter rather than reverted, since match-based dispatch
+    across a real 3-member bytes|str|dict union remains genuinely untested
+    territory even now, per _encode_body's own comment).
+    `json=`/`.json()` remain deferred (no json library yet, unchanged from
+    the original plan). Relative Location headers on a redirect ARE now
+    resolved (via lib/urllib/parse.py's urljoin() - see "urllib.parse
+    migration" below; this was originally a gap, fixed once urljoin()
+    landed). Covered by http_client_test.py's SessionLoopbackTests:
+    cookie-jar harvest+replay across two real requests, a real 302 redirect
+    followed transparently (with params= merged + percent-encoded into the
+    pre-redirect request), a relative-Location redirect resolved correctly,
+    and a form POST with Basic auth - all verified by having the fake
+    server inspect the raw bytes it actually received, not just checking
+    the client-side response.
+
+  urllib.parse migration (lib/urllib/parse.py, commit 23baa97) — http.client's
+    own hand-rolled ParsedURL/_parse_url/_merge_query_params/_form_encode were
+    replaced with thin wrappers around urlsplit()/parse_qsl()/urlencode()/
+    urljoin(). Two real, positive behavior changes came with it, not just a
+    refactor:
+      - Query-string/form encoding now goes through urlencode() (quote_plus:
+        space -> '+'), matching requests' own params=/data= dict encoding
+        exactly - the old hand-rolled version used quote()-style %20, a
+        subtle mismatch with what it was supposed to mirror.
+      - Redirect Location headers may now be relative, resolved against the
+        request URL via urljoin() (RFC 3986 5.3) - previously only absolute
+        http:// Location values were followed; a relative one silently
+        wasn't treated as a redirect at all. Covered by a new loopback test,
+        session_follows_relative_redirect.
+
+Four real compiler gaps found while landing this plan - all now fixed
+
+Each was flagged as its own follow-up task while lib/http/client.py worked
+around it; all four have since landed on master, and every workaround below
+has been reverted back to the originally-intended shape. Kept here as a
+historical record (worth knowing if similar tuple/union code elsewhere in
+this codebase was hitting the same walls before these fixes landed).
+
+1. No DNS/getaddrinfo in lib/socket.py (task_a8b4e7c3) - host had to be a
+   pre-resolved IP literal. Fixed by commit f794edb ("socket: add
+   getaddrinfo-based hostname resolution") - Socket.connect() now resolves
+   real hostnames transparently. No lib/http/client.py changes were needed
+   either way - HTTPConnection.connect()/Session already just called
+   sock.connect(host, port) and got hostname support for free once the fix
+   landed underneath them.
+
+2. Widening a bare @union error type (HTTPError) into a WIDER declared union
+   return type (e.g. OSError|HTTPError) was broken three related ways -
+   .or_return(), a direct return Result.Err(e), and a staged explicitly-
+   typed local all failed (task_ef51cec6). Worked around by never declaring
+   a union return type at all - every public HTTPConnection method returns
+   a bare Result[_, HTTPError], with small `_*_or_http_err` helpers
+   collapsing any OSError from lib/socket.py into HTTPError.Other() at the
+   call site. Fixed by commit a4ca6a3 ("Fix union widening: nominal @union
+   error types can now widen into a bigger union"). NOT reverted -
+   collapsing every Socket-facing OSError into HTTPError.Other() is still
+   arguably better API design on its own merits (HTTPConnection's own
+   public error type stays a single, simple HTTPError instead of leaking
+   lib/socket.py's OSError), so the design was kept deliberately once fixed,
+   not just left as a stale workaround - see lib/http/client.py's own
+   comment above `_connect_or_http_err`.
+
+3. tuple[T|None, ...] (a union as a tuple's own ELEMENT type) generated C
+   that didn't compile (task_34251c9f) - `_encode_body()` originally
+   returned tuple[bytes|None, str|None], and the generated C called an
+   allocator function that was never declared anywhere in the translation
+   unit, plus assigned raw pointers directly into fields that should have
+   been tagged-union structs. Worked around with a small dedicated
+   _EncodedBody class (two fields) instead of a tuple return type. Fixed by
+   commit 98c2010 ("tuple: coerce elements into their declared union types
+   during construction") - reverted back to `tuple[bytes|None, str|None]`,
+   _EncodedBody removed.
+
+4. tuple[...] as a MEMBER of an outer union (the inverse of #3) crashed the
+   emitter outright - not a bad-compile-error, an uncaught Python
+   AssertionError inside emit_c() itself, the moment a real tuple[str,str]
+   value flowed through a tuple[str,str]|None-typed parameter (auth=
+   ('user','pass') in this case) (task_827c2650). Worked around by giving
+   auth= a dedicated BasicAuth(user, password) class instead of requests'
+   own bare-tuple ergonomics. Fixed by commit 0c3ab27 ("Fix tuple-in-union
+   Allocate crash: don't trust expected_type blindly for dest's type") -
+   reverted back to `auth: tuple[str,str]|None`, BasicAuth removed. auth=
+   now matches requests' own `auth=(user, password)` ergonomics exactly.
+
+  Phase 4a — landed: `json=` (on Session/post/put/patch and their module-level
+    counterparts) and `Response.json()`, built on lib/json.py (commit cc116c9)
+    - `json=` serializes via json.dumps() and sets Content-Type: application/
+    json if not already present; `.json()` parses `.content` via json.loads(),
+    collapsing either a UTF-8 decode failure or a JSON parse failure into
+    HTTPError.InvalidJSON. `json=`/`data=`/`form=` remain mutually exclusive,
+    checked in that priority order (json= wins if more than one is somehow
+    given). Covered by http_client_test.py's session_json_request_and_response:
+    a real loopback POST with json=, server verifies the raw Content-Type and
+    JSON body bytes, response comes back as its own JSON body, parsed back via
+    .json() and read through object_get()/as_str()/as_int(). Two real compiler
+    gaps found while landing this - see "Compiler gaps found while landing
+    Phase 4a" below.
+
+  Phase 4b — landed: HTTPSConnection/TLS, once lib/ssl.py's Windows and Linux
+    backends existed (see PLAN_SSL.md - a large separate undertaking of its
+    own, scoped and landed in its own parallel plan/session rather than
+    inline here). _parse_url now accepts https:// (default port 443, same
+    ParsedURL.scheme field that already existed but was previously checked
+    against 'http' only); a new _Transport @union (Socket | ssl.SSLSocket)
+    replaces HTTPConnection's old concrete `__sock: Socket` field so the same
+    request()/getresponse()/close() code path works over either transport
+    unmodified (see lib/http/client.py's own comment on why this is a union
+    and not a real HTTPSConnection(HTTPConnection) subclass - MetalPy's
+    RCClass subclassing rules forbid a subclass shadowing a base field with a
+    different type, which a plain-vs-TLS transport field would need).
+    HTTPSConnection itself is a small standalone class (not a subclass)
+    whose connect() returns the same HTTPConnection type, already carrying
+    whichever transport it was given - CPython-shaped naming without needing
+    real subtype polymorphism, which nothing here actually requires.
+    HTTPError gained one new member, TLSError (a plain None-payload variant,
+    matching every other member's shape - a caller wanting the specific
+    ssl.SSLError reason would need to use lib/ssl.py directly).
+    _next_redirect_url now follows a Location resolving to either http:// or
+    https:// (previously only http:// - the https:// restriction existed
+    only because nothing could reach it yet). Covered by http_client_test.py's
+    new HTTPSClientTests: a real Session.get('https://...'), a direct
+    HTTPSConnection.connect() round trip, and a certificate-failure path
+    (expired.badssl.com) confirmed to surface as HTTPError.TLSError - same
+    "dial out to a real public host, no loopback TLS server" departure
+    ssl_test.py's own handshake tests already are, for the same reason
+    (lib/ssl.py is client-only). Verified on all three toolchains this
+    project supports (MSVC, clang on Windows; gcc on Linux via WSL).
+
+    One real, pre-existing compiler gap found while landing this (unrelated
+    to TLS/HTTP specifically - see PLAN_SSL.md's own note): `expr.field.
+    method() is None` failed to compile where the equivalent staged through
+    a local (`local.method() is None`) compiled fine. Fixed for real since
+    (commits 38c6df1/9bdd36b - see MEMORY.md's own chained_field_is_none_
+    narrowing_bug_fixed note) - the http_client_test.py workaround was
+    already reverted back to the plain chained form once that landed, same
+    as every other compiler gap this plan has tracked.
+
+  Transport redesign (_Transport union -> generic _Connection[T]) — the
+  original Phase 4b landing used a `@union class _Transport: Plain: Socket;
+  Secure: ssl.SSLSocket` field on HTTPConnection so request()/getresponse()/
+  close() had one thing to call send()/recv()/close() on regardless of
+  scheme. Per explicit user feedback (also captured in this session's
+  memory), replaced with a GENERIC `_Connection[T]` (T=Socket or
+  T=ssl.SSLSocket, monomorphized separately) instead - HTTPConnection/
+  HTTPSConnection are now thin non-generic entry-point classes whose
+  connect() returns a specific instantiation. Confirmed via real compile
+  spikes before committing to the design: a generic free function/method
+  can call a NAMED method directly on a bare type parameter with no shared
+  base class/interface (`transport.send(...)`), and this works even nested
+  two levels deep (_do_request_response[T] -> _Connection[T]._from_transport
+  -> generic methods calling transport.send/recv/close). Session.request()
+  keeps exactly ONE runtime scheme branch (_perform_request_for_scheme) -
+  unavoidable, since it doesn't know the scheme until the URL is parsed -
+  with everything downstream of that one branch fully generic/dispatch-free.
+
+  What this bought (tested, not assumed): the runtime tag-dispatch `match`
+  code that used to be sprinkled through every I/O call site (_send_all/
+  _GrowableBuffer.fill_from/_read_*_body) is gone, and each _Connection[T]
+  is sized exactly for whichever transport it holds rather than the union's
+  own tag + larger-payload layout. It IS also a binary-size/linkage win, as
+  the user originally expected - my first measurement of this (HTTPConnection
+  -only .exe vs. HTTPSConnection-only .exe, byte-identical, both linking
+  secur32) was correct as a measurement but wrong in its conclusion. I
+  originally attributed the identical linkage to "importing http.client
+  schedules the whole module regardless of usage" - the user pushed back
+  ("I think you have uncovered a bug in the compiler. The ssl library
+  should not have been brought in for an unused generic parameter") and
+  asked for a `--dep-report`/`type_resolver.triggered_by()` trace instead of
+  a hand-wave. That trace found the real cause: a LOCAL VARIABLE in
+  _Connection.request() was named `head`, colliding with this module's own
+  top-level `head()` convenience function. type_resolver.py's
+  _try_resolve_callable_namespace (a "silent probe" run at every call site
+  to detect generic-function calls, e.g. `x.method(...)`) resolves a bare
+  Name via `discovery.find_name_or_none(...)` BEFORE local variables are
+  registered in the function's own namespace, so a local named the same as
+  a module-level function is genuinely indistinguishable from that function
+  at this pre-lowering pass - the probe's own docstring already acknowledges
+  this. The bug is that even though the probe is documented to have NO
+  side effects on a miss (returns None, lowering.py resolves the real call
+  normally afterward), it calls `self.resolver.ensure_resolved(base)` on
+  whatever it finds before confirming the guess was right - and
+  ensure_resolved() unconditionally hands its argument to schedule(),
+  which queues it for compilation. So `head.encode()` inside
+  _Connection.request() spuriously scheduled http.client.head() (and
+  everything IT transitively calls: Session, Session.request,
+  _perform_request_for_scheme, and the whole ssl.py surface) even in a
+  program that never calls head()/Session/HTTPSConnection at all. Confirmed
+  with a minimal repro outside this file (a local var named the same as an
+  unrelated top-level function, `.dotted()`-called) - reproduces identically
+  on a plain non-generic class, so this is a general local-variable name-
+  shadowing bug, NOT specific to generics or unions; the old @union-based
+  code would have shown the exact same false linkage had its own local
+  variable happened to collide the same way. Worked around here by renaming
+  the local variable (head -> request_head) in _Connection.request(); after
+  the rename, --dep-report for an HTTPConnection-only program shows zero
+  ssl.* references (153 functions scheduled, was 653), while an
+  HTTPSConnection-only program still correctly pulls in ssl.py (102 ssl.*
+  references). Flagged as task_6e15ed96 for a real compiler-side fix
+  (defer scheduling until the probe's guess is confirmed, or run local-name
+  resolution before this probe). Until that lands, EVERY MetalPy stdlib
+  module should avoid naming a local variable the same as one of that
+  module's own top-level function/class names if a method gets called on
+  it - the collision silently drags in that function's whole dependency
+  graph with no compile error to flag it.
+
+  One real compiler gap found while landing this: inside a generic class's
+  OWN method body, self-construction must use the bare class name with
+  `.__allocate__(...)` (`_Connection.__allocate__(...)`), not the name
+  re-parametrized with its own type argument (`_Connection[T].__allocate__
+  (...)` fails: "'_Connection' is not a value, cannot use it as an
+  expression"). Worked around by using the bare name - every other
+  .__allocate__() factory in this codebase is on a non-generic class, so
+  this was genuinely new territory, not a previously-exercised path.
+  Flagged as task_3abe3f4f.
+
+  verify=False landed — a `verify: bool = True` parameter threaded through
+  Session.request()/get/post/put/patch/delete/head/options, the matching
+  module-level convenience functions, and HTTPSConnection.connect(), down
+  to _connect_tls_or_http_err(). verify=False switches to a new
+  ssl.SSLContext.create_unverified_context() sibling factory (added on both
+  the Windows/Schannel and Linux/OpenSSL backends - Windows via
+  SCH_CRED_MANUAL_CRED_VALIDATION instead of SCH_CRED_AUTO_CRED_VALIDATION,
+  Linux via SSL_CTX_set_verify(..., SSL_VERIFY_NONE, ...) instead of
+  SSL_VERIFY_PEER - both purely additive, existing create_default_context()
+  untouched). macOS's poison-pill SSLContext stub got a matching
+  create_unverified_context() stub too, for API symmetry. Proven for real,
+  not just compiled: a new test (https_verify_false_accepts_expired_cert)
+  hits the same expired.badssl.com endpoint the existing certificate-
+  failure test already dials (which correctly still rejects with
+  verify=True/default), and confirms verify=False's handshake succeeds
+  anyway. Run across all three local compilers (MSVC and clang on Windows -
+  Schannel backend, gcc via WSL - OpenSSL backend) - full suite green on
+  all three (1401 tests).
+
+  Phase 4c (deferred/future plan doc) — multipart `files=` uploads,
+    connection reuse/keep-alive, HTTP/2. timeout_ms= is also still
+    deferred, but no longer blocked here specifically - a separate session
+    is adding non-blocking I/O (incl. timeout support) to lib/socket.py.
+
+Compiler gaps found while landing Phase 4a
+
+1. A tuple literal passed DIRECTLY as Result.Ok(...)'s own argument, where
+   the enclosing function's declared return type wraps a tuple with union
+   element types (Result[tuple[bytes|None,str|None], HTTPError] here), left
+   T ambiguous - "inferred as both tuple[bytes|None,str|None] and
+   tuple[bytes,str]" (a real compile error). Worked around at the time by
+   staging every such tuple literal through an explicitly-typed local first,
+   then passing THAT to Result.Ok(). Flagged as task_ffb0bdb5. FIXED - turned
+   out to already be resolved on master by the time this was revisited: the
+   same root cause as union_coercion_rc_test.py's "bug (4)"
+   (monomorphize.py's substitute_type_params eagerly resolving a TupleType
+   bound to a TypeVar into its backing RCClass before _expr_Tuple's own
+   union-coercion pass saw it, so a bare TupleType-shaped hint went
+   unrecognized and the tuple's NATURAL element types got inferred instead,
+   disagreeing with the declared return type) - that fix already covered
+   this shape too, nobody had circled back to remove the workaround.
+   Re-verified directly (bytes|None+str|None asymmetric pair, 3-element
+   tuples, non-Optional union members i32|str, and Result.Err(...) instead
+   of Result.Ok(...) - all compile clean now) before removing the staging
+   locals from _encode_body and re-running the full http_client_test.py +
+   tests.py suites (1401 tests, all green).
+
+2. A nested `match` (every arm returning) directly inside an `if x is not
+   None:` block, immediately followed by a plain `if` checking a DIFFERENT
+   parameter, produced a nonsensical diagnostic on the unrelated parameter -
+   "'form' is not initialized on all code branches", where `form` is an
+   ordinary always-bound parameter never touched by the preceding block.
+   Worked around by extracting the nested-match branch into its own small
+   single-return-statement helper function (_encode_json_body). Fixed for
+   real by c20b4d1 (_stmt_diverges now recognizes a terminating nested
+   if/else, including the if-chain a match desugars into); the helper was
+   re-inlined into _encode_body once that landed. Flagged as task_ccb9f3d6.
+
+3. (Not a compiler bug - a real bug in this file, found and fixed the same
+   way): a match-arm capture bound to the name `text` inside Response.json()
+   collided with Response's own text() method, "'text' is not a variable,
+   cannot assign to it". Fixed by renaming the capture to `decoded`.
 
 Testing approach
 
@@ -249,3 +604,141 @@ Testing approach
   A manual smoke test (compile a small program that GETs a local fixture and prints
   status_code/text) is worth running by hand once Phase 3 lands, per this project's
   existing practice of verifying compiled programs via print()/exit codes.
+
+Remaining backlog / future work
+
+  Everything below is scoped but NOT started. Recorded here (2026-08-19) so
+  the list survives across sessions - this is expected to take a while to
+  work through, not a next-session todo.
+
+  1. Request/response logging with secret redaction - LANDED. `log:
+     Ptr[Callable[[str],None]] = _no_op_sink` and `sensitive_values:
+     list[str]|None = None` threaded through Session.request()/get/post/
+     put/patch/delete/head/options and the matching module-level
+     convenience functions. Verified for real, not just compiled:
+     http_client_test.py's session_log_with_secret_redaction spins up a
+     loopback server, makes a real request with a secret header value and
+     a real sink function, and confirms both the request line and the
+     response status line reached the sink, the secret itself never
+     appears in the captured text, and the '***CENSORED***' placeholder
+     does (proving substitution happened, not that the header was silently
+     dropped). Full suite green on all three local compilers (MSVC, clang,
+     gcc via WSL - 1408 tests each).
+
+     One real compiler bug found landing this, WORKAROUND NOW REVERTED - the
+     real fix landed (7e0703e, task_92b90a9a): `Ptr[Callable[...]]|None`
+     compiles as a parameter type (matches lib/bisect.py's own pre-existing
+     `key: Callable[[T],K]|None` signature) but used to fail calling
+     THROUGH it after narrowing ("cannot call log"), and a deeper emitter
+     crash storing one as a union payload ("NotImplementedError: c_type:
+     unsupported type CallableType(...)"). `log` briefly shipped defaulting
+     to a real no-op function instead of `None` to sidestep both (no union
+     ever constructed) - reverted back to the plain, obvious
+     `Ptr[Callable[[str],None]]|None = None` shape once the real fix
+     landed, verified again on all three compilers. The narrowing itself
+     goes through a small helper (_log_if_present), not inlined
+     `if log is not None:` at each call site - Session.request()'s own
+     while-True loop still doesn't let `is not None` narrowing survive a
+     loop back-edge (a separate, older, still-present limitation - see that
+     loop's own comment), same reason every other Optional it touches
+     already goes through a small non-looping helper.
+
+     Deliberate v1 simplification, not a gap: a binary (non-UTF-8) request/
+     response body logs as a `<N bytes, not valid UTF-8>` placeholder
+     rather than an escaped byte-for-byte rendering (CPython's
+     backslashreplace equivalent) - this stdlib has no codec support for
+     that yet, and it wasn't worth blocking the feature on it.
+
+     Design was settled (before implementation) by studying a working
+     real-world reference the user
+     already relies on day to day: C:\cvs\itas\incpy\demands.py (a Python/
+     `requests`-based wrapper the user built for the same job). Conclusions
+     to carry over into http.client's own version, not open questions:
+
+       - Redact by VALUE, not by header name. The reference takes a
+         `sensitive_values: list[str]` - the actual secret strings (an API
+         key, a password, a bearer token, ...) - not a set of header names
+         to blank out. It builds one alternation regex over all of them
+         (`re.escape`d, sorted LONGEST-first so a shorter secret that
+         happens to be a substring of a longer one doesn't partially
+         redact it) and substitutes '***CENSORED***' for every match.
+         This is strictly more robust than a header-name blocklist
+         (Authorization/Cookie/...): it catches a secret anywhere it shows
+         up - a header, the body, even a query string - without having to
+         predict every place a secret could leak into. http.client's
+         version should take the same shape: a caller-supplied
+         list[str]|None of the exact secret values in play for that
+         request (the password half of auth=, an API key the caller is
+         about to put in a custom header, etc.) - NOT an attempt to
+         auto-detect "this looks like a secret". Per the user directly:
+         don't use a regex library for this in MetalPy - every value being
+         matched is a literal string, not a pattern, so there's nothing
+         regex buys here. A chain of str.replace(secret, '***CENSORED***')
+         calls (one per sensitive value, sorted LONGEST-first for the same
+         substring-safety reason the reference sorts its regex
+         alternatives) gets the identical result with no `re`-equivalent
+         library dependency at all.
+       - Redact the WHOLE serialized message in one pass, not header-by-
+         header. The reference builds one flat string for the full wire
+         message first (method+url, then headers, then a blank line, then
+         body for the request; status-line, headers, blank line, body for
+         the response - i.e. exactly what HTTPHeaders/Response already
+         hold in this file) and applies the substitution once over that
+         whole blob, then splits on line breaks for line-prefixed output
+         (the reference uses 'C>'/'S>' prefixes per line). http.client
+         already has everything needed to build that flat string - see
+         _build_request_head for the request side.
+       - Redact BEFORE anything is handed to a log sink - never log-then-
+         redact. The reference censors the string at the exact point it's
+         about to be logged, never passes the raw string to the log
+         callback and redacts after. Confirms the principle already
+         written into this doc above.
+       - SETTLED (confirmed directly with the user, not just a v1
+         placeholder): the integration point is a plain `Callable[[str],
+         None]|None` sink (MetalPy's Closure[[str],None]) - NOT a
+         lib/logging.py Logger, permanently, not just until logging.py
+         matures. Two concrete reasons the user gave: (1) a fixed Logger
+         would funnel every request through the same logging context,
+         where a caller-supplied callable lets each call site log in ITS
+         OWN context instead (e.g. tagging which higher-level operation a
+         given request belongs to); (2) sometimes the destination isn't a
+         logging target at all - e.g. a bare `print()` while investigating
+         something interactively. This means the lib/logging.py maturity
+         blocker applies to essentially none of this feature - a sink
+         parameter needs no Logger machinery at all, only a working
+         callable-parameter type - unrelated to logging.py's own
+         readiness. Confirmed correct: ended up using `Ptr[Callable[[str],
+         None]]`, not `Closure[[str],None]` (Closure turned out to be
+         specifically for bound-method values like `w.get`, not a general
+         callable slot - see the "LANDED" note above for the real shape
+         used and the compiler bug hit getting there).
+
+  2. `files=` multipart/form-data uploads. Deferred since the original
+     scoping pass - even the PHP fetch() reference this project mirrors
+     just delegates multipart encoding to curl rather than hand-rolling it.
+     MetalPy would need to hand-roll RFC 7578 multipart encoding (boundary
+     generation, Content-Disposition per part, binary-safe body assembly)
+     from scratch - no existing precedent anywhere in lib/ to build on.
+
+  3. Connection pooling / keep-alive reuse across requests, HTTP/2, proxies.
+     Every request today opens a fresh TCP (+ TLS, for https://) connection
+     and closes it (_do_request_response's own close() call) - correct but
+     wasteful for a Session issuing several requests to the same host.
+     Keep-alive reuse would need _Connection[T] instances to outlive a
+     single request() call, keyed by (scheme, host, port) on the Session,
+     with real lifecycle rules (Connection: close from either side, idle
+     timeout, max-requests-per-connection) - a real chunk of design work on
+     its own, not a small addition. HTTP/2 and proxy support are further
+     out still and not scoped in any detail yet.
+
+  4. `timeout_ms=` (connect/read timeouts). Deferred since the original
+     scoping pass - lib/socket.py has never had any timeout support to
+     build on (blocking-only sockets). No longer specifically blocked here:
+     a separate, already-in-progress session is adding non-blocking I/O
+     (including timeout support) to lib/socket.py. Once that lands, this
+     needs a `timeout_ms: u32|None = None` parameter threaded through the
+     same call chain verify= just went through (Session.request()/
+     convenience methods/module-level functions down to
+     _connect_or_http_err/_connect_tls_or_http_err and the read loops in
+     getresponse()), plus deciding how a timeout surfaces as an HTTPError
+     variant.

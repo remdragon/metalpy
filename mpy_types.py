@@ -1,8 +1,15 @@
 # stdlib imports:
 import ast
 from dataclasses import dataclass, field
+from itertools import count
 from pathlib import Path
 from typing import Callable, Union
+
+# local imports:
+from errors import RedundantCompilationError
+
+# backs Variable.uid - see its own comment
+_variable_uid_counter = count()
 
 @dataclass( kw_only = True )
 class Name:
@@ -13,9 +20,37 @@ class Name:
 	file: Path|None
 	line: int|None
 
-@dataclass( kw_only = True )
+	# set once, permanently, when this name's own creation/resolution
+	# raised a CompileError - see Discovery._resolve_guarded and
+	# lowering.py's per-kind equivalents. Never cleared: a broken symbol is
+	# only ever attempted once (same convention .resolve = None already
+	# follows). Checked by ScopeMixin.get_local_or_raise/Discovery.find_name
+	# so a later reference raises RedundantCompilationError instead of
+	# either using a half-built object or reporting a confusing second
+	# error - the real one was already recorded at the point of failure.
+	broken: bool = False
+
+@dataclass( kw_only = True, repr = False )
 class Type( Name ):
 	''' maybe only use this to distinguish types from values '''
+
+	def __repr__( self ) -> str:
+		# every Type subclass below opts out of the dataclass-generated repr
+		# (repr=False) and inherits this one instead, deliberately never
+		# recursing into another field. dataclasses' auto-repr is only guarded
+		# against a field re-entering the SAME object already on the repr call
+		# stack (reprlib.recursive_repr, keyed by id(self)) - it does nothing
+		# for a DAG where the same object is reachable via multiple sibling
+		# fields (e.g. Specialization.base and Specialization.args both
+		# pointing at a shared prior type): each convergence re-expands the
+		# whole subtree, so a chain of N such diamonds costs O(3^N) - a real,
+		# reproduced hang (confirmed: depth 10 already produces a 9.7MB repr
+		# in 88ms; the depth seen from a real compiler bug ran the process out
+		# of 24+GB of RAM before ever raising). A mistyped Type value reaching
+		# an assertion's error message must fail fast, not become a resource-
+		# exhaustion trap - so this never walks into another Type's own fields.
+		return f'<{type(self).__name__} {self.qualname!r}>'
+
 	def leaves( self ) -> list['Type']:
 		# a single concrete type is its own only leaf - TaggedUnion overrides
 		# this to return its member types instead. shared by overload
@@ -47,6 +82,11 @@ class Type( Name ):
 		pointer, but ALSO for an aggregate that merely CONTAINS one (a
 		TaggedUnion with any RC member), which is why this is not the same
 		question as is_rc_pointer() below. '''
+		return False
+
+	def is_result_type( self ) -> bool:
+		''' True when this type is a concrete Result[T,E] specialization -
+		overridden on TaggedUnion, delegated on Specialization. '''
 		return False
 
 	def is_rc_pointer( self ) -> bool:
@@ -116,6 +156,23 @@ class ScopeMixin:
 	def get_local( self, name: str ) -> Name|None:
 		return self.names.get( name )
 
+	def get_local_or_raise( self, name: str ) -> Name|None:
+		''' like get_local, but raises RedundantCompilationError instead of
+		handing back a name whose own creation/resolution already failed.
+		Still returns None (not an error) for a name that's genuinely
+		absent - only a caller that needs "this must exist" should keep
+		failing on that separately, same as today. Every ordinary "look up
+		a specific, known member on an already-in-hand scope object" call
+		site should go through this instead of touching .names directly,
+		so a broken member doesn't surface as a second, confusing failure
+		downstream - get_local itself stays a raw, never-raising accessor,
+		since tests rely on it to inspect a deliberately-broken object's
+		state directly. '''
+		found = self.get_local( name )
+		if found is not None and found.broken:
+			raise RedundantCompilationError()
+		return found
+
 	def in_private_scope( self, scope: 'Type|None' ) -> bool:
 		''' true if `scope` (whatever class the function currently being
 		lowered belongs to - Lowering._current_fn.cls, possibly a
@@ -139,7 +196,7 @@ class ScopeMixin:
 		base = scope.base if isinstance( scope, Specialization ) else scope
 		return base is self
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Scalar( Type, ScopeMixin ):
 	'''
 	isize, usize, i32, u32, etc - also used for generic pointer intrinsics
@@ -173,11 +230,34 @@ def int_stem_range( t: Scalar ) -> tuple[int,int]:
 		return -(2**(bits-1)), 2**(bits-1) - 1
 	return 0, 2**bits - 1
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class TypeVar( Type ):
 	''' a placeholder for one of a generic's type parameters, e.g. T in class Result[T,E] '''
+	# TypeVar(bound=SomeProtocol) - the only bound kind supported (discovery.py's
+	# _parse_type_params rejects anything else). Checked at generic
+	# instantiation time via bound_satisfied_by below, from every call site
+	# that substitutes a concrete type for this TypeVar (lowering.py's
+	# _finish_generic_call/_lower_generic_function_call/_lower_class_generic_
+	# method_call/_lower_generic_construction_args, and type_resolver.py's
+	# _ReferenceResolver, which bails rather than hard-failing so lowering's
+	# own copy reports the real error) - deliberately NOT in discovery.py's
+	# _get_or_create_specialization, a low-level shared cache/builder with no
+	# AST node/error-location available.
+	bound: 'Protocol|None' = None
 
-@dataclass( kw_only = True )
+	def bound_satisfied_by( self, concrete: Type ) -> bool:
+		''' True if `concrete` may be substituted for this TypeVar. Always
+		true when unbound. When bound to a Protocol, `concrete` must be an
+		RCClass that has ALREADY had its own conformance verified - this is
+		just a membership check against RCClass.protocols, not re-doing the
+		structural verification discovery.py's _validate_protocol_conformance
+		already did once, at that class's own definition. '''
+		if self.bound is None:
+			return True
+		base = concrete.base if isinstance( concrete, Specialization ) else concrete
+		return isinstance( base, RCClass ) and self.bound in base.protocols
+
+@dataclass( kw_only = True, repr = False )
 class Specialization( Type ):
 	''' a generic base type applied to concrete (or still-typevar) type arguments, e.g. Result[i32,IntError] '''
 	base: Type
@@ -208,14 +288,35 @@ class Specialization( Type ):
 	def names( self ) -> dict[str,Name]|None:
 		return getattr( self.base, 'names', None )
 
-	# every RC/layout question about Box[i32] is really a question about Box.
-	# This delegation is what retires the `base = t.base if isinstance( t,
-	# Specialization ) else t` idiom that used to be copy-pasted verbatim in 14
-	# places across cfg/lowering/emitter_c/type_resolver, each site
-	# independently deciding whether to ALSO handle Move/Copy/TupleType.
-	# Without it, every generic-class/generic-union instance method's own
-	# `self` (already typed as a Specialization) wrongly looks untracked.
-	def is_rc( self ) -> bool: return self.base.is_rc()
+	# every RC/layout question about Box[i32] is really a question about Box -
+	# a generic CLASS's RC-ness comes from being an RCClass with a header,
+	# never from what its type params happen to be bound to, so delegating to
+	# self.base is correct there. This delegation is what retires the `base =
+	# t.base if isinstance( t, Specialization ) else t` idiom that used to be
+	# copy-pasted verbatim in 14 places across cfg/lowering/emitter_c/type_
+	# resolver, each site independently deciding whether to ALSO handle Move/
+	# Copy/TupleType. Without it, every generic-class/generic-union instance
+	# method's own `self` (already typed as a Specialization) wrongly looks
+	# untracked.
+	#
+	# A generic UNION (Result[T,E]) is different: is_rc() GENUINELY depends
+	# on what T/E are bound to, not just on being a TaggedUnion - self.base
+	# alone (the abstract, unsubstituted union) always reports non-RC
+	# (rc_leaves()'s own comment: "a bare TypeVar is never RC" - Type.is_rc()'s
+	# own default), regardless of self.args, so a bare `self.base.is_rc()`
+	# here made EVERY Result[SomeRCType,SomeRCType]-typed value look non-RC.
+	# Confirmed via a real reference leak: a generator's own promoted
+	# Result[Box,StopIteration]-typed field (yield-from's own raw next()
+	# result, crossing a suspend) was silently excluded from the state-aware
+	# destructor's own RC-field cascade entirely, since _build_generator_
+	# destructor gates each field on is_rc(). rc_leaves() already does the
+	# substitution correctly (same method, see its own docstring) - reuse it
+	# rather than duplicating the substitution logic here.
+	def is_rc( self ) -> bool:
+		if isinstance( self.base, TaggedUnion ):
+			return bool( self.rc_leaves() )
+		return self.base.is_rc()
+	def is_result_type( self ) -> bool: return self.base.is_result_type()
 	def is_rc_pointer( self ) -> bool: return self.base.is_rc_pointer()
 	def has_object_header( self ) -> bool: return self.base.has_object_header()
 	def has_vtable( self ) -> bool: return self.base.has_vtable()
@@ -268,6 +369,20 @@ class Variable( Name ):
 	# local variables, neither of which is a standalone compile unit; this is
 	# what lets Compiler._enqueue tell them apart without a separate lookup
 	is_global: bool = False
+	# set only for a local declared `Volatile[T]` (_stmt_AnnAssign) - means
+	# its C storage must be qualified `volatile` (see emitter_c._declarator)
+	is_volatile: bool = False
+	# set only for a @cstruct/@cunion field declared `Aligned[N, T]`
+	# (discovery.py's _apply_aligned_annotation) - N overrides just THIS
+	# field's own C alignment, independent of the owning struct's
+	# CStruct.packed. Works in either direction (N below or above T's own
+	# natural alignment) - emitter_c.py's _struct_or_union_body emits a
+	# compiler-conditional pair, both verified empirically on real MSVC/
+	# clang/gcc: MSVC needs #pragma pack(push,N)/pop (a cap - shrink only)
+	# LAYERED WITH __declspec(align(N)) on the field (grow only) since
+	# neither alone covers both directions; clang/gcc's single GNU
+	# __attribute__((packed,aligned(N))) already covers both on its own.
+	c_align: int|None = None
 	# stage 2's lowered form of `init` (None until Compiler._lower's Variable
 	# branch runs) - kept directly on the Variable itself, not only reachable
 	# through compiler.globals' own LoweredGlobal list, so a global's own
@@ -275,6 +390,36 @@ class Variable( Name ):
 	# PLAN_GLOBAL_INIT.md). String-quoted to avoid a mpy_types<->ir import
 	# cycle (ir.py doesn't need to know about Variable at all).
 	init_instructions: list['ir.Instruction']|None = None
+	# assigned once, at construction, from a process-wide counter - lets
+	# emitter_c.py give an independently-declared local its own C
+	# identifier (stem + '$' + uid) instead of colliding by source name
+	# alone, when it actually needs one (see needs_uid_suffix below).
+	# repr=False/compare=False: lowering_test.py compares IR instructions
+	# both by their exact string repr AND via assertEqual's own structural
+	# dataclass equality - a process-wide counter value has no business
+	# being part of either (order-dependent, not what those tests are
+	# checking; two separately-constructed-but-conceptually-equal Variable
+	# objects would otherwise never compare equal again).
+	uid: int = field( default_factory = lambda: next( _variable_uid_counter ), repr = False, compare = False )
+	# NOT set at construction - mutated in place by emitter_c.py the first
+	# time it sees this Variable declared/assigned, if-and-only-if this
+	# base C name is already occupied by an INCOMPATIBLE (different type
+	# or volatility) prior declaration in the same function (e.g. `del x;
+	# x: T2 = ...` redeclaring x with an incompatible type - see del_
+	# reuse_and_emitter_naming_bug). Deliberately NOT set just because a
+	# Variable is "a local" in the abstract: two independently-declared
+	# Variable objects sharing both a stem AND a compatible type (e.g. the
+	# same `x: u32 = ...` re-declared, once per arm, across a plain if/
+	# elif/else chain - a common, working pattern, see lib/builtins/
+	# __File.py's own `creation` local) are INTENDED to share one piece of
+	# C storage, exactly as they did before this field existed; suffixing
+	# them unconditionally would silently split that one shared C variable
+	# into several, only one of which the merged control flow actually
+	# initializes on any given path. repr=False/compare=False for the same
+	# reasons as uid above (also: this is emission-time-derived, mutated
+	# well after lowering.py hands the IR off, not part of the IR's own
+	# structural identity).
+	needs_uid_suffix: bool = field( default = False, repr = False, compare = False )
 
 @dataclass( kw_only = True )
 class Parameter( Variable ):
@@ -325,7 +470,7 @@ def _ownership_annotation_error( t: 'Type', question: str ) -> AssertionError:
 		f'Call .unwrap_ownership() first.'
 	)
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Move( Type ):
 	''' `move[T]` in annotation position - ownership of a T is transferred into this binding rather than borrowed/copied. The CFG uses this to know the source binding must be invalidated after the transfer.
 
@@ -348,7 +493,7 @@ class Move( Type ):
 	def has_object_header( self ) -> bool: raise _ownership_annotation_error( self, 'has_object_header' )
 	def has_vtable( self ) -> bool: raise _ownership_annotation_error( self, 'has_vtable' )
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Copy( Type ):
 	''' `copy[T]` in annotation position - the callee wants its own
 	independent reference (an explicit INCREF in its own prologue, a
@@ -369,7 +514,7 @@ class Copy( Type ):
 	def has_object_header( self ) -> bool: raise _ownership_annotation_error( self, 'has_object_header' )
 	def has_vtable( self ) -> bool: raise _ownership_annotation_error( self, 'has_vtable' )
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CallableType( Type ):
 	''' `Callable[[Arg1,Arg2,...], Ret]` in annotation position - a bare
 	function SIGNATURE used as a type (see PLAN_CALLABLE.md), for typing a
@@ -385,7 +530,39 @@ class CallableType( Type ):
 	arg_types: list[Type]
 	return_type: Type
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
+class FixedArrayType( Type ):
+	''' `ElemType[N]` used as a @cstruct/@cunion FIELD annotation only
+	(SYNTAX.md's "Fixed-Size Inline Array": `u16[32]`, `u8[8]`) - a real,
+	fixed-size C array embedded inline in the struct body (`uint16_t
+	name[32];`), not a heap-allocated/RC sequence the way list[T] is.
+	Recognized textually in visit_Subscript (a non-generic base type
+	subscripted by a bare positive integer constant, as opposed to a real
+	generic type argument - see its own comment), interned by discovery.py's
+	_get_or_create_fixed_array the same way CallableType/TupleType already
+	are, so two annotations spelling the same (element type, count) share
+	one object.
+
+	Deliberately NOT a general-purpose value type: C's own array declarator
+	syntax is discontinuous ("TYPE NAME[N]", not a plain prefix type the
+	way every other field is spelled) and a bare C array is not assignable
+	via `=` at all (only a WHOLE containing struct/union is, or an explicit
+	memcpy). A value of this type is never read/written as a whole (`x =
+	arr` / `dest->field = arr` are both rejected, matching real C, rather
+	than silently emitting invalid C) - only three real operations exist:
+	(1) the class-body compound-literal construction path (a `= 0` field
+	default or an explicit `ClassName(field=0)` argument, meaning "zero-
+	fill the whole array" - the one shape a C designated initializer
+	`.field = {0}` can express), (2) element-level indexed read/write
+	(`f.arr[i]`, both directions - ir.GetAttrIndex/ir.SetAttrIndex), and
+	(3) compiler.addrof(x.arr) -> Ptr[ElemType] at the array's own start,
+	via C's own array-to-pointer decay (ir.ArrayFieldPtr). Parameter/
+	return/local-variable annotations of this type are rejected outright -
+	only a @cstruct/@cunion field. '''
+	elem_type: Type
+	count: int
+
+@dataclass( kw_only = True, repr = False )
 class TupleType( Type ):
 	''' `tuple[T0, T1, ..., Tn]` in annotation position (see PLAN_TUPLE.md) -
 	a heterogeneous, fixed-arity value group. Unlike list[T]/dict[K,V]
@@ -434,14 +611,16 @@ class TupleType( Type ):
 	# this annotation. The emitter never allocates a TupleType directly - it
 	# allocates the backing RCClass, which answers True on its own behalf.
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class GeneratorType( Type ):
-	''' `Iterator[T]` (infallible) or `Generator[T,E]` (fallible,
-	PLAN_GENERATORS.md Phase 4/roadmap Phase 4) in a function's own return
-	annotation. Recognized textually in visit_Subscript, same posture as
+	''' `Iterator[Result[T,E]]` or `Generator[T,E]` (E always includes
+	StopIteration - PLAN_GENERATORS.md's StopIteration reversal) in a
+	function's own return annotation - both spellings build the exact same
+	GeneratorType from here on, they're purely syntactic alternatives (see
+	discovery.py's visit_Subscript). Recognized textually, same posture as
 	CallableType/TupleType above. Deliberately NOT interned/shared the way
-	those are: two unrelated generator functions both declaring `->
-	Iterator[i32]` still need two independent backing RCClasses (each
+	those are: two unrelated generator functions both declaring the same
+	elem_type/error_type still need two independent backing RCClasses (each
 	function's own, private state machine/fields) - unifying them by
 	elem_type alone would wrongly conflate two functions' unrelated local
 	state. A fresh GeneratorType is built for every annotation occurrence;
@@ -449,7 +628,14 @@ class GeneratorType( Type ):
 	actually contains a `yield` and synthesizes its backing class (keyed
 	to that one Function, not to this type). '''
 	elem_type: Type
-	error_type: 'Type|None' = None # None: Iterator[T] (infallible); set: Generator[T,error_type] - __next__ returns Result[elem_type|None, error_type] instead of plain elem_type|None
+	# error_type is never actually None for any LEGALLY constructed
+	# GeneratorType (discovery.py's visit_Subscript requires StopIteration
+	# among its leaves unconditionally) - the field keeps its Optional type/
+	# default purely so nothing else in this dataclass's own construction
+	# needs simultaneous updating; __next__ always returns
+	# Result[elem_type, error_type], never a bare nullable elem_type|None
+	error_type: 'Type|None' = None
+	send_type: 'Type|None' = None # None: no .send() support; set (PLAN_GENERATORS.md Phase C, Generator[T,SendType,E] - 3 type args): (yield expr) is usable as an EXPRESSION evaluating to plain SendType, delivered via .send(v) - the backing method becomes $$__resume__ instead of $$__next__, with thin __next__()/send(v) wrappers over it
 	backing: 'RCClass|None' = None
 
 # a class's own body scan (revealing its attribute/method *names*) is
@@ -458,6 +644,26 @@ class GeneratorType( Type ):
 # calls it. type_params is the one exception: it's parsed eagerly, at
 # creation time, because external code subscripting this class as a generic
 # (Result[i32,usize]) needs to see it before this class's own .resolve ever runs.
+
+def _next_chain_node( base: 'InheritanceChainMixin|Specialization|None' ) -> 'InheritanceChainMixin|None':
+	''' one step of a single-inheritance chain walk - unwraps a still-abstract
+	generic base (RCClass.base holding a Specialization, e.g. Real[T] where T
+	is the SUBCLASS's own not-yet-bound TypeVar, or even a fully concrete
+	Real[i32] that just hasn't been monomorphized in place yet - see
+	discovery.py's _parse_ClassDef_RCClass/on_generic_base_resolved) down to
+	the underlying abstract template class itself (Real). Every chain-walking
+	method in InheritanceChainMixin below only ever needs NAMES/existence
+	from an ancestor, never a substituted TYPE (that's Monomorphizer's job -
+	see monomorphize_class's own eager .base substitution step, and
+	Discovery.on_generic_base_resolved for the already-concrete case) - so
+	discarding the Specialization's own .args here and continuing the walk
+	from its abstract .base is always correct for what these methods answer.
+	A fully-monomorphized/normalized class never has a Specialization here at
+	all, so this is a no-op for every chain that doesn't involve an abstract
+	generic ancestor. '''
+	if isinstance( base, Specialization ):
+		return base.base
+	return base
 
 class InheritanceChainMixin:
 	'''
@@ -488,12 +694,41 @@ class InheritanceChainMixin:
 	which is also the honest place for it - RCClass is always True, a CStruct
 	only when @interface, so the two genuinely differ and there is no shared
 	answer to hoist.
+
+	RCClass.base specifically may ALSO be a Specialization (Real[T] or
+	Real[i32] - a generic ancestor, still abstract or already concrete - see
+	discovery.py's _parse_ClassDef_RCClass) rather than a plain RCClass|None
+	- CStruct.base never is (CStruct inheritance stays restricted to
+	@interface, unrelated to this). Every walk below only ever needs an
+	ancestor's NAMES (existence, dispatch), never a substituted TYPE, so
+	_next_chain_node's unwrap-to-the-abstract-template is always correct
+	here - a real, substituted view of a generic ancestor's ATTRIBUTE TYPES
+	is Monomorphizer's job (monomorphize.py's monomorphize_class, which
+	substitutes/monomorphizes .base itself, and Discovery.
+	on_generic_base_resolved for the already-concrete non-generic-subclass
+	case), not something these chain-walking methods ever attempt.
 	'''
-	base: 'InheritanceChainMixin|None'
+	base: 'InheritanceChainMixin|Specialization|None'
 	names: dict[str,Name]
 	methods: list['Function|Overload']
 	attributes: list['Variable']
 	resolve: Callable[[],None]|None
+
+	def resolve_chain( self ) -> None:
+		''' resolve self and every ancestor in the single-inheritance chain
+		(self, then .base, then .base.base, ... until None) - needed before
+		trusting any level's .attributes/.names are populated (e.g.
+		flattened_attributes(), whose own docstring warns it resolves
+		nothing it returns) when there's no name being searched for to
+		drive the walk the way chain_lookup's own walk does. Same per-level
+		resolve() call chain_lookup already performs, factored out so a
+		caller that doesn't have (or want) a name to look up can still get
+		the walk's resolving side effect. '''
+		node: 'InheritanceChainMixin|None' = self
+		while node is not None:
+			if node.resolve is not None:
+				node.resolve()
+			node = _next_chain_node( node.base )
 
 	def chain_lookup( self, name: str ) -> Name|None:
 		''' walk this class's own single-inheritance chain (self, then base,
@@ -508,10 +743,10 @@ class InheritanceChainMixin:
 		while node is not None:
 			if node.resolve is not None: # each level's .names is populated lazily, same "None means already resolved" convention as everywhere else - a base's own body may not have run yet just because the derived class's own resolve() (already done by the caller) ran
 				node.resolve()
-			found = node.names.get( name )
+			found = node.get_local_or_raise( name ) # every real InheritanceChainMixin (RCClass/CStruct) is also a ScopeMixin
 			if found is not None:
 				return found
-			node = node.base
+			node = _next_chain_node( node.base )
 		return None
 
 	def own_new_virtual_slots( self ) -> list['Function']:
@@ -526,12 +761,12 @@ class InheritanceChainMixin:
 		if self.resolve is not None:
 			self.resolve()
 		inherited_names: set[str] = set()
-		node = self.base
+		node = _next_chain_node( self.base )
 		while node is not None:
 			if node.resolve is not None:
 				node.resolve()
 			inherited_names.update( m.stem for m in node.methods if isinstance( m, Function ) and m.is_virtual )
-			node = node.base
+			node = _next_chain_node( node.base )
 		return [ m for m in self.methods if isinstance( m, Function ) and m.is_virtual and m.stem not in inherited_names ]
 
 	def vtbl_owner( self ) -> 'InheritanceChainMixin':
@@ -554,8 +789,8 @@ class InheritanceChainMixin:
 		KIND", not "the same class". Those two narrowing overrides are all that
 		remains of what used to be ten forwarding stubs. '''
 		node = self
-		while node.base is not None and not node.own_new_virtual_slots():
-			node = node.base
+		while _next_chain_node( node.base ) is not None and not node.own_new_virtual_slots():
+			node = _next_chain_node( node.base )
 		return node
 
 	def virtual_slots( self ) -> list['Function']:
@@ -570,7 +805,7 @@ class InheritanceChainMixin:
 		node: 'InheritanceChainMixin|None' = self.vtbl_owner()
 		while node is not None:
 			chain.append( node )
-			node = node.base
+			node = _next_chain_node( node.base )
 		slots: list[Function] = []
 		for node in reversed( chain ):
 			slots.extend( node.own_new_virtual_slots() )
@@ -592,25 +827,71 @@ class InheritanceChainMixin:
 		NOTE: unlike own_new_virtual_slots above, this resolves NOTHING it
 		returns - a caller that goes on to ask an attribute about its own
 		.type has to resolve it first (see cfg.py's complete_base_construction,
-		which does exactly that, and says why). '''
+		which does exactly that, and says why).
+
+		NOTE 2: if some level's own .base is still an ABSTRACT generic
+		Specialization (Real[T], T not yet bound to anything concrete - see
+		discovery.py's _parse_ClassDef_RCClass), the attribute contributed
+		from that ancestor is the ABSTRACT, unsubstituted one (Real's own
+		bare TypeVar-typed field) - substituting it against a concrete
+		instantiation is the caller's job (see monomorphize.py's
+		substituted_field), same as it already is for a class's own fields
+		declared directly with its own type params. '''
 		chain: list['InheritanceChainMixin'] = []
 		node: 'InheritanceChainMixin|None' = self
 		while node is not None:
 			chain.append( node )
-			node = node.base
+			node = _next_chain_node( node.base )
 		attrs: list[Variable] = []
 		for node in reversed( chain ):
 			attrs.extend( node.attributes )
 		return attrs
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
+class Protocol( Type, ScopeMixin ): # @protocol class Foo:
+	''' A structural interface contract (SYNTAX.md's `@protocol`). Never
+	instantiated, never RC-managed, has no vtable - purely a compile-time
+	conformance contract. A conforming class declares "I implement this"
+	via ordinary base-class syntax (`class Bar(Foo):`) even though Foo isn't
+	a real base - see discovery.py's _parse_ClassDef_RCClass, which routes a
+	Protocol-typed entry in node.bases into RCClass.protocols below instead
+	of RCClass.base (no vtable/chain_lookup participation at all). Declaring
+	this makes it a compile error, right there at Bar's own definition, if
+	Bar doesn't fit the contract - see discovery.py's
+	_validate_protocol_conformance, which also splices any method the
+	protocol supplies a real (non-stub) default body for directly into the
+	conforming class's own dispatch table, so ordinary method lookup/dispatch
+	needs no new runtime fallback mechanism at all - ITS conformance is
+	settled once, at declaration time, not re-checked or scanned per-call. '''
+	methods: list['Function|Overload'] = field( default_factory = list )
+	names: dict[str,Name] = field( default_factory = dict )
+	resolve: Callable[[],None]|None = None
+
+	def is_rc( self ) -> bool: return False
+	def is_rc_pointer( self ) -> bool: return False
+	def has_object_header( self ) -> bool: return False
+	def has_vtable( self ) -> bool: return False
+
+@dataclass( kw_only = True, repr = False )
 class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted class
 	# base is resolved eagerly at class-creation time, same as type_params -
 	# Python itself requires a base class to already exist when the `class
 	# Foo(Base):` statement runs, so there's no forward-reference case to
 	# defer here. Multiple inheritance is a compile error (see discovery.py),
-	# so this is a single pointer, not a list/MRO.
-	base: 'RCClass|None' = None
+	# so this is a single pointer, not a list/MRO. May ALSO be a Specialization
+	# (a generic base, e.g. Real[T] or Real[i32] - see discovery.py's
+	# _parse_ClassDef_RCClass) rather than a plain RCClass - see
+	# InheritanceChainMixin's own docstring for how the chain walk and
+	# monomorphize.py's monomorphize_class/Discovery.on_generic_base_resolved
+	# handle that.
+	base: 'RCClass|Specialization|None' = None
+	# @protocol types this class has explicitly declared conformance to
+	# (base-class-list syntax - see Protocol's own docstring). Small and
+	# per-class by construction - NOT a global registry, and NOT involved in
+	# chain_lookup/vtable at all. discovery.py's _validate_protocol_
+	# conformance checks and splices against this list once, at this class's
+	# own definition.
+	protocols: list[Protocol] = field( default_factory = list )
 	type_params: list[TypeVar]|None = None # if not None, this is a generic class
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
@@ -625,7 +906,7 @@ class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted c
 	# vtbl_owner can legitimately be a plain RCClass ancestor.
 	def vtbl_owner( self ) -> 'RCClass':
 		owner = super().vtbl_owner()
-		assert isinstance( owner, RCClass ) # the chain is homogeneous - .base is typed RCClass|None
+		assert isinstance( owner, RCClass ) # _next_chain_node always unwraps a Specialization down to its real RCClass template, so the walk itself is homogeneous even though .base may hold one
 		return owner
 
 	# the whole point of the class - and ClosureType (the only RCClass
@@ -636,7 +917,7 @@ class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted c
 	def has_object_header( self ) -> bool: return True
 	def has_vtable( self ) -> bool: return True
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class ClosureType( RCClass ):
 	''' `Closure[[Arg1,Arg2,...], Ret]` - a bound-method VALUE (`worker.run`
 	used as a value, not called - see PLAN_CALLABLE.md's own "closure in
@@ -662,7 +943,7 @@ class ClosureType( RCClass ):
 	arg_types: list[Type] = field( default_factory = list )
 	return_type: Type|None = None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 	# base is only meaningful for @interface CStructs (single inheritance,
 	# same "resolved eagerly at class-creation time" reasoning as
@@ -671,6 +952,12 @@ class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 	# PLAN_SUBCLASSING_VTABLES_COM.md's "Subclassing mechanics")
 	base: 'CStruct|None' = None
 	is_interface: bool = False # @interface class Foo: - NOT inherited implicitly, see plan doc
+	# @cstruct(packed=True) - emitter_c.py wraps the whole struct body in
+	# #pragma pack(push,1)/pop, so no field ever gets compiler-inserted
+	# padding (verified identical layout across MSVC/clang/gcc). The
+	# general, always-portable way to replicate an external ABI's exact
+	# byte layout - see Variable.c_align for the narrower per-field knob.
+	packed: bool = False
 	type_params: list[TypeVar]|None = None
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
@@ -693,15 +980,16 @@ class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
 		# check is exactly this question.
 		return self.is_interface
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CUnion( Type, ScopeMixin ): # @cunion class Foo:
+	packed: bool = False # see CStruct.packed
 	type_params: list[TypeVar]|None = None
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backing type for synthesized anonymous unions (X|Y)
 	# each variant is an attribute: name -> type. Synthesized anonymous
 	# unions are built fully-formed directly (never deferred, resolve stays
@@ -757,6 +1045,9 @@ class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backin
 		# already had its params substituted by whichever caller is asking.
 		return any( leaf.is_rc() for leaf in self._resolved_leaves() )
 
+	def is_result_type( self ) -> bool:
+		return self.stem == 'Result'
+
 	def is_rc_pointer( self ) -> bool:
 		# a union's runtime shape is a tag+data VALUE STRUCT, never a bare
 		# pointer - see Type.is_rc_pointer's docstring
@@ -783,16 +1074,17 @@ def by_value_dependency( t: 'Type|None' ) -> 'CStruct|CUnion|TaggedUnion|None':
 	base = t.base if isinstance( t, Specialization ) else t
 	return base if isinstance( base, ( CStruct, CUnion, TaggedUnion )) else None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CEnum( Type, ScopeMixin ): # @enum class Foo:
 	value_type: Type
 	next_auto: int = 0
 	members: dict[str,int] = field( default_factory = dict )
 	values: dict[int,str] = field( default_factory = dict )
+	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class CType( Type ):
 	''' a C type defined in an external header, referenced by bare name.
 	Used with compiler.c_type('pthread_mutex_t', header='pthread.h') -
@@ -804,10 +1096,18 @@ class CType( Type ):
 # anything that can own methods/be a Function's .cls
 ClassLike = Union[ RCClass, CStruct, CUnion, TaggedUnion, CEnum ]
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Function( Type, ScopeMixin ):
 	cls: ClassLike|None
 	node: ast.FunctionDef # whole def - node.args/.returns resolved lazily, node.body untouched until IR generation
+	# the module this function was DEFINED in (set from Discovery.module_stack
+	# at parse time, once, alongside .file - never reassigned afterward).
+	# Lets a caller go straight from a Function to its owning Module without
+	# a self.modules.values() scan-by-file - see discovery.py's
+	# _splice_protocol_default, the motivating caller: a @protocol default
+	# method's free/qualified names must resolve against the PROTOCOL's own
+	# module, not whichever module happens to be conforming to it.
+	module: 'Module|None' = None
 	type_params: list[TypeVar]|None = None # if not None, this is a generic function (e.g. def alloc[T](...))
 	parameters: list[Parameter]|None = None
 	return_type: Type|None = None
@@ -837,10 +1137,57 @@ class Function( Type, ScopeMixin ):
 	extern_lib: str|None = None
 	extern_symbol: str|None = None
 	extern_header: str|None = None # optional header that declares this @extern function; when included via require_header, the emitter skips the prototype
+	# optional runtime DLL(s) (bare filenames, e.g. 'tcl86t.dll') this
+	# @extern function needs loadable at runtime - not the same as
+	# extern_lib (the .lib/.so linked against at build time, which can
+	# live in a different directory than the .dll, or not exist as a
+	# separate file at all for a header-only/forwarded symbol). Written as
+	# dll='name.dll' or dll=['name.dll', 'other.dll'] - deliberately a
+	# fixed, author-supplied list rather than something the compiler
+	# derives by scanning a DLL's own import table: the transitive
+	# dependency set of a real DLL includes both genuinely-needed vendored
+	# files (e.g. tcl86t.dll needs zlib1.dll) AND system components
+	# (kernel32.dll, the api-ms-win-crt-*.dll forwarders, ...) that must
+	# NEVER be bundled - reliably telling those apart automatically would
+	# need either a maintained system-DLL blacklist (a maintenance
+	# nightmare, explicitly rejected) or heuristics prone to bundling the
+	# wrong thing. An explicit, per-declaration list sidesteps the
+	# question entirely: the author decides exactly what ships, including
+	# deliberately leaving out something like VCRUNTIME140.dll if it's
+	# assumed already present on target machines. See compiler.py's
+	# extern_dlls collection and mpy.py's post-link bundling step.
+	extern_dlls: tuple[str,...] = ()
+	# optional 3rd-party license notice identifier(s) required when this
+	# @extern function (and, transitively, whatever it bundles via
+	# extern_dlls) ships in a built program's dist/ output. Written as
+	# notice='NAME' or notice=['NAME', 'OTHER'] - each NAME resolves to
+	# licenses/NAME.txt relative to the metalpy installation itself (see
+	# mpy.py's own resolution). Deliberately a separate declaration from
+	# extern_dlls, not auto-derived from it: a notice can be shared across
+	# unrelated libraries (e.g. 'ZLIB' applies to anything that happens to
+	# bundle zlib1.dll, not just Tcl/Tk), so collapsing the two ideas would
+	# either duplicate the same license text under every DLL that happens
+	# to depend on it, or require guessing which dll= entries share a
+	# notice. Same reachability-gated collection as extern_dlls (see
+	# compiler.py) and same "explicit author list, fails the build if
+	# unresolvable" philosophy - see mpy.py's post-link step, which
+	# combines every referenced notice into one dist/THIRD-PARTY-LICENSES
+	# file.
+	extern_notices: tuple[str,...] = ()
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)
 	is_destructor: bool = False # synthesized $$__destructor__ body — emitter uses void(void*) signature + cast prologue
+	# PLAN_GENERATORS.md Phase F - synthesized $$__next__ body (a
+	# generator's backing class method) - lowering.py gates its own
+	# state-check dispatch prologue on this, mirroring is_destructor's
+	# identical "synthesized method, special lowering-time treatment"
+	# precedent. node.generator_yield_states (a list[tuple[int,str]] tag
+	# set once by type_resolver.py's _build_generator_next_function, not
+	# a dataclass field - same convention as this file's other AST-level
+	# generator tags) carries the (state, resume_label) pairs the
+	# prologue dispatches on.
+	is_generator_next: bool = False
 
 	# implementations only (never set on a stub - stubs are never scheduled
 	# as real compile units, so they never need a C symbol of their own) -
@@ -861,6 +1208,45 @@ class Function( Type, ScopeMixin ):
 	# body directly at each call site instead of ever emitting a real
 	# Call/FuncStart/FuncEnd for it
 	is_inline: bool = False
+
+	# @property - a zero-argument getter that reads like a plain field:
+	# `obj.attr` (no call parens) calls this method and returns its result,
+	# instead of the ordinary "bound-method closure" _expr_Attribute builds
+	# for any other method used as a value (see lowering.py's _expr_
+	# Attribute). Read-only only - no @x.setter support yet (would need its
+	# own exemption from discovery.py's duplicate-definition check, the same
+	# way @overload gets one).
+	is_property: bool = False
+
+	# @fallible_arithmetic - a dunder (e.g. int.__floordiv__, or a scalar-
+	# registered __add__) whose Result[T,E] return should be consumed by
+	# binop dispatch through the SAME ambient-arithmetic-mode machinery
+	# scalar Check-mode opcodes already use (_consume_checked_result),
+	# instead of being left opaque for the caller to .unwrap()/.or_return()
+	# explicitly. Named for what it marks (arithmetic that can fail and
+	# should thread through wrap/saturate/panic_arithmetic too), not
+	# "checked" - that word already means something narrower and different
+	# in this file (ArithmeticChecked/Check-mode opcodes/checked_errors -
+	# the DEFAULT mode specifically), and this flag's own behavior spans
+	# every mode, not just that one. Only consulted by _lower_binop_values/
+	# _classify_leaf_pair_binop for real ast.BinOp operator dispatch - never
+	# for explicit method-call syntax. Return-type shape (must be
+	# Result[T,E]) is validated where it's used, not here - return_type
+	# isn't resolved yet at parse time (see .resolve).
+	is_fallible_arithmetic: bool = False
+
+	# @requires_crt - marks a function whose mere reachability (not any
+	# @extern('c', ...) call it makes itself) means the whole build must
+	# link the real CRT rather than the freestanding Windows entry point -
+	# e.g. a library that runs user code on a small/foreign stack and can't
+	# rule out that code needing MSVC's __chkstk, which a no_crt build has
+	# no way to supply (see msvc_no_crt_missing_chkstk). No effect on
+	# non-Windows targets, where there's no freestanding/no_crt distinction
+	# to override. compiler.py's Compiler._lower sets self.requires_crt
+	# on the Compiler instance the same way it already does for
+	# extern_lib/compiler.extern_libs - only when THIS function is actually
+	# lowered (reachable from main()), never merely discovered.
+	requires_crt: bool = False
 
 def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
 	# identity-based deliberately, not `==` - Type dataclasses have structural
@@ -903,7 +1289,7 @@ class ConditionalDispatch:
 	conditions: list[tuple[Parameter,Type]]
 	function: Function
 
-@dataclass( kw_only = True )
+@dataclass( kw_only = True, repr = False )
 class Overload( Type ):
 	'''
 	stands in for a Function when multiple defs share a name in the same scope.
