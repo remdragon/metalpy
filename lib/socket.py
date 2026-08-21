@@ -964,6 +964,26 @@ class Socket:
 		return Socket.create( family, SOCK_DGRAM )
 
 
+def make_loopback_pair() -> tuple[Socket, Socket]:
+	''' a connected TCP loopback (127.0.0.1) pair - returns (accepted_side,
+	connected_side). A portable, always-available inter-thread wake-up
+	primitive (the classic reactor "self-pipe" trick), used directly (as a
+	genuinely blocking recv()) or registered non-blocking with a Poller,
+	depending on the caller - see lib/reactor.py's Worker (non-blocking,
+	polled) and lib/asyncfile.py's thread pool (blocking, no Poller
+	involved at all). NOT a real pipe(2): WSAPoll can only poll actual
+	SOCKETs on Windows, and a connected TCP pair works identically on both
+	platforms either way, so there's no reason for two implementations. '''
+	listener: Socket = Socket.tcp().unwrap( 'make_loopback_pair: listener create failed' )
+	listener.bind( '127.0.0.1', u16( 0 )).unwrap( 'make_loopback_pair: bind failed' )
+	listener.listen().unwrap( 'make_loopback_pair: listen failed' )
+	bound: SocketAddr = listener.getsockname().unwrap( 'make_loopback_pair: getsockname failed' )
+	side_b: Socket = Socket.tcp().unwrap( 'make_loopback_pair: connect-side create failed' )
+	side_b.connect( '127.0.0.1', bound.port() ).unwrap( 'make_loopback_pair: connect failed' )
+	( side_a, _addr ) = listener.accept().unwrap( 'make_loopback_pair: accept failed' )
+	return ( side_a, side_b )
+
+
 # ---------------------------------------------------------------------------
 # RecvBuffer — accumulates bytes read off a Socket across multiple recv()
 # calls. A single recv() may return less than requested, and the total

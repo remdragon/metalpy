@@ -209,34 +209,78 @@ class FdReadiness:
 		self.want_write = want_write
 
 
+class CompletionHandle:
+	''' payload for Signal.Completion - a one-shot result box for an
+	operation that runs to completion entirely OFF this fiber's own thread
+	(e.g. lib/asyncfile.py's thread pool doing a real blocking file read/
+	write), matching IOCP/io_uring's own model: by the time this fires, the
+	actual result already exists, nothing left to "try again" the way an
+	FdReady wakeup might need. The producer (whichever thread actually runs
+	the operation) calls _complete() exactly once; the waiter reads take()
+	after wait_for_signal() returns Ok - never before, so take() never
+	itself has to block or check is_done(). __done is the one field every
+	other field's own visibility depends on: __value/__err/__ok are plain
+	(non-atomic) writes made BEFORE the atomic store, safe to read only
+	AFTER observing __done via atomic load (Worker.__drain_completed_waits'
+	own is_done() check) - standard release-store/acquire-load handoff. '''
+	__done:  atomic.Atomic[bool]
+	__ok:    bool
+	__value: usize
+	__err:   OSError
+
+	def __init__( self ) -> None:
+		self.__done = atomic.Atomic[bool]( False )
+		self.__ok = False
+		self.__value = 0
+		self.__err = OSError.Other
+
+	def complete( self, result: Result[usize, OSError] ) -> None:
+		match result:
+			case Result.Ok( v ):
+				self.__value = v
+				self.__ok = True
+			case Result.Err( e ):
+				self.__err = e
+				self.__ok = False
+		self.__done.store( True )
+
+	def is_done( self ) -> bool:
+		return self.__done.load()
+
+	def take( self ) -> Result[usize, OSError]:
+		if self.__ok:
+			return Result.Ok( self.__value )
+		return Result.Err( self.__err )
+
+
 @union
 class Signal:
 	''' what a fiber is waiting for. A tagged union, not a bare fd+interest
 	struct, because "something worth waking a fiber up for" has more than
 	one real shape:
-	  - FdReady (the only variant implemented so far) - a poller notices a
-	    registered fd's readiness (lib/poller.py, epoll/WSAPoll). This is
-	    a READINESS signal: once it fires, the caller still has to
-	    actually perform the read/write itself, and might get WouldBlock
-	    again (a spurious wakeup) - see NonBlockingIO's own eventual
-	    read()/write() retry-loop shape.
-	  - Completion (future, not built yet) - IOCP/io_uring's own model:
-	    the wait target IS the completing operation itself, not a
+	  - FdReady - a poller notices a registered fd's readiness (lib/
+	    poller.py, epoll/WSAPoll). This is a READINESS signal: once it
+	    fires, the caller still has to actually perform the read/write
+	    itself, and might get WouldBlock again (a spurious wakeup) - see
+	    lib/tcp.py's own read()/write() retry-loop shape.
+	  - Completion - IOCP/io_uring's own model, and what lib/asyncfile.py's
+	    thread pool uses today (a real, non-IOCP producer, but the same
+	    shape): the wait target IS the completing operation itself, not a
 	    readiness check - by the time this fires, the actual result (bytes
-	    transferred, or an error) already exists, nothing left to "try
-	    again". A fundamentally different shape from FdReady, which is
-	    exactly why this needed to become a union rather than growing
-	    fields on one struct - Worker's own internals (__check_signals,
-	    __drain_waiting_for_shutdown) will need to branch on kind, not
-	    just interpret every Signal as "some fd is ready".
+	    transferred, or an error) already exists in the CompletionHandle,
+	    nothing left to "try again". A fundamentally different shape from
+	    FdReady, which is exactly why this needed to become a union rather
+	    than growing fields on one struct.
 	  - a bare "wake me directly" kind (future, not built yet) - what
 	    Queue/Event will need: no fd, no completion object, just "some
 	    other fiber/thread called wake() on the specific token I'm holding".
-	Worker._wait_on_signal/__check_signals/__drain_waiting_for_shutdown
-	are the only places that need to know which kinds exist - everything
-	above them (wait_for_signal, and eventually NonBlockingIO's own
-	read()/write()) just holds a Signal opaquely and waits for it. '''
-	FdReady: FdReadiness
+	Worker's own internals (_wait_on_signal, __check_signals, __drain_
+	waiting_for_shutdown, __drain_expired_waits, __fd_still_waited_on) are
+	the only places that need to know which kinds exist - everything above
+	them (wait_for_signal, lib/tcp.py, lib/asyncfile.py) just holds a
+	Signal opaquely and waits for it. '''
+	FdReady:    FdReadiness
+	Completion: CompletionHandle
 
 def fd_signal( fd: poller.SOCKET, want_read: bool, want_write: bool ) -> Signal:
 	''' convenience constructor - Signal.FdReady(FdReadiness(...)) spelled
@@ -306,12 +350,15 @@ def _blocking_wait_no_reactor( signal: Signal ) -> Result[None, WaitError]:
 	up) rather than any shared/cached instance - this path is expected to
 	be rare (real reactor-driven code never takes it) and simplicity
 	beats reuse here. Only FdReady is handleable this way (a real OS-
-	level blocking wait needs something pollable) - the match is
-	exhaustive today because FdReady is the only variant that exists;
-	adding a second kind will force a real decision here, not a silent
-	gap. Respects _current_deadline() the same way the reactor-driven path
-	does (via a ThreadLocal fallback, since there's no Worker/fiber
-	bookkeeping to lean on here - see _current_deadline's own docstring). '''
+	level blocking wait needs something pollable) - a Completion signal
+	should never actually reach here: lib/asyncfile.py's own reader/
+	writer types check current_worker() themselves BEFORE ever
+	constructing one, calling the blocking syscall directly instead when
+	there's no Worker to hand the job's completion back to - see this
+	function's own Signal.Completion arm below. Respects
+	_current_deadline() the same way the reactor-driven path does (via a
+	ThreadLocal fallback, since there's no Worker/fiber bookkeeping to
+	lean on here - see _current_deadline's own docstring). '''
 	deadline: f64 = _current_deadline()
 	timeout_ms: i32 = -1
 	if deadline != fiber.NO_DEADLINE:
@@ -324,26 +371,8 @@ def _blocking_wait_no_reactor( signal: Signal ) -> Result[None, WaitError]:
 			if events.__len__() == 0 and deadline != fiber.NO_DEADLINE:
 				return Result.Err( WaitError.TimedOut( None ))
 			return Result.Ok( None )
-
-
-def _make_wake_pair() -> tuple[socket.Socket, socket.Socket]:
-	''' a connected loopback TCP pair used purely as a wake-up signal (the
-	classic reactor "self-pipe" trick) - NOT a real pipe(2), since WSAPoll
-	can only poll actual SOCKETs on Windows, and this codebase already has
-	a fully proven, portable TCP loopback pattern (lib/socket.py) rather
-	than needing a second, POSIX-only primitive just for this. Returns
-	(read_side, write_side) - the read side is registered with a Worker's
-	own poller unconditionally (see Worker.__init__), the write side is
-	poked by schedule() to interrupt a blocked poller.wait() on whichever
-	thread (possibly a different one) is currently driving this Worker. '''
-	listener: socket.Socket = socket.Socket.tcp().unwrap( '_make_wake_pair: listener create failed' )
-	listener.bind( '127.0.0.1', u16( 0 )).unwrap( '_make_wake_pair: bind failed' )
-	listener.listen().unwrap( '_make_wake_pair: listen failed' )
-	bound: socket.SocketAddr = listener.getsockname().unwrap( '_make_wake_pair: getsockname failed' )
-	write_side: socket.Socket = socket.Socket.tcp().unwrap( '_make_wake_pair: connect-side create failed' )
-	write_side.connect( '127.0.0.1', bound.port() ).unwrap( '_make_wake_pair: connect failed' )
-	( read_side, _addr ) = listener.accept().unwrap( '_make_wake_pair: accept failed' )
-	return ( read_side, write_side )
+		case Signal.Completion( _ ):
+			sys.panic( '_blocking_wait_no_reactor: Completion signals require a Worker to hand the result back to - callers must check current_worker() before constructing one' )
 
 
 class Worker:
@@ -365,7 +394,7 @@ class Worker:
 		self.__poller = poller.Poller()
 		self.__registered_fds = list[poller.SOCKET]()
 		self.__waiting = list[_PendingWait]()
-		( wake_read, wake_write ) = _make_wake_pair()
+		( wake_read, wake_write ) = socket.make_loopback_pair()
 		poller.set_nonblocking( wake_read.fileno() ).unwrap( 'Worker.__init__: set_nonblocking (wake read side) failed' )
 		poller.set_nonblocking( wake_write.fileno() ).unwrap( 'Worker.__init__: set_nonblocking (wake write side) failed' )
 		self.__wake_read = wake_read
@@ -395,6 +424,20 @@ class Worker:
 			case Result.Err( e ):
 				if e != OSError.WouldBlock:
 					sys.panic( 'Worker.__poke_wake: wake-pair write failed unexpectedly' )
+
+	def wake_external( self ) -> None:
+		''' pokes this Worker's own wake pair from OUTSIDE any Worker/
+		Reactor machinery entirely - the public counterpart to
+		schedule()/request_shutdown()'s own internal __poke_wake() calls,
+		for a producer that isn't part of this module at all: lib/
+		asyncfile.py's thread pool calls this once a background file I/O
+		job's CompletionHandle is filled in, so the Worker driving the
+		waiting fiber notices promptly (via __drain_completed_waits, on its
+		own next tick) instead of only finding out whenever something else
+		happens to wake its poller. Same underlying mechanism, safe to call
+		from any thread for the same reason schedule()/request_shutdown()
+		already are (see __poke_wake's own docstring). '''
+		self.__poke_wake()
 
 	def schedule( self, task: Closure[[], None] ) -> None:
 		''' enqueue a fresh task - picked up by whichever thread next calls
@@ -484,6 +527,8 @@ class Worker:
 				if not self.__is_registered( fdr.fd ):
 					self.__poller.register( fdr.fd, fdr.want_read, fdr.want_write ).unwrap( 'Worker._wait_on_signal: poller register failed' )
 					self.__registered_fds.append( fdr.fd ).unwrap( 'Worker._wait_on_signal: registered-fd list overflow' )
+			case Signal.Completion( _ ):
+				pass   # nothing to register - the completing thread pokes wake_external() directly, see __drain_completed_waits
 		cur: fiber.Fiber|None = fiber.current()
 		if cur is None:
 			sys.panic( 'Worker._wait_on_signal: no current fiber - must be called from inside a task this Worker is running' )
@@ -527,6 +572,8 @@ class Worker:
 				case Signal.FdReady( fdr ):
 					if fdr.fd == fd:
 						return True
+				case Signal.Completion( _ ):
+					pass
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		return False
@@ -573,9 +620,49 @@ class Worker:
 					if self.__is_registered( fdr.fd ) and not self.__fd_still_waited_on( fdr.fd ):
 						self.__poller.unregister( fdr.fd ).unwrap( 'Worker.__drain_expired_waits: poller unregister failed' )
 						self.__forget_registered_fd( fdr.fd )
+				case Signal.Completion( _ ):
+					pass   # the pool job keeps running regardless - its eventual complete() lands on an abandoned handle, harmlessly (see CompletionHandle's own docstring)
 			with compiler.wrap_arithmetic:
 				j = j + 1
 		return True
+
+	def __drain_completed_waits( self ) -> bool:
+		''' sweeps __waiting for every Signal.Completion entry whose own
+		handle.is_done() is now true, moving each to __ready_to_unpark -
+		same "requeue for the NEXT tick, not this one" discipline every
+		other drain method here already uses. Nothing to unregister (a
+		Completion signal was never registered with this Worker's own
+		poller in the first place - see _wait_on_signal's own Completion
+		arm), so this is simpler than __drain_expired_waits/__check_signals'
+		own sweeps. Runs on every __check_signals call regardless of
+		whether THIS tick's own wake was actually caused by a completed
+		file I/O job or something unrelated - cheap at the __waiting sizes
+		this codebase expects (bounded by one Worker's own concurrent
+		connection count), same tradeoff __drain_expired_waits already
+		makes. '''
+		if self.__waiting.__len__() == 0:
+			return False
+		still_waiting: list[_PendingWait] = list[_PendingWait]()
+		progressed: bool = False
+		n: usize = self.__waiting.__len__()
+		i: usize = 0
+		while i < n:
+			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__drain_completed_waits: index in bounds by construction' )
+			done: bool = False
+			match w.signal:
+				case Signal.FdReady( _ ):
+					pass
+				case Signal.Completion( handle ):
+					done = handle.is_done()
+			if done:
+				self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_completed_waits: ready-to-unpark queue overflow' )
+				progressed = True
+			else:
+				still_waiting.append( w ).unwrap( 'Worker.__drain_completed_waits: rebuild overflow' )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		self.__waiting = still_waiting
+		return progressed
 
 	def __is_registered( self, fd: poller.SOCKET ) -> bool:
 		n: usize = self.__registered_fds.__len__()
@@ -627,6 +714,8 @@ class Worker:
 					if self.__is_registered( fdr.fd ):
 						self.__poller.unregister( fdr.fd ).unwrap( 'Worker.__drain_waiting_for_shutdown: poller unregister failed' )
 						self.__forget_registered_fd( fdr.fd )
+				case Signal.Completion( _ ):
+					pass   # same reasoning as __drain_expired_waits' own Completion arm
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__waiting = list[_PendingWait]()
@@ -703,6 +792,8 @@ class Worker:
 				match w.signal:
 					case Signal.FdReady( fdr ):
 						matched = fdr.fd == ev.fd
+					case Signal.Completion( _ ):
+						pass   # never matched via an fd-based poller event - see __drain_completed_waits
 				if matched:
 					self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__check_signals: ready-to-unpark queue overflow' )
 					progressed = True
@@ -716,6 +807,8 @@ class Worker:
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		if self.__drain_expired_waits():
+			progressed = True
+		if self.__drain_completed_waits():
 			progressed = True
 		return progressed
 
