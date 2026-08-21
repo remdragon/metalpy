@@ -2955,7 +2955,10 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertIn( 'move(...) does not support a field or subscript target', self.discovery.errors.errors[0] )
+		error = self.discovery.errors.errors[0]
+		self.assertIn( "cannot move 'h.foo' directly", error )
+		self.assertIn( 'assign it to a local variable first', error.lower() )
+		self.assertIn( 'field or subscript', error ) # same restriction applies to both shapes
 
 	def test_move_of_a_subscript_is_a_compile_error( self ) -> None:
 		# needs builtins for list[T]
@@ -2974,7 +2977,10 @@ class Tests( unittest.TestCase ):
 		])
 		comp.import_code( code, filename = Path( '__test__.py' ))
 		comp._lower( disco.main )
-		self.assertIn( 'move(...) does not support a field or subscript target', disco.errors.errors[0] )
+		error = disco.errors.errors[0]
+		self.assertIn( "cannot move 'fs[0]' directly", error )
+		self.assertIn( 'assign it to a local variable first', error.lower() )
+		self.assertIn( 'field or subscript', error ) # same restriction applies to both shapes
 
 	def test_move_of_a_fresh_constructor_call_lowers_cleanly( self ) -> None:
 		# a fresh rvalue (e.g. a constructor call) has no other owner to

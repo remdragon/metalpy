@@ -1510,8 +1510,16 @@ class Lowering:
 			# the aliasing shapes at the call site instead of silently
 			# miscompiling.
 			if isinstance( moved, ( ast.Attribute, ast.Subscript )):
+				if isinstance( moved, ast.Attribute ):
+					reason = ( "a class attribute can't be moved out from under its object "
+						"(that would leave the object partially uninitialized)" )
+				else:
+					reason = "a container element can't be moved out from under its container in place"
 				self.discovery.fail(
-					f'move(...) does not support a field or subscript target, only a local variable, parameter, or a fresh value: {ast.unparse(call)}',
+					f"move(...) cannot move {ast.unparse(moved)!r} directly - {reason}, and the same "
+					f"restriction applies to any field or subscript target. Assign it to a local "
+					f"variable first, then move() the local, e.g. `tmp = {ast.unparse(moved)}` then "
+					f"`move(tmp)`: {ast.unparse(call)}",
 					call,
 				)
 			return moved
