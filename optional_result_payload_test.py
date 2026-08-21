@@ -105,6 +105,59 @@ def main() -> i32:
 	return 0
 '''
 
+# Bug 3 (type_resolver.py's ensure_resolved): a generic FREE function whose
+# own return type is Result[T,E], with T its own type param but E a concrete
+# class - e.g. `def convert[T](r: Result[T, SrcErr]) -> Result[T, DstErr]:`
+# converting between two different Result error types while forwarding the
+# same T success payload unchanged - crashed emitter_c.py's c_type with
+# NotImplementedError: c_type: unsupported type <TypeVar 'convert.T'>.
+#
+# Root cause: `if convert(...).is_ok():` reaches visit_If's truthiness-
+# rewrite pass (_rewrite_tagged_union_truthiness) BEFORE generic_visit has
+# visited the inner `convert(...)` Call node, so it hasn't been tagged with
+# node.resolved_callee yet. _type_of_expr's own Call-node handling then
+# falls back to a bare-name lookup, finding the still-GENERIC `convert`
+# function itself (type_params=[T] still unbound) and reading its raw
+# declared return type straight off it: Result[T, DstErr], with T still the
+# abstract TypeVar. That Specialization gets handed to ensure_resolved,
+# whose Specialization+ClassLike branch monomorphizes unconditionally - no
+# concreteness guard, unlike its sibling _eagerly_monomorphize_declared_type
+# - so it silently built a bogus "concrete" Result[T,DstErr] union whose own
+# v_Ok field was still typed with the bare TypeVar, and scheduled it as a
+# real compile unit.
+_GENERIC_FUNCTION_CONVERTS_RESULT_ERROR_TYPE = '''
+class SrcErr:
+	message: str
+	def __init__( self, message: str ) -> None:
+		self.message = message
+
+class DstErr:
+	message: str
+	def __init__( self, message: str ) -> None:
+		self.message = message
+
+def make_ok() -> Result[u32, SrcErr]:
+	return Result.Ok( u32( 5 ) )
+
+def make_err() -> Result[u32, SrcErr]:
+	return Result.Err( SrcErr( 'bad' ) )
+
+def convert[T]( r: Result[T, SrcErr] ) -> Result[T, DstErr]:
+	match r:
+		case Result.Ok( v ):
+			return Result.Ok( v )
+		case Result.Err( _ ):
+			return Result.Err( DstErr( 'converted' ) )
+
+def main() -> i32:
+	b: u32 = convert( make_ok() ).unwrap( 'x' )
+	if b != 5:
+		return 1
+	if convert( make_err() ).is_ok():
+		return 2
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
 class OptionalResultPayloadTests( RealCompileMixin, unittest.TestCase ):
@@ -113,6 +166,9 @@ class OptionalResultPayloadTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_match_bound_name_narrows_on_is_not_none( self ) -> None:
 		self.assert_programs_run([ ( 'match_bound_name_narrows_on_is_not_none', _MATCH_BOUND_NAME_NARROWS_ON_IS_NOT_NONE ) ])
+
+	def test_generic_function_converts_result_error_type( self ) -> None:
+		self.assert_programs_run([ ( 'generic_function_converts_result_error_type', _GENERIC_FUNCTION_CONVERTS_RESULT_ERROR_TYPE ) ])
 
 
 if __name__ == '__main__':
