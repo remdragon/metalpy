@@ -68,3 +68,12 @@ have it take a str|bytes type?
 
 explore what's the different between Callable[] and Closure[]. Is there a
 reason to have both?
+
+================================================================================
+
+create an open() method for people that want to be lazy and not use the more
+type-efficient methods. This will require returning a
+BinaryReadWriter|StrReadWriter since we can't know at compile time which one
+they're choosing. We could however, implement a special case in type_resolver.py
+to catch literal strings passed to open() and swap it out with a more type-
+specific File opener method.
