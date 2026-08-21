@@ -2776,6 +2776,68 @@ class Tests( unittest.TestCase ):
 		f_cls = self.discovery.modules['__test__'].get_local( 'Foo' )
 		self.assertIs( calls[0].args[0].type, f_cls ) # move(f) unwraps to the real f, not a leftover call expression
 
+	def test_move_of_a_field_access_is_a_compile_error( self ) -> None:
+		# cfg.py's ownership tracking only tracks top-level bindings (params/
+		# locals/self), never struct/union fields - move(self.foo) would
+		# silently miscompile into a double-free (source field keeps its
+		# pointer, destination's destructor frees the same storage again)
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'class Holder:',
+			'	foo: Foo',
+			'	def __init__( self ) -> None:',
+			'		self.foo = Foo()',
+			'',
+			'def takeown( x: move[Foo] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	h: Holder = Holder()',
+			'	takeown( move( h.foo ))',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'move(...) does not support a field or subscript target', self.discovery.errors.errors[0] )
+
+	def test_move_of_a_subscript_is_a_compile_error( self ) -> None:
+		# needs builtins for list[T]
+		disco = Discovery( import_builtins = True )
+		comp = Compiler( disco )
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeown( x: move[Foo] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	fs: list[Foo] = [ Foo() ]',
+			'	takeown( move( fs[0] ))',
+			'	return',
+		])
+		comp.import_code( code, filename = Path( '__test__.py' ))
+		comp._lower( disco.main )
+		self.assertIn( 'move(...) does not support a field or subscript target', disco.errors.errors[0] )
+
+	def test_move_of_a_fresh_constructor_call_lowers_cleanly( self ) -> None:
+		# a fresh rvalue (e.g. a constructor call) has no other owner to
+		# double-free, unlike a field/subscript - this must stay legal (see
+		# lib/http/client.py's bytes.from_bytearray(move(bytearray(0))))
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeown( x: move[Foo] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	takeown( move( Foo() ))',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	# --- compiler.sizeof(T) ----------------------------------------------------
 
 	def test_compiler_sizeof_folds_to_const( self ) -> None:
