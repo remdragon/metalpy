@@ -302,16 +302,15 @@ _registry: UnsafeDict[str, Logger] = UnsafeDict[str, Logger]()
 _registry_lock: threading.FastLock = threading.FastLock()
 
 def getLogger( name: str = '' ) -> Logger:
-	_registry_lock.acquire().unwrap( 'logging.getLogger: lock failed' )
-	defer( _registry_lock.release() )
-	existing: Result[Logger,KeyError] = _registry.__getitem__( name )
-	if existing.is_ok():
-		return existing.unwrap( 'unreachable: is_ok just confirmed' )
-	logger: Logger = Logger( name )
-	if name == '':
-		logger.level = WARNING # root's own explicit default level, matches Python
-	_registry[name] = logger
-	return logger
+	with _registry_lock:
+		existing: Result[Logger,KeyError] = _registry.__getitem__( name )
+		if existing.is_ok():
+			return existing.unwrap( 'unreachable: is_ok just confirmed' )
+		logger: Logger = Logger( name )
+		if name == '':
+			logger.level = WARNING # root's own explicit default level, matches Python
+		_registry[name] = logger
+		return logger
 
 def root() -> Logger:
 	return getLogger( '' )

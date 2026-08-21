@@ -32,9 +32,6 @@ else:
 	ThreadHandle: TypeAlias = pthread_t
 
 
-class LockError:
-	pass
-
 class FastLock:
 	__lock: Ptr[LockOpaque]  # Ptr[_SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
 	__locked: bool
@@ -81,38 +78,52 @@ class FastLock:
 		sys.free( self.__lock )
 
 	# ------------------------------------------------------------------
-	# acquire( blocking: bool = True ) -> Result[None, LockError]
+	# __enter__/__exit__ ( with lock )
+	# ------------------------------------------------------------------
+	
+	def __enter__( self ) -> None:
+		self.acquire()
+
+	def __exit__( self ) -> None:
+		self.release()
+
+	# ------------------------------------------------------------------
+	# acquire() -> None
 	# ------------------------------------------------------------------
 
 	@compiler.target( os = 'windows' )
-	def acquire( self, blocking: bool = True ) -> Result[None, LockError]:
-		from windows.kernel32 import AcquireSRWLockExclusive, TryAcquireSRWLockExclusive
-		if blocking:
-			AcquireSRWLockExclusive( self.__lock )
-			self.__locked = True
-			return Result.Ok( None )
-		else:
-			if TryAcquireSRWLockExclusive( self.__lock ):
-				self.__locked = True
-				return Result.Ok( None )
-			return Result.Err( LockError() )
-
+	def acquire( self ) -> None:
+		from windows.kernel32 import AcquireSRWLockExclusive
+		AcquireSRWLockExclusive( self.__lock )
+		self.__locked = True
+	
 	@compiler.target( os = not 'windows' )
-	def acquire( self, blocking: bool = True ) -> Result[None, LockError]:
-		from posix.pthread import pthread_mutex_lock, pthread_mutex_trylock
-		result: i32
-		if blocking:
-			result = pthread_mutex_lock( self.__lock )
-			if result != 0:
-				return Result.Err( LockError() )
-			self.__locked = True
-			return Result.Ok( None )
-		else:
-			result = pthread_mutex_trylock( self.__lock )
-			if result != 0:
-				return Result.Err( LockError() )
-			self.__locked = True
-			return Result.Ok( None )
+	def acquire( self ) -> None:
+		from posix.pthread import pthread_mutex_lock
+		result: i32 = pthread_mutex_lock( self.__lock )
+		if result != 0:
+			sys.panic( f'pthread_mutex_lock() failed with error code {result!r}' )
+		self.__locked = True
+
+	# ------------------------------------------------------------------
+	# try_acquire() -> bool
+	# ------------------------------------------------------------------
+
+	@compiler.target( os = 'windows' )
+	def try_acquire( self ) -> bool:
+		from windows.kernel32 import TryAcquireSRWLockExclusive
+		if not TryAcquireSRWLockExclusive( self.__lock ):
+			return False
+		self.__locked = True
+		return self.__locked
+	
+	@compiler.target( os = not 'windows' )
+	def try_acquire( self ) -> bool:
+		from posix.pthread import pthread_mutex_trylock
+		if 0 != pthread_mutex_trylock( self.__lock ):
+			return False
+		self.__locked = True
+		return self.__locked
 
 	# ------------------------------------------------------------------
 	# release() -> None
@@ -131,9 +142,10 @@ class FastLock:
 		pthread_mutex_unlock( self.__lock )
 
 	# ------------------------------------------------------------------
-	# locked() -> bool
+	# locked -> bool
 	# ------------------------------------------------------------------
 
+	@property
 	def locked( self ) -> bool:
 		return self.__locked
 

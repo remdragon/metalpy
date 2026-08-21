@@ -329,38 +329,33 @@ class list[T]:
 		self.__borrows = 0
 
 	def __len__( self ) -> usize:
-		self.__lock.acquire().unwrap( 'list.__len__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__len__()
+		with self.__lock:
+			return self.__inner.__len__()
 
 	def capacity( self ) -> usize:
-		self.__lock.acquire().unwrap( 'list.capacity: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.capacity()
+		with self.__lock:
+			return self.__inner.capacity()
 
 	# Append a value at the end. Increfs val if T is an RC type.
 	def append( self, val: T ) -> Result[None, OverflowError|BorrowError]:
-		self.__lock.acquire().unwrap( 'list.append: lock failed' )
-		defer( self.__lock.release() )
-		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
-			return Result.Err( BorrowError() )
-		return self.__inner.append( val )
+		with self.__lock:
+			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+				return Result.Err( BorrowError() )
+			return self.__inner.append( val )
 
 	# Insert a value at idx, shifting everything at/after idx one slot to
 	# the right. idx > len clamps to len (append), matching Python's own
 	# list.insert. Increfs val if T is an RC type.
 	def insert( self, idx: usize, val: T ) -> Result[None, OverflowError|BorrowError]:
-		self.__lock.acquire().unwrap( 'list.insert: lock failed' )
-		defer( self.__lock.release() )
-		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
-			return Result.Err( BorrowError() )
-		return self.__inner.insert( idx, val )
+		with self.__lock:
+			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+				return Result.Err( BorrowError() )
+			return self.__inner.insert( idx, val )
 
 	# Access element by position. Returns a copy (with incref if RC).
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
-		self.__lock.acquire().unwrap( 'list.__getitem__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__getitem__( idx )
+		with self.__lock:
+			return self.__inner.__getitem__( idx )
 
 	# Overwrite the element at idx. Increfs val and decrefs the value it
 	# replaces. NOT gated on __borrows: unlike append/insert/erase_at/pop,
@@ -370,9 +365,8 @@ class list[T]:
 	# a separate, pre-existing category of hazard borrow_slice() was never
 	# meant to solve either - see its own comment).
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
-		self.__lock.acquire().unwrap( 'list.__setitem__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__setitem__( idx, val )
+		with self.__lock:
+			return self.__inner.__setitem__( idx, val )
 
 	# Remove and return the LAST element (O(1), no shift needed) - list[T]
 	# has no equivalent of this today; natural for a producer/consumer
@@ -383,27 +377,25 @@ class list[T]:
 	# negligible next to the lock acquire/release this already pays for;
 	# revisit only if profiling ever says otherwise.
 	def pop( self ) -> Result[T, IndexError|BorrowError]:
-		self.__lock.acquire().unwrap( 'list.pop: lock failed' )
-		defer( self.__lock.release() )
-		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
-			return Result.Err( BorrowError() )
-		n: usize = self.__inner.__len__()
-		if n == 0:
-			return Result.Err( IndexError() )
-		with compiler.wrap_arithmetic: # n > 0, just checked
-			last: usize = n - 1
-		val: T = self.__inner.__getitem__( last ).unwrap( 'list.pop: index in bounds by construction' )
-		self.__inner.erase_at( last ).unwrap( 'list.pop: index in bounds by construction' )
-		return Result.Ok( val )
+		with self.__lock:
+			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+				return Result.Err( BorrowError() )
+			n: usize = self.__inner.__len__()
+			if n == 0:
+				return Result.Err( IndexError() )
+			with compiler.wrap_arithmetic: # n > 0, just checked
+				last: usize = n - 1
+			val: T = self.__inner.__getitem__( last ).unwrap( 'list.pop: index in bounds by construction' )
+			self.__inner.erase_at( last ).unwrap( 'list.pop: index in bounds by construction' )
+			return Result.Ok( val )
 
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError|BorrowError]:
-		self.__lock.acquire().unwrap( 'list.erase_at: lock failed' )
-		defer( self.__lock.release() )
-		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
-			return Result.Err( BorrowError() )
-		return self.__inner.erase_at( idx )
+		with self.__lock:
+			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+				return Result.Err( BorrowError() )
+			return self.__inner.erase_at( idx )
 
 	# Borrow a read-only slice[T] view over the WHOLE buffer, valid until the
 	# matching release_borrow() call. Unlike UnsafeList[T].as_slice() (safe
@@ -429,11 +421,10 @@ class list[T]:
 	# borrow is outstanding is still the caller's own responsibility to
 	# avoid, exactly as it already is for UnsafeList[T].as_slice().
 	def borrow_slice( self ) -> slice[T]:
-		self.__lock.acquire().unwrap( 'list.borrow_slice: lock failed' )
-		defer( self.__lock.release() )
-		view: slice[T] = self.__inner.as_slice()
-		compiler.atomic_add( compiler.addrof( self.__borrows ), 1 )
-		return view
+		with self.__lock:
+			view: slice[T] = self.__inner.as_slice()
+			compiler.atomic_add( compiler.addrof( self.__borrows ), 1 )
+			return view
 
 	# Ends a borrow started by borrow_slice() - see its own comment. Safe to
 	# call without holding __lock: this only needs to be atomic with respect
@@ -444,12 +435,11 @@ class list[T]:
 
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> Result[None, BorrowError]:
-		self.__lock.acquire().unwrap( 'list.clear: lock failed' )
-		defer( self.__lock.release() )
-		if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
-			return Result.Err( BorrowError() )
-		self.__inner.clear()
-		return Result.Ok( None )
+		with self.__lock:
+			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
+				return Result.Err( BorrowError() )
+			self.__inner.clear()
+			return Result.Ok( None )
 
 	# Hold the lock across more than one call - for compound, "check-then-
 	# act" sequences that need to happen atomically (e.g. "append only if
@@ -459,6 +449,5 @@ class list[T]:
 	# object that owns whatever else needs to be touched alongside this
 	# list under the same critical section.
 	def with_lock( self, body: Closure[[], None] ) -> None:
-		self.__lock.acquire().unwrap( 'list.with_lock: lock failed' )
-		defer( self.__lock.release() )
-		body()
+		with self.__lock:
+			body()

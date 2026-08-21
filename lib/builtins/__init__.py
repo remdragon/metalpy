@@ -2438,39 +2438,32 @@ class dict[K, V]:
 		self.__lock  = threading.FastLock()
 
 	def __len__( self ) -> usize:
-		self.__lock.acquire().unwrap( 'dict.__len__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__len__()
+		with self.__lock:
+			return self.__inner.__len__()
 
 	def __getitem__( self, key: K ) -> Result[V, KeyError]:
-		self.__lock.acquire().unwrap( 'dict.__getitem__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__getitem__( key )
+		with self.__lock:
+			return self.__inner.__getitem__( key )
 
 	def __contains__( self, key: K ) -> bool:
-		self.__lock.acquire().unwrap( 'dict.__contains__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__contains__( key )
+		with self.__lock:
+			return self.__inner.__contains__( key )
 
 	def __delitem__( self, key: K ) -> Result[None, KeyError]:
-		self.__lock.acquire().unwrap( 'dict.__delitem__: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.__delitem__( key )
+		with self.__lock:
+			return self.__inner.__delitem__( key )
 
 	def key_at( self, index: usize ) -> Result[K, IndexError]:
-		self.__lock.acquire().unwrap( 'dict.key_at: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.key_at( index )
+		with self.__lock:
+			return self.__inner.key_at( index )
 
 	def value_at( self, index: usize ) -> Result[V, IndexError]:
-		self.__lock.acquire().unwrap( 'dict.value_at: lock failed' )
-		defer( self.__lock.release() )
-		return self.__inner.value_at( index )
+		with self.__lock:
+			return self.__inner.value_at( index )
 
 	def __setitem__( self, key: K, value: V ) -> None:
-		self.__lock.acquire().unwrap( 'dict.__setitem__: lock failed' )
-		defer( self.__lock.release() )
-		self.__inner.__setitem__( key, value )
+		with self.__lock:
+			self.__inner.__setitem__( key, value )
 
 	def with_lock( self, body: Closure[[UnsafeDict[K, V]], None] ) -> None:
 		# unlike list[T]'s own no-arg with_lock, body here takes the raw
@@ -2480,9 +2473,8 @@ class dict[K, V]:
 		# and __inner is private - body has no other way in. Calling back
 		# through self.__getitem__/self.__setitem__ from inside body would
 		# try to re-acquire this same (non-reentrant) FastLock and deadlock.
-		self.__lock.acquire().unwrap( 'dict.with_lock: lock failed' )
-		defer( self.__lock.release() )
-		body( self.__inner )
+		with self.__lock:
+			body( self.__inner )
 
 # import this at the end because it depends on str etc to already be pre-parsed.
 # BinaryReader/BinaryWriter/BinaryReadWriter are re-exported alongside File

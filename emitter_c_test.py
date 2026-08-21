@@ -4597,15 +4597,14 @@ import threading
 def main() -> i32:
 	lock: threading.FastLock = threading.FastLock()
 	# blocking acquire should succeed
-	if lock.acquire().is_err():
-		return 1
+	lock.acquire()
 	# non-blocking re-acquire should fail (already locked)
-	if not lock.acquire( False ).is_err():
+	if lock.try_acquire():
 		return 2
 	# release it
 	lock.release()
 	# after release, non-blocking acquire should succeed again
-	if lock.acquire( False ).is_err():
+	if not lock.try_acquire():
 		return 3
 	lock.release()
 	return 0
