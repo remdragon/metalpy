@@ -563,10 +563,12 @@ class Worker:
 		m: usize = expired.__len__()
 		j: usize = 0
 		while j < m:
-			w: _PendingWait = expired.__getitem__( j ).unwrap( 'Worker.__drain_expired_waits: index in bounds by construction' )
-			w.timed_out = True
-			self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_expired_waits: ready-to-unpark queue overflow' )
-			match w.signal:
+			# distinct name from the sweep loop's own `w` above - a
+			# variable's type is only ever declared once per function
+			ew: _PendingWait = expired.__getitem__( j ).unwrap( 'Worker.__drain_expired_waits: index in bounds by construction' )
+			ew.timed_out = True
+			self.__ready_to_unpark.append( ew.waiting_fiber ).unwrap( 'Worker.__drain_expired_waits: ready-to-unpark queue overflow' )
+			match ew.signal:
 				case Signal.FdReady( fdr ):
 					if self.__is_registered( fdr.fd ) and not self.__fd_still_waited_on( fdr.fd ):
 						self.__poller.unregister( fdr.fd ).unwrap( 'Worker.__drain_expired_waits: poller unregister failed' )
