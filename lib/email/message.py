@@ -589,12 +589,11 @@ def _try_parse_encoded_word( value: str, start: usize ) -> _EncodedWord:
 	n: usize = value.byte_len()
 	with compiler.wrap_arithmetic:
 		p1: usize = start + 2
-	q1: usize = 0
-	match value.find( '?', p1 ):
-		case Result.Ok( idx ):
-			q1 = idx
-		case Result.Err( e ):
-			return _EncodedWord( False, '', '', '', start )
+	q1_found: isize = value.find( '?', p1 )
+	if q1_found == isize( -1 ):
+		return _EncodedWord( False, '', '', '', start )
+	with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+		q1: usize = usize( q1_found )
 	charset: str = value[p1:q1]
 	if charset.byte_len() == 0:
 		return _EncodedWord( False, '', '', '', start )
@@ -614,12 +613,11 @@ def _try_parse_encoded_word( value: str, start: usize ) -> _EncodedWord:
 		return _EncodedWord( False, '', '', '', start )
 	with compiler.wrap_arithmetic:
 		p4: usize = p3 + 1
-	term: usize = 0
-	match value.find( '?=', p4 ):
-		case Result.Ok( idx2 ):
-			term = idx2
-		case Result.Err( e2 ):
-			return _EncodedWord( False, '', '', '', start )
+	term_found: isize = value.find( '?=', p4 )
+	if term_found == isize( -1 ):
+		return _EncodedWord( False, '', '', '', start )
+	with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+		term: usize = usize( term_found )
 	text: str = value[p4:term]
 	with compiler.wrap_arithmetic:
 		endpos: usize = term + 2
@@ -704,14 +702,12 @@ def decode_header( value: str ) -> Result[str, EmailError]:
 	i: usize = 0
 	prev_was_encoded: bool = False
 	while i < n:
-		has_more: bool = False
+		found_signed: isize = value.find( '=?', i )
+		has_more: bool = found_signed != isize( -1 )
 		found_at: usize = 0
-		match value.find( '=?', i ):
-			case Result.Ok( idx ):
-				has_more = True
-				found_at = idx
-			case Result.Err( e ):
-				has_more = False
+		if has_more:
+			with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+				found_at = usize( found_signed )
 		if not has_more:
 			result = result + value[i:n]
 			break
@@ -791,13 +787,11 @@ def _split_multipart( body: str, boundary: str ) -> Result[list[Message], EmailE
 		has_first = True
 		pos = 0
 	else:
-		match body.find( '\r\n' + delim ):
-			case Result.Ok( idx ):
-				has_first = True
-				with compiler.wrap_arithmetic:
-					pos = idx + 2
-			case Result.Err( e ):
-				has_first = False
+		first_signed: isize = body.find( '\r\n' + delim )
+		if first_signed != isize( -1 ):
+			has_first = True
+			with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+				pos = usize( first_signed ) + 2
 	if not has_first:
 		return Result.Err( EmailError.UnterminatedBoundary( None ))
 
@@ -809,18 +803,16 @@ def _split_multipart( body: str, boundary: str ) -> Result[list[Message], EmailE
 		with compiler.wrap_arithmetic:
 			line_end: usize = pos + delim.byte_len()
 		part_start: usize = 0
-		match body.find( '\n', line_end ):
-			case Result.Ok( nl_idx ):
-				with compiler.wrap_arithmetic:
-					part_start = nl_idx + 1
-			case Result.Err( e2 ):
-				return Result.Err( EmailError.UnterminatedBoundary( None ))
-		next_pos: usize = 0
-		match body.find( '\r\n' + delim, part_start ):
-			case Result.Ok( next_idx ):
-				next_pos = next_idx
-			case Result.Err( e3 ):
-				return Result.Err( EmailError.UnterminatedBoundary( None ))
+		nl_signed: isize = body.find( '\n', line_end )
+		if nl_signed == isize( -1 ):
+			return Result.Err( EmailError.UnterminatedBoundary( None ))
+		with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+			part_start = usize( nl_signed ) + 1
+		next_signed: isize = body.find( '\r\n' + delim, part_start )
+		if next_signed == isize( -1 ):
+			return Result.Err( EmailError.UnterminatedBoundary( None ))
+		with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+			next_pos: usize = usize( next_signed )
 		part_text: str = body[part_start:next_pos]
 		part_msg: Message = message_from_string( part_text ).or_return()
 		parts.append( part_msg ).unwrap( '_split_multipart: append failed' )
@@ -847,22 +839,26 @@ def message_from_string( raw: str ) -> Result[Message, EmailError]:
 		header_block = ''
 		body = raw[1:raw.byte_len()]
 	else:
-		match raw.find( '\r\n\r\n' ):
-			case Result.Ok( idx ):
-				header_block = raw[0:idx]
+		blank_signed: isize = raw.find( '\r\n\r\n' )
+		if blank_signed != isize( -1 ):
+			with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+				idx: usize = usize( blank_signed )
+			header_block = raw[0:idx]
+			with compiler.wrap_arithmetic:
+				body_start: usize = idx + 4
+			body = raw[body_start:raw.byte_len()]
+		else:
+			blank_signed2: isize = raw.find( '\n\n' )
+			if blank_signed2 != isize( -1 ):
+				with compiler.panic_arithmetic( 'find() never returns a negative offset once the -1/not-found case is excluded' ):
+					idx2: usize = usize( blank_signed2 )
+				header_block = raw[0:idx2]
 				with compiler.wrap_arithmetic:
-					body_start: usize = idx + 4
-				body = raw[body_start:raw.byte_len()]
-			case Result.Err( e ):
-				match raw.find( '\n\n' ):
-					case Result.Ok( idx2 ):
-						header_block = raw[0:idx2]
-						with compiler.wrap_arithmetic:
-							body_start2: usize = idx2 + 2
-						body = raw[body_start2:raw.byte_len()]
-					case Result.Err( e2 ):
-						header_block = raw
-						body = ''
+					body_start2: usize = idx2 + 2
+				body = raw[body_start2:raw.byte_len()]
+			else:
+				header_block = raw
+				body = ''
 
 	lines: list[str] = _split_lines( header_block )
 	unfolded: list[str] = _unfold_headers( lines )
