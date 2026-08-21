@@ -18952,6 +18952,235 @@ def main() -> i32:
 			return 2
 		return 0
 ''' ),
+		# --- generator value-return (this session's fix - previously a
+		# bare `return`/`return None` was the only return shape allowed
+		# inside a generator body; `return <expr>` matching the
+		# generator's own Result[elem_type,error_type] exactly is now
+		# allowed too, reusing the SAME generator_already_result_shaped
+		# tag yield from's own forwarding yield already used - see
+		# _validate_and_tag_generator_value_returns/_rewrite_bare_return_
+		# stmts in type_resolver.py)
+		( 'generator_value_return_of_already_constructed_err_ends_iteration', '''
+@union
+class BoomError:
+	Boom: None
+
+def gen( trigger_at: usize ) -> Generator[usize, BoomError | StopIteration]:
+	i: usize = 0
+	while i < 5:
+		if i == trigger_at:
+			return Result.Err( BoomError.Boom( None ))
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen( 2 )
+		a = g.__next__() # i=0 - yields
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( v ):
+				if v != 0:
+					return 2
+		b = g.__next__() # i=1 - yields
+		match b:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( v ):
+				if v != 1:
+					return 4
+		c = g.__next__() # i=2 == trigger_at - hits the value-return's own Err, NOT auto-wrapped/derived from or_return()
+		errored = False
+		match c:
+			case Result.Err( e ):
+				match e:
+					case BoomError.Boom( _ ):
+						errored = True
+					case _:
+						return 5
+			case Result.Ok( v ):
+				return 5
+		if not errored:
+			return 6
+		d = g.__next__() # permanently done - Err(StopIteration()), not a re-run of the value-return
+		match d:
+			case Result.Err( e ):
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 7
+			case Result.Ok( v ):
+				return 7
+		return 0
+''' ),
+		( 'generator_value_return_of_ok_delivers_one_final_value_then_stops', '''
+@union
+class BoomError:
+	Boom: None
+
+def gen() -> Generator[usize, BoomError | StopIteration]:
+	yield 1
+	yield 2
+	return Result.Ok( 99 )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		a = g.__next__()
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( v ):
+				if v != 1:
+					return 2
+		b = g.__next__()
+		match b:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( v ):
+				if v != 2:
+					return 4
+		c = g.__next__() # the value-return's own final value
+		match c:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( v ):
+				if v != 99:
+					return 6
+		d = g.__next__() # must stay permanently done, not re-deliver 99 or resume
+		match d:
+			case Result.Err( e ):
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 7
+			case Result.Ok( v ):
+				return 7
+		return 0
+''' ),
+		( 'generator_value_return_nested_in_if_inside_while_ends_iteration_permanently', '''
+@union
+class BoomError:
+	Boom: None
+
+def gen( limit: i32 ) -> Generator[i32, BoomError | StopIteration]:
+	x: i32 = 0
+	while x < limit:
+		if x == 2:
+			return Result.Ok( 100 )
+		yield x
+		with compiler.wrap_arithmetic:
+			x += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen( 5 )
+		a = g.__next__()
+		match a:
+			case Result.Err( _ ):
+				return 1
+			case Result.Ok( v ):
+				if v != 0:
+					return 2
+		b = g.__next__()
+		match b:
+			case Result.Err( _ ):
+				return 3
+			case Result.Ok( v ):
+				if v != 1:
+					return 4
+		c = g.__next__() # x becomes 2 here, hits the nested value-return before yielding again
+		match c:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( v ):
+				if v != 100:
+					return 6
+		d = g.__next__() # must stay permanently done, not resume mid-loop
+		match d:
+			case Result.Err( e ):
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 7
+			case Result.Ok( v ):
+				return 7
+		f = g.__next__()
+		match f:
+			case Result.Err( e2 ):
+				match e2:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 8
+			case Result.Ok( v ):
+				return 8
+		return 0
+''' ),
+		( 'generator_value_return_replays_armed_defer_exactly_once', '''
+@union
+class BoomError:
+	Boom: None
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( b: Box, count: usize ) -> Generator[usize, BoomError | StopIteration]:
+	i: usize = 0
+	with defer:
+		compiler.incref( b )
+	while i < count:
+		if i == 1:
+			return Result.Ok( 999 )
+		yield i
+		with compiler.wrap_arithmetic:
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 1 )
+		g = gen( b, 5 )
+		if compiler.refcount( b ) != 2: # caller + generator's own captured param
+			return 1
+		a = g.__next__() # i=0, yields
+		match a:
+			case Result.Err( _ ):
+				return 2
+			case Result.Ok( v ):
+				if v != 0:
+					return 3
+		if compiler.refcount( b ) != 2: # defer must not have fired yet
+			return 4
+		c = g.__next__() # i=1, hits the value-return before yielding again - armed defer replays here
+		match c:
+			case Result.Err( _ ):
+				return 5
+			case Result.Ok( v ):
+				if v != 999:
+					return 6
+		if compiler.refcount( b ) != 3: # defer fired exactly once, at the value-return exit
+			return 7
+		d = g.__next__() # already done - must not re-fire
+		match d:
+			case Result.Err( e ):
+				match e:
+					case StopIteration( _ ):
+						pass
+					case _:
+						return 8
+			case Result.Ok( v ):
+				return 8
+		if compiler.refcount( b ) != 3:
+			return 9
+		return 0
+''' ),
 		# --- Phase 5 (roadmap Phase 5, the last roadmap item): RC-typed
 		# locals crossing a yield. Lifts v1's own scalar-only restriction
 		# on promoted locals (a not-yet-initialized RC field would make
@@ -19901,6 +20130,28 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'or_return()', str( self.discovery.errors.errors[0] ))
+
+	def test_return_wrong_shaped_value_from_generator_is_rejected( self ) -> None:
+		# _validate_and_tag_generator_value_returns's negative path - a
+		# `return <expr>` that resolves to a real type but doesn't match
+		# this generator's own Result[elem_type,error_type] EXACTLY (here,
+		# a bare i32 literal, not even a Result at all) is still a clean
+		# compile error, not a crash - mirrors yield from's own exact-shape
+		# rejection wording this reuses.
+		self._run( '''
+@union
+class BoomError:
+	Boom: None
+
+def gen() -> Generator[i32, BoomError | StopIteration]:
+	yield 1
+	return 5
+
+def main() -> None:
+	g = gen()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'a generator function can only', str( self.discovery.errors.errors[0] ))
 
 	# PLAN_GENERATORS.md Phase C - `.send()`. Generator[T, SendType, E | StopIteration] (3-
 	# arg form) makes `(yield expr)` usable as a captured EXPRESSION,
