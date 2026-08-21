@@ -10590,6 +10590,85 @@ def main() -> i32:
 		return 5
 	return 0
 ''' ),
+			# `type(x) is T`/`is not`/instanceof() where x's own static type
+			# is NOT a union at all (a plain @property getter returning a
+			# concrete, non-nullable type - "an anonymous union whose own
+			# underlying type can change at runtime" doesn't apply here,
+			# there's nothing that COULD vary) - this mechanism was never
+			# real RTTI/isinstance across a class hierarchy, only ever a
+			# TaggedUnion's own tag, so the whole check is a pure compile-
+			# time fact: True only if T is EXACTLY x's own declared type.
+			# _rewrite_type_is_comparison used to hard-error ("X is not a
+			# union type") instead of folding - matching the SAME shape
+			# `match type(x):` already folds via _try_fold_match_type,
+			# which `if`/`while type(x) is T:` had no counterpart for at
+			# all. Also confirms the fold is REAL (compile-time, no runtime
+			# check at all - not just "wrapped in an always-false branch")
+			# via generated-C inspection during development, and that a
+			# still-generic (unbound TypeVar) subject correctly defers the
+			# fold to the monomorphized copy's own second pass instead of
+			# baking a wrong answer into the shared, abstract body
+			( 'type_is_on_non_union_subject_folds_to_a_compile_time_constant', '''
+class Ops:
+	def do_read( self, v: i32 ) -> i32:
+		return v
+
+class Other:
+	def x( self ) -> i32:
+		return 0
+
+class Holder:
+	_aio: Ops
+	def __init__( self, aio: Ops ) -> None:
+		self._aio = aio
+	@property
+	def aio( self ) -> Ops:
+		return self._aio
+	def matches_while( self ) -> i32:
+		n: i32 = 0
+		while type( self.aio ) is Ops:
+			n = 1
+			return n # avoid an infinite loop - just proves the fold is True
+		return 0
+	def matches_if( self ) -> i32:
+		if type( self.aio ) is Ops:
+			return 1
+		return 0
+	def no_match_while( self ) -> i32:
+		n: i32 = 0
+		while type( self.aio ) is Other:
+			n = 99
+		return n
+	def no_match_if( self ) -> i32:
+		if type( self.aio ) is not Ops:
+			return 1
+		return 0
+
+class Box[T]:
+	val: T
+	def __init__( self, val: T ) -> None:
+		self.val = val
+	def check( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			if type( self.val ) is i32:
+				return 1
+			return 0
+
+def main() -> i32:
+	h = Holder( Ops() )
+	if h.matches_while() != 1:
+		return 1
+	if h.matches_if() != 1:
+		return 2
+	if h.no_match_while() != 0:
+		return 3
+	if h.no_match_if() != 0:
+		return 4
+	b: Box[i32] = Box[i32]( 5 )
+	if b.check() != 1:
+		return 5
+	return 0
+''' ),
 			# `union_val == leaf` / `!=` - comparing a still-union-typed value
 			# directly against a leaf, with no match-based extraction needed
 			# first. Used to fall through to the plain dunder-or-flat-Cmp path,

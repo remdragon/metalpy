@@ -5421,10 +5421,43 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		subj_type = self._type_of_expr( subject_expr )
 		if subj_type is None:
 			self.discovery.fail( f'type(...) is ...: cannot determine the type of {ast.unparse(subject_expr)}: {ast.unparse(node)}', node )
+		if isinstance( subj_type, TypeVar ):
+			# still abstract (a generic function's own unbound T, e.g. a
+			# property/parameter typed with it) - this rewrite runs once
+			# against the SHARED, abstract body, well before any concrete
+			# specialization exists (resolve_function_body's own docstring)
+			# - nothing can be decided yet, not even "is this a union".
+			# Return the ORIGINAL node completely untouched (not a fold,
+			# not an error) so the monomorphized copy's own independently
+			# deep-copied body gets a fresh, correct shot at this exact
+			# node once T is concretely bound - same "hold unvisited"
+			# discipline _try_fold_match_type's own docstring documents at
+			# length for the identical concern (baking a wrong answer into
+			# the SHARED node would permanently corrupt every other
+			# specialization that copies it afterward).
+			return node
 		spec = self.resolver._as_specialization( subj_type ) # not a bare isinstance check - subj_type may already be eagerly-monomorphized, see visit_Match's own comment
 		base = spec.base if spec is not None else subj_type
 		if not isinstance( base, TaggedUnion ):
-			self.discovery.fail( f'type(...) is ...: {ast.unparse(subject_expr)} is not a union type: {ast.unparse(node)}', node )
+			# a concrete, non-union type has nothing to check at runtime -
+			# this mechanism was never real RTTI/isinstance across a class
+			# hierarchy (see _try_fold_match_type's own "no runtime
+			# reflection" note), only ever a TaggedUnion's own tag - so
+			# type(x) is T against a non-union x is a pure compile-time
+			# fact: True only if T is EXACTLY x's own declared type, same
+			# "no subclass polymorphism, only ever exact identity" rule the
+			# union-tag case already has (a union's own tag never
+			# distinguishes a member's subclasses either). Mirrors _try_
+			# fold_match_type's own identical fold for the match-statement
+			# shape - this is the `if`/`while`/instanceof() counterpart,
+			# which had no such fold at all before, only ever this method's
+			# own "is not a union type" hard error (confirmed via a real
+			# repro: `while type(self.prop) is T:`, self.prop a plain,
+			# non-union-returning @property).
+			is_not = isinstance( node.ops[0], ast.IsNot )
+			result = ast.Constant( value = self.resolver._same_type( leaf_type, subj_type ) != is_not )
+			ast.copy_location( result, node )
+			return result
 		members = self._resolved_union_members( subj_type, base )
 		member = next( ( attr for attr in members if attr.type is leaf_type ), None )
 		if member is None:
@@ -5944,7 +5977,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if rewritten is not None:
 				node.test = rewritten
 			else:
-				node.test = self.generic_visit_expr( node.test )
+				# self.visit (full dispatch), NOT generic_visit_expr (a bare
+				# self.generic_visit(node) - walks node's own CHILDREN only,
+				# never re-dispatches node ITSELF through the visitor). A
+				# `type(x) is T` test that _type_is_shape declined (x isn't
+				# narrowable, or isn't even a union at all - see _rewrite_
+				# type_is_comparison's own fold for that second case) still
+				# needs visit_Compare's own unconditional rewrite-2 to
+				# produce a valid comparison (or a folded True/False
+				# Constant) - generic_visit_expr skipped that, leaving the
+				# ORIGINAL, un-rewritten `type(x) is T` AST (still
+				# containing a literal `type(...)` Call) to reach lowering
+				# untouched, where `type` isn't a real callable name at
+				# all: "name 'type' is not defined". Confirmed via a real
+				# repro. Safe for the SAME reason visit_If's own fallback
+				# already uses plain self.visit(node.test) unconditionally.
+				node.test = self.visit( node.test )
 		case_entry_narrowed = dict( self._narrowed )
 		if body_member is not None and subject_name is not None:
 			self._narrowed[subject_name] = [ body_member.type ]
