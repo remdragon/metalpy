@@ -578,3 +578,14 @@ def UnmapViewOfFile(
 	lpBaseAddress: ConstPtr[None],
 ) -> bool:
 	...
+
+# ALL_PROCESSOR_GROUPS (winnt.h): passed to GetActiveProcessorCount to get
+# the total active processor count across every processor group, not just
+# the calling thread's own group - what sys.cpu_count() actually wants.
+ALL_PROCESSOR_GROUPS: u16 = 0xFFFF
+
+@extern('kernel32', 'GetActiveProcessorCount')
+def GetActiveProcessorCount(
+	GroupNumber: u16,
+) -> u32:
+	...

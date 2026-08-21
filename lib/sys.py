@@ -69,6 +69,27 @@ def cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
 	return strnlen( ptr, max_length )
 
 @compiler.target( os = 'windows' )
+def cpu_count() -> u32:
+	''' the number of active logical processors - e.g. for sizing a
+	reactor.Reactor's own worker count. Clamped to at least 1 (paranoid
+	safety net for a platform reporting 0/unknown, matching Python's own
+	`os.cpu_count() or 1` idiom), never fails/panics. '''
+	from windows.kernel32 import GetActiveProcessorCount, ALL_PROCESSOR_GROUPS
+	n: u32 = GetActiveProcessorCount( ALL_PROCESSOR_GROUPS )
+	if n == 0:
+		return 1
+	return n
+
+@compiler.target( os = not 'windows' )
+def cpu_count() -> u32:
+	from posix.unistd import sysconf, _SC_NPROCESSORS_ONLN
+	n: i64 = sysconf( _SC_NPROCESSORS_ONLN )
+	if n <= 0:
+		return 1
+	with compiler.wrap_arithmetic:
+		return u32( n )
+
+@compiler.target( os = 'windows' )
 def free( ptr: Ptr[u8] ) -> None:
 	from windows.kernel32 import GetProcessHeap, HeapFree, HeapSize, HEAP_SIZE_FAILED
 	heap = GetProcessHeap()
