@@ -56,3 +56,9 @@ and stream it instead of allocating it in memory twice
 
 I want to explore the possibility of user-created decorators. I've done some
 research and I believe this may be possible with the infrastructure we've built
+
+================================================================================
+
+demo http server has Response.bytes_(...). This is ugly. Other http apis have
+more rich method names, but in this case maybe we implement Response.text() and
+have it take a str|bytes type?
