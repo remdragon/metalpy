@@ -6711,9 +6711,17 @@ class FunctionLowering:
 			# union would use to decide to wrap it anyway, just performed as a
 			# non-failing probe first so a genuine non-member (e.g. that
 			# unrelated Result[T,OtherE]) is left untouched for its own,
-			# more-specific caller-side handling instead
+			# more-specific caller-side handling instead. Also probes via
+			# _is_rcclass_upcast, not just _same_type: a subclass instance
+			# (Sub) is just as valid a fit for a leaf declared as its OWN
+			# base class (Base) as an exact-type match is - ordinary
+			# derived->base substitution works everywhere else a Base-typed
+			# parameter appears, so a Base|None-typed one shouldn't reject
+			# it just because the match has to happen leaf-by-leaf here
+			# instead of directly against expected_type itself.
 			if any(
 				self.lowering._type_resolver._same_type( attr.type, operand.type )
+				or self._is_rcclass_upcast( operand.type, attr.type )
 				for attr in expected_union.attributes
 			):
 				was_fresh = self._cfg.is_fresh_temp( operand )
@@ -6968,6 +6976,23 @@ class FunctionLowering:
 		# declared `list[Op]|None` return type wrongly fell through to the
 		# "not one of its members" failure below.
 		leaf = next( ( attr for attr in union.attributes if self.lowering._type_resolver._same_type( attr.type, operand.type ) ), None )
+		if leaf is None:
+			# no leaf matches operand's own type exactly - but a derived RCClass
+			# (Sub) flowing into a leaf declared as one of ITS OWN base classes
+			# (Base) is still a legitimate member, same as passing Sub() directly
+			# to an ordinary Base-typed parameter works everywhere else. The
+			# synthesized ctor below is declared to take exactly `leaf.type`
+			# (Base), never whatever subclass actually flowed in, so operand
+			# needs the identical CastWrap reinterpretation _coerce_or_check_
+			# operand's own RCClass-upcast branch applies for a plain (non-union)
+			# target - done here explicitly since this call bypasses that branch
+			# entirely (this function's own caller only reaches it after already
+			# deciding a coercion applies).
+			leaf = next( ( attr for attr in union.attributes if self._is_rcclass_upcast( operand.type, attr.type ) ), None )
+			if leaf is not None:
+				cast_dest = self._new_temp( leaf.type )
+				self._emit( ir.CastWrap( dest = cast_dest, operand = operand ) )
+				operand = cast_dest
 		if leaf is None:
 			self.lowering.discovery.fail(
 				f'{ast.unparse(node)}: expected {union.qualname}, got a type that is not one of its members',
