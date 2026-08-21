@@ -32,7 +32,11 @@ http_server_demo_async.py, do we need a synchronous TcpServer that implements
 BaseServer and _ConnectionHandler (with better names) so that the sync and async
 versions of the http server are more similar?
 
-I think python has something like this already too
+I think python has something like this already too.
+
+Additionally, the sync version appears to be serving on only one thread.
+Should we have an option to service requests with multiple threads? Do we need
+a separate reusable ThreadPool class for this?
 
 ================================================================================
 
