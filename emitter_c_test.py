@@ -18,6 +18,7 @@ from errors import CompileError
 from mpy_types import (
 	CEnum, CStruct, Function, Parameter, RCClass, Scalar, Specialization, TaggedUnion, Variable,
 )
+from targets import ActiveTarget
 
 def _scalar( stem: str, qualname: str|None = None ) -> Scalar:
 	return Scalar( stem = stem, qualname = qualname or f'intrinsics.{stem}', file = None, line = None, sizeof = 0 )
@@ -4449,13 +4450,13 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		'	return 0',
 	])
 
-	# minimal but complete active_target dicts (see discovery.py's own
-	# _detect_active_target for the real shape) - only 'os' actually
+	# minimal but complete active_target dicts (see targets.py's own
+	# detect() for the real shape) - only 'os' actually
 	# matters to anything this test class checks
-	_WINDOWS_TARGET = { 'os': 'windows', 'arch': 'x86_64', 'family': 'windows', 'bits': 64, 'debug': True, 'posix': False }
-	_LINUX_TARGET = { 'os': 'linux', 'arch': 'x86_64', 'family': 'unix', 'bits': 64, 'debug': True, 'posix': True }
+	_WINDOWS_TARGET = ActiveTarget( os = 'windows', arch = 'x86_64', family = 'windows', bits = 64, debug = True, posix = False )
+	_LINUX_TARGET = ActiveTarget( os = 'linux', arch = 'x86_64', family = 'unix', bits = 64, debug = True, posix = True )
 
-	def _compiled_source( self, active_target: dict[str,object] ) -> str:
+	def _compiled_source( self, active_target: ActiveTarget ) -> str:
 		discovery = Discovery( import_builtins = True, active_target = active_target )
 		compiler = Compiler( discovery )
 		compiler.import_code( self._FIXTURE, Path( '__main__.py' ), scope = None )
@@ -4468,7 +4469,7 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		end = src.index( '\n}', start )
 		return src[ start : end ]
 
-	def _compiled_source_no_crt( self, active_target: dict[str,object] ) -> str:
+	def _compiled_source_no_crt( self, active_target: ActiveTarget ) -> str:
 		# separate from _compiled_source above (which always passes emit_c()'s
 		# own no_crt=False default) - mainCRTStartup is only emitted when
 		# no_crt=True is passed to emit_c(), so this threads the compiler's

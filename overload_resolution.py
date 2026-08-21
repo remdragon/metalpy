@@ -2,11 +2,13 @@
 from dataclasses import dataclass
 import itertools
 import math
-from typing import Callable
+from typing import Callable, TypeVar as MyPyTypeVar
 
 # local imports:
 from errors import CompileError
 from mpy_types import Type, Function, Parameter, ConditionalDispatch, TypeVar
+
+T = MyPyTypeVar( 'T' )
 
 '''
 Resolves an overloaded call site to a runtime dispatch plan. Pure function
@@ -97,10 +99,10 @@ class _Candidate:
 	# module's own header comment). Such a slot accepts every leaf by
 	# construction (lowering.py monomorphizes T from whatever the real
 	# argument type turns out to be - see _lower_overload_generic_call), so
-	# it's treated as a wildcard everywhere below rather than as "required
-	# type: TypeVar" - the lowest-priority fallback when a concrete candidate
-	# also matches, never a source of the "no matching overload"/ambiguity
-	# errors on its own.
+	# it's treated as a wildcard everywhere below rather than as
+	# "required type: TypeVar" - the lowest-priority fallback when a concrete
+	# candidate also matches, never a source of the
+	# "no matching overload"/ambiguity errors on its own.
 	wildcard: tuple[bool,...]
 
 @dataclass( kw_only = True )
@@ -130,11 +132,11 @@ def _translate_indices( member: Function, call_slots: list[int|str] ) -> tuple[i
 		if isinstance( key, int ):
 			if key >= len( params ):
 				return None
-			idx = key
+			idx: int|None = key
 		else:
 			idx = next( ( i for i, p in enumerate( params ) if p.stem == key ), None )
-			if idx is None:
-				return None
+		if idx is None:
+			return None
 		indices.append( idx )
 		covered.add( idx )
 	if not all( i in covered or p.default is not None for i, p in enumerate( params ) ):
@@ -166,7 +168,9 @@ def stub_covers_call(
 		return False
 	params = stub.parameters or []
 	for slot, idx in zip( call_slots, indices ):
-		required = tuple( params[idx].type.leaves() )
+		param_type = params[idx].type
+		assert param_type is not None
+		required = tuple( param_type.leaves() )
 		if not all( _contains( required, leaf, same_type ) for leaf in arg_leaves[slot] ):
 			return False
 	return True
@@ -184,7 +188,12 @@ def _build_candidates( members: list[Function], call_slots: list[int|str], targe
 		params = member.parameters or []
 		target = targets[ id( member ) ]
 		target_params_list = target.parameters or []
-		required = tuple( tuple( params[i].type.leaves() ) for i in indices )
+		param_types: list[Type] = []
+		for i in indices:
+			param_type = params[i].type
+			assert param_type is not None
+			param_types.append( param_type )
+		required = tuple( tuple( pt.leaves() ) for pt in param_types )
 		wildcard = tuple( isinstance( params[i].type, TypeVar ) for i in indices )
 		target_params = tuple(
 			target_params_list[i] if i < len( target_params_list ) else params[i]
@@ -230,6 +239,10 @@ def _sweep(
 				misses.append( _State( slots = piece ))
 		prefix.append( inter )
 	return tuple( matched ), tuple( needs_check ), misses
+
+def not_none( value: T|None ) -> T:
+	assert value is not None, f'invalid {value=}'
+	return value
 
 def resolve_call(
 	stubs: list[Function],
@@ -286,9 +299,9 @@ def resolve_call(
 		key = lambda f: ( _is_wildcard_member( f ), f.line ),
 	)
 	plains = [ f for f in implementations if not f.is_overload ]
-	targets = {
-		**{ id( m ): ( m.bound_to if m in stubs else m ) for m in overload_members },
-		**{ id( p ): p for p in plains },
+	targets: dict[int,Function] = {
+		**{ id( m ): not_none( m.bound_to if m in stubs else m ) for m in overload_members },
+		**{ id( p ): not_none(p) for p in plains },
 	}
 
 	overload_candidates = _build_candidates( overload_members, call_slots, targets )
@@ -376,7 +389,7 @@ def resolve_call(
 	for target in distinct_targets:
 		own = [ c for c, t in combo_targets if t is target ]
 		others = [ c for c, t in combo_targets if t is not target ]
-		conditions: list[tuple[Parameter,Type]] = []
+		conditions = []
 		target_candidate = next( c for c in plain_candidates if c.target is target )
 		for i in range( len( call_slots )):
 			own_leaves = [ c[i] for c in own ]

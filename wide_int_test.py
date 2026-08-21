@@ -16,11 +16,12 @@ import tempfile
 import unittest
 
 # local imports:
+from compiler import Compiler
+from discovery import Discovery
 import emitter_c
 import linker_c
+import targets
 import test_support
-from compiler import Compiler
-from discovery import Discovery, _detect_active_target
 
 _CC = linker_c.detect_cc()
 _HAS_I128 = linker_c.has_i128( _CC )
@@ -31,7 +32,7 @@ class WideIntBehaviorTests( unittest.TestCase ):
 	def _run_program( self, code: str ) -> subprocess.CompletedProcess:
 		''' compiles `code` (a full MetalPy source with its own def main() ->
 		i32), links it, runs it, and returns the finished CompletedProcess. '''
-		active_target = _detect_active_target()
+		active_target = targets.detect()
 		active_target['has_i128'] = _HAS_I128
 		discovery = Discovery( import_builtins = True, active_target = active_target )
 		compiler = Compiler( discovery )
@@ -170,7 +171,7 @@ def main() -> i32:
 	x: u128 = u128(340282366920938463463374607431768211455)
 	return 0
 '''
-		active_target = _detect_active_target()
+		active_target = targets.detect()
 		active_target['has_i128'] = False
 		discovery = Discovery( import_builtins = True, active_target = active_target )
 		compiler = Compiler( discovery )

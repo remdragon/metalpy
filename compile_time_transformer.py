@@ -46,10 +46,14 @@ stays consistent with what the language actually supports:
 # stdlib imports:
 import ast
 import operator
-from typing import Callable
+from types import EllipsisType
+from typing import Any, Callable, TYPE_CHECKING, TypeVar
 
 # local imports:
 import fstring_format_spec
+from targets import ActiveTarget
+if TYPE_CHECKING:
+	import linker_c
 
 def _c_floordiv( a: object, b: object ) -> int:
 	''' C-style truncating division (quotient rounds toward zero) - this
@@ -78,12 +82,14 @@ def _c_mod( a: object, b: object ) -> int:
 	return r
 
 
-_BINOP_FNS: dict[type,object] = {
+T = TypeVar( 'T' )
+
+_BINOP_FNS: dict[type,Callable[[T,T],T]] = {
 	ast.Add: operator.add,
 	ast.Sub: operator.sub,
 	ast.Mult: operator.mul,
-	ast.FloorDiv: _c_floordiv,
-	ast.Mod: _c_mod,
+	ast.FloorDiv: _c_floordiv, # type: ignore[dict-item]
+	ast.Mod: _c_mod, # type: ignore[dict-item]
 	ast.BitAnd: operator.and_,
 	ast.BitOr: operator.or_,
 	ast.BitXor: operator.xor,
@@ -93,19 +99,19 @@ _BINOP_FNS: dict[type,object] = {
 	# exists in this language (see lowering.py's _BINOP_OPCODES comment) and
 	# neither has a runtime opcode to match against once unfolded
 }
-_CMP_FNS: dict[type,object] = {
+_CMP_FNS: dict[type,Callable[[T,T],Any]] = {
 	ast.Eq: operator.eq,
 	ast.NotEq: operator.ne,
-	ast.Lt: operator.lt,
-	ast.LtE: operator.le,
-	ast.Gt: operator.gt,
-	ast.GtE: operator.ge,
+	ast.Lt: operator.lt, # type: ignore[dict-item]
+	ast.LtE: operator.le, # type: ignore[dict-item]
+	ast.Gt: operator.gt, # type: ignore[dict-item]
+	ast.GtE: operator.ge, # type: ignore[dict-item]
 }
-_UNARY_FNS: dict[type,object] = {
+_UNARY_FNS: dict[type,Callable[[T],Any]] = {
 	ast.Not: operator.not_,
-	ast.USub: operator.neg,
-	ast.UAdd: operator.pos,
-	ast.Invert: operator.invert,
+	ast.USub: operator.neg, # type: ignore[dict-item]
+	ast.UAdd: operator.pos, # type: ignore[dict-item]
+	ast.Invert: operator.invert, # type: ignore[dict-item]
 }
 
 
@@ -135,7 +141,7 @@ def _is_compiler_has_library_call( node: ast.expr ) -> bool:
 
 
 class _ConstFolder( ast.NodeTransformer ):
-	def __init__( self, active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> None:
+	def __init__( self, active_target: ActiveTarget, detect_cc: 'Callable[[],linker_c.CcTool|None]|None' = None ) -> None:
 		self.active_target = active_target
 		# a CALLABLE, not an already-resolved CcTool - detect_cc() itself is
 		# cheap once cached (see Discovery._detect_cc), but this class is
@@ -167,7 +173,9 @@ class _ConstFolder( ast.NodeTransformer ):
 	def visit_Attribute( self, node: ast.Attribute ) -> ast.expr:
 		key = _is_compiler_target_query( node )
 		if key is not None and key in self.active_target:
-			return ast.copy_location( ast.Constant( value = self.active_target[key] ), node )
+			return ast.copy_location( ast.Constant(
+				value = self.active_target[key], # type: ignore
+			), node )
 		self.generic_visit( node )
 		return node
 
@@ -221,7 +229,7 @@ class _ConstFolder( ast.NodeTransformer ):
 		self.generic_visit( node )
 		if not all( isinstance( value, ast.Constant ) for value in node.values ):
 			return node
-		values = [ value.value for value in node.values ]
+		values = [ getattr( value, 'value' ) for value in node.values ]
 		is_and = isinstance( node.op, ast.And )
 		# Python's own short-circuit semantics: `and` returns the first falsy
 		# operand (or the last one, if none are), `or` the first truthy one
@@ -288,9 +296,10 @@ class _ConstFolder( ast.NodeTransformer ):
 
 		spec_text = None
 		if value.format_spec is not None:
-			if not all( isinstance( part, ast.Constant ) for part in value.format_spec.values ):
+			values = getattr( value.format_spec, 'values' )
+			if not all( isinstance( part, ast.Constant ) for part in values ):
 				return None # dynamic format spec - not foldable, matches lowering.py's own restriction
-			spec_text = ''.join( part.value for part in value.format_spec.values )
+			spec_text = ''.join( part.value for part in values )
 
 		if value.conversion in ( 114, 115 ): # '!r' or '!s' - a format spec, if present, applies to the RESULTING str (not the original value) - matches lowering.py's own _lower_fstring_part ordering
 			text = repr( v ) if value.conversion == 114 else str( v ) # str(v)/repr(v) here match metalpy's own int.__str__()/__repr__() exactly (plain decimal digits + optional leading '-', nothing else - see int_test.py's own round-trip assertions) - a genuine constant fold, not an approximation
@@ -323,7 +332,7 @@ class _ConstFolder( ast.NodeTransformer ):
 		ops = node.ops
 		
 		# First pass: try to resolve each adjacent pair
-		resolved = []  # List of either boolean constants or (left, op, right) tuples
+		resolved: list[ast.Constant|tuple[ast.expr,ast.cmpop,ast.expr]] = []  # List of either boolean constants or (left, op, right) tuples
 		
 		for i in range(len(ops)):
 			left = operands[i]
@@ -438,7 +447,7 @@ class _ConstFolder( ast.NodeTransformer ):
 		self.generic_visit( node )
 		if not isinstance( node.subject, ast.Constant ):
 			return node
-		value = node.subject.value
+		value: str|bytes|int|float|complex|None|EllipsisType = node.subject.value
 		for case in node.cases:
 			result = self._match_pattern( case.pattern, value )
 			if result is None:
@@ -455,11 +464,11 @@ class _ConstFolder( ast.NodeTransformer ):
 			return prologue + case.body
 		return [] # no case matched - same as Python's own match falling through with no effect
 
-	def _bind_stmt( self, name: str, value: object, node: ast.AST ) -> ast.Assign:
+	def _bind_stmt( self, name: str, value: str|bytes|int|float|complex|None|EllipsisType, node: ast.AST ) -> ast.Assign:
 		assign = ast.Assign( targets = [ ast.Name( id = name, ctx = ast.Store() ) ], value = ast.Constant( value = value ))
 		return ast.copy_location( assign, node )
 
-	def _match_pattern( self, pattern: ast.pattern, value: object ) -> tuple[bool,list[tuple[str,object]]]|None:
+	def _match_pattern( self, pattern: ast.pattern, value: str|bytes|int|float|complex|None|EllipsisType ) -> tuple[bool,list[tuple[str,str|bytes|int|float|complex|None|EllipsisType]]]|None:
 		''' returns (matched, bindings) for a pattern tested against a known
 		compile-time value, or None if this pattern shape can't be resolved
 		at compile time (MatchClass/MatchSequence/MatchMapping/MatchStar) '''
@@ -492,7 +501,7 @@ class _ConstFolder( ast.NodeTransformer ):
 		return None
 
 
-def transform_stmt_list( body: list[ast.stmt], active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> list[ast.stmt]:
+def transform_stmt_list( body: list[ast.stmt], active_target: ActiveTarget, detect_cc: 'Callable[[],linker_c.CcTool|None]|None' = None ) -> list[ast.stmt]:
 	'''
 	Folds compile-time-constant expressions, if/while/match statements, and
 	compiler.target.<key> queries in a list of statements. Works on function
@@ -513,12 +522,15 @@ def transform_stmt_list( body: list[ast.stmt], active_target: dict[str,object], 
 	return container.body
 
 
-def transform_function_body( body: list[ast.stmt], active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> list[ast.stmt]:
+def transform_function_body( body: list[ast.stmt], active_target: ActiveTarget, detect_cc: 'Callable[[],linker_c.CcTool|None]|None' = None ) -> list[ast.stmt]:
 	''' legacy name \u2014 just transform_stmt_list, kept for existing callers '''
 	return transform_stmt_list( body, active_target, detect_cc )
 
 
-def transform_expr( node: ast.expr, active_target: dict[str,object], detect_cc: 'Callable[[],object]|None' = None ) -> ast.expr:
+def transform_expr( node: ast.expr,
+	active_target: ActiveTarget,
+	detect_cc: 'Callable[[],linker_c.CcTool]|None' = None,
+) -> ast.expr:
 	''' single-expression sibling of transform_function_body - for contexts
 	that lower a bare expression rather than a statement list (a global
 	variable's or a class attribute's own initializer - see discovery.py's
@@ -527,4 +539,6 @@ def transform_expr( node: ast.expr, active_target: dict[str,object], detect_cc: 
 	wrapper = ast.Expr( value = node )
 	ast.copy_location( wrapper, node )
 	folded = transform_function_body( [ wrapper ], active_target, detect_cc )
-	return folded[0].value
+	value = getattr( folded[0], 'value' )
+	assert isinstance( value, ast.expr )
+	return value

@@ -3,10 +3,12 @@ import ast
 from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
-from typing import Callable, Union
+from typing import Callable, Union, TYPE_CHECKING
 
 # local imports:
 from errors import RedundantCompilationError
+if TYPE_CHECKING:
+	import ir
 
 # backs Variable.uid - see its own comment
 _variable_uid_counter = count()
@@ -194,7 +196,7 @@ class ScopeMixin:
 		`__allocate__` this way (see union_storage.py's _build_member_
 		constructor) '''
 		base = scope.base if isinstance( scope, Specialization ) else scope
-		return base is self
+		return base is self # type: ignore
 
 @dataclass( kw_only = True, repr = False )
 class Scalar( Type, ScopeMixin ):
@@ -446,7 +448,7 @@ class Parameter( Variable ):
 	is_move: bool = False
 	is_copy: bool = False
 
-def _ownership_annotation_error( t: 'Type', question: str ) -> AssertionError:
+def _ownership_annotation_error( t: 'Move|Copy', question: str ) -> AssertionError:
 	''' move[T]/copy[T] are an ownership STATUS on a binding, not types (see
 	Move's own docstring) - asking one whether it's reference-counted, or how
 	it's laid out in memory, is a category error, and the only honest answer
@@ -662,10 +664,11 @@ def _next_chain_node( base: 'InheritanceChainMixin|Specialization|None' ) -> 'In
 	all, so this is a no-op for every chain that doesn't involve an abstract
 	generic ancestor. '''
 	if isinstance( base, Specialization ):
+		assert isinstance( base.base, InheritanceChainMixin ), f'invalid {base.base=}'
 		return base.base
 	return base
 
-class InheritanceChainMixin:
+class InheritanceChainMixin( ScopeMixin ):
 	'''
 	shared single-inheritance-chain / vtable behaviour for the two class kinds
 	that have one: RCClass and CStruct. Both grew an identically-shaped
@@ -789,8 +792,8 @@ class InheritanceChainMixin:
 		KIND", not "the same class". Those two narrowing overrides are all that
 		remains of what used to be ten forwarding stubs. '''
 		node = self
-		while _next_chain_node( node.base ) is not None and not node.own_new_virtual_slots():
-			node = _next_chain_node( node.base )
+		while (next_node := _next_chain_node( node.base )) is not None and not node.own_new_virtual_slots():
+			node = next_node
 		return node
 
 	def virtual_slots( self ) -> list['Function']:
@@ -873,7 +876,7 @@ class Protocol( Type, ScopeMixin ): # @protocol class Foo:
 	def has_vtable( self ) -> bool: return False
 
 @dataclass( kw_only = True, repr = False )
-class RCClass( Type, ScopeMixin, InheritanceChainMixin ): # normal ref-counted class
+class RCClass( Type, InheritanceChainMixin ): # normal ref-counted class
 	# base is resolved eagerly at class-creation time, same as type_params -
 	# Python itself requires a base class to already exist when the `class
 	# Foo(Base):` statement runs, so there's no forward-reference case to
@@ -944,7 +947,7 @@ class ClosureType( RCClass ):
 	return_type: Type|None = None
 
 @dataclass( kw_only = True, repr = False )
-class CStruct( Type, ScopeMixin, InheritanceChainMixin ): # @cstruct class Foo:
+class CStruct( Type, InheritanceChainMixin ): # @cstruct class Foo:
 	# base is only meaningful for @interface CStructs (single inheritance,
 	# same "resolved eagerly at class-creation time" reasoning as
 	# RCClass.base above) - a plain (non-@interface) CStruct subclassing
@@ -1005,6 +1008,7 @@ class TaggedUnion( Type, ScopeMixin ): # @union class Foo: ... , also the backin
 		for attr in self.attributes:
 			if attr.resolve is not None:
 				attr.resolve()
+			assert attr.type is not None
 			result.append( attr.type )
 		return result
 
@@ -1248,12 +1252,13 @@ class Function( Type, ScopeMixin ):
 	# lowered (reachable from main()), never merely discovered.
 	requires_crt: bool = False
 
-def _leaf_is_accepted( leaf: Type, declared: Type ) -> bool:
+def _leaf_is_accepted( leaf: Type, declared: Type|None ) -> bool:
 	# identity-based deliberately, not `==` - Type dataclasses have structural
 	# equality (comparing every field, including mutable dicts/lists), which is
 	# both wrong and expensive for "is this the same type" here. The existing
 	# _get_or_create_union/_specialization/_move dedup caches already guarantee
 	# "the same type" is the same object within one Discovery instance.
+	assert declared is not None
 	return any( leaf is candidate for candidate in declared.leaves() )
 
 def _is_covered_by( narrow: Function, wide: Function ) -> bool:
@@ -1267,10 +1272,13 @@ def _is_covered_by( narrow: Function, wide: Function ) -> bool:
 		return False # one of them failed to resolve - can't reason about coverage
 	if len( narrow.parameters ) != len( wide.parameters ):
 		return False
-	return all(
-		all( _leaf_is_accepted( leaf, wide.parameters[i].type ) for leaf in narrow.parameters[i].type.leaves() )
-		for i in range( len( narrow.parameters ))
-	)
+	for i in range( len( narrow.parameters )):
+		narrow_param_type = narrow.parameters[i].type
+		assert narrow_param_type is not None
+		for leaf in narrow_param_type.leaves():
+			if not _leaf_is_accepted( leaf, wide.parameters[i].type ):
+				return False
+	return True
 
 def _overlaps( a: Function, b: Function ) -> bool:
 	''' some concrete call could satisfy both `a` and `b` simultaneously. Used for plain-implementation-vs-plain-implementation ambiguity. '''
@@ -1278,10 +1286,13 @@ def _overlaps( a: Function, b: Function ) -> bool:
 		return False # one of them failed to resolve - can't reason about overlap
 	if len( a.parameters ) != len( b.parameters ):
 		return False
-	return all(
-		any( _leaf_is_accepted( leaf, b.parameters[i].type ) for leaf in a.parameters[i].type.leaves() )
-		for i in range( len( a.parameters ))
-	)
+	for i in range( len( a.parameters )):
+		a_param_type = a.parameters[i].type
+		assert a_param_type is not None
+		b_param_type = b.parameters[i].type
+		if not any( _leaf_is_accepted( leaf, b_param_type ) for leaf in a_param_type.leaves() ):
+			return False
+	return True
 
 @dataclass( kw_only = True )
 class ConditionalDispatch:

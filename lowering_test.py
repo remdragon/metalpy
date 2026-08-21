@@ -8,10 +8,11 @@ import unittest
 # local imports:
 from compiler import Compiler, LoweredFunction
 import discovery
-from discovery import Discovery, _detect_active_target
+from discovery import Discovery
 from errors import CompileError
 import ir
 from mpy_types import Variable, Specialization, Function, ClosureType, TaggedUnion
+import targets
 
 logger = logging.getLogger( __name__ )
 
@@ -7589,7 +7590,7 @@ class Tests( unittest.TestCase ):
 			'def main() -> None:',
 			'	x: isize = 2147483648',
 		])
-		target32 = dict( _detect_active_target(), bits = 32 )
+		target32 = dict( targets.detect(), bits = 32 )
 		discovery32 = Discovery( import_builtins = False, active_target = target32 )
 		compiler32 = Compiler( discovery32 )
 		compiler32.import_code( code, filename = Path( '__test__.py' ))
@@ -7612,14 +7613,14 @@ class Tests( unittest.TestCase ):
 			'def main() -> None:',
 			'	x: u128 = 18446744073709551616', # 2**64, needs 65 bits
 		])
-		target_no_i128 = dict( _detect_active_target(), has_i128 = False )
+		target_no_i128: ActiveTarget = dict( targets.detect(), has_i128 = False )
 		discovery_no_i128 = Discovery( import_builtins = False, active_target = target_no_i128 )
 		compiler_no_i128 = Compiler( discovery_no_i128 )
 		compiler_no_i128.import_code( code, filename = Path( '__test__.py' ))
 		compiler_no_i128._lower( discovery_no_i128.main )
 		self.assertIn( 'is out of range for intrinsics.u128', discovery_no_i128.errors.errors[0] )
 
-		target_i128 = dict( _detect_active_target(), has_i128 = True )
+		target_i128: ActiveTarget = dict( targets.detect(), has_i128 = True )
 		discovery_i128 = Discovery( import_builtins = False, active_target = target_i128 )
 		compiler_i128 = Compiler( discovery_i128 )
 		compiler_i128.import_code( code, filename = Path( '__test__.py' ))

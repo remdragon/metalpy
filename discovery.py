@@ -5,7 +5,7 @@ from contextlib import contextmanager, nullcontext
 import itertools
 import platform
 from pathlib import Path
-from typing import Any, Callable, Generator, NoReturn
+from typing import Any, Callable, Generator, NoReturn, TYPE_CHECKING
 
 # local imports
 import compile_time_transformer
@@ -15,6 +15,10 @@ from mpy_types import (
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType, Protocol,
 	Module, _is_covered_by, _overlaps, int_stem_range,
 )
+import targets
+from targets import ActiveTarget
+if TYPE_CHECKING:
+	import linker_c
 
 def _collect_reachable_returns( stmts: list[ast.stmt] ) -> list[ast.Return]:
 	''' every ast.Return reachable anywhere within `stmts` (if/for/while/
@@ -86,31 +90,6 @@ def is_stub_body( body: list[ast.stmt] ) -> bool:
 
 class CompilerModule( Module ):
 	' TODO FIXME: put target object here and anything else needed'
-
-
-_HOST_OS_TO_TARGET_OS = {
-	'Windows': 'windows',
-	'Linux': 'linux',
-	'Darwin': 'macos',
-}
-_HOST_MACHINE_TO_TARGET_ARCH = {
-	'AMD64': 'x86_64',
-	'x86_64': 'x86_64',
-	'arm64': 'arm64',
-	'aarch64': 'arm64',
-}
-
-def _detect_active_target() -> dict[str,object]:
-	os_name = _HOST_OS_TO_TARGET_OS.get( platform.system(), platform.system().lower() )
-	arch = _HOST_MACHINE_TO_TARGET_ARCH.get( platform.machine(), platform.machine() )
-	# family is one of SYNTAX.md's FamilySpec literals ('unix'/'windows'/
-	# 'wasm') - 'posix' is a *separate* bool field on TargetQuery, not a
-	# family value
-	family = 'windows' if os_name == 'windows' else 'unix'
-	# debug=True by default (matches sys.alloc()'s existing debug-only
-	# zeroing behavior) - overridable via Discovery(active_target=...) same
-	# as every other key, until a real CLI exposes a release-build flag
-	return { 'os': os_name, 'arch': arch, 'family': family, 'bits': 64, 'debug': True, 'posix': family == 'unix' }
 
 
 def _folds_into_package( stem: str ) -> bool:
@@ -210,7 +189,7 @@ class Discovery( ast.NodeVisitor ):
 	def __init__( self,
 		paths: list[Path]|None = None,
 		import_builtins: bool = True,
-		active_target: dict[str,object]|None = None,
+		active_target: ActiveTarget|None = None,
 	) -> None:
 		self.paths: list[Path] = list( paths ) if paths else []
 		if not self.paths:
@@ -223,7 +202,7 @@ class Discovery( ast.NodeVisitor ):
 			# _find_module_for) silently treats the same file on disk as two
 			# different ones
 			self.paths.append( Path( '.' ).resolve() )
-		self.active_target = active_target if active_target is not None else _detect_active_target()
+		self.active_target = active_target if active_target is not None else targets.detect()
 		self.compiler_module = CompilerModule(
 			stem = 'compiler',
 			qualname = 'compiler',
@@ -238,7 +217,7 @@ class Discovery( ast.NodeVisitor ):
 		self.required_headers: set[str] = set()
 
 		self.module_stack: list[Module] = []
-		self.scope_stack: list[Module|ClassLike|Function] = []
+		self.scope_stack: list[Module|ClassLike|Function|Protocol] = []
 
 		# every module-level qualname claimed so far, mapped to the Name that
 		# claimed it - see _check_qualname_collisions() for what this is
@@ -715,6 +694,7 @@ class Discovery( ast.NodeVisitor ):
 		# specialization, which has no real source-level spelling at all
 		resolved = getattr( node, 'resolved_type', None )
 		if resolved is not None:
+			assert isinstance( resolved, Name )
 			return resolved
 		assert isinstance( node.ctx, ast.Load ), f'invalid context on {node=}' # internal invariant - Load is the only context an expression-position Name can have
 		name = self.find_name( node.id, node )
@@ -738,7 +718,9 @@ class Discovery( ast.NodeVisitor ):
 			name = 'str'
 		else:
 			self.fail( f'cannot resolve type of constant {value!r}', node )
-		return self.find_name( name, node )
+		obj = self.find_name( name, node )
+		assert isinstance( obj, Type )
+		return obj
 
 	def visit_Attribute( self, node: ast.Attribute ) -> Name:
 		base = self.visit( node.value )
@@ -748,6 +730,7 @@ class Discovery( ast.NodeVisitor ):
 		name_obj = names.get( node.attr )
 		if name_obj is None:
 			self.fail( f'{base.qualname} has no member {node.attr!r}', node )
+		assert isinstance( name_obj, Name )
 		return name_obj
 
 	def visit_BinOp( self, node: ast.BinOp ) -> TaggedUnion:
@@ -807,7 +790,9 @@ class Discovery( ast.NodeVisitor ):
 		flattened: list[Type] = []
 		for operand in operands:
 			if isinstance( operand, TaggedUnion ) and operand.file is None:
-				flattened.extend( attr.type for attr in operand.attributes )
+				for attr in operand.attributes:
+					assert attr.type is not None
+					flattened.append( attr.type )
 			else:
 				flattened.append( operand )
 		deduped: dict[str,Type] = {}
@@ -836,7 +821,7 @@ class Discovery( ast.NodeVisitor ):
 		self._unions[key] = union
 		return union
 
-	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|FixedArrayType|GeneratorType:
+	def visit_Subscript( self, node: ast.Subscript ) -> Specialization|Move|Copy|CallableType|TupleType|FixedArrayType|GeneratorType|ClosureType:
 		# move[T]/copy[T] are compiler syntax, not a real generic lookup -
 		# recognized textually here the same way @move is recognized
 		# textually as a decorator name in _parse_function, rather than
@@ -862,7 +847,9 @@ class Discovery( ast.NodeVisitor ):
 		if isinstance( node.value, ast.Name ) and node.value.id == 'Volatile':
 			if isinstance( node.slice, ast.Tuple ):
 				self.fail( f'Volatile[...] takes exactly one type argument: {ast.unparse(node)}', node )
-			return self.visit( node.slice )
+			obj = self.visit( node.slice )
+			assert obj is not None
+			return obj # type: ignore
 
 		# Aligned[N, T] - compiler syntax too, same "resolves transparently
 		# to plain T" posture as Volatile[T] just above (arithmetic/
@@ -883,7 +870,9 @@ class Discovery( ast.NodeVisitor ):
 				and ( n_node.value & ( n_node.value - 1 )) == 0
 			):
 				self.fail( f'Aligned[N, ...] - N must be a positive power-of-two integer literal: {ast.unparse(node)}', node )
-			return self.visit( type_node )
+			obj = self.visit( type_node )
+			assert obj is not None
+			return obj # type: ignore
 
 		# Callable[[Arg1,Arg2,...], Ret] - also compiler syntax (see
 		# PLAN_CALLABLE.md), recognized the same textual way as move/copy
@@ -898,7 +887,7 @@ class Discovery( ast.NodeVisitor ):
 			)
 			if not shape_ok:
 				self.fail( f"Callable[...] must look like Callable[[ArgType, ...], RetType]: {ast.unparse(node)}", node )
-			arg_nodes, ret_node = node.slice.elts
+			arg_nodes, ret_node = node.slice.elts # type: ignore
 			arg_types = [ self.visit( arg_node ) for arg_node in arg_nodes.elts ]
 			return_type = self.visit( ret_node )
 			return self._get_or_create_callable_type( arg_types, return_type )
@@ -917,7 +906,7 @@ class Discovery( ast.NodeVisitor ):
 			)
 			if not shape_ok:
 				self.fail( f"Closure[...] must look like Closure[[ArgType, ...], RetType]: {ast.unparse(node)}", node )
-			arg_nodes, ret_node = node.slice.elts
+			arg_nodes, ret_node = node.slice.elts # type: ignore
 			arg_types = [ self.visit( arg_node ) for arg_node in arg_nodes.elts ]
 			return_type = self.visit( ret_node )
 			return self._get_or_create_closure_type( arg_types, return_type )
@@ -944,7 +933,7 @@ class Discovery( ast.NodeVisitor ):
 				# parenthesized expression) - deferred rather than guessed
 				# at, see PLAN_TUPLE.md's own "Deferred" list
 				self.fail( f'tuple[...] needs at least 2 type arguments: {ast.unparse(node)}', node )
-			elem_types = [ self.visit( elt ) for elt in node.slice.elts ]
+			elem_types = [ self.visit( elt ) for elt in node.slice.elts ] # type: ignore
 			return self._get_or_create_tuple_type( elem_types )
 
 		# Iterator[T] - PLAN_GENERATORS.md. Recognized textually, same
@@ -1199,7 +1188,7 @@ class Discovery( ast.NodeVisitor ):
 		# never itself further subscripted, so unlike type_params there's
 		# no eager-resolution requirement here)
 		def resolve() -> None:
-			ptr_cls = self.get_intrinsics()['Ptr']
+			ptr_cls: Type = self.get_intrinsics()['Ptr'] # type: ignore
 			ptr_none_type = self._get_or_create_specialization( ptr_cls, [ self.get_none_type() ] )
 			fn_field = Variable( stem = 'fn', qualname = f'{key}.fn', file = cls.file, line = cls.line, type = ptr_none_type )
 			self_field = Variable( stem = 'self', qualname = f'{key}.self', file = cls.file, line = cls.line, type = ptr_none_type )

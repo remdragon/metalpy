@@ -158,3 +158,11 @@ print( x[0].unwrap() )
 
 These two things should be the same, why is the 2nd producing an automatic .or_return()?
 
+================================================================================
+
+need to take a careful look at this commit on master:
+
+9a464b8bc2488863bcac6f04a5adcaeb1eb7701a
+
+it clobbered my mpy.py --hide-warnings flag and I'm pretty sure some other
+enhancements were lost too

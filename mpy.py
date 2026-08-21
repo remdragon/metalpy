@@ -23,11 +23,12 @@ import sys
 import tempfile
 
 # local imports:
-import emitter_c
-import linker_c
 from compiler import Compiler
-from discovery import Discovery, _detect_active_target
+from discovery import ActiveTarget, Discovery
+import emitter_c
 from errors import CompileError
+import linker_c
+import targets
 
 def _parse_args() -> argparse.Namespace:
 	p = argparse.ArgumentParser(
@@ -83,15 +84,15 @@ def _default_output_path( source: Path, suffix: str ) -> Path:
 	_DIST_DIR.mkdir( parents = True, exist_ok = True )
 	return _DIST_DIR / ( source.stem + suffix )
 
-def _build_active_target( args: argparse.Namespace, cc: linker_c.CcTool|None ) -> dict[str,object]:
+def _build_active_target( args: argparse.Namespace, cc: linker_c.CcTool|None ) -> ActiveTarget:
 	'''
-	Build the active_target dict. Starts from _detect_active_target() just
+	Build the active_target dict. Starts from targets.detect() just
 	like Discovery does, then overrides debug based on --release and has_i128
 	based on the detected C compiler backend (`cc` must already be detected -
 	compile_time_transformer folds compiler.target.* eagerly, so this needs a
 	concrete answer before Discovery ever starts, not a lazily-resolved one).
 	'''
-	target = _detect_active_target()
+	target = targets.detect()
 	target['debug'] = not args.release
 	target['has_i128'] = linker_c.has_i128( cc )
 	return target

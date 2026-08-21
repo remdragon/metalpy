@@ -3289,6 +3289,7 @@ class TypeResolver:
 	def _build_field_teardown_ast( self, field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
 		''' recursively build AST statements to decref every RC leaf
 		reachable from field_expr, given its declared type. '''
+		assert field_type is not None, f'{field_expr=}'
 		base = field_type.base if isinstance( field_type, Specialization ) else field_type
 		line = field_expr.lineno if hasattr( field_expr, 'lineno' ) and field_expr.lineno else 1
 

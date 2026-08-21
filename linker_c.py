@@ -133,15 +133,15 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> bool:
 				os.chmod( tmp, 0o666 )
 			except OSError:
 				pass
+		last_e = None
 		for attempt in range( 3 ):
 			try:
 				os.replace( tmp, cache_file )
 				return True
 			except OSError as e:
-				if attempt == 2:
-					# give up publishing - see "best-effort" above
-					print( f'WARNING - metalpy: cannot publish cache file {cache_file} ({e}) - continuing without caching', file = sys.stderr )
-					return False
+				last_e = e
+		print( f'WARNING - metalpy: cannot publish cache file {cache_file} ({last_e}) - continuing without caching', file = sys.stderr )
+		return False
 	finally:
 		# never leave a stray .tmp behind - on the give-up path above, and on
 		# any exception from the writes themselves. Nothing reaps %TEMP%/metalpy
@@ -167,7 +167,7 @@ class CcTool:
 		asan: bool = False,
 		cflags: str = '',
 		warnings: bool = False,
-	) -> subprocess.CompletedProcess[bytes]:
+	) -> subprocess.CompletedProcess[str]:
 		''' compile a single .c file to a .o object file '''
 		# asan forces debug INFO on regardless of debug/release, so a crash
 		# report is symbolized - optimization level still follows debug/release
@@ -260,7 +260,7 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False ) -> subprocess.CompletedProcess[bytes]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False ) -> subprocess.CompletedProcess[str]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []

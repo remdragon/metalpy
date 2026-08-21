@@ -8,13 +8,13 @@ import unittest
 
 import test_support
 from test_support import RealCompileMixin
-from discovery import Discovery
+from discovery import ActiveTarget, Discovery
 from compiler import Compiler
 from pathlib import Path
 import emitter_c
 
 
-def _release_target() -> dict[str,object]:
+def _release_target() -> ActiveTarget:
 	# start from the real default (matches the host this suite actually
 	# runs on) and flip only 'debug' - active_target replaces the whole
 	# dict, so every other key (os/arch/family/bits/posix) has to survive

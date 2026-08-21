@@ -7,10 +7,10 @@ import compile_time_transformer as ctt
 import linker_c
 import test_support
 from compiler import Compiler
-from discovery import Discovery
+from discovery import ActiveTarget, Discovery
 
 
-def _fold( src: str, active_target: dict[str,object], detect_cc = None ) -> str:
+def _fold( src: str, active_target: ActiveTarget, detect_cc = None ) -> str:
 	body = ctt.transform_function_body( ast.parse( src ).body, active_target, detect_cc )
 	return '\n'.join( ast.unparse( stmt ) for stmt in body )
 
@@ -355,7 +355,7 @@ class TransformExprTests( unittest.TestCase ):
 	discovery.py's visit_Assign/visit_AnnAssign to fold a global/attribute
 	initializer, a context that never lowers a statement list at all '''
 
-	def _fold_expr( self, src: str, active_target: dict[str,object] ) -> str:
+	def _fold_expr( self, src: str, active_target: ActiveTarget ) -> str:
 		node = ast.parse( src, mode = 'eval' ).body
 		return ast.unparse( ctt.transform_expr( node, active_target ))
 
@@ -379,7 +379,7 @@ class TopLevelFoldingTests( unittest.TestCase ):
 	single write_all body with a compile-time-conditional TypeAlias instead of
 	two @compiler.target overloads. '''
 
-	def _fold_top( self, src: str, active_target: dict[str,object] ) -> str:
+	def _fold_top( self, src: str, active_target: ActiveTarget ) -> str:
 		body = ctt.transform_stmt_list( ast.parse( src ).body, active_target )
 		return '\n'.join( ast.unparse( stmt ) for stmt in body )
 
