@@ -31,9 +31,11 @@
 # floormod_i64 (lib/_civil_calendar.py) are used anywhere a negative operand
 # is possible.
 #
-# No strftime()/strptime() (arbitrary format strings) - isoformat()/__str__()
-# (ISO-8601) is the only string output in this pass; a documented scope cut,
-# not an oversight.
+# datetime.strftime() covers the common directives (%Y %y %m %d %H %I %M %S
+# %f %p %z %Z %a %A %b %B %j %%) - not locale-aware (%c/%x/%X), no week-of-
+# year (%U/%W/%V); date/time (the tzinfo-free calendar/clock-only classes)
+# don't get one of their own, only datetime does. strptime() (parsing) is
+# still not implemented - a documented scope cut, not an oversight.
 
 import compiler
 from _civil_calendar import days_from_civil, civil_from_days, weekday_from_days, days_in_month
@@ -427,6 +429,28 @@ def _format_utc_offset( offset_seconds: i32 ) -> str:
 		mm: i32 = ( abs_offset // 60 ) % 60
 	return f'{sign}{int(hh):02d}:{int(mm):02d}'
 
+def _format_utc_offset_no_colon( offset_seconds: i32 ) -> str:
+	''' '+HHMM' or '-HHMM' - strftime's own %z spelling (no colon), unlike
+	isoformat()'s. '''
+	sign: str = '+'
+	abs_offset: i32 = offset_seconds
+	if abs_offset < 0:
+		sign = '-'
+		with compiler.wrap_arithmetic:
+			abs_offset = -abs_offset
+	with compiler.panic_arithmetic( 'unreachable: divisors are non-zero literals' ):
+		hh: i32 = abs_offset // 3600
+		mm: i32 = ( abs_offset // 60 ) % 60
+	return f'{sign}{int(hh):02d}{int(mm):02d}'
+
+# 0=Sunday..6=Saturday - matches _civil_calendar.weekday_from_days' own
+# convention. Month lists are 1-indexed with a dummy '' at [0] so a plain
+# i32 month (1..12) indexes directly, no -1 offset to get wrong.
+_WEEKDAY_NAMES: list[str] = [ 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday' ]
+_WEEKDAY_ABBR:  list[str] = [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ]
+_MONTH_NAMES:   list[str] = [ '', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December' ]
+_MONTH_ABBR:    list[str] = [ '', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec' ]
+
 __date: TypeAlias = date
 __time: TypeAlias = time
 
@@ -682,3 +706,91 @@ class datetime:
 
 	def __str__( self ) -> str:
 		return self.isoformat()
+
+	def _strftime_field( self, spec: str, weekday: i32 ) -> str:
+		''' the substitution for a single %<spec> directive (spec is the one
+		character after '%') - split out of strftime() itself so that
+		method stays a plain scan loop. An unrecognized spec is echoed back
+		as '%<spec>' unchanged, matching real strftime's own common
+		behavior for a code it doesn't understand rather than dropping it
+		silently or panicking on user-supplied format text. '''
+		wd: usize = usize( weekday )
+		if spec == 'Y':
+			return f'{int(self.year):04d}'
+		if spec == 'y':
+			with compiler.panic_arithmetic( 'unreachable: divisor is a non-zero literal' ):
+				return f'{int(self.year % 100):02d}'
+		if spec == 'm':
+			return f'{int(self.month):02d}'
+		if spec == 'd':
+			return f'{int(self.day):02d}'
+		if spec == 'H':
+			return f'{int(self.hour):02d}'
+		if spec == 'I':
+			with compiler.panic_arithmetic( 'unreachable: divisor is a non-zero literal' ):
+				hour12: i32 = self.hour % 12
+			if hour12 == 0:
+				hour12 = 12
+			return f'{int(hour12):02d}'
+		if spec == 'M':
+			return f'{int(self.minute):02d}'
+		if spec == 'S':
+			return f'{int(self.second):02d}'
+		if spec == 'f':
+			return f'{int(self.microsecond):06d}'
+		if spec == 'p':
+			if self.hour >= 12:
+				return 'PM'
+			return 'AM'
+		if spec == 'z':
+			return _format_utc_offset_no_colon( self._utcoffset_seconds() )
+		if spec == 'Z':
+			return self.tzinfo.abbr( self._to_epoch_seconds() )
+		if spec == 'a':
+			return _WEEKDAY_ABBR.__getitem__( wd ).unwrap( 'strftime: weekday in 0..6 by construction' )
+		if spec == 'A':
+			return _WEEKDAY_NAMES.__getitem__( wd ).unwrap( 'strftime: weekday in 0..6 by construction' )
+		if spec == 'b':
+			return _MONTH_ABBR.__getitem__( usize( self.month )).unwrap( 'strftime: month in 1..12 by construction' )
+		if spec == 'B':
+			return _MONTH_NAMES.__getitem__( usize( self.month )).unwrap( 'strftime: month in 1..12 by construction' )
+		if spec == 'j':
+			with compiler.wrap_arithmetic:
+				day_of_year: i32 = i32( days_from_civil( self.year, self.month, self.day ) - days_from_civil( self.year, 1, 1 ) + 1 )
+			return f'{int(day_of_year):03d}'
+		if spec == '%':
+			return '%'
+		return '%' + spec
+
+	def strftime( self, fmt: str ) -> str:
+		''' arbitrary-format string output - the common directives (%Y %y
+		%m %d %H %I %M %S %f %p %z %Z %a %A %b %B %j %%), covering every
+		field CPython's own strftime supports except the locale-aware
+		aggregates (%c/%x/%X) and week-of-year (%U/%W/%V) - a documented
+		scope cut (see this module's own header comment), not an
+		oversight. A trailing lone '%' (no directive character after it,
+		i.e. i + 1 is out of bounds) is emitted as a literal '%' rather than
+		reading past the end of fmt. '''
+		result: str = ''
+		n: usize = fmt.__len__() # codepoint count - __getitem__ is codepoint-indexed, not byte_len()
+		i: usize = 0
+		weekday: i32 = weekday_from_days( days_from_civil( self.year, self.month, self.day ))
+		while i < n:
+			ch: str = fmt.__getitem__( i ).unwrap( 'strftime: index in bounds by construction' )
+			if ch != '%':
+				result = result + ch
+				with compiler.wrap_arithmetic:
+					i += 1
+				continue
+			with compiler.wrap_arithmetic:
+				spec_index: usize = i + 1
+			if spec_index >= n:
+				result = result + '%'
+				with compiler.wrap_arithmetic:
+					i += 1
+				continue
+			spec: str = fmt.__getitem__( spec_index ).unwrap( 'strftime: index in bounds by construction' )
+			result = result + self._strftime_field( spec, weekday )
+			with compiler.wrap_arithmetic:
+				i += 2
+		return result

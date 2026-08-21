@@ -116,7 +116,7 @@ def scenario() -> Result[i32, OSError]:
 	server_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	client_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	server: BareServer = BareServer( listener, app, server_flag )
-	client: BareClient = BareClient( addr.port(), client_flag )
+	client: BareClient = BareClient( addr.port, client_flag )
 	t_server: threading.Thread = threading.Thread( server.run )
 	t_client: threading.Thread = threading.Thread( client.run )
 	t_server.join()
@@ -235,7 +235,7 @@ def scenario() -> Result[i32, OSError]:
 	serve( listener, app.handle, r )
 
 	client_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
-	client: ClientDriver = ClientDriver( addr.port(), r, client_flag )
+	client: ClientDriver = ClientDriver( addr.port, r, client_flag )
 	t: threading.Thread = threading.Thread( client.run )
 	r.run()
 	t.join()

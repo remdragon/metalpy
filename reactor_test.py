@@ -250,7 +250,7 @@ def run() -> Result[i32, OSError]:
 	bound = server.getsockname().or_return()
 
 	client = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 
 	poller.set_nonblocking( conn.fileno() ).or_return()
@@ -316,7 +316,7 @@ def run() -> Result[i32, OSError]:
 	bound = server.getsockname().or_return()
 
 	client = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 
 	poller.set_nonblocking( conn.fileno() ).or_return()
@@ -421,7 +421,7 @@ def run() -> Result[i32, OSError]:
 	server.listen().or_return()
 	bound = server.getsockname().or_return()
 	client = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 	poller.set_nonblocking( conn.fileno() ).or_return()
 
@@ -520,7 +520,7 @@ def run() -> Result[i32, OSError]:
 	server.listen().or_return()
 	bound = server.getsockname().or_return()
 	client = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 	poller.set_nonblocking( conn.fileno() ).or_return()
 
@@ -585,7 +585,7 @@ def make_conn_pair() -> Result[tuple[socket.Socket, socket.Socket], OSError]:
 	server.listen().or_return()
 	bound = server.getsockname().or_return()
 	client = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 	poller.set_nonblocking( conn.fileno() ).or_return()
 	return Result.Ok(( conn, client ))

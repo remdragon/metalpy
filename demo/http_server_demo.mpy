@@ -4,7 +4,45 @@ from datetime import datetime
 import socket
 import threading
 import tcp
+import io
+import asyncfile
+from fs import SEEK_SET, SEEK_END
 from http.server import Request, Response, _handle_connection
+
+def _is_safe_relative_path( path: str ) -> bool:
+	''' rejects any '..' path segment outright - simplest correct check,
+	not full canonicalization. '''
+	segments: list[str] = path.split( '/' )
+	n: usize = segments.__len__()
+	i: usize = 0
+	for i in range( n ):
+		segment: str = segments.__getitem__( i ).unwrap( '_is_safe_relative_path: index in bounds by construction' )
+		if segment == '..':
+			return False
+	return True
+
+def _read_static_file( file_path: str ) -> Result[bytes, OSError]:
+	reader: BinaryReader = asyncfile.AsyncFile.binary_reader( file_path ).or_return()
+	size: i64 = reader.seek( i64( 0 ), SEEK_END ).or_return()
+	reader.seek( i64( 0 ), SEEK_SET ).or_return()
+	with compiler.panic_arithmetic( 'a real static file fits well within usize' ):
+		n: usize = usize( size )
+	buf: bytearray = bytearray( n )
+	io.read_exact( reader, buf.get_ptr(), n ).or_return()
+	return Result.Ok( bytes.from_bytearray( move( buf )))
+
+def _serve_static( path: str ) -> Response:
+	''' resolves path against the www/ subfolder next to this file and
+	serves it via async file I/O - the point being to exercise that path
+	under the reactor, not just sockets. '''
+	if not _is_safe_relative_path( path ):
+		return Response.text( 'Forbidden\n', 403, 'Forbidden' )
+	file_path: str = 'demo/www' + path
+	match _read_static_file( file_path ):
+		case Result.Ok( content ):
+			return Response.bytes_( content, 'text/html; charset=utf-8', 200, 'OK' )
+		case Result.Err( _ ):
+			return Response.text( 'Not Found\n', 404, 'Not Found' )
 
 class App:
 	def handle( self, req: Request ) -> Response:
@@ -15,7 +53,7 @@ class App:
 			case '/echo':
 				return Response.text( 'you asked for ' + req.path )
 			case _:
-				return Response.text( 'nope', 404, 'Not Found' )
+				return _serve_static( req.path )
 
 class BareServer:
 	__listener: tcp.TcpListener
@@ -29,13 +67,13 @@ class BareServer:
 		match self.__listener.accept():
 			case Result.Ok( conn ):
 				_handle_connection( conn, self.__app.handle )
-			case Result.Err( _ ):
-				print( 'error accepting connection' )
+			case Result.Err( e ):
+				print( f'error accepting connection: {e}' )
 
 def main() -> i32:
 	listener: tcp.TcpListener = tcp.TcpListener.bind( '127.0.0.1', u16( 0 )).unwrap( 'error binding default port' )
 	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
-	print( f'listening on port {addr.port()!r}' )
+	print( f'listening on port {addr.port!r}' )
 	app: App = App()
 
 	server: BareServer = BareServer( listener, app )

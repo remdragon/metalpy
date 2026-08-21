@@ -1920,6 +1920,69 @@ class Discovery( ast.NodeVisitor ):
 			ast.increment_lineno( stmt, node.lineno - 1 )
 		return synthesized
 
+	def _synthesize_cenum_str_method( self, class_name: str, node: ast.ClassDef, value_type: Scalar ) -> list[ast.FunctionDef]:
+		''' `def __str__( self ) -> str:` returning the matching member's own
+		declared name (e.g. OSError.WouldBlock.__str__() == 'WouldBlock'),
+		for printing/logging a CEnum value without every caller having to
+		hand-roll its own if-chain first. Member NAMES only, not their
+		numeric values, are needed here - unlike _register_enum_member
+		(which resolves each member's actual value, including '_' auto-
+		increment), this only needs the ordered list of declared names, read
+		straight off node.body before the class's own deferred .resolve()
+		would otherwise populate cls.values (see _register_enum_member's own
+		comment on why that's deferred). One `if self == {class_name}.
+		{member}: return '{member}'` per NAMED (non-'_') member, generated as
+		a source snippet and parsed - same reasoning as
+		_synthesize_cenum_comparison_methods' own docstring - relying on
+		whichever __eq__ this class ends up with (synthesized or
+		user-defined) exactly like every hand-written `if e != OSError.X`
+		comparison elsewhere in this codebase already does.
+
+		A member declared via the '_' auto-increment sentinel (e.g. OSError's
+		own `Other = _`) is deliberately EXCLUDED from the named if-chain -
+		confirmed with the user: such a member exists precisely to catch
+		values nothing else names, so printing its own bare member name back
+		would throw away the one piece of information worth keeping (which
+		underlying code it actually was). Any enum declaring at least one
+		such member instead falls through to `'{class_name}({raw})'` (e.g.
+		"OSError(42)") - raw extracted via a plain assignment to
+		value_type (`n: {value_type}; n = self`), not a T(x) call: CEnum<->
+		value_type is already bidirectionally assignable (_check_assignable,
+		lowering.py ~6849) even though `{value_type}(self)` construction-call
+		syntax is not (a separate code path, _try_lower_scalar_construct_call,
+		with no matching CEnum exemption - confirmed via a real compile
+		attempt rather than assumed). An enum with NO '_' member keeps the
+		original fixed placeholder instead, since every one of its values is
+		by construction a named member - reaching the fallback there would
+		mean a value came from somewhere outside this enum's own declared
+		members entirely (e.g. a raw bit-reinterpret), not an expected "some
+		other platform code" case. Skipped entirely (returns []) for an enum
+		with no members at all - nothing meaningful to synthesize. '''
+		member_names: list[str] = []
+		has_catchall = False
+		for stmt in node.body:
+			if not ( isinstance( stmt, ast.Assign ) and len( stmt.targets ) == 1 and isinstance( stmt.targets[0], ast.Name ) ):
+				continue
+			if isinstance( stmt.value, ast.Name ) and stmt.value.id == '_':
+				has_catchall = True
+				continue
+			member_names.append( stmt.targets[0].id )
+		if not member_names and not has_catchall:
+			return []
+		arms = '\n'.join(
+			f"\tif self == {class_name}.{name}:\n\t\treturn '{name}'"
+			for name in member_names
+		)
+		if has_catchall:
+			fallback = f"\traw: {value_type.stem} = self\n\treturn '{class_name}(' + raw.__str__() + ')'"
+		else:
+			fallback = f"\treturn '<unrecognized {class_name}>'"
+		source = f"def __str__( self ) -> str:\n{arms}\n{fallback}\n"
+		synthesized = ast.parse( source ).body
+		for stmt in synthesized:
+			ast.increment_lineno( stmt, node.lineno - 1 )
+		return synthesized
+
 	def _parse_ClassDef_CEnum( self, node: ast.ClassDef, qualname: str, value_type: Scalar ) -> CEnum:
 		module = self.module_stack[-1]
 		class_obj = CEnum(
@@ -1944,6 +2007,13 @@ class Discovery( ast.NodeVisitor ):
 		)
 		if not user_defined_comparison:
 			body = body + self._synthesize_cenum_comparison_methods( node.name, node )
+
+		user_defined_str = any(
+			isinstance( stmt, ast.FunctionDef ) and stmt.name == '__str__'
+			for stmt in node.body
+		)
+		if not user_defined_str:
+			body = body + self._synthesize_cenum_str_method( node.name, node, value_type )
 
 		try:
 			unresolved = self._shallow_class_body_scan( class_obj, body )

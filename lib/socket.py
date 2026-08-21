@@ -250,9 +250,11 @@ class SocketAddr:
 	__host: str
 	__port: u16
 
+	@property
 	def host( self ) -> str:
 		return self.__host
 
+	@property
 	def port( self ) -> u16:
 		return self.__port
 
@@ -979,7 +981,7 @@ def make_loopback_pair() -> tuple[Socket, Socket]:
 	listener.listen().unwrap( 'make_loopback_pair: listen failed' )
 	bound: SocketAddr = listener.getsockname().unwrap( 'make_loopback_pair: getsockname failed' )
 	side_b: Socket = Socket.tcp().unwrap( 'make_loopback_pair: connect-side create failed' )
-	side_b.connect( '127.0.0.1', bound.port() ).unwrap( 'make_loopback_pair: connect failed' )
+	side_b.connect( '127.0.0.1', bound.port ).unwrap( 'make_loopback_pair: connect failed' )
 	( side_a, _addr ) = listener.accept().unwrap( 'make_loopback_pair: accept failed' )
 	return ( side_a, side_b )
 
@@ -1056,7 +1058,7 @@ class RecvBuffer:
 # directly testable surface independent of a live TCP connect().
 #
 # port is irrelevant to a pure address lookup, so _resolve_v4/_v6 are called
-# with a dummy 0 and the port is dropped again (via SocketAddr.host()) rather
+# with a dummy 0 and the port is dropped again (via SocketAddr.host) rather
 # than exposing SocketAddr's own host+port pairing here, which would wrongly
 # imply the port means something.
 # ---------------------------------------------------------------------------
@@ -1068,10 +1070,10 @@ def resolve( host: str, family: i32 = AF_INET ) -> Result[list[str], OSError]:
 		candidates: list[SockAddrIn6] = _resolve_v6( host, u16( 0 ), SOCK_STREAM ).or_return()
 		for i in range( len( candidates )):
 			addr: SocketAddr = _sockaddr_in6_to_addr( candidates.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
-			out.append( addr.host() ).unwrap( 'resolve: append' )
+			out.append( addr.host ).unwrap( 'resolve: append' )
 	else:
 		candidates4: list[SockAddrIn] = _resolve_v4( host, u16( 0 ), SOCK_STREAM ).or_return()
 		for i in range( len( candidates4 )):
 			addr4: SocketAddr = _sockaddr_in_to_addr( candidates4.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
-			out.append( addr4.host() ).unwrap( 'resolve: append' )
+			out.append( addr4.host ).unwrap( 'resolve: append' )
 	return Result.Ok( out )

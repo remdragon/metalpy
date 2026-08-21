@@ -274,7 +274,7 @@ A `tuple[T0, T1, ...]`-typed value can be unpacked into individual names, either
 ```metalpy
 def accept_one( server: Socket ) -> Result[i32, OSError]:
 	( conn, addr ) = server.accept().or_return()   # Result[tuple[Socket, SocketAddr], OSError]
-	print( addr.host() )
+	print( addr.host )
 	conn.close()
 	return Result.Ok( 0 )
 

@@ -44,11 +44,11 @@ def main() -> i32:
 	server.bind( '127.0.0.1', u16( 0 )).unwrap( 'server bind' )
 	server.listen().unwrap( 'server listen' )
 	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
-	if bound.host() != '127.0.0.1':
+	if bound.host != '127.0.0.1':
 		return 1
 
 	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
-	client.connect( '127.0.0.1', bound.port() ).unwrap( 'client connect' )
+	client.connect( '127.0.0.1', bound.port ).unwrap( 'client connect' )
 
 	match server.accept():
 		case Result.Ok( pair ):
@@ -100,10 +100,10 @@ def run() -> Result[i32, OSError]:
 	bound: socket.SocketAddr = server.getsockname().or_return()
 
 	client: socket.Socket = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 
 	( conn, addr ) = server.accept().or_return()
-	if addr.host() != '127.0.0.1':
+	if addr.host != '127.0.0.1':
 		return Result.Ok( 1 )
 
 	msg: bytes = b'ping!'
@@ -143,7 +143,7 @@ def run() -> Result[i32, OSError]:
 	bound: socket.SocketAddr = server.getsockname().or_return()
 
 	client: socket.Socket = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 
 	payload: bytearray = bytearray( 200000 )
@@ -216,7 +216,7 @@ def run() -> Result[i32, OSError]:
 	bound: socket.SocketAddr = server.getsockname().or_return()
 
 	client: socket.Socket = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 
 	payload: bytearray = bytearray( 10000 )
@@ -269,7 +269,7 @@ def run() -> Result[i32, OSError]:
 	bound: socket.SocketAddr = server.getsockname().or_return()
 
 	client: socket.Socket = socket.Socket.tcp().or_return()
-	client.connect( '127.0.0.1', bound.port() ).or_return()
+	client.connect( '127.0.0.1', bound.port ).or_return()
 	( conn, _addr ) = server.accept().or_return()
 	client.close() # peer closes without ever sending anything
 
@@ -352,11 +352,11 @@ def main() -> i32:
 	server.bind( '::1', u16( 0 )).unwrap( 'server bind' )
 	server.listen().unwrap( 'server listen' )
 	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
-	if bound.host() != '::1':
+	if bound.host != '::1':
 		return 1
 
 	client: socket.Socket = socket.Socket.tcp( socket.AF_INET6 ).unwrap( 'client create' )
-	client.connect( '::1', bound.port() ).unwrap( 'client connect' )
+	client.connect( '::1', bound.port ).unwrap( 'client connect' )
 
 	match server.accept():
 		case Result.Ok( pair ):
@@ -390,7 +390,7 @@ def main() -> i32:
 	a2: socket.SocketAddr = u2.getsockname().unwrap( 'u2 getsockname' )
 
 	msg: bytes = b'udp!'
-	sent: usize = u1.sendto( msg.get_const_ptr(), usize( 4 ), '127.0.0.1', a2.port() ).unwrap( 'sendto' )
+	sent: usize = u1.sendto( msg.get_const_ptr(), usize( 4 ), '127.0.0.1', a2.port ).unwrap( 'sendto' )
 	if sent != usize( 4 ):
 		return 1
 
@@ -403,9 +403,9 @@ def main() -> i32:
 			return 2
 	if n != usize( 4 ):
 		return 3
-	if from_addr.port() != a1.port():
+	if from_addr.port != a1.port:
 		return 4
-	if from_addr.host() != '127.0.0.1':
+	if from_addr.host != '127.0.0.1':
 		return 5
 
 	u1.close()
@@ -429,7 +429,7 @@ def main() -> i32:
 	pA: socket.SocketAddr = sA.getsockname().unwrap( 'sA getsockname' )
 
 	sB: socket.Socket = socket.Socket.tcp().unwrap( 'sB create' )
-	match sB.bind( '127.0.0.1', pA.port() ):
+	match sB.bind( '127.0.0.1', pA.port ):
 		case Result.Ok( _ ):
 			return 1  # should have failed - address already in use
 		case Result.Err( e ):
@@ -453,7 +453,7 @@ def main() -> i32:
 
 	sB: socket.Socket = socket.Socket.tcp().unwrap( 'sB create' )
 	sB.set_reuseaddr( True ).unwrap( 'sB set_reuseaddr' )
-	sB.bind( '127.0.0.1', pA.port() ).unwrap( 'sB bind after close+reuseaddr' )
+	sB.bind( '127.0.0.1', pA.port ).unwrap( 'sB bind after close+reuseaddr' )
 	return 0
 '''
 
@@ -469,7 +469,7 @@ def main() -> i32:
 	sC.close()
 
 	sD: socket.Socket = socket.Socket.tcp().unwrap( 'sD create' )
-	match sD.connect( '127.0.0.1', pC.port() ):
+	match sD.connect( '127.0.0.1', pC.port ):
 		case Result.Ok( _ ):
 			return 1  # should have failed - nothing listening on pC's port
 		case Result.Err( e ):
@@ -507,7 +507,7 @@ def main() -> i32:
 	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
 
 	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
-	client.connect( 'localhost', bound.port() ).unwrap( 'client connect via hostname' )
+	client.connect( 'localhost', bound.port ).unwrap( 'client connect via hostname' )
 
 	match server.accept():
 		case Result.Ok( pair ):
@@ -533,7 +533,7 @@ def main() -> i32:
 	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
 
 	client: socket.Socket = socket.Socket.tcp( socket.AF_INET6 ).unwrap( 'client create' )
-	client.connect( 'localhost', bound.port() ).unwrap( 'client connect via hostname' )
+	client.connect( 'localhost', bound.port ).unwrap( 'client connect via hostname' )
 
 	match server.accept():
 		case Result.Ok( pair ):
@@ -579,7 +579,7 @@ def main() -> i32:
 	bound: socket.SocketAddr = server.getsockname().unwrap( 'server getsockname' )
 
 	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
-	client.connect( '127.0.0.1', bound.port() ).unwrap( 'client connect via IP literal' )
+	client.connect( '127.0.0.1', bound.port ).unwrap( 'client connect via IP literal' )
 
 	match server.accept():
 		case Result.Ok( pair ):

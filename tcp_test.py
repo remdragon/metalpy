@@ -91,7 +91,7 @@ def run() -> Result[i32, OSError]:
 	server_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	client_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	server = Server( listener, server_flag )
-	client = Client( addr.port(), client_flag )
+	client = Client( addr.port, client_flag )
 	t_server = threading.Thread( server.run )
 	t_client = threading.Thread( client.run )
 	t_server.join()
@@ -123,7 +123,7 @@ def run() -> Result[i32, OSError]:
 	server_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	client_flag: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
 	server = Server( listener, server_flag )
-	client = Client( addr.port(), client_flag )
+	client = Client( addr.port, client_flag )
 
 	r: reactor.Reactor = reactor.Reactor( 2 )
 	r.spawn( server.run )
