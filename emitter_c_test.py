@@ -10415,6 +10415,109 @@ def main() -> i32:
 		return 7
 	return 0
 ''' ),
+			# a FURTHER attribute hop chained on top of a narrowed single-
+			# level field (`self.field.other_field...`) - the narrowing fix
+			# above only ever resolves `self.field` ITSELF (via a synthetic
+			# 'self::field' key fed into cfg.py's narrow()/narrowed_member());
+			# a second hop's base is no longer a bare Name, so it never
+			# matched that key directly. The real lowering path
+			# (_expr_Attribute) already generalizes fine here since it
+			# recurses through _lower_expr, narrowing each bare-Name-based
+			# level as it goes - the gap was specifically in
+			# _static_type_of_value_expr (lowering.py), a SEPARATE,
+			# non-emitting helper _try_lower_indirect_call uses to decide
+			# whether a call's receiver is a field-typed Ptr[Callable]
+			# ("field call") vs an ordinary method - its own ast.Attribute
+			# branch never checked cfg.narrowed_member() the way its ast.Name
+			# sibling branch already did, so it always reported the field's
+			# plain declared (still-union) type. That crashed outright the
+			# moment a REAL method existed one hop further in
+			# (`self.field.other.real_method()`): _attr_lookup found no such
+			# attribute on the union at all, instead of gracefully returning
+			# None the way a genuinely non-callable shape does (which lets
+			# the ordinary method-call path take over and lower correctly,
+			# as it already does for the single-hop case above). Fix mirrors
+			# the ast.Name branch's own check; because
+			# _static_type_of_value_expr recurses on node.value, this
+			# generalizes past depth 2 for free - a THIRD hop
+			# (`self.box.holder.counter...`) works the same way, since only
+			# the innermost, bare-Name-based level is ever narrowed and
+			# everything past it is an ordinary (already-concrete) field
+			# lookup.
+			( 'attribute_chain_on_top_of_narrowed_field', '''
+class Counter:
+	n: i32
+	def __init__( self ) -> None:
+		self.n = 0
+	def bump( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			self.n = self.n + 1
+		return self.n
+
+class Holder:
+	counter: Counter
+	def __init__( self, counter: Counter ) -> None:
+		self.counter = counter
+
+class Box:
+	holder: Holder
+	def __init__( self, holder: Holder ) -> None:
+		self.holder = holder
+
+class Owner:
+	holder: Holder|None
+	box: Box|None
+	def __init__( self, holder: Holder|None, box: Box|None ) -> None:
+		self.holder = holder
+		self.box = box
+	# depth 2: self.holder is the narrowed field, .counter is the extra
+	# hop, .bump()/.n reach a real method/field two levels past the
+	# narrowing subject itself
+	def touch( self ) -> i32:
+		if self.holder is not None:
+			return self.holder.counter.bump()
+		return -1
+	def read_n( self ) -> i32:
+		if self.holder is not None:
+			return self.holder.counter.n
+		return -1
+	# depth 3: self.box is the narrowed field, .holder.counter are two
+	# further hops before reaching a real method/field
+	def touch_deep( self ) -> i32:
+		if self.box is not None:
+			return self.box.holder.counter.bump()
+		return -1
+	def read_n_deep( self ) -> i32:
+		if self.box is not None:
+			return self.box.holder.counter.n
+		return -1
+
+def main() -> i32:
+	c1 = Counter()
+	o = Owner( Holder( c1 ), Box( Holder( Counter() )))
+	if compiler.refcount( c1 ) != 2: # o.holder.counter + this local
+		return 1
+	if o.touch() != 1:
+		return 2
+	if o.touch() != 2:
+		return 3
+	if o.read_n() != 2:
+		return 4
+	if o.touch_deep() != 1:
+		return 5
+	if o.touch_deep() != 2:
+		return 6
+	if o.touch_deep() != 3:
+		return 7
+	if o.read_n_deep() != 3:
+		return 8
+	empty = Owner( None, None )
+	if empty.touch() != -1:
+		return 9
+	if empty.touch_deep() != -1:
+		return 10
+	return 0
+''' ),
 			# same single-level field narrowing as the case above, but for
 			# visit_While's Phase 7 (`while type(self.field) is T:`) and
 			# visit_Match's own wildcard-deduces-the-other-member narrowing
