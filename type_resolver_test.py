@@ -324,6 +324,131 @@ class TypeResolutionTests( unittest.TestCase ):
 		fn = self._resolved_fn( mod, 'main' )
 		src = ast.unparse( fn.node )
 		self.assertIn( '1 if x.tag != 1 and x.data.v_Val else 0', src )
+
+	# --- type(x) is T / instanceof() ---------------------------------------
+
+	def test_type_is_on_union_subject_rewrites_to_tag_compare( self ) -> None:
+		# the ORDINARY case (a real, runtime-varying subject) - contrast for
+		# the non-union fold tests below, confirming those don't regress
+		# this into a fold too
+		mod = self._import( '\n'.join([
+			'@union',
+			'class Maybe:',
+			'	Some: i32',
+			'	Nothing: None',
+			'',
+			'def main( x: Maybe ) -> bool:',
+			'	return type( x ) is i32',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'True', src )
+		self.assertNotIn( 'False', src )
+		self.assertIn( 'x.tag ==', src )
+
+	def test_type_is_on_matching_nonunion_type_folds_to_true( self ) -> None:
+		# type(x) is T was never real RTTI - only ever a TaggedUnion's own
+		# tag - so against a NON-union x, the answer is a pure compile-time
+		# fact: True only if T is exactly x's own declared type. Same fold
+		# `match type(x): case T(): ...` already had (_try_fold_match_type)
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main( x: Foo ) -> bool:',
+			'	return type( x ) is Foo',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'type(', src )
+		self.assertIn( 'return True', src )
+
+	def test_type_is_on_nonmatching_nonunion_type_folds_to_false( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'class Bar: pass',
+			'',
+			'def main( x: Foo ) -> bool:',
+			'	return type( x ) is Bar',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'type(', src )
+		self.assertIn( 'return False', src )
+
+	def test_type_is_not_on_matching_nonunion_type_negates_the_fold( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main( x: Foo ) -> bool:',
+			'	return type( x ) is not Foo',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'return False', src )
+
+	def test_instanceof_on_nonunion_type_folds_the_same_way( self ) -> None:
+		# instanceof(x, T) is sugar for type(x) is T (visit_Call) - same fold
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main( x: Foo ) -> bool:',
+			'	return instanceof( x, Foo )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'instanceof', src )
+		self.assertIn( 'return True', src )
+
+	def test_while_type_is_on_matching_nonunion_type_folds_to_while_true( self ) -> None:
+		# visit_While's own Phase 7 handling shares the identical fold
+		# (previously it never even reached visit_Compare's own rewrite for
+		# a declined shape at all - see while_type_is_nonnarrowable_subject_
+		# fixed.md/type_is_nonunion_constant_fold_shipped.md)
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'',
+			'def main( x: Foo ) -> i32:',
+			'	while type( x ) is Foo:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'type(', src )
+		self.assertIn( 'while True', src )
+
+	def test_while_type_is_on_nonmatching_nonunion_type_folds_to_while_false( self ) -> None:
+		mod = self._import( '\n'.join([
+			'class Foo: pass',
+			'class Bar: pass',
+			'',
+			'def main( x: Foo ) -> i32:',
+			'	while type( x ) is Bar:',
+			'		return 1',
+			'	return 0',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'type(', src )
+		self.assertIn( 'while False', src )
+
+	def test_type_is_on_unbound_typevar_defers_the_fold( self ) -> None:
+		# a still-generic function's own unbound T - nothing can be decided
+		# yet (not even "is this a union"). Must be left COMPLETELY
+		# untouched here (not folded, not errored) so the monomorphized
+		# copy's own independently deep-copied body gets a correct, fresh
+		# shot at this exact node once T is concretely bound - folding
+		# against the abstract TypeVar itself would permanently bake a
+		# wrong answer into this SHARED node (same concern _try_fold_match_
+		# type's own docstring documents at length)
+		mod = self._import( '\n'.join([
+			'def check[T]( x: T ) -> bool:',
+			'	return type( x ) is i32',
+		]))
+		fn = self._resolved_fn( mod, 'check' )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'type(x) is i32', src )
+
 	# --- match ------------------------------------------------------------
 
 	def test_match_union_rewrites_to_if_elif_chain( self ) -> None:
