@@ -10415,6 +10415,90 @@ def main() -> i32:
 		return 7
 	return 0
 ''' ),
+			# same single-level field narrowing as the case above, but for
+			# visit_While's Phase 7 (`while type(self.field) is T:`) and
+			# visit_Match's own wildcard-deduces-the-other-member narrowing
+			# - both used to be bare-Name-only, same restriction visit_If
+			# itself had, until _narrow_subject_key was factored out and
+			# shared by all three. Also exercises a regression the refactor
+			# introduced and fixed in the same pass: _type_of_expr's own
+			# ast.Attribute branch gained a narrowed-lookup (mirroring its
+			# ast.Name branch) so an inner re-check inside an already-
+			# narrowed field-branch degrades the same safe way the bare-
+			# Name case already did - which then needed a matching
+			# invalidation (visit_Assign/visit_AnnAssign's own Attribute-
+			# target branch) so a reassignment of the SAME field between
+			# the outer narrow and an inner re-check doesn't leave this
+			# pass's advisory tracker stale (confirmed via a real repro
+			# derived from the case above's own read_reassign method)
+			( 'while_and_match_field_narrowing_via_shared_helper', '''
+class Ops:
+	@abstractmethod
+	def do_read( self, v: i32 ) -> i32:
+		...
+
+class RealOps( Ops ):
+	@virtual
+	def do_read( self, v: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return v + 1
+
+class Holder:
+	fd: i32
+	aio: Ops|None
+	count: i32
+	def __init__( self, fd: i32, aio: Ops ) -> None:
+		self.fd = fd
+		self.aio = aio
+		self.count = 0
+	# while's own BODY narrowing: dispatch on self.aio inside the loop
+	def run_body( self ) -> i32:
+		total: i32 = 0
+		while type( self.aio ) is Ops:
+			with compiler.wrap_arithmetic:
+				total = total + self.aio.do_read( self.fd )
+				self.count = self.count + 1
+			if self.count >= 3:
+				self.aio = None
+		return total
+	# while's own EXIT narrowing: self.aio is provably NoneType once the
+	# loop's condition goes false - just confirm this compiles and a
+	# fresh is-not-None re-check afterward still reads the real value
+	def run_exit( self ) -> i32:
+		while type( self.aio ) is Ops:
+			self.aio = None
+		if self.aio is not None:
+			return 1
+		return 0
+
+class Box:
+	x: i32|None
+	def __init__( self, x: i32|None ) -> None:
+		self.x = x
+	# match's own wildcard-deduces-the-other-member narrowing on a field
+	def classify( self ) -> i32:
+		match self.x:
+			case None:
+				return -1
+			case _:
+				with compiler.wrap_arithmetic:
+					return self.x + 1
+
+def main() -> i32:
+	h = Holder( 5, RealOps() )
+	if h.run_body() != 18: # (5+1) three times
+		return 1
+	h2 = Holder( 5, RealOps() )
+	if h2.run_exit() != 0:
+		return 2
+	b1: Box = Box( 41 )
+	if b1.classify() != 42:
+		return 3
+	b2: Box = Box( None )
+	if b2.classify() != -1:
+		return 4
+	return 0
+''' ),
 			# `union_val == leaf` / `!=` - comparing a still-union-typed value
 			# directly against a leaf, with no match-based extraction needed
 			# first. Used to fall through to the plain dunder-or-flat-Cmp path,
