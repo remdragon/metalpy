@@ -58,7 +58,7 @@ import compiler
 import sys
 import base64
 import time
-from email._quoprimime import encode as _qp_encode, decode as _qp_decode
+from email.quoprimime import encode as _qp_encode, decode as _qp_decode
 from codecs.utf8 import utf8
 from codecs.ascii import ascii as _AsciiCodec
 from codecs.latin1 import latin1 as _Latin1Codec

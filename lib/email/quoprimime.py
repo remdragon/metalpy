@@ -1,9 +1,11 @@
 '''
-Quoted-printable (RFC 2045 section 6.7) encode/decode - the private helper
-module backing lib/email/message.py's Content-Transfer-Encoding:
-quoted-printable support and RFC 2047 'Q' encoded-words. No precedent exists
-anywhere else in this repo (unlike base64, which lib/base64.py already
-provides).
+Quoted-printable (RFC 2045 section 6.7) encode/decode - backs
+lib/email/message.py's Content-Transfer-Encoding: quoted-printable support
+and RFC 2047 'Q' encoded-words, and is public (mirrors Python's own
+email.quoprimime) for any other caller that just wants a standalone
+quoted-printable codec without going through email.message at all. No
+top-level quopri module exists in this repo - unlike base64, which
+lib/base64.py already provides - use this module directly instead.
 
 decode() is deliberately lenient (matches Python's own email.quoprimime /
 quopri modules): a soft line break ("=\\r\\n" or "=\\n") is removed, "=XX"
