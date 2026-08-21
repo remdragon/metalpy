@@ -10,7 +10,7 @@ class App:
 	def handle( self, req: Request ) -> Response:
 		match req.path:
 			case '/':
-				now = datetime.now().strftime( '%Y-%m-%d %H:%I:%S' )
+				now = datetime.now().strftime( '%Y-%m-%d %H:%I:%S%z %Z' )
 				return Response.text( f'hello from MetalPy http demo server @ {now}' )
 			case '/echo':
 				return Response.text( 'you asked for ' + req.path )
