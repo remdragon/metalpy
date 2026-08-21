@@ -45,15 +45,17 @@ class mmap:
 				return Result.Err( OSError( GetLastError() ))
 			with compiler.panic_arithmetic( 'file size does not fit in usize' ):
 				real_length = usize( size )
+		protect: u32
+		map_access: u32
 		if access == ACCESS_WRITE:
-			protect: u32 = PAGE_READWRITE
-			map_access: u32 = FILE_MAP_WRITE
+			protect = PAGE_READWRITE
+			map_access = FILE_MAP_WRITE
 		elif access == ACCESS_COPY:
-			protect: u32 = PAGE_READWRITE
-			map_access: u32 = FILE_MAP_COPY
+			protect = PAGE_READWRITE
+			map_access = FILE_MAP_COPY
 		else:
-			protect: u32 = PAGE_READONLY
-			map_access: u32 = FILE_MAP_READ
+			protect = PAGE_READONLY
+			map_access = FILE_MAP_READ
 		mapping: Ptr[None] = CreateFileMappingA( fileno, None, protect, 0, 0, None )
 		if mapping is None:
 			return Result.Err( OSError( GetLastError() ))
@@ -88,15 +90,17 @@ class mmap:
 			size: i64 = compiler.c_field( buf, 'st_size', i64 )
 			with compiler.panic_arithmetic( 'file size does not fit in usize' ):
 				real_length = usize( size )
+		prot: i32
+		flags: i32
 		if access == ACCESS_READ:
-			prot: i32 = PROT_READ
-			flags: i32 = MAP_SHARED
+			prot = PROT_READ
+			flags = MAP_SHARED
 		elif access == ACCESS_WRITE:
-			prot: i32 = PROT_READ | PROT_WRITE
-			flags: i32 = MAP_SHARED
+			prot = PROT_READ | PROT_WRITE
+			flags = MAP_SHARED
 		else:
-			prot: i32 = PROT_READ | PROT_WRITE
-			flags: i32 = MAP_PRIVATE
+			prot = PROT_READ | PROT_WRITE
+			flags = MAP_PRIVATE
 		result: Ptr[None] = _mmap( None, real_length, prot, flags, fileno, 0 )
 		if result == MAP_FAILED:
 			return Result.Err( OSError( get_errno() ))

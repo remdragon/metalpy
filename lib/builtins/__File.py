@@ -155,18 +155,19 @@ class File:
 		exists: bool|None = None,
 	) -> Result[BinaryWriter, OSError]:
 		access: u32 = GENERIC_WRITE
+		creation: u32
 		if exists is None:
 			if truncate:
-				creation: u32 = CREATE_ALWAYS
+				creation = CREATE_ALWAYS
 			else:
-				creation: u32 = OPEN_ALWAYS
+				creation = OPEN_ALWAYS
 		elif exists:
 			if truncate:
-				creation: u32 = TRUNCATE_EXISTING
+				creation = TRUNCATE_EXISTING
 			else:
-				creation: u32 = OPEN_EXISTING
+				creation = OPEN_EXISTING
 		else:
-			creation: u32 = CREATE_NEW
+			creation = CREATE_NEW
 		fd: FD = open_raw( path.get_cstr(), access, creation ).or_return()
 		if append:
 			seek_raw( fd, 0, SEEK_END ).or_return()
@@ -206,18 +207,19 @@ class File:
 		exists: bool|None = None,
 	) -> Result[BinaryReadWriter, OSError]:
 		access: u32 = GENERIC_READ | GENERIC_WRITE
+		creation: u32
 		if exists is None:
 			if truncate:
-				creation: u32 = CREATE_ALWAYS
+				creation = CREATE_ALWAYS
 			else:
-				creation: u32 = OPEN_ALWAYS
+				creation = OPEN_ALWAYS
 		elif exists:
 			if truncate:
-				creation: u32 = TRUNCATE_EXISTING
+				creation = TRUNCATE_EXISTING
 			else:
-				creation: u32 = OPEN_EXISTING
+				creation = OPEN_EXISTING
 		else:
-			creation: u32 = CREATE_NEW
+			creation = CREATE_NEW
 		fd: FD = open_raw( path.get_cstr(), access, creation ).or_return()
 		if append:
 			seek_raw( fd, 0, SEEK_END ).or_return()

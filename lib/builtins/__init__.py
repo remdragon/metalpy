@@ -546,12 +546,14 @@ class str:
 		offset: usize = 0
 
 		for i in range( count ):
-			part: str = parts.get_unchecked( i )
-			compiler.incref( part )
+			# distinct name from the sizing loop's own `part` above - a
+			# variable's type is only ever declared once per function
+			copy_part: str = parts.get_unchecked( i )
+			compiler.incref( copy_part )
 			with compiler.panic_arithmetic( 'irrational string length' ):
-				part_len: usize = part.__byte_size - 1
+				part_len: usize = copy_part.__byte_size - 1
 			with compiler.wrap_arithmetic:
-				sys.memcpy( new_buf + offset, part.__data, part_len )
+				sys.memcpy( new_buf + offset, copy_part.__data, part_len )
 				offset += part_len
 
 		new_buf[offset] = 0 # guarantee null termination
@@ -1823,26 +1825,29 @@ class str:
 		# can't use cstrlen() here, we can only check to make sure the terminating 0 exists where expected
 		if byte_size_including_zero_terminator == 0:
 			return Result.Err( CodecError( 'utf-8', 'empty buffer' ))
-		byte_len: usize
+		text_len: usize
 		with compiler.wrap_arithmetic: # guaranteed to be > 0
-			byte_len = byte_size_including_zero_terminator - 1
-		if ptr[byte_len] != 0:
+			text_len = byte_size_including_zero_terminator - 1
+		if ptr[text_len] != 0:
 			return Result.Err( CodecError( 'utf-8', 'missing 0-terminator' ))
 
 		# sparse codepoint-position index (see __index's own field comment) -
 		# built alongside the validation scan below at zero extra passes.
-		with compiler.panic_arithmetic( 'index sizing bounded by byte_size, cannot overflow' ):
+		# Named char_index, not index - str.index() is a real instance
+		# method, and this language has no local-shadows-outer-scope
+		# semantics (see _existing_local_or_none's own comment).
+		with compiler.panic_arithmetic( 'char_index sizing bounded by byte_size, cannot overflow' ):
 			entries: usize = ( byte_size_including_zero_terminator >> 8 ) + 1
-		index: Ptr[usize] = sys.alloc[usize]( entries )
-		errdefer( sys.free( index ))
+		char_index: Ptr[usize] = sys.alloc[usize]( entries )
+		errdefer( sys.free( char_index ))
 		char_count: usize = 0
 
 		# walk through ptr and confirm valid utf-8 encoding or return CodecError
 		i: usize = 0
-		with compiler.panic_arithmetic( 'bounded by byte_len, cannot overflow ' ):
-			while i < byte_len:
+		with compiler.panic_arithmetic( 'bounded by text_len, cannot overflow ' ):
+			while i < text_len:
 				if ( char_count & 0xFF ) == 0:
-					index[char_count >> 8] = i
+					char_index[char_count >> 8] = i
 				byte1 = ptr[i]
 
 				# 1-byte sequence (ASCII): 0xxxxxxx
@@ -1857,7 +1862,7 @@ class str:
 				
 				# 2-byte sequence: 110xxxxx 10xxxxxx
 				elif (byte1 & 0xE0) == 0xC0:
-					if i + 1 >= byte_len:
+					if i + 1 >= text_len:
 						return Result.Err( CodecError( 'utf-8', 'Truncated 2-byte sequence' ))
 					# Overlong encoding check: code point must be >= U+0080
 					if byte1 < 0xC2:
@@ -1870,7 +1875,7 @@ class str:
 
 				# 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
 				elif (byte1 & 0xF0) == 0xE0:
-					if i + 2 >= byte_len:
+					if i + 2 >= text_len:
 						return Result.Err( CodecError( 'utf-8', 'Truncated 3-byte sequence' ))
 					byte2 = ptr[i + 1]
 					byte3 = ptr[i + 2]
@@ -1887,7 +1892,7 @@ class str:
 
 				# 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
 				elif (byte1 & 0xF8) == 0xF0:
-					if i + 3 >= byte_len:
+					if i + 3 >= text_len:
 						return Result.Err( CodecError( 'utf-8', 'Truncated 4-byte sequence' ))
 					byte2 = ptr[i + 1]
 					byte3 = ptr[i + 2]
@@ -1913,7 +1918,7 @@ class str:
 			__data = ptr,
 			__byte_size = byte_size_including_zero_terminator,
 			__char_count = char_count,
-			__index = index,
+			__index = char_index,
 		)
 		return Result.Ok( s )
 

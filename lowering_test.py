@@ -509,6 +509,145 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 
+	def test_annotated_redeclaration_without_del_is_a_compile_error_same_type( self ) -> None:
+		# `x: int; x: int` (equal types, no del, straight-line - no
+		# branching at all) is STILL a redeclaration error: an explicit
+		# type annotation is only ever given once per variable, full stop
+		# - matching types doesn't exempt it, only `del` does. This is
+		# the direct counterpart to the del-then-redeclare test above,
+		# which is allowed for exactly the reason this isn't: del ends
+		# the old binding's lifetime first, this doesn't.
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = 1',
+			'	x: i32 = 2',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'x' already has a declared type", str( self.discovery.errors.errors[0] ))
+
+	def test_annotated_redeclaration_without_del_is_a_compile_error_different_type( self ) -> None:
+		# the exact scenario that motivated this whole diagnostic: no del,
+		# genuinely incompatible types - must be rejected, not silently
+		# accepted (which is what used to happen before _stmt_AnnAssign
+		# started checking for an existing binding at all - see del_
+		# reuse_and_emitter_naming_bug)
+		code = '\n'.join([
+			'import builtins',
+			'def main() -> None:',
+			'	x: i32 = 1',
+			'	x: builtins.str = "hello"',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'x' already has a declared type", str( self.discovery.errors.errors[0] ))
+
+	def test_annotated_redeclaration_across_branches_is_a_compile_error( self ) -> None:
+		# the if/elif/else-arm variant of the two tests above - even
+		# though the two arms are mutually exclusive at runtime (only one
+		# ever actually executes), fn.names is function-flat with no
+		# block scoping (see cfg.py's own module docstring), so `x` from
+		# the first arm is STILL a live, already-declared binding by the
+		# time the second arm's own `x: i32 = ...` is reached. This is
+		# exactly the pattern lib/builtins/__File.py's own `creation`
+		# local used to follow (and had to be rewritten away from - see
+		# this fix's own commit message) - the valid replacement is a
+		# bare `x: i32` declared once before the chain, then a plain
+		# (un-annotated) `x = ...` per arm, covered by emitter_c_test.py's
+		# AnnotatedLocalRedeclaredAcrossBranchesRealCompileTests.
+		code = '\n'.join([
+			'def main( a: bool ) -> None:',
+			'	if a:',
+			'		x: i32 = 1',
+			'	else:',
+			'		x: i32 = 2',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'x' already has a declared type", str( self.discovery.errors.errors[0] ))
+
+	def test_bare_reassignment_across_branches_is_still_allowed( self ) -> None:
+		# the control case distinguishing "an explicit type annotation is
+		# only given once" from "a variable can only ever be assigned
+		# once" - they're NOT the same rule. A bare (un-annotated,
+		# INFERRED-type) `x = ...` repeated once per arm of an if/else is
+		# an ordinary reassignment to the SAME binding (the type is fixed
+		# by whichever assignment reaches it first - see _stmt_Assign's
+		# own "reuse existing" branch), ordinary and unaffected by the
+		# annotated-redeclaration checks the tests above cover.
+		code = '\n'.join([
+			'def main( a: bool ) -> None:',
+			'	x: i32',
+			'	if a:',
+			'		x = 1',
+			'	else:',
+			'		x = 2',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_global_reassignment_from_inside_a_function_still_works( self ) -> None:
+		# _existing_local_or_none (shared by _stmt_Assign/_stmt_AnnAssign/
+		# _expr_NamedExpr/_bind_loop_target) needed to grow a genuine
+		# MODULE-scope fallback once _stmt_AnnAssign started calling it at
+		# all - fn.names alone (the CURRENT function's own scope) can't
+		# see a module-level global at all, and _stmt_Global is
+		# deliberately a no-op (see its own comment) that relies entirely
+		# on this fallback existing. A real, confirmed regression along
+		# the way: restricting the lookup to fn.names alone made `global
+		# x; x = value` look like a fresh LOCAL instead of a reassignment,
+		# silently shadowing the real global.
+		code = '\n'.join([
+			'x: i32 = 1',
+			'def bump() -> None:',
+			'	global x',
+			'	x = x + 1',
+			'def main() -> i32:',
+			'	bump()',
+			'	bump()',
+			'	return x',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_local_may_shadow_an_enclosing_class_method_of_the_same_name( self ) -> None:
+		# this language has no local-shadows-outer-scope semantics for a
+		# MODULE-level name (see _stmt_Global's own comment - assigning an
+		# already-visible module name always reassigns it, never shadows)
+		# - but a method body's own locals are still free to shadow an
+		# unrelated CLASS MEMBER of the same name, the same way any
+		# nested Python scope shadows an enclosing one. A real, confirmed
+		# regression along the way: str._from_owned_cstr's own local
+		# named byte_len (now renamed to text_len, but exercised here
+		# under its original name against a minimal repro class) started
+		# getting rejected as "not a variable, cannot assign to it" once
+		# _stmt_AnnAssign began walking the full enclosing-scope chain -
+		# find_name_or_none reached the CLASS's own byte_len() method
+		# before ever finding "no local yet" and stopping.
+		code = '\n'.join([
+			'class Box:',
+			'	def byte_len( self ) -> i32:',
+			'		return 5',
+			'	def describe( self ) -> i32:',
+			'		byte_len: i32 = 3',
+			'		return byte_len',
+			'def main() -> i32:',
+			'	b: Box = Box()',
+			'	return b.describe()',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_del_between_match_statements_allows_reusing_binding_name_with_incompatible_type( self ) -> None:
 		# ties directly to test_match_binding_name_reused_with_incompatible_
 		# type_gets_a_clear_diagnostic above: THAT test's whole point is
@@ -1860,12 +1999,25 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_if_with_else_shape( self ) -> None:
+		# b declared bare, ONCE, before the if/else - not `b: i32 = 1`/
+		# `b: i32 = 2` once per arm (that pattern is now a redeclaration
+		# error - an explicit type annotation is only ever given once per
+		# variable, even across mutually exclusive branches - see
+		# test_annotated_redeclaration_across_branches_is_a_compile_error
+		# below). Both arms' own `b = ...` are ordinary, INFERRED-type-
+		# already-established reassignments to the SAME b, matching the
+		# "type set on first [here, the bare] assignment, even within a
+		# branch" rule - so this IR shape has only ONE b Variable object,
+		# not two, and the bare declaration itself emits no instruction at
+		# all (ir.DeclareLocal is reserved for a narrower, unrelated
+		# @inline-splice case - see its own docstring)
 		code = '\n'.join([
 			'def main( a: bool ) -> None:',
+			'	b: i32',
 			'	if a:',
-			'		b: i32 = 1',
+			'		b = 1',
 			'	else:',
-			'		b: i32 = 2',
+			'		b = 2',
 			'	return',
 		])
 		self._import( code )
@@ -1874,16 +2026,15 @@ class Tests( unittest.TestCase ):
 		if self.discovery.main.resolve is not None:
 			self.discovery.main.resolve()
 		a = self.discovery.main.parameters[0]
-		b_then = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 3, type = i32 )
-		b_else = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 5, type = i32 )
+		b = Variable( stem = 'b', qualname = 'main.b', file = Path( '__test__.py' ), line = 2, type = i32 )
 		fn = self._lower_main()
 		self._assert_ir( fn, [
 			ir.FuncStart( name = 'main', params = [ a ], return_type = none_type ),
 			ir.JumpIfFalse( cond = a, target = '__if_else_0__' ),
-			ir.Assign( dest = b_then, src = ir.Const( type = i32, value = 1 )),
+			ir.Assign( dest = b, src = ir.Const( type = i32, value = 1 )),
 			ir.Jump( target = '__if_end_1__' ),
 			ir.Label( name = '__if_else_0__' ),
-			ir.Assign( dest = b_else, src = ir.Const( type = i32, value = 2 )),
+			ir.Assign( dest = b, src = ir.Const( type = i32, value = 2 )),
 			ir.Label( name = '__if_end_1__' ),
 			ir.Return( value = None ),
 			ir.FuncEnd( name = 'main' ),
@@ -1892,17 +2043,22 @@ class Tests( unittest.TestCase ):
 	def test_if_elif_else_chains_via_nested_orelse( self ) -> None:
 		# elif is just a nested If inside orelse in the AST - confirms it
 		# "just works" through the same recursive _lower_stmt dispatch, no
-		# special-casing needed
+		# special-casing needed. x declared bare, ONCE, before the chain -
+		# not `x: i32 = 1`/`= 2`/`= 3` once per arm (a redeclaration error -
+		# an explicit type annotation is only ever given once per variable,
+		# even across mutually exclusive branches - see
+		# test_annotated_redeclaration_across_branches_is_a_compile_error)
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: bool = True',
 			'	c: bool = True',
+			'	x: i32',
 			'	if a:',
-			'		x: i32 = 1',
+			'		x = 1',
 			'	elif c:',
-			'		x: i32 = 2',
+			'		x = 2',
 			'	else:',
-			'		x: i32 = 3',
+			'		x = 3',
 			'	return',
 		])
 		self._import( code )

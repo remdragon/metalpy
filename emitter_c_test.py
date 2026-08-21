@@ -8665,11 +8665,11 @@ def main() -> i32:
 	j: usize = 0
 	with compiler.wrap_arithmetic:
 		while j < 50:
-			key: i32 = compiler.cast( i32, j )
-			r: Result[i32,KeyError] = d.__getitem__( key )
+			lookup_key: i32 = compiler.cast( i32, j )
+			r: Result[i32,KeyError] = d.__getitem__( lookup_key )
 			if r.is_err():
 				return 2
-			if r.unwrap( 'x' ) != key * 2:
+			if r.unwrap( 'x' ) != lookup_key * 2:
 				return 3
 			j += 1
 	return 0
@@ -19983,32 +19983,37 @@ def main() -> i32:
 
 
 class AnnotatedLocalRedeclaredAcrossBranchesRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
-	''' companion to DelRedeclareRealCompileTests' own genuinely-different-
-	type case: the SAME-type-both-times pattern, but produced WITHOUT del
-	at all - re-declaring an annotated local (`x: T = ...`) once per arm
-	of a plain if/elif/else chain is a normal, working, and (per lib/
-	builtins/__File.py's own `creation` local) actually-used pattern.
-	lowering.py's _stmt_AnnAssign always constructs a fresh Variable
-	object per arm (no "already declared" check, unlike a bare `x = ...`)
-	- exercising Variable.needs_uid_suffix's own compatible-reuse path
-	(see its docstring), not just the incompatible-collision path the del
-	tests above cover. Each arm below is reached via a DIFFERENT runtime
-	condition, so this only passes if the merged control flow really does
-	share one piece of storage across all three arms - a naive "always
-	suffix every redeclaration" fix would instead read back whichever
-	arm's OWN uninitialized storage happened to follow it in memory. '''
+	''' a variable's explicit type annotation (`x: T = ...`) is only ever
+	given ONCE per function - even a same-type redeclaration once per arm
+	of a plain if/elif/else chain, with no del in between, is a genuine
+	compile error now (see lowering.py's _stmt_AnnAssign and
+	test_annotated_redeclaration_across_branches_is_a_compile_error in
+	lowering_test.py for the direct diagnostic check). The VALID way to
+	get a value out of an if/elif/else chain is what lib/builtins/
+	__File.py's own `creation` local actually does: declare the local
+	BARE once, before the chain, then a plain (un-annotated) `result =
+	...` per arm - INFERRED-type reassignment, not a second declaration,
+	so it's allowed to repeat across branches (see _stmt_Assign's own
+	"reuse existing" path). This class exercises exactly that corrected
+	pattern as a real compile-and-run check: each arm below is reached
+	via a DIFFERENT runtime condition, so this only passes if the merged
+	control flow really does share one piece of storage across all three
+	arms - a naive "give every local its own storage" fix would instead
+	read back whichever arm's OWN uninitialized storage happened to
+	follow it in memory. '''
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_programs_compile_and_run( self ) -> None:
 		self.assert_programs_run([
 			( 'first_arm', '''
 def classify( n: i32 ) -> i32:
+	result: i32
 	if n < 0:
-		result: i32 = -1
+		result = -1
 	elif n == 0:
-		result: i32 = 0
+		result = 0
 	else:
-		result: i32 = 1
+		result = 1
 	return result
 
 def main() -> i32:
@@ -20018,12 +20023,13 @@ def main() -> i32:
 ''' ),
 			( 'second_arm', '''
 def classify( n: i32 ) -> i32:
+	result: i32
 	if n < 0:
-		result: i32 = -1
+		result = -1
 	elif n == 0:
-		result: i32 = 0
+		result = 0
 	else:
-		result: i32 = 1
+		result = 1
 	return result
 
 def main() -> i32:
@@ -20033,12 +20039,13 @@ def main() -> i32:
 ''' ),
 			( 'third_arm', '''
 def classify( n: i32 ) -> i32:
+	result: i32
 	if n < 0:
-		result: i32 = -1
+		result = -1
 	elif n == 0:
-		result: i32 = 0
+		result = 0
 	else:
-		result: i32 = 1
+		result = 1
 	return result
 
 def main() -> i32:

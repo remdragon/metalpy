@@ -832,14 +832,16 @@ class Socket:
 		return _listen_raw( self.__sock, backlog )
 
 	def accept( self ) -> Result[tuple[Socket, SocketAddr], OSError]:
+		conn: SOCKET
+		peer_addr: SocketAddr
 		if self.__family == AF_INET6:
 			peer: SockAddrIn6 = SockAddrIn6()
-			conn: SOCKET = _accept_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( peer )), compiler.sizeof( SockAddrIn6 )).or_return()
-			peer_addr: SocketAddr = _sockaddr_in6_to_addr( peer ).or_return()
+			conn = _accept_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( peer )), compiler.sizeof( SockAddrIn6 )).or_return()
+			peer_addr = _sockaddr_in6_to_addr( peer ).or_return()
 		else:
 			peer4: SockAddrIn = SockAddrIn()
-			conn: SOCKET = _accept_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( peer4 )), compiler.sizeof( SockAddrIn )).or_return()
-			peer_addr: SocketAddr = _sockaddr_in_to_addr( peer4 ).or_return()
+			conn = _accept_raw( self.__sock, compiler.cast( Ptr[None], compiler.addrof( peer4 )), compiler.sizeof( SockAddrIn )).or_return()
+			peer_addr = _sockaddr_in_to_addr( peer4 ).or_return()
 		return Result.Ok(( Socket._from_raw( conn, self.__family ), peer_addr ))
 
 	# Resolves host (a hostname OR a numeric IP literal - getaddrinfo handles
@@ -906,14 +908,16 @@ class Socket:
 			return _sendto_raw( self.__sock, buf, count, compiler.cast( Ptr[None], compiler.addrof( addr4 )), compiler.sizeof( SockAddrIn ))
 
 	def recvfrom( self, buf: Ptr[u8], count: usize ) -> Result[tuple[usize, SocketAddr], OSError]:
+		n: usize
+		peer_addr: SocketAddr
 		if self.__family == AF_INET6:
 			peer: SockAddrIn6 = SockAddrIn6()
-			n: usize = _recvfrom_raw( self.__sock, buf, count, compiler.cast( Ptr[None], compiler.addrof( peer )), compiler.sizeof( SockAddrIn6 )).or_return()
-			peer_addr: SocketAddr = _sockaddr_in6_to_addr( peer ).or_return()
+			n = _recvfrom_raw( self.__sock, buf, count, compiler.cast( Ptr[None], compiler.addrof( peer )), compiler.sizeof( SockAddrIn6 )).or_return()
+			peer_addr = _sockaddr_in6_to_addr( peer ).or_return()
 		else:
 			peer4: SockAddrIn = SockAddrIn()
-			n: usize = _recvfrom_raw( self.__sock, buf, count, compiler.cast( Ptr[None], compiler.addrof( peer4 )), compiler.sizeof( SockAddrIn )).or_return()
-			peer_addr: SocketAddr = _sockaddr_in_to_addr( peer4 ).or_return()
+			n = _recvfrom_raw( self.__sock, buf, count, compiler.cast( Ptr[None], compiler.addrof( peer4 )), compiler.sizeof( SockAddrIn )).or_return()
+			peer_addr = _sockaddr_in_to_addr( peer4 ).or_return()
 		return Result.Ok(( n, peer_addr ))
 
 	def shutdown( self, how: i32 ) -> Result[None, OSError]:

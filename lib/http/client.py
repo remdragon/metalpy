@@ -522,17 +522,20 @@ class _GrowableBuffer:
 # ---------------------------------------------------------------------------
 
 def _build_request_head( method: str, path: str, host: str, headers: HTTPHeaders|None, body: bytes|None ) -> str:
-	head: str = method + ' ' + path + ' HTTP/1.1\r\n' + 'Host: ' + host + '\r\n'
+	# request_head, not head - this module ALSO has a module-level head()
+	# verb helper, and this language has no local-shadows-outer-scope
+	# semantics (see _existing_local_or_none's own comment)
+	request_head: str = method + ' ' + path + ' HTTP/1.1\r\n' + 'Host: ' + host + '\r\n'
 	if headers is not None:
 		n: usize = headers.__len__()
 		i: usize = 0
 		for i in range( n ):
 			name: str = headers.name_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
 			value: str = headers.value_at( i ).unwrap( '_build_request_head: index in bounds by construction' )
-			head = head + name + ': ' + value + '\r\n'
+			request_head = request_head + name + ': ' + value + '\r\n'
 	if body is not None:
-		head = head + 'Content-Length: ' + body.__len__().__str__() + '\r\n'
-	return head + '\r\n'
+		request_head = request_head + 'Content-Length: ' + body.__len__().__str__() + '\r\n'
+	return request_head + '\r\n'
 
 # Every socket-facing call in this file is funneled through one of the
 # _*_or_http_err helpers below rather than propagated as a bare OSError via
@@ -1085,11 +1088,12 @@ def _body_text_for_log( content: bytes ) -> str:
 			return '<' + content.__len__().__str__() + ' bytes, not valid UTF-8>'
 
 def _build_request_text( method: str, path: str, host: str, headers: HTTPHeaders, body: bytes|None ) -> str:
-	head: str = _build_request_head( method, path, host, headers, body )
+	# request_head, not head - see _build_request_head's own comment
+	request_head: str = _build_request_head( method, path, host, headers, body )
 	if body is None:
-		return head
+		return request_head
 	b: bytes = body
-	return head + _body_text_for_log( b )
+	return request_head + _body_text_for_log( b )
 
 def _log_if_present( log: Ptr[Callable[[str],None]]|None, text: str ) -> None:
 	''' a plain (non-looping) helper, not `if log is not None: log(text)`
@@ -1101,14 +1105,15 @@ def _log_if_present( log: Ptr[Callable[[str],None]]|None, text: str ) -> None:
 		log( text )
 
 def _build_response_text( response: Response ) -> str:
-	head: str = 'HTTP/1.1 ' + response.status_code.__str__() + ' ' + response.reason + '\r\n'
+	# response_head, not head - see _build_request_head's own comment
+	response_head: str = 'HTTP/1.1 ' + response.status_code.__str__() + ' ' + response.reason + '\r\n'
 	n: usize = response.headers.__len__()
 	i: usize = 0
 	for i in range( n ):
 		name: str = response.headers.name_at( i ).unwrap( '_build_response_text: index in bounds by construction' )
 		value: str = response.headers.value_at( i ).unwrap( '_build_response_text: index in bounds by construction' )
-		head = head + name + ': ' + value + '\r\n'
-	return head + '\r\n' + _body_text_for_log( response.content )
+		response_head = response_head + name + ': ' + value + '\r\n'
+	return response_head + '\r\n' + _body_text_for_log( response.content )
 
 class Session:
 	headers: HTTPHeaders
