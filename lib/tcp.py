@@ -21,6 +21,21 @@ import reactor
 import socket
 
 
+def _wait_error_to_os_error( werr: reactor.WaitError ) -> OSError:
+	''' maps wait_for_signal()'s own error kinds onto OSError, the error
+	type every Reader/Writer method already returns - Shutdown is a real
+	interruption (there's no OSError member specifically for "the reactor
+	is shutting down", so this reuses Interrupted, same as before
+	WaitError existed), TimedOut maps onto OSError's own existing
+	TimedOut member (WSAETIMEDOUT/ETIMEDOUT) rather than inventing a
+	second name for the same idea. '''
+	match werr:
+		case reactor.WaitError.Shutdown( _ ):
+			return OSError.Interrupted
+		case reactor.WaitError.TimedOut( _ ):
+			return OSError.TimedOut
+
+
 class TcpConnection( io.Reader, io.Writer ):
 	__sock: socket.Socket
 
@@ -35,8 +50,8 @@ class TcpConnection( io.Reader, io.Writer ):
 			match reactor.wait_for_signal( reactor.fd_signal( self.__sock.fileno(), True, False )):
 				case Result.Ok( _ ):
 					pass
-				case Result.Err( _ ):
-					return Result.Err( OSError.Interrupted )
+				case Result.Err( werr ):
+					return Result.Err( _wait_error_to_os_error( werr ))
 
 	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
 		while True:
@@ -49,8 +64,8 @@ class TcpConnection( io.Reader, io.Writer ):
 			match reactor.wait_for_signal( reactor.fd_signal( self.__sock.fileno(), False, True )):
 				case Result.Ok( _ ):
 					pass
-				case Result.Err( _ ):
-					return Result.Err( OSError.Interrupted )
+				case Result.Err( werr ):
+					return Result.Err( _wait_error_to_os_error( werr ))
 
 	def fileno( self ) -> socket.SOCKET:
 		return self.__sock.fileno()
@@ -89,8 +104,8 @@ class TcpListener:
 			match reactor.wait_for_signal( reactor.fd_signal( self.__sock.fileno(), True, False )):
 				case Result.Ok( _ ):
 					pass
-				case Result.Err( _ ):
-					return Result.Err( OSError.Interrupted )
+				case Result.Err( werr ):
+					return Result.Err( _wait_error_to_os_error( werr ))
 
 	@staticmethod
 	def bind( host: str, port: u16, backlog: i32 = 128 ) -> Result[TcpListener, OSError]:

@@ -45,10 +45,12 @@
 # wait can now legitimately never return (correct "keep serving"
 # behavior, not a bug) - UNLESS Reactor.shutdown()/Worker.request_
 # shutdown() has been called, which reuses the SAME wake pair to force-
-# resume every waiting fiber with a ShuttingDown error (wait_for_signal()
-# returns Result[None, ShutdownError], not a bare None) instead of
+# resume every waiting fiber with a WaitError.Shutdown (wait_for_signal()
+# returns Result[None, WaitError], not a bare None) instead of
 # leaving it hoping for a signal that may never come - see request_
-# shutdown()/__drain_waiting_for_shutdown()'s own docstrings.
+# shutdown()/__drain_waiting_for_shutdown()'s own docstrings. The same
+# WaitError union also carries TimedOut, for an active `with timeout(...):`
+# deadline elapsing first - see timeout()'s own docstring.
 #
 # current_worker() - an ambient lookup so code running INSIDE a fiber (e.g.
 # a future NonBlockingIO read()/wait_for()) can find which Worker owns it,
@@ -88,6 +90,8 @@ import fiber
 import poller
 import socket
 import atomic
+import time
+from datetime import timedelta
 
 _current_worker: threading.ThreadLocal[Worker] = threading.ThreadLocal[Worker]()
 
@@ -98,6 +102,98 @@ def current_worker() -> Worker|None:
 	from outside any worker. See this module's own header comment for the
 	full ownership reasoning. '''
 	return _current_worker.get()
+
+
+# ---------------------------------------------------------------------------
+# timeout() - `with timeout(delta):` bounds every wait_for_signal() call
+# inside the block, however deeply nested (e.g. a TcpConnection.read()
+# calling wait_for_signal() internally), without threading a deadline
+# parameter through read()/readline()/write_all()/accept()/etc.
+# ---------------------------------------------------------------------------
+
+class _DeadlineBox:
+	''' ThreadLocal[T] requires T to be an RC type - see threading.py's own
+	module comment - so the no-fiber fallback slot below needs f64 boxed. '''
+	value: f64
+	def __init__( self, value: f64 ) -> None:
+		self.value = value
+
+_thread_deadline: threading.ThreadLocal[_DeadlineBox] = threading.ThreadLocal[_DeadlineBox]()
+
+def _current_deadline() -> f64:
+	''' the currently-active `with timeout(...)` deadline (time.monotonic()
+	seconds), or fiber.NO_DEADLINE if none is active. Checked via
+	fiber.current() first - a real fiber's own deadline survives its
+	park()/unpark() for free, since it's the fiber's own field, not shared
+	state a DIFFERENT cooperatively-scheduled fiber running on the same OS
+	thread in between would otherwise clobber - falling back to a
+	ThreadLocal only when there's no current fiber at all (genuinely
+	synchronous, fiber-free code; nothing else could possibly interleave on
+	this thread in that case, so a plain ThreadLocal is exactly as safe as
+	a Fiber-owned field would be there). '''
+	cur: fiber.Fiber|None = fiber.current()
+	if cur is not None:
+		return cur.get_deadline()
+	box: _DeadlineBox|None = _thread_deadline.get()
+	if box is None:
+		return fiber.NO_DEADLINE
+	return box.value
+
+def _set_current_deadline( deadline: f64 ) -> None:
+	cur: fiber.Fiber|None = fiber.current()
+	if cur is not None:
+		cur.set_deadline( deadline )
+		return
+	if deadline == fiber.NO_DEADLINE:
+		_thread_deadline.clear()
+	else:
+		_thread_deadline.set( _DeadlineBox( deadline ))
+
+def _ms_until( deadline: f64 ) -> i32:
+	''' deadline (a time.monotonic() reading) as a millisecond countdown
+	from NOW, clamped to [0, 2_000_000_000] - 0 if already past (poller.wait
+	should check immediately, not block), the upper clamp so a deadline
+	millennia away can't overflow i32. '''
+	now: f64 = time.monotonic()
+	with compiler.wrap_arithmetic:
+		remaining_s: f64 = deadline - now
+	if remaining_s <= 0.0:
+		return i32( 0 )
+	with compiler.wrap_arithmetic:
+		ms_f: f64 = remaining_s * 1000.0
+	if ms_f > 2000000000.0:
+		return i32( 2000000000 )
+	with compiler.wrap_arithmetic:
+		return i32( ms_f )
+
+class timeout:
+	''' `with timeout(delta):` bounds every wait_for_signal() call inside
+	the block to at most `delta` from now - a TcpConnection.read() calling
+	wait_for_signal() internally is covered with no parameter threading
+	needed. Nesting narrows, never widens: an inner timeout can only
+	tighten an outer one's deadline (never push it later), matching
+	Python's own contextvar-style "innermost wins, but can't escape an
+	outer bound" convention - __enter__ computes min(candidate, previous)
+	so this holds regardless of nesting order. Always restores the
+	previous ambient deadline on __exit__ (with's own defer-based
+	scope-exit guarantee covers every exit path, including an early
+	.or_return() from inside the block), so a fiber pulled from the idle
+	pool for its NEXT, unrelated task never inherits a stale deadline. '''
+	__previous: f64
+	__delta:    timedelta
+	def __init__( self, delta: timedelta ) -> None:
+		self.__delta = delta
+		self.__previous = fiber.NO_DEADLINE
+	def __enter__( self ) -> None:
+		self.__previous = _current_deadline()
+		with compiler.wrap_arithmetic:
+			candidate: f64 = time.monotonic() + self.__delta.total_seconds()
+		if self.__previous != fiber.NO_DEADLINE and self.__previous < candidate:
+			_set_current_deadline( self.__previous )
+		else:
+			_set_current_deadline( candidate )
+	def __exit__( self ) -> None:
+		_set_current_deadline( self.__previous )
 
 
 class FdReadiness:
@@ -157,42 +253,52 @@ class _PendingWait:
 	# compiler_name_shadow_scheduling_bug.md.
 	signal:        Signal
 	waiting_fiber: fiber.Fiber
+	# set by Worker.__drain_expired_waits (never by anything else) BEFORE
+	# waiting_fiber is moved to __ready_to_unpark - _wait_on_signal reads it
+	# straight off this SAME object (the one it appended to __waiting, held
+	# in its own local the whole time) once fiber.park() returns, to tell a
+	# timeout apart from a real signal/shutdown wakeup.
+	timed_out:     bool
 	def __init__( self, signal: Signal, waiting_fiber: fiber.Fiber ) -> None:
 		self.signal = signal
 		self.waiting_fiber = waiting_fiber
+		self.timed_out = False
 
 
-class ShutdownError:
-	''' returned by wait_for_signal() instead of Ok when the Worker
-	driving this fiber has been asked to stop (Reactor.shutdown()/
-	Worker.request_shutdown()) - lets handler code written with defer/
-	errdefer for cleanup behave identically whether a connection closed
-	normally, errored, or the reactor is shutting down (this is the whole
-	point: a shutdown-interrupted wait looks like just another kind of
-	failure to unwind from, not a special case every caller has to know
-	about). Never produced by the no-reactor blocking path below - there
-	is no Worker to ask it to stop, so that path always succeeds once its
-	signal fires. '''
-	pass
+@union
+class WaitError:
+	''' why wait_for_signal() gave up instead of returning Ok:
+	  - Shutdown - the Worker driving this fiber was asked to stop
+	    (Reactor.shutdown()/Worker.request_shutdown()). Never produced by
+	    the no-reactor blocking path - there's no Worker to ask it to stop.
+	  - TimedOut - an enclosing `with timeout(...):` deadline elapsed
+	    before the signal fired. Produced by BOTH paths.
+	Either way, handler code written with defer/errdefer for cleanup
+	behaves identically whether a connection closed normally, errored, hit
+	its deadline, or the reactor is shutting down - none of those are a
+	special case a caller has to know about up front. '''
+	Shutdown:  None
+	TimedOut:  None
 
 
-def wait_for_signal( signal: Signal ) -> Result[None, ShutdownError]:
+def wait_for_signal( signal: Signal ) -> Result[None, WaitError]:
 	''' the ONE reactor-optional wait primitive every higher-level helper
-	(a future NonBlockingIO's read()/write_all()/accept()) is meant to
-	call instead of talking to a Worker or a Poller directly - branches
-	on current_worker() to either park the calling fiber and wait for
+	(TcpConnection's read()/write(), TcpListener's accept()) calls instead
+	of talking to a Worker or a Poller directly - branches on
+	current_worker() to either park the calling fiber and wait for
 	`signal` via whichever Worker is driving this thread, or perform a
 	real, standalone blocking wait if no Worker is driving this thread at
 	all. This is what makes the exact same connection-handling code work
 	unmodified as ordinary synchronous blocking code with zero Reactor
-	setup, or as a cooperative fiber inside a full reactor. '''
+	setup, or as a cooperative fiber inside a full reactor - including
+	`with timeout(...):`, which bounds either path identically (see
+	timeout()'s own docstring). '''
 	w: Worker|None = current_worker()
 	if w is not None:
 		return w._wait_on_signal( signal )
-	_blocking_wait_no_reactor( signal )
-	return Result.Ok( None )
+	return _blocking_wait_no_reactor( signal )
 
-def _blocking_wait_no_reactor( signal: Signal ) -> None:
+def _blocking_wait_no_reactor( signal: Signal ) -> Result[None, WaitError]:
 	''' no Worker driving this thread - there's nothing to park a fiber
 	INTO, so this really does block the calling OS thread, same as an
 	ordinary blocking recv() would. A throwaway, single-use Poller
@@ -203,12 +309,21 @@ def _blocking_wait_no_reactor( signal: Signal ) -> None:
 	level blocking wait needs something pollable) - the match is
 	exhaustive today because FdReady is the only variant that exists;
 	adding a second kind will force a real decision here, not a silent
-	gap. '''
+	gap. Respects _current_deadline() the same way the reactor-driven path
+	does (via a ThreadLocal fallback, since there's no Worker/fiber
+	bookkeeping to lean on here - see _current_deadline's own docstring). '''
+	deadline: f64 = _current_deadline()
+	timeout_ms: i32 = -1
+	if deadline != fiber.NO_DEADLINE:
+		timeout_ms = _ms_until( deadline )
 	match signal:
 		case Signal.FdReady( fdr ):
 			p: poller.Poller = poller.Poller()
 			p.register( fdr.fd, fdr.want_read, fdr.want_write ).unwrap( 'wait_for_signal: poller register failed (no reactor driving this thread)' )
-			p.wait( -1 ).unwrap( 'wait_for_signal: poller wait failed (no reactor driving this thread)' )
+			events: list[poller.ReadyEvent] = p.wait( timeout_ms ).unwrap( 'wait_for_signal: poller wait failed (no reactor driving this thread)' )
+			if events.__len__() == 0 and deadline != fiber.NO_DEADLINE:
+				return Result.Err( WaitError.TimedOut( None ))
+			return Result.Ok( None )
 
 
 def _make_wake_pair() -> tuple[socket.Socket, socket.Socket]:
@@ -343,22 +458,27 @@ class Worker:
 			case fiber.FiberState.RUNNING:
 				sys.panic( 'Worker: fiber reported RUNNING after being switched out of - internal bug' )
 
-	def _wait_on_signal( self, signal: Signal ) -> Result[None, ShutdownError]:
+	def _wait_on_signal( self, signal: Signal ) -> Result[None, WaitError]:
 		''' called from WITHIN a running fiber's own task (via the free
 		function wait_for_signal, never directly) - for an FdReady signal,
 		registers its fd with this worker's own poller if not already
 		watched; records which fiber is waiting for it, and parks. Resumes
-		once EITHER a
-		later run_until_idle()'s own __check_signals() notices the fd
-		became ready (see __requeue_by_state's own comment for the other
-		half of how that stays exactly-once), OR __drain_waiting_for_
-		shutdown() force-resumes it because this worker was asked to stop
-		- checked both BEFORE parking (a shutdown already in progress
-		when this is first called shouldn't register/park at all - see
-		its own comment) and AFTER (the only way to tell which of the two
-		actually happened). '''
+		once ONE of three things happens: a later run_until_idle()'s own
+		__check_signals() notices the fd became ready (see
+		__requeue_by_state's own comment for the other half of how that
+		stays exactly-once), __drain_waiting_for_shutdown() force-resumes
+		it because this worker was asked to stop, or __drain_expired_waits()
+		force-resumes it because an active `with timeout(...):` deadline
+		elapsed first - checked in that order (shutdown first, matching
+		this method's own pre-park check) both BEFORE parking (an
+		already-in-progress shutdown shouldn't register/park at all - see
+		its own comment) and AFTER (the only way to tell which of the three
+		actually happened - pw is the SAME object appended to __waiting
+		below, so a mutation to pw.timed_out by __drain_expired_waits is
+		visible here through this same local, even though that code runs
+		from a completely different call). '''
 		if self.__shutting_down.load():
-			return Result.Err( ShutdownError() )
+			return Result.Err( WaitError.Shutdown( None ))
 		match signal:
 			case Signal.FdReady( fdr ):
 				if not self.__is_registered( fdr.fd ):
@@ -367,11 +487,93 @@ class Worker:
 		cur: fiber.Fiber|None = fiber.current()
 		if cur is None:
 			sys.panic( 'Worker._wait_on_signal: no current fiber - must be called from inside a task this Worker is running' )
-		self.__waiting.append( _PendingWait( signal = signal, waiting_fiber = cur )).unwrap( 'Worker._wait_on_signal: waiting-list overflow' )
+		pw: _PendingWait = _PendingWait( signal = signal, waiting_fiber = cur )
+		self.__waiting.append( pw ).unwrap( 'Worker._wait_on_signal: waiting-list overflow' )
 		fiber.park()
 		if self.__shutting_down.load():
-			return Result.Err( ShutdownError() )
+			return Result.Err( WaitError.Shutdown( None ))
+		if pw.timed_out:
+			return Result.Err( WaitError.TimedOut( None ))
 		return Result.Ok( None )
+
+	def __soonest_deadline( self ) -> f64:
+		''' fiber.NO_DEADLINE if nothing currently in __waiting has an
+		active `with timeout(...):` deadline, otherwise the earliest one -
+		drives __check_signals' own poller.wait() timeout so a real OS-level
+		wakeup happens close to when a timeout should actually fire, rather
+		than only whenever some unrelated fd event happens to wake it. '''
+		soonest: f64 = fiber.NO_DEADLINE
+		n: usize = self.__waiting.__len__()
+		i: usize = 0
+		while i < n:
+			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__soonest_deadline: index in bounds by construction' )
+			d: f64 = w.waiting_fiber.get_deadline()
+			if d != fiber.NO_DEADLINE and ( soonest == fiber.NO_DEADLINE or d < soonest ):
+				soonest = d
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		return soonest
+
+	def __fd_still_waited_on( self, fd: poller.SOCKET ) -> bool:
+		''' whether some OTHER entry still in __waiting (as of the call
+		site's own snapshot) still needs `fd` registered - guards
+		__drain_expired_waits against unregistering an fd out from under a
+		sibling waiter that shares it and hasn't timed out. '''
+		n: usize = self.__waiting.__len__()
+		i: usize = 0
+		while i < n:
+			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__fd_still_waited_on: index in bounds by construction' )
+			match w.signal:
+				case Signal.FdReady( fdr ):
+					if fdr.fd == fd:
+						return True
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		return False
+
+	def __drain_expired_waits( self ) -> bool:
+		''' sweeps __waiting for every entry whose own fiber's deadline has
+		now passed, moving each to __ready_to_unpark with timed_out=True
+		set first (see _PendingWait's own comment) - same "requeue for the
+		NEXT tick, not this one" discipline __check_signals/__drain_
+		waiting_for_shutdown already use. Runs on every run_until_idle tick
+		(not just right after a deadline-derived poller.wait() elapses) so
+		an already-expired deadline is still caught by a purely non-blocking
+		peek (poller_timeout_ms=0) that never touches the poller's own
+		timeout math at all. '''
+		if self.__waiting.__len__() == 0:
+			return False
+		now: f64 = time.monotonic()
+		expired: list[_PendingWait] = list[_PendingWait]()
+		still_waiting: list[_PendingWait] = list[_PendingWait]()
+		n: usize = self.__waiting.__len__()
+		i: usize = 0
+		while i < n:
+			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__drain_expired_waits: index in bounds by construction' )
+			d: f64 = w.waiting_fiber.get_deadline()
+			if d != fiber.NO_DEADLINE and now >= d:
+				expired.append( w ).unwrap( 'Worker.__drain_expired_waits: expired-list overflow' )
+			else:
+				still_waiting.append( w ).unwrap( 'Worker.__drain_expired_waits: rebuild overflow' )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		if expired.__len__() == 0:
+			return False
+		self.__waiting = still_waiting
+		m: usize = expired.__len__()
+		j: usize = 0
+		while j < m:
+			w: _PendingWait = expired.__getitem__( j ).unwrap( 'Worker.__drain_expired_waits: index in bounds by construction' )
+			w.timed_out = True
+			self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_expired_waits: ready-to-unpark queue overflow' )
+			match w.signal:
+				case Signal.FdReady( fdr ):
+					if self.__is_registered( fdr.fd ) and not self.__fd_still_waited_on( fdr.fd ):
+						self.__poller.unregister( fdr.fd ).unwrap( 'Worker.__drain_expired_waits: poller unregister failed' )
+						self.__forget_registered_fd( fdr.fd )
+			with compiler.wrap_arithmetic:
+				j = j + 1
+		return True
 
 	def __is_registered( self, fd: poller.SOCKET ) -> bool:
 		n: usize = self.__registered_fds.__len__()
@@ -459,8 +661,22 @@ class Worker:
 		rest of this method already uses). The wake fd (__init__'s own
 		self-pipe-equivalent) is handled separately - drained, not
 		unregistered, and never matched against __waiting (nothing is
-		ever "waiting on" it in that sense - see __drain_wake). '''
-		ready: list[poller.ReadyEvent] = self.__poller.wait( timeout_ms ).unwrap( 'Worker.__check_signals: poller wait failed' )
+		ever "waiting on" it in that sense - see __drain_wake).
+		Additionally clamps timeout_ms down to __soonest_deadline() (never
+		up - a caller-requested SHORTER wait always wins) so a genuinely
+		infinite drain_fully() block still wakes up promptly for a `with
+		timeout(...):` deadline with nothing else outstanding, then sweeps
+		__waiting for any deadline that's passed via __drain_expired_waits
+		- covers both "this call's own poller.wait() just elapsed because of
+		a deadline" and "an unrelated fd event returned first, but some
+		OTHER waiter's deadline had already passed anyway". '''
+		effective_timeout_ms: i32 = timeout_ms
+		soonest: f64 = self.__soonest_deadline()
+		if soonest != fiber.NO_DEADLINE:
+			deadline_ms: i32 = _ms_until( soonest )
+			if timeout_ms < 0 or deadline_ms < timeout_ms:
+				effective_timeout_ms = deadline_ms
+		ready: list[poller.ReadyEvent] = self.__poller.wait( effective_timeout_ms ).unwrap( 'Worker.__check_signals: poller wait failed' )
 		progressed: bool = False
 		n: usize = ready.__len__()
 		i: usize = 0
@@ -497,6 +713,8 @@ class Worker:
 			self.__forget_registered_fd( ev.fd )
 			with compiler.wrap_arithmetic:
 				i = i + 1
+		if self.__drain_expired_waits():
+			progressed = True
 		return progressed
 
 	def run_until_idle( self, poller_timeout_ms: i32 = 0 ) -> bool:

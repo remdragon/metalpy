@@ -107,6 +107,12 @@ class FiberState:
 	PARKED  = 2   # yielded mid-task via park() - unpark() resumes exactly where it left off
 
 
+# sentinel for Fiber.__deadline/get_deadline()/set_deadline() - time.monotonic()
+# is always >= 0, so a negative value unambiguously means "no active
+# deadline" without needing an f64|None Optional on a field this hot.
+NO_DEADLINE: f64 = f64( -1.0 )
+
+
 class Fiber:
 	__handle: FiberHandle
 	__caller: FiberHandle|None       # who to switch back to on park() - set fresh each start()/unpark()
@@ -120,6 +126,14 @@ class Fiber:
 	# declaration inside a class body the way @compiler.target gates methods
 	__base: Ptr[None]
 	__guard_and_stack: usize
+	# monotonic-clock deadline (seconds, time.monotonic()'s own units) an
+	# active `with reactor.timeout(...):` block wants this fiber's own
+	# wait_for_signal() calls bounded by, or NO_DEADLINE if none is active.
+	# Lives here (not a Worker-side table, not a ThreadLocal) specifically
+	# so it survives park()/unpark() for free: it's this fiber's own field,
+	# untouched by whichever OTHER fiber happens to run on the same OS
+	# thread in between - see reactor.py's timeout()/_current_deadline().
+	__deadline: f64
 
 	@compiler.target( os = 'windows' )
 	def __init__( self, stack_size: usize = DEFAULT_STACK_SIZE ) -> None:
@@ -133,6 +147,7 @@ class Fiber:
 		self.__state = FiberState.IDLE
 		self.__base = None            # unused on Windows - see the field's own comment
 		self.__guard_and_stack = 0
+		self.__deadline = NO_DEADLINE
 
 	@compiler.target( os = not 'windows' )
 	def __init__( self, stack_size: usize = DEFAULT_STACK_SIZE ) -> None:
@@ -173,6 +188,7 @@ class Fiber:
 		self.__pending = None
 		self.__caller = None
 		self.__state = FiberState.IDLE
+		self.__deadline = NO_DEADLINE
 
 	@compiler.target( os = 'windows' )
 	def __del__( self ) -> None:
@@ -191,6 +207,14 @@ class Fiber:
 		task). Never observes RUNNING from outside - that's only ever this
 		fiber's own view of itself while switched in. '''
 		return self.__state
+
+	def get_deadline( self ) -> f64:
+		''' NO_DEADLINE if no `with reactor.timeout(...):` is currently
+		active on this fiber - see reactor.py's timeout()/_current_deadline(). '''
+		return self.__deadline
+
+	def set_deadline( self, deadline: f64 ) -> None:
+		self.__deadline = deadline
 
 	def start( self, task: Closure[[], None] ) -> None:
 		''' switch control into this IDLE fiber to run a NEW `task` from
