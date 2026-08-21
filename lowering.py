@@ -8041,75 +8041,6 @@ class FunctionLowering:
 	def _lower_str_add( self, left: ir.Operand, right: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
 		return self._lower_method_call( left, '__add__', [ right ], str_type, node )
 
-	def _lower_unwrap_result(
-		self, result: ir.Operand, errmsg: str, payload_type: Type, error_type: Type, str_type: Type, node: ast.AST, *, want_result: bool = True,
-	) -> ir.Operand|None:
-		# unwrap()s a Result[T,E] this pass itself just produced (an
-		# UnsafeList[str].append() call, below). (payload_type, error_type)
-		# are passed in explicitly by the caller rather than read back off
-		# result.type, since substitute_type_params can leave two visibly
-		# different shapes there depending on whether the Result's own
-		# structure mentions a type param the caller substituted (an
-		# already-monomorphized TaggedUnion) or was fully concrete already
-		# in the abstract declaration (a plain Specialization, e.g. append's
-		# own Result[None,OverflowError]) - the caller already knows both
-		# types unambiguously either way.
-		#
-		# Resolves the CONCRETE Result[payload_type,error_type] CLASS
-		# first (_get_or_create_specialization + _ensure_resolved), then
-		# reads `unwrap` off ITS OWN .names - the same "always go through
-		# the concrete class, never build a method Specialization directly
-		# off the abstract one" fix _expr_JoinedStr's own UnsafeList[str]
-		# handling above already needed (see its own comment). Building
-		# unwrap's Function-Specialization directly against the ABSTRACT
-		# Result class (this method's first, abandoned implementation)
-		# compiles and runs, but silently ALSO schedules a second, bogus,
-		# unspecialized copy of Result.is_ok (called from unwrap's own
-		# `if self.is_ok(): ...` body) under the bare, un-mangled C symbol
-		# name - a real "conflicting types for 'builtins$Result$is_ok'"
-		# link-shape error, confirmed via a real compile attempt and fixed
-		# by going through the concrete class first instead, exactly like
-		# ordinary source's own `some_result.unwrap(msg)` dispatch already
-		# does (Lowering._find_method's own owner_type = self._ensure_
-		# resolved(owner_type) is the same "resolve the class, not the
-		# method" step). These Results are provably always Ok (the buffer
-		# is pre-sized to exactly len(node.values) and never appended to
-		# more than that many times, and index 0 is always valid once N >=
-		# 2) - unwrap() rather than silently discarding keeps this
-		# consistent with the rest of the language's own "a Result is
-		# never silently ignored" discipline, and turns a violated
-		# invariant into a clear panic instead of undefined behavior.
-		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		result_spec = self.lowering.discovery._get_or_create_specialization( result_cls, [ payload_type, error_type ])
-		concrete_result_cls = self.lowering._ensure_resolved( result_spec )
-		unwrap = concrete_result_cls.get_local_or_raise( 'unwrap' )
-		self.lowering._ensure_resolved( unwrap ) # schedules unwrap itself as a compile unit - see _expr_JoinedStr's own identical comment on init/append/get_ptr
-		self.lowering.schedule( unwrap.return_type )
-		for p in ( unwrap.parameters or [] ):
-			self.lowering.schedule( p.type )
-		errmsg_const = ir.Const( type = str_type, value = errmsg )
-		# want_result=False (append's own Result[None,OverflowError] - the
-		# payload is never used for anything, the call is made purely for
-		# its panic-on-Err side effect) discards the result rather than
-		# storing a None-typed payload in a Temp - a real, narrow, pre-
-		# existing emitter gap around a GENERIC Result[T,E].unwrap()
-		# monomorphized with T=NoneType (confirmed via a real compile
-		# attempt: the emitted unwrap[NoneType,...] function returns C
-		# `void`, but a stored dest expects an assignable MetalpyNone
-		# value - a mismatch nothing in lib/ has ever hit before, since no
-		# existing caller anywhere calls .unwrap() on a Result[None,_] -
-		# ListGenericTests' own list.append() usage only ever calls
-		# .is_err(), never .unwrap()). Fixing that gap for real belongs to
-		# whoever next needs a real None-payload Result value, not this
-		# pass - discarding is both correct (nothing here ever reads the
-		# payload) and sufficient (Err is still a real panic either way)
-		if not want_result:
-			self._emit( ir.Call( dest = None, target = unwrap, receiver = result, args = [ errmsg_const ], kwargs = {} ))
-			return None
-		dest = self._new_temp( unwrap.return_type )
-		self._emit( ir.Call( dest = dest, target = unwrap, receiver = result, args = [ errmsg_const ], kwargs = {} ))
-		return dest
-
 	def _expr_JoinedStr( self, node: ast.JoinedStr, expected_type: Type|None ) -> ir.Operand:
 		# f-string (PLAN_FSTRINGS.md). A fully compile-time-known JoinedStr
 		# never reaches here at all - compile_time_transformer.py's own
@@ -8174,20 +8105,21 @@ class FunctionLowering:
 		n_const = ir.Const( type = usize_cls, value = n )
 		self._emit( ir.Call( dest = None, target = init, receiver = buf, args = [ n_const ], kwargs = {} ))
 
-		none_type = self.lowering.discovery.get_none_type()
-		overflow_error_cls = self.lowering.discovery.find_name( 'OverflowError', node )
+		#none_type = self.lowering.discovery.get_none_type()
+		#overflow_error_cls = self.lowering.discovery.find_name( 'OverflowError', node )
 		append = concrete_cls.get_local_or_raise( 'append' )
 		self.lowering._ensure_resolved( append ) # see init's own comment on why this is needed
 		self.lowering.schedule( append.return_type )
 		for p in ( append.parameters or [] ):
 			self.lowering.schedule( p.type )
 		for part in parts:
-			append_result = self._new_temp( append.return_type )
-			self._emit( ir.Call( dest = append_result, target = append, receiver = buf, args = [ part ], kwargs = {} ))
-			self._lower_unwrap_result(
-				append_result, 'f-string: internal append failed (unreachable - buffer is pre-sized exactly)',
-				none_type, overflow_error_cls, str_type, node, want_result = False,
-			)
+			#append_result = self._new_temp( append.return_type )
+			#self._emit( ir.Call( dest = append_result, target = append, receiver = buf, args = [ part ], kwargs = {} ))
+			#self._lower_unwrap_result(
+			#	append_result, 'f-string: internal append failed (unreachable - buffer is pre-sized exactly)',
+			#	none_type, overflow_error_cls, str_type, node, want_result = False,
+			#)
+			self._emit( ir.Call( dest = None, target = append, receiver = buf, args = [ part ], kwargs = {} ))
 
 		# UnsafeList[str].as_slice() - a real slice[str] view over the WHOLE
 		# buffer, exactly n elements (the buffer is pre-sized to exactly

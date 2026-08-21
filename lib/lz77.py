@@ -64,7 +64,7 @@ def _match_length( ptr: ConstPtr[u8], a: usize, b: usize, n: usize ) -> usize:
 # find_matches - encode side
 # ---------------------------------------------------------------------------
 
-def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> Result[UnsafeList[LZ77Token], OverflowError]:
+def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> UnsafeList[LZ77Token]:
 	''' level (0..9, like zlib's own) controls how many hash-chain
 	candidates get examined per position - a deeper search finds better
 	matches but costs more time. Affects compression ratio only: every
@@ -77,9 +77,9 @@ def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> Result[UnsafeList[L
 		i: usize = 0
 		with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
 			while i < n:
-				tokens.append( LZ77Token.Literal( ptr[i] )).or_return()
+				tokens.append( LZ77Token.Literal( ptr[i] ))
 				i += 1
-		return Result.Ok( tokens )
+		return tokens
 
 	with compiler.wrap_arithmetic:
 		max_chain: usize = usize( level ) * 8 + 8
@@ -88,14 +88,14 @@ def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> Result[UnsafeList[L
 	hi: usize = 0
 	with compiler.wrap_arithmetic:
 		while hi < HASH_SIZE:
-			head.append( i32( -1 )).unwrap( 'sized to HASH_SIZE, never overflows' )
+			head.append( i32( -1 ))
 			hi += 1
 
 	prev: UnsafeList[i32] = UnsafeList[i32]( n )
 	pi: usize = 0
 	with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
 		while pi < n:
-			prev.append( i32( -1 )).unwrap( 'sized to n, never overflows' )
+			prev.append( i32( -1 ))
 			pi += 1
 
 	pos: usize = 0
@@ -104,7 +104,7 @@ def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> Result[UnsafeList[L
 			with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
 				have_anchor: bool = pos + MIN_MATCH <= n
 			if not have_anchor:
-				tokens.append( LZ77Token.Literal( ptr[pos] )).or_return()
+				tokens.append( LZ77Token.Literal( ptr[pos] ))
 				pos += 1
 				continue
 
@@ -134,7 +134,7 @@ def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> Result[UnsafeList[L
 			if best_len >= MIN_MATCH:
 				with compiler.panic_arithmetic( 'both bounded by RFC 1951 limits, fit in u16' ):
 					tok: LZ77Token = LZ77Token.Match( LZ77Match( length = u16( best_len ), distance = u16( best_dist )))
-				tokens.append( tok ).or_return()
+				tokens.append( tok )
 
 				# insert every position the match covers into the hash
 				# chains too - otherwise future matches that would
@@ -150,10 +150,10 @@ def find_matches( data: bytes|bytearray, level: i32 = 6 ) -> Result[UnsafeList[L
 						j += 1
 				pos = match_end
 			else:
-				tokens.append( LZ77Token.Literal( ptr[pos] )).or_return()
+				tokens.append( LZ77Token.Literal( ptr[pos] ))
 				pos += 1
 
-	return Result.Ok( tokens )
+	return tokens
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +179,6 @@ def copy_match( out: UnsafeList[u8], distance: usize, length: usize ) -> Result[
 		while i < length:
 			src_idx: usize = start + i
 			b: u8 = out.__getitem__( src_idx ).unwrap( 'src_idx always already-written: either original data (src_idx < out_len) or already appended earlier this call (distance >= 1 keeps src_idx behind the write cursor)' )
-			match out.append( b ):
-				case Result.Ok( _ ):
-					pass
-				case Result.Err( _ ):
-					return Result.Err( LZ77Error( 'copy_match: output buffer overflow' ))
+			out.append( b )
 			i += 1
 	return Result.Ok( None )

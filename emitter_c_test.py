@@ -5257,9 +5257,9 @@ class ListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'list_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
-	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
+	r0: Result[None,BorrowError] = x.append( 10 )
+	r1: Result[None,BorrowError] = x.append( 20 )
+	r2: Result[None,BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	if x.__len__() != 3:
@@ -5298,7 +5298,7 @@ def main() -> i32:
 			( 'list_rc_element_getitem_unwrap_chained_on_bare_receiver', '''
 def main() -> i32:
 	x: list[int] = list[int]()
-	x.append( int( 5 )).unwrap( 'append failed' )
+	x.append( int( 5 )).unwrap( 'x' )
 	got: int = x.__getitem__( 0 ).unwrap( 'getitem failed' )
 	if got != int( 5 ):
 		return 1
@@ -5313,7 +5313,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,OverflowError|BorrowError] = x.append( compiler.cast( i32, i ))
+			ar: Result[None,BorrowError] = x.append( compiler.cast( i32, i ))
 			if ar.is_err():
 				return 9
 			i += 1
@@ -5340,11 +5340,11 @@ def main() -> i32:
 			( 'erase_at_preserves_positional_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
-	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
-	r3: Result[None,OverflowError|BorrowError] = x.append( 40 )
-	r4: Result[None,OverflowError|BorrowError] = x.append( 50 )
+	r0: Result[None,BorrowError] = x.append( 10 )
+	r1: Result[None,BorrowError] = x.append( 20 )
+	r2: Result[None,BorrowError] = x.append( 30 )
+	r3: Result[None,BorrowError] = x.append( 40 )
+	r4: Result[None,BorrowError] = x.append( 50 )
 	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
 		return 9
 	er: Result[None,IndexError|BorrowError] = x.erase_at( 2 )
@@ -5372,12 +5372,12 @@ def main() -> i32:
 			( 'insert_shifts_tail_right_and_preserves_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
-	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
+	r0: Result[None,BorrowError] = x.append( 10 )
+	r1: Result[None,BorrowError] = x.append( 20 )
+	r2: Result[None,BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
-	ir: Result[None,OverflowError|BorrowError] = x.insert( 1, 99 )
+	ir: Result[None,BorrowError] = x.insert( 1, 99 )
 	if ir.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -5401,11 +5401,11 @@ def main() -> i32:
 			( 'insert_past_end_clamps_to_append', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
+	r0: Result[None,BorrowError] = x.append( 10 )
+	r1: Result[None,BorrowError] = x.append( 20 )
 	if r0.is_err() or r1.is_err():
 		return 9
-	ir: Result[None,OverflowError|BorrowError] = x.insert( 100, 30 )
+	ir: Result[None,BorrowError] = x.insert( 100, 30 )
 	if ir.is_err():
 		return 8
 	if x.__len__() != 3:
@@ -5429,9 +5429,9 @@ def set_it( x: list[i32] ) -> Result[None,IndexError]:
 
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 10 )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 20 )
-	r2: Result[None,OverflowError|BorrowError] = x.append( 30 )
+	r0: Result[None,BorrowError] = x.append( 10 )
+	r1: Result[None,BorrowError] = x.append( 20 )
+	r2: Result[None,BorrowError] = x.append( 30 )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	sr: Result[None,IndexError] = set_it( x )
@@ -5453,8 +5453,8 @@ def main() -> i32:
 			( 'list_str_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 'hello' )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 'world' )
+	r0: Result[None,BorrowError] = x.append( 'hello' )
+	r1: Result[None,BorrowError] = x.append( 'world' )
 	if r0.is_err() or r1.is_err():
 		return 9
 	if x.__len__() != 2:
@@ -5475,7 +5475,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,OverflowError|BorrowError] = x.append( 'item' )
+			ar: Result[None,BorrowError] = x.append( 'item' )
 			if ar.is_err():
 				return 9
 			i += 1
@@ -5516,7 +5516,7 @@ class Holder:
 		self.items = list[i32]()
 
 	def add( self, v: i32 ) -> None:
-		r: Result[None,OverflowError|BorrowError] = self.items.append( v )
+		r: Result[None,BorrowError] = self.items.append( v )
 		if r.is_err():
 			sys.panic( 'append failed' )
 
@@ -5573,7 +5573,7 @@ class Triple:
 
 def main() -> i32:
 	xs: list[Triple] = list[Triple]()
-	r1: Result[None,OverflowError|BorrowError] = xs.append( Triple( 5 ))
+	r1: Result[None,BorrowError] = xs.append( Triple( 5 ))
 	if r1.is_err():
 		return 1
 	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
@@ -5625,9 +5625,9 @@ def main() -> i32:
 			( 'list_str_erase_at_preserves_order_and_refcounts', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,OverflowError|BorrowError] = x.append( 'a' )
-	r1: Result[None,OverflowError|BorrowError] = x.append( 'b' )
-	r2: Result[None,OverflowError|BorrowError] = x.append( 'c' )
+	r0: Result[None,BorrowError] = x.append( 'a' )
+	r1: Result[None,BorrowError] = x.append( 'b' )
+	r2: Result[None,BorrowError] = x.append( 'c' )
 	if r0.is_err() or r1.is_err() or r2.is_err():
 		return 9
 	er: Result[None,IndexError|BorrowError] = x.erase_at( 1 )
@@ -5686,9 +5686,9 @@ class UnsafeListGenericTests( CompilerTestCase ):
 		self._run( '''
 def main() -> i32:
 	x: UnsafeList[i32] = UnsafeList[i32]()
-	x.append( 1 ).unwrap( 'append failed' )
-	x.append( 2 ).unwrap( 'append failed' )
-	x.append( 3 ).unwrap( 'append failed' )
+	x.append( 1 )
+	x.append( 2 )
+	x.append( 3 )
 	if x.__len__() != 3:
 		return 1
 	v: i32 = x.__getitem__( 1 ).unwrap( 'getitem failed' )
@@ -9493,9 +9493,9 @@ class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'as_slice_over_value_typed_elements', '''
 def main() -> i32:
 	arr: UnsafeList[i32] = UnsafeList[i32]()
-	arr.append( 10 ).unwrap( 'append' )
-	arr.append( 20 ).unwrap( 'append' )
-	arr.append( 30 ).unwrap( 'append' )
+	arr.append( 10 )
+	arr.append( 20 )
+	arr.append( 30 )
 	s: slice[i32] = arr.as_slice()
 	if len( s ) != 3:
 		return 1
@@ -9523,9 +9523,9 @@ def main() -> i32:
 			( 'as_slice_over_rc_elements', '''
 def main() -> i32:
 	arr: UnsafeList[str] = UnsafeList[str]()
-	arr.append( 'apple' ).unwrap( 'append' )
-	arr.append( 'banana' ).unwrap( 'append' )
-	arr.append( 'cherry' ).unwrap( 'append' )
+	arr.append( 'apple' )
+	arr.append( 'banana' )
+	arr.append( 'cherry' )
 	s: slice[str] = arr.as_slice()
 	if s.get_unchecked( 0 ) != 'apple':
 		return 1
@@ -9540,11 +9540,11 @@ import bisect
 
 def main() -> i32:
 	arr: UnsafeList[i32] = UnsafeList[i32]()
-	arr.append( 1 ).unwrap( 'append' )
-	arr.append( 3 ).unwrap( 'append' )
-	arr.append( 3 ).unwrap( 'append' )
-	arr.append( 5 ).unwrap( 'append' )
-	arr.append( 7 ).unwrap( 'append' )
+	arr.append( 1 )
+	arr.append( 3 )
+	arr.append( 3 )
+	arr.append( 5 )
+	arr.append( 7 )
 	s: slice[i32] = arr.as_slice()
 	if bisect.bisect_left( s, 3 ) != 1:
 		return 1
@@ -9575,10 +9575,10 @@ def hash_of( n: Node ) -> u64:
 
 def main() -> i32:
 	arr: UnsafeList[Node] = UnsafeList[Node]()
-	arr.append( Node( hash = 1, payload = 0 )).unwrap( 'append' )
-	arr.append( Node( hash = 3, payload = 1 )).unwrap( 'append' )
-	arr.append( Node( hash = 3, payload = 2 )).unwrap( 'append' )
-	arr.append( Node( hash = 5, payload = 3 )).unwrap( 'append' )
+	arr.append( Node( hash = 1, payload = 0 ))
+	arr.append( Node( hash = 3, payload = 1 ))
+	arr.append( Node( hash = 3, payload = 2 ))
+	arr.append( Node( hash = 5, payload = 3 ))
 	key: Ptr[Callable[[Node],u64]] = hash_of
 	s: slice[Node] = arr.as_slice()
 	if bisect.bisect_left_by_key( s, u64( 3 ), key ) != 1:

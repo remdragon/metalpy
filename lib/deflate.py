@@ -98,24 +98,12 @@ def _build_lengths( freqs: UnsafeList[u32], max_len: u8, context: str ) -> Resul
 			return Result.Err( DeflateError( context ))
 
 
-def _do_find_matches( data: bytes|bytearray, level: i32, context: str ) -> Result[UnsafeList[lz77.LZ77Token], DeflateError]:
-	match lz77.find_matches( data, level ):
-		case Result.Ok( v ):
-			return Result.Ok( v )
-		case Result.Err( _ ):
-			return Result.Err( DeflateError( context ))
+def _do_find_matches( data: bytes|bytearray, level: i32 ) -> UnsafeList[lz77.LZ77Token]:
+	return lz77.find_matches( data, level )
 
 
 def _do_copy_match( out: UnsafeList[u8], distance: usize, length: usize, context: str ) -> Result[None, DeflateError]:
 	match lz77.copy_match( out, distance, length ):
-		case Result.Ok( _ ):
-			return Result.Ok( None )
-		case Result.Err( _ ):
-			return Result.Err( DeflateError( context ))
-
-
-def _append_u8( dst: UnsafeList[u8], val: u8, context: str ) -> Result[None, DeflateError]:
-	match dst.append( val ):
 		case Result.Ok( _ ):
 			return Result.Ok( None )
 		case Result.Err( _ ):
@@ -149,7 +137,7 @@ def _build_cl_order() -> UnsafeList[u8]:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'fixed 19-entry literal, cannot overflow' ):
 		while i < usize( len( data )):
-			order.append( u8( data.__getitem__( i ).unwrap( 'i in range' ))).unwrap( 'x' )
+			order.append( u8( data.__getitem__( i ).unwrap( 'i in range' )))
 			i += 1
 	return order
 
@@ -186,8 +174,8 @@ def _build_length_table() -> _U16U8Table:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'fixed 58-entry literal, cannot overflow' ):
 		while i < usize( len( data )):
-			bases.append( u16( data.__getitem__( i ).unwrap( 'i in range' ))).unwrap( 'x' )
-			extra.append( u8( data.__getitem__( i + 1 ).unwrap( 'i+1 in range' ))).unwrap( 'x' )
+			bases.append( u16( data.__getitem__( i ).unwrap( 'i in range' )))
+			extra.append( u8( data.__getitem__( i + 1 ).unwrap( 'i+1 in range' )))
 			i += 2
 	return _U16U8Table( bases, extra )
 
@@ -221,8 +209,8 @@ def _build_dist_table() -> _U16U8Table:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'fixed 60-entry literal, cannot overflow' ):
 		while i < usize( len( data )):
-			bases.append( u16( data.__getitem__( i ).unwrap( 'i in range' ))).unwrap( 'x' )
-			extra.append( u8( data.__getitem__( i + 1 ).unwrap( 'i+1 in range' ))).unwrap( 'x' )
+			bases.append( u16( data.__getitem__( i ).unwrap( 'i in range' )))
+			extra.append( u8( data.__getitem__( i + 1 ).unwrap( 'i+1 in range' )))
 			i += 2
 	return _U16U8Table( bases, extra )
 
@@ -277,13 +265,13 @@ def _build_fixed_litlen_lengths() -> UnsafeList[u8]:
 	with compiler.panic_arithmetic( 'bounded by 288, cannot overflow' ):
 		while sym < usize( 288 ):
 			if sym <= 143:
-				lengths.append( u8( 8 )).unwrap( 'x' )
+				lengths.append( u8( 8 ))
 			elif sym <= 255:
-				lengths.append( u8( 9 )).unwrap( 'x' )
+				lengths.append( u8( 9 ))
 			elif sym <= 279:
-				lengths.append( u8( 7 )).unwrap( 'x' )
+				lengths.append( u8( 7 ))
 			else:
-				lengths.append( u8( 8 )).unwrap( 'x' )
+				lengths.append( u8( 8 ))
 			sym += 1
 	return lengths
 
@@ -293,7 +281,7 @@ def _build_fixed_dist_lengths() -> UnsafeList[u8]:
 	sym: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 32, cannot overflow' ):
 		while sym < usize( 32 ):
-			lengths.append( u8( 5 )).unwrap( 'x' )
+			lengths.append( u8( 5 ))
 			sym += 1
 	return lengths
 
@@ -306,20 +294,20 @@ _FIXED_DIST_LENGTHS:   UnsafeList[u8] = _build_fixed_dist_lengths()
 # compress
 # ---------------------------------------------------------------------------
 
-def compress( data: bytes|bytearray, level: i32 = 6 ) -> Result[bytes, DeflateError]:
-	tokens: UnsafeList[lz77.LZ77Token] = _do_find_matches( data, level, 'compress: lz77.find_matches overflowed' ).or_return()
+def compress( data: bytes|bytearray, level: i32 = 6 ) -> Result[bytes,DeflateError]:
+	tokens: UnsafeList[lz77.LZ77Token] = _do_find_matches( data, level )
 
 	litlen_freqs: UnsafeList[u32] = UnsafeList[u32]( usize( 286 ))
 	fi: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 286, cannot overflow' ):
 		while fi < usize( 286 ):
-			litlen_freqs.append( u32( 0 )).unwrap( 'x' )
+			litlen_freqs.append( u32( 0 ))
 			fi += 1
 	dist_freqs: UnsafeList[u32] = UnsafeList[u32]( usize( 30 ))
 	di: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 30, cannot overflow' ):
 		while di < usize( 30 ):
-			dist_freqs.append( u32( 0 )).unwrap( 'x' )
+			dist_freqs.append( u32( 0 ))
 			di += 1
 
 	_tally_frequencies( tokens, litlen_freqs, dist_freqs )
@@ -340,7 +328,7 @@ def compress( data: bytes|bytearray, level: i32 = 6 ) -> Result[bytes, DeflateEr
 		dist_enc2: huffman.HuffmanEncoder = _build_encoder( _FIXED_DIST_LENGTHS, 'compress: fixed dist encoder build failed' ).or_return()
 		_emit_tokens( writer, tokens, litlen_enc2, dist_enc2 ).or_return()
 
-	return Result.Ok( writer.finish() )
+	return writer.finish()
 
 
 def _tally_frequencies( tokens: UnsafeList[lz77.LZ77Token], litlen_freqs: UnsafeList[u32], dist_freqs: UnsafeList[u32] ) -> None:
@@ -407,7 +395,12 @@ def _try_build_dynamic_lengths( litlen_freqs: UnsafeList[u32], dist_freqs: Unsaf
 			return None
 
 
-def _emit_tokens( writer: bitstream.BitWriter, tokens: UnsafeList[lz77.LZ77Token], litlen_enc: huffman.HuffmanEncoder, dist_enc: huffman.HuffmanEncoder ) -> Result[None, DeflateError]:
+def _emit_tokens(
+	writer: bitstream.BitWriter,
+	tokens: UnsafeList[lz77.LZ77Token],
+	litlen_enc: huffman.HuffmanEncoder,
+	dist_enc: huffman.HuffmanEncoder,
+) -> Result[None, DeflateError]:
 	ti: usize = 0
 	with compiler.panic_arithmetic( 'bounded by len(tokens), cannot overflow' ):
 		while ti < len( tokens ):
@@ -440,19 +433,19 @@ def _emit_dynamic_header( writer: bitstream.BitWriter, litlen_lengths: UnsafeLis
 	ci: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 286, cannot overflow' ):
 		while ci < len( litlen_lengths ):
-			combined.append( litlen_lengths.__getitem__( ci ).unwrap( 'ci in range' )).unwrap( 'x' )
+			combined.append( litlen_lengths.__getitem__( ci ).unwrap( 'ci in range' ))
 			ci += 1
 	di: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 30, cannot overflow' ):
 		while di < len( dist_lengths ):
-			combined.append( dist_lengths.__getitem__( di ).unwrap( 'di in range' )).unwrap( 'x' )
+			combined.append( dist_lengths.__getitem__( di ).unwrap( 'di in range' ))
 			di += 1
 
 	cl_freqs: UnsafeList[u32] = UnsafeList[u32]( usize( 19 ))
 	cfi: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 19, cannot overflow' ):
 		while cfi < usize( 19 ):
-			cl_freqs.append( u32( 0 )).unwrap( 'x' )
+			cl_freqs.append( u32( 0 ))
 			cfi += 1
 
 	rle_symbols: UnsafeList[u8] = UnsafeList[u8]()
@@ -469,9 +462,9 @@ def _emit_dynamic_header( writer: bitstream.BitWriter, litlen_lengths: UnsafeLis
 			if val == 0:
 				while run >= 11:
 					take: usize = run if run < 138 else usize( 138 )
-					rle_symbols.append( u8( 18 )).unwrap( 'x' )
+					rle_symbols.append( u8( 18 ))
 					with compiler.wrap_arithmetic:
-						rle_extra.append( u8( take - 11 )).unwrap( 'x' )
+						rle_extra.append( u8( take - 11 ))
 						bump18: u32 = cl_freqs.__getitem__( usize( 18 )).unwrap( 'x' ) + 1
 					cl_freqs.__setitem__( usize( 18 ), bump18 ).unwrap( 'x' )
 					with compiler.panic_arithmetic( 'take <= run, cannot underflow' ):
@@ -479,25 +472,25 @@ def _emit_dynamic_header( writer: bitstream.BitWriter, litlen_lengths: UnsafeLis
 					i += take
 				while run >= 3:
 					take2: usize = run if run < 10 else usize( 10 )
-					rle_symbols.append( u8( 17 )).unwrap( 'x' )
+					rle_symbols.append( u8( 17 ))
 					with compiler.wrap_arithmetic:
-						rle_extra.append( u8( take2 - 3 )).unwrap( 'x' )
+						rle_extra.append( u8( take2 - 3 ))
 						bump17: u32 = cl_freqs.__getitem__( usize( 17 )).unwrap( 'x' ) + 1
 					cl_freqs.__setitem__( usize( 17 ), bump17 ).unwrap( 'x' )
 					with compiler.panic_arithmetic( 'take2 <= run, cannot underflow' ):
 						run -= take2
 					i += take2
 				while run > 0:
-					rle_symbols.append( u8( 0 )).unwrap( 'x' )
-					rle_extra.append( u8( 0 )).unwrap( 'x' )
+					rle_symbols.append( u8( 0 ))
+					rle_extra.append( u8( 0 ))
 					with compiler.wrap_arithmetic:
 						bump0: u32 = cl_freqs.__getitem__( usize( 0 )).unwrap( 'x' ) + 1
 					cl_freqs.__setitem__( usize( 0 ), bump0 ).unwrap( 'x' )
 					run -= 1
 					i += 1
 			else:
-				rle_symbols.append( val ).unwrap( 'x' )
-				rle_extra.append( u8( 0 )).unwrap( 'x' )
+				rle_symbols.append( val )
+				rle_extra.append( u8( 0 ))
 				with compiler.wrap_arithmetic:
 					bumpv: u32 = cl_freqs.__getitem__( usize( val )).unwrap( 'x' ) + 1
 				cl_freqs.__setitem__( usize( val ), bumpv ).unwrap( 'x' )
@@ -506,17 +499,17 @@ def _emit_dynamic_header( writer: bitstream.BitWriter, litlen_lengths: UnsafeLis
 					run -= 1
 				while run >= 3:
 					take3: usize = run if run < 6 else usize( 6 )
-					rle_symbols.append( u8( 16 )).unwrap( 'x' )
+					rle_symbols.append( u8( 16 ))
 					with compiler.wrap_arithmetic:
-						rle_extra.append( u8( take3 - 3 )).unwrap( 'x' )
+						rle_extra.append( u8( take3 - 3 ))
 						bump16: u32 = cl_freqs.__getitem__( usize( 16 )).unwrap( 'x' ) + 1
 					cl_freqs.__setitem__( usize( 16 ), bump16 ).unwrap( 'x' )
 					with compiler.panic_arithmetic( 'take3 <= run, cannot underflow' ):
 						run -= take3
 					i += take3
 				while run > 0:
-					rle_symbols.append( val ).unwrap( 'x' )
-					rle_extra.append( u8( 0 )).unwrap( 'x' )
+					rle_symbols.append( val )
+					rle_extra.append( u8( 0 ))
 					with compiler.wrap_arithmetic:
 						bumpv2: u32 = cl_freqs.__getitem__( usize( val )).unwrap( 'x' ) + 1
 					cl_freqs.__setitem__( usize( val ), bumpv2 ).unwrap( 'x' )
@@ -620,7 +613,7 @@ def _inflate_stored( reader: bitstream.BitReader, out: UnsafeList[u8] ) -> Resul
 	with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
 		while i < count:
 			b: u32 = _read_bits( reader, u32( 8 ), '_inflate_stored: unexpected end of stream reading data' ).or_return()
-			_append_u8( out, u8( b ), '_inflate_stored: output buffer overflow' ).or_return()
+			out.append( u8( b ))
 			i += 1
 	return Result.Ok( None )
 
@@ -635,7 +628,7 @@ def _inflate_huffman_block( reader: bitstream.BitReader, out: UnsafeList[u8], li
 		if sym < 256:
 			with compiler.panic_arithmetic( 'sym < 256, fits in u8' ):
 				lit_byte: u8 = u8( sym )
-			_append_u8( out, lit_byte, '_inflate_huffman_block: output buffer overflow' ).or_return()
+			out.append( lit_byte )
 		elif sym == 256:
 			break
 		else:
@@ -681,7 +674,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 	zi: usize = 0
 	with compiler.panic_arithmetic( 'bounded by 19, cannot overflow' ):
 		while zi < usize( 19 ):
-			cl_lengths.append( u8( 0 )).unwrap( 'x' )
+			cl_lengths.append( u8( 0 ))
 			zi += 1
 	ci: usize = 0
 	with compiler.panic_arithmetic( 'bounded by hclen <= 19, cannot overflow' ):
@@ -701,7 +694,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 			csym: u16 = _decode_symbol( cl_dec, reader, '_inflate_dynamic_block: failed to decode a code-length symbol' ).or_return()
 
 			if csym < 16:
-				_append_u8( combined, u8( csym ), '_inflate_dynamic_block: combined length table overflow' ).or_return()
+				combined.append( u8( csym ))
 			elif csym == 16:
 				if len( combined ) == 0:
 					return Result.Err( DeflateError( '_inflate_dynamic_block: repeat-previous code with no previous length' ))
@@ -713,7 +706,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 				ri16: u32 = 0
 				with compiler.panic_arithmetic( 'repeat_count <= 6, cannot overflow' ):
 					while ri16 < repeat_count:
-						_append_u8( combined, prev_len, '_inflate_dynamic_block: combined length table overflow' ).or_return()
+						combined.append( prev_len )
 						ri16 += 1
 			elif csym == 17:
 				extra17: u32 = _read_bits( reader, u32( 3 ), '_inflate_dynamic_block: unexpected end of stream reading repeat-zero(short) extra bits' ).or_return()
@@ -722,7 +715,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 				ri17: u32 = 0
 				with compiler.panic_arithmetic( 'zrun <= 10, cannot overflow' ):
 					while ri17 < zrun:
-						_append_u8( combined, u8( 0 ), '_inflate_dynamic_block: combined length table overflow' ).or_return()
+						combined.append( u8( 0 ))
 						ri17 += 1
 			elif csym == 18:
 				extra18: u32 = _read_bits( reader, u32( 7 ), '_inflate_dynamic_block: unexpected end of stream reading repeat-zero(long) extra bits' ).or_return()
@@ -731,7 +724,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 				ri18: u32 = 0
 				with compiler.panic_arithmetic( 'zrun2 <= 138, cannot overflow' ):
 					while ri18 < zrun2:
-						_append_u8( combined, u8( 0 ), '_inflate_dynamic_block: combined length table overflow' ).or_return()
+						combined.append( u8( 0 ))
 						ri18 += 1
 			else:
 				return Result.Err( DeflateError( '_inflate_dynamic_block: invalid code-length symbol' ))
@@ -743,7 +736,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 	li: usize = 0
 	with compiler.panic_arithmetic( 'bounded by hlit, cannot overflow' ):
 		while li < hlit:
-			litlen_lengths.append( combined.__getitem__( li ).unwrap( 'li < total' )).unwrap( 'x' )
+			litlen_lengths.append( combined.__getitem__( li ).unwrap( 'li < total' ))
 			li += 1
 	dist_lengths: UnsafeList[u8] = UnsafeList[u8]( hdist )
 	dj: usize = 0
@@ -751,7 +744,7 @@ def _inflate_dynamic_block( reader: bitstream.BitReader, out: UnsafeList[u8] ) -
 		while dj < hdist:
 			with compiler.wrap_arithmetic:
 				src_idx: usize = hlit + dj
-			dist_lengths.append( combined.__getitem__( src_idx ).unwrap( 'src_idx < total' )).unwrap( 'x' )
+			dist_lengths.append( combined.__getitem__( src_idx ).unwrap( 'src_idx < total' ))
 			dj += 1
 
 	return _inflate_huffman_block( reader, out, litlen_lengths, dist_lengths )

@@ -1576,7 +1576,7 @@ class str:
 		consumed: usize = 0
 		with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 			while i < self_len:
-				starts.append( i ).unwrap( 'rstrip: append failed' )
+				starts.append( i )
 				decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
 				i += consumed
 
@@ -2107,6 +2107,14 @@ def chr( cp: u32 ) -> str:
 	encode_utf8_at( buf, 0, cp )
 	buf[encoded_len] = 0
 	return str._from_owned_cstr( buf, buf_size ).unwrap( 'chr(): not a valid Unicode code point' )
+
+@inline
+def max[T]( a: T, b: T ) -> T:
+	return a if a >= b else b
+
+@inline
+def min[T]( a: T, b: T ) -> T:
+	return a if a <= b else b
 
 def ord( s: str ) -> u32:
 	''' the inverse of chr() above - decodes s's own first (and only) code

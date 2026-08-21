@@ -17,28 +17,6 @@ import subprocess
 import sys
 
 
-def resolve_no_crt( no_crt: bool, asan: bool ) -> bool:
-	'''
-	--asan requires the C runtime: the ASan runtime library itself depends on
-	CRT symbols (getenv, memcpy, malloc, ...) regardless of what the user's
-	own program needs, so a no-CRT link against it dies with a wall of
-	LNK2019s. Force real CRT linking whenever asan is requested, overriding
-	whatever no_crt the caller auto-detected.
-
-	Must be called BEFORE emitter_c.emit_c(), not just before
-	CcTool.compile()/link(): no_crt also selects which entry-point shape
-	emit_c() generates (a hand-rolled mainCRTStartup stub that calls main(),
-	vs plain main() as the real entry) - overriding only the compile/link
-	flags after C source generation would link CRT-provided startup code
-	against a source file that still defines its own conflicting
-	mainCRTStartup, trading one wall of link errors for another.
-	'''
-	if asan and no_crt:
-		print( 'WARNING - --asan requires the C runtime - forcing CRT linking (no_crt=True request ignored)', file = sys.stderr )
-		return False
-	return no_crt
-
-
 def ensure_cache_dir( cache_dir: Path ) -> bool:
 	''' best-effort mkdir for one of this codebase's %TEMP%/metalpy/<category>
 	disk-cache directories - shared by every cache call site (atomic_write_
@@ -183,7 +161,13 @@ class CcTool:
 		self.name = name
 		self.path = path
 
-	def compile( self, src: Path, obj: Path, verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, cflags: str = '' ) -> subprocess.CompletedProcess[bytes]:
+	def compile( self, src: Path, obj: Path, verbose: bool = False,
+		no_crt: bool = False,
+		debug: bool = True,
+		asan: bool = False,
+		cflags: str = '',
+		warnings: bool = False,
+	) -> subprocess.CompletedProcess[bytes]:
 		''' compile a single .c file to a .o object file '''
 		# asan forces debug INFO on regardless of debug/release, so a crash
 		# report is symbolized - optimization level still follows debug/release
@@ -191,16 +175,10 @@ class CcTool:
 		# fuzzing performance)
 		want_debug_info = debug or asan
 		if self.name == 'cl':
-			cmd = [ self.path, '/nologo', '/std:c11',
-				'/experimental:c11atomics',
-				# /wd4701 ("potentially uninitialized local variable used") -
-				# see the matching -Wno-sometimes-uninitialized/-Wno-
-				# uninitialized below for the full reasoning (a confirmed
-				# false positive: __return_value, this codebase's own shared
-				# multi-entry function epilogue, is a goto-heavy pattern this
-				# static analysis can't prove exhaustive even when metalpy's
-				# own discovery/type-checking already has)
-				'/W4', '/wd4701', '-c', str( src ), f'/Fo:{obj}' ]
+			cmd = [ self.path, '/nologo', '/std:c11' ]
+			if warnings:
+				cmd += [ '/W4', '/wd4701' ]
+			cmd += [ '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
 			if want_debug_info:
@@ -231,14 +209,13 @@ class CcTool:
 			if asan:
 				cmd += [ '/fsanitize=address' ]
 		else:
-			cmd = [ self.path, '-std=c11', '-Wall', '-Wextra', '-c', str( src ), '-o', str( obj ) ]
-			# -Wno-sometimes-uninitialized (clang) / -Wno-maybe-uninitialized
-			# (gcc) - see cl.exe's /wd4701 branch above for the full
-			# reasoning; -Wno-uninitialized covers both compilers' own
-			# plain (not just conditional) flavor of the same false
-			# positive
-			cmd += [ '-Wno-uninitialized' ]
-			cmd += [ '-Wno-sometimes-uninitialized' ] if self.name == 'clang' else [ '-Wno-maybe-uninitialized' ]
+			cmd = [ self.path, '-std=c11' ]
+			if warnings:
+				cmd += [ '-Wall', '-Wextra' ]
+			cmd += [ '-c', str( src ), '-o', str( obj ) ]
+			if warnings:
+				cmd += [ '-Wno-uninitialized' ]
+				cmd += [ '-Wno-sometimes-uninitialized' ] if self.name == 'clang' else [ '-Wno-maybe-uninitialized' ]
 			if want_debug_info:
 				cmd += [ '-g' ]
 			if debug:

@@ -553,14 +553,14 @@ class int:
 		# Variable-receiver one for is_ok/is_err/unwrap/unwrap_or) - that
 		# fix applies equally regardless of which list type this is.
 		multiples: UnsafeList[int] = UnsafeList[int]()
-		multiples.append( base ).unwrap( 'divmod: multiples.append failed' )
+		multiples.append( base )
 		with compiler.panic_arithmetic( 'building exactly eight more multiples of the divisor cannot overflow usize bookkeeping' ):
 			k: usize = 1
 			while k < 9:
 				prev: int = multiples.__getitem__( k - 1 ).unwrap( 'divmod: multiples index in bounds by construction' )
 				next_multiple = prev.clone()
 				next_multiple._add_magnitude( base ).or_return()
-				multiples.append( next_multiple ).unwrap( 'divmod: multiples.append failed' )
+				multiples.append( next_multiple )
 				k += 1
 
 		quotient = int( 0 )

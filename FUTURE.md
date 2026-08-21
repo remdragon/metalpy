@@ -85,14 +85,76 @@ we need min() and max(). each needs to be an overload, for example:
 def min[T]( a: T, b: T ) -> T:
 	return a if a < b else b
 
-def min[T]( it: Iterator[T] ) -> T:
+def min[T]( seq: Sequence[T] ) -> T:
+	it = iter( seq )
 	value: T = next( it )
 	for t in it:
 		value = min( value, t )
 	return value
 
-This is going to require defining a @protocol Iterator that can be implemented
-by list[T], tuple[T], slice[T], and any user classes that want to participate
-in this.
+I've already added the first form, but the second form needs some design work:
 
-Yes this is a break from python, but metalpy doesn't support *args
+This is going to require defining a @protocol class Sequence
+that can be implemented by list[T], tuple[T], slice[T], and any user classes
+that want to participate in this.
+
+Additionaly, iter() is not implemented yet, maybe something like:
+
+def iter[T]( seq: Sequence[T] ) -> Iterator[T,StopIteration]:
+	for item in seq:
+		yield item
+
+we also need the following functions (I'm not sure if they are all correct):
+
+def any[T]( seq: Sequence[T] ) -> bool:
+	for item in seq:
+		if item:
+			return True
+	return False
+
+def all[T]( seq: Sequence[T] ) -> bool:
+	for item in seq:
+		if not item:
+			return False
+	return True
+
+def enumerate[T]( seq: Sequence[T], start: isize = 0 ) -> Iterator[tuple[isize,T],StopIteration]:
+	with compiler.wrap_arithmetic:
+		for item in seq:
+			yield start, item
+			start += 1
+
+def map[T,U]( fn: Callable[[T],U], seq: Sequence[T] ) -> Iterator[U,StopIteration]:
+	for item in seq:
+		yield fn( item )
+
+def reduce[T]( fn: Callable[[T,T],U], seq: Sequence[T] ) -> Iterator[T,StopIterator]:
+	it = iter( seq )
+	value1 = next( it )
+	for value2 in it:
+		value1 = fn( value1, value2 )
+	return value1
+
+def sum[T]( seq: Sequence[T], start: T = 0 ) -> T:
+	for item in seq:
+		start += item
+	return start
+
+================================================================================
+
+need ssl server support, including self-signed certs
+
+================================================================================
+
+there seems to be a bug with list. The following code works fine:
+
+x: list[str] = [ 'foo' ]
+print( x.__getitem__( 0 ).unwrap() )
+
+but the following code requires the function it's in to return a Result[IndexError]:
+
+x: list[str] = [ 'foo' ]
+print( x[0].unwrap() )
+
+These two things should be the same, why is the 2nd producing an automatic .or_return()?
+

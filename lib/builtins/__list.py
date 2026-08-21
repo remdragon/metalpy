@@ -104,39 +104,37 @@ class RawList:
 		return Result.Ok( self._slot_ptr( idx ))
 
 	# Doubles buffer capacity.
-	def _grow( self ) -> Result[None, OverflowError]:
-		new_cap: usize = self.__cap * 2
-		new_data_bytes: usize = new_cap * self.__element_size
+	def _grow( self ) -> None:
+		with compiler.panic_arithmetic( f'impossibly large RawList size requested' ):
+			new_cap: usize = self.__cap * 2
+			new_data_bytes: usize = new_cap * self.__element_size
 
-		new_data: Ptr[None] = compiler.cast( Ptr[None], sys.alloc[u8]( new_data_bytes ))
-		errdefer( sys.free( new_data ))
-		sys.memcpy( new_data, self.__data, self.__len * self.__element_size )
+			new_data: Ptr[None] = compiler.cast( Ptr[None], sys.alloc[u8]( new_data_bytes ))
+			sys.memcpy( new_data, self.__data, self.__len * self.__element_size )
 		sys.free( self.__data )
 
 		self.__data = new_data
 		self.__cap  = new_cap
-		return Result.Ok( None )
 
 	# Appends a pre-RC-increffed element (caller is responsible for RC).
-	def _append( self, val_ptr: Ptr[None] ) -> Result[None, OverflowError]:
+	def _append( self, val_ptr: Ptr[None] ) -> None:
 		if self.__len >= self.__cap:
-			self._grow().or_return()
+			self._grow()
 		sys.memcpy( self._slot_ptr( self.__len ), val_ptr, self.__element_size )
 		with compiler.panic_arithmetic( 'RawList _append: overflow' ):
 			self.__len = self.__len + 1
-		return Result.Ok( None )
 
 	# Inserts a pre-RC-increffed element at idx, shifting [idx, len) right
 	# by one slot via memmove (memcpy is NOT safe here - the source and
 	# destination ranges overlap). idx > len clamps to len (append),
 	# matching Python's own list.insert - there's no failure mode here
 	# distinct from OverflowError worth a separate error type for.
-	def _insert_at( self, idx: usize, val_ptr: Ptr[None] ) -> Result[None, OverflowError]:
+	def _insert_at( self, idx: usize, val_ptr: Ptr[None] ) -> None:
 		clamped_idx: usize = idx
 		if idx > self.__len:
 			clamped_idx = self.__len
 		if self.__len >= self.__cap:
-			self._grow().or_return()
+			self._grow()
 		with compiler.panic_arithmetic( 'RawList _insert_at: shift overflow' ):
 			shift_count: usize = self.__len - clamped_idx
 		if shift_count > 0:
@@ -147,7 +145,6 @@ class RawList:
 		sys.memcpy( self._slot_ptr( clamped_idx ), val_ptr, self.__element_size )
 		with compiler.panic_arithmetic( 'RawList _insert_at: overflow' ):
 			self.__len = self.__len + 1
-		return Result.Ok( None )
 
 	# Removes the element at idx, shifting [idx+1, len) left by one slot
 	# via memmove. Does NOT perform RC decref — caller is responsible.
@@ -246,18 +243,16 @@ class UnsafeList[T]:
 		return self.__raw.capacity()
 
 	# Append a value at the end. Increfs val if T is an RC type.
-	def append( self, val: T ) -> Result[None, OverflowError]:
+	def append( self, val: T ) -> None:
 		compiler.incref( val )
-		self.__raw._append( compiler.cast( Ptr[None], compiler.addrof( val ))).or_return()
-		return Result.Ok( None )
+		self.__raw._append( compiler.cast( Ptr[None], compiler.addrof( val )))
 
 	# Insert a value at idx, shifting everything at/after idx one slot to
 	# the right. idx > len clamps to len (append), matching Python's own
 	# list.insert. Increfs val if T is an RC type.
-	def insert( self, idx: usize, val: T ) -> Result[None, OverflowError]:
+	def insert( self, idx: usize, val: T ) -> None:
 		compiler.incref( val )
-		self.__raw._insert_at( idx, compiler.cast( Ptr[None], compiler.addrof( val ))).or_return()
-		return Result.Ok( None )
+		self.__raw._insert_at( idx, compiler.cast( Ptr[None], compiler.addrof( val )))
 
 	# Access element by position. Returns a copy (with incref if RC).
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
@@ -337,7 +332,7 @@ class list[T]:
 			return self.__inner.capacity()
 
 	# Append a value at the end. Increfs val if T is an RC type.
-	def append( self, val: T ) -> Result[None, OverflowError|BorrowError]:
+	def append( self, val: T ) -> Result[None, BorrowError]:
 		with self.__lock:
 			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
 				return Result.Err( BorrowError() )
@@ -346,11 +341,11 @@ class list[T]:
 	# Insert a value at idx, shifting everything at/after idx one slot to
 	# the right. idx > len clamps to len (append), matching Python's own
 	# list.insert. Increfs val if T is an RC type.
-	def insert( self, idx: usize, val: T ) -> Result[None, OverflowError|BorrowError]:
+	def insert( self, idx: usize, val: T ) -> Result[None, BorrowError]:
 		with self.__lock:
 			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
 				return Result.Err( BorrowError() )
-			return self.__inner.insert( idx, val )
+			self.__inner.insert( idx, val )
 
 	# Access element by position. Returns a copy (with incref if RC).
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:

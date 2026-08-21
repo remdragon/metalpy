@@ -38,7 +38,7 @@ def colored( text: str, color: str|None = None, attrs: list[str]|None = None ) -
 			case Result.Ok( code ):
 				parts.append( code ).unwrap( 'termcolor.colored: append failed' )
 			case Result.Err( e ):
-				sys.panic( 'termcolor.colored: unknown color ' + color )
+				sys.panic( f'termcolor.colored: unknown color {color}' )
 	if attrs is not None:
 		attr_list: list[str] = attrs
 		i: usize = 0
@@ -52,5 +52,6 @@ def colored( text: str, color: str|None = None, attrs: list[str]|None = None ) -
 				i += 1
 	if len( parts ) == 0:
 		return text
-	prefix: str = '\x1b[' + ';'.join( parts ) + 'm'
-	return prefix + text + '\x1b[0m'
+	_parts_ = ';'.join( parts )
+	prefix: str = f'\x1b[{_parts_}m'
+	return f'{prefix}{text}\x1b[0m'

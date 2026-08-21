@@ -9399,12 +9399,10 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		# body, not here - see lowering.py's own _expr_JoinedStr comment
 		# on reusing the already-existing as_slice() instead of hand-
 		# building a slice via a direct ir.Allocate the way this used to,
-		# before as_slice() existed), exactly 1 str.concat call, and
-		# (append's own Result[None,OverflowError] x2 - as_slice() itself
+		# before as_slice() existed), exactly 1 str.concat call - as_slice() itself
 		# returns a bare slice[T], no Result, so nothing to unwrap for it)
-		# exactly 2 unwrap calls - and, the actual point of this whole
-		# pass, ZERO calls to str.__add__ (proving this ISN'T N-1 chained
-		# string concatenation)
+		# and, the actual point of this whole pass, ZERO calls to str.__add__
+		# (proving this ISN'T N-1 chained string concatenation)
 		self._import( '\n'.join([
 			'def main( a: str, b: str ) -> str:',
 			'	return f"{a}{b}"',
@@ -9414,7 +9412,6 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( len( self._allocates_of( fn, 'UnsafeList' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '.append' )), 2 )
 		self.assertEqual( len( self._calls_to( fn, 'as_slice' )), 1 )
-		self.assertEqual( len( self._calls_to( fn, 'unwrap' )), 2 )
 		self.assertEqual( len( self._calls_to( fn, '.concat' )), 1 )
 		self.assertEqual( self._calls_to( fn, '__add__' ), [] )
 

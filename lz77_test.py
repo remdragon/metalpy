@@ -26,7 +26,7 @@ def replay( tokens: UnsafeList[lz77.LZ77Token] ) -> Result[UnsafeList[u8], lz77.
 			tok: lz77.LZ77Token = tokens.__getitem__( i ).unwrap( 'i < len(tokens)' )
 			match tok:
 				case lz77.LZ77Token.Literal( b ):
-					out.append( b ).unwrap( 'replay: append failed' )
+					out.append( b )
 				case lz77.LZ77Token.Match( m ):
 					lz77.copy_match( out, usize( m.distance ), usize( m.length )).or_return()
 			i += 1
@@ -34,7 +34,7 @@ def replay( tokens: UnsafeList[lz77.LZ77Token] ) -> Result[UnsafeList[u8], lz77.
 
 def main() -> i32:
 	original: bytes = ( 'abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc' ).encode().unwrap( 'x' )
-	tokens: UnsafeList[lz77.LZ77Token] = lz77.find_matches( original ).unwrap( 'find_matches' )
+	tokens: UnsafeList[lz77.LZ77Token] = lz77.find_matches( original )
 
 	# highly repetitive input should produce far fewer tokens than bytes
 	if len( tokens ) >= len( original ):
@@ -65,7 +65,7 @@ def replay( tokens: UnsafeList[lz77.LZ77Token] ) -> Result[UnsafeList[u8], lz77.
 			tok: lz77.LZ77Token = tokens.__getitem__( i ).unwrap( 'i < len(tokens)' )
 			match tok:
 				case lz77.LZ77Token.Literal( b ):
-					out.append( b ).unwrap( 'replay: append failed' )
+					out.append( b )
 				case lz77.LZ77Token.Match( m ):
 					lz77.copy_match( out, usize( m.distance ), usize( m.length )).or_return()
 			i += 1
@@ -89,7 +89,7 @@ def main() -> i32:
 	rp[11] = 190
 	original: bytes = bytes.from_bytearray( move( raw ))
 
-	tokens: UnsafeList[lz77.LZ77Token] = lz77.find_matches( original ).unwrap( 'find_matches' )
+	tokens: UnsafeList[lz77.LZ77Token] = lz77.find_matches( original )
 	if len( tokens ) != len( original ):  # every byte should be a literal
 		return 1
 
@@ -111,7 +111,7 @@ import lz77
 
 def main() -> i32:
 	out: UnsafeList[u8] = UnsafeList[u8]()
-	out.append( u8( 65 )).unwrap( 'x' )  # seed byte 'A'
+	out.append( u8( 65 ))  # seed byte 'A'
 
 	# distance=1, length=10: must produce 10 more copies of 'A' - a
 	# straight memcpy of the current 1-byte buffer would NOT do this
@@ -133,8 +133,8 @@ import lz77
 
 def main() -> i32:
 	out: UnsafeList[u8] = UnsafeList[u8]()
-	out.append( u8( 1 )).unwrap( 'x' )
-	out.append( u8( 2 )).unwrap( 'x' )
+	out.append( u8( 1 ))
+	out.append( u8( 2 ))
 
 	if lz77.copy_match( out, usize( 0 ), usize( 1 )).is_ok():
 		return 1
@@ -147,7 +147,7 @@ import lz77
 
 def main() -> i32:
 	empty: bytes = bytes.from_bytearray( move( bytearray( 0 )))
-	tokens: UnsafeList[lz77.LZ77Token] = lz77.find_matches( empty ).unwrap( 'find_matches' )
+	tokens: UnsafeList[lz77.LZ77Token] = lz77.find_matches( empty )
 	if len( tokens ) != usize( 0 ):
 		return 1
 	return 0

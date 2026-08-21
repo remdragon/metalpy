@@ -40,7 +40,7 @@ def _count_per_length( code_lengths: UnsafeList[u8] ) -> Result[UnsafeList[u16],
 	i: usize = 0
 	with compiler.wrap_arithmetic:
 		while i < TABLE_SIZE:
-			count.append( u16( 0 )).unwrap( 'fixed TABLE_SIZE entries, never overflows' )
+			count.append( u16( 0 ))
 			i += 1
 	sym: usize = 0
 	with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
@@ -76,7 +76,7 @@ def _canonical_codes_from_lengths( code_lengths: UnsafeList[u8] ) -> Result[Unsa
 	i: usize = 0
 	with compiler.wrap_arithmetic:
 		while i < TABLE_SIZE:
-			first_code.append( u32( 0 )).unwrap( 'fixed TABLE_SIZE entries, never overflows' )
+			first_code.append( u32( 0 ))
 			i += 1
 	code: u32 = 0
 	bits: u32 = 1
@@ -91,7 +91,7 @@ def _canonical_codes_from_lengths( code_lengths: UnsafeList[u8] ) -> Result[Unsa
 	j: usize = 0
 	with compiler.wrap_arithmetic:
 		while j < TABLE_SIZE:
-			next_code.append( first_code.__getitem__( j ).unwrap( 'j < TABLE_SIZE' )).unwrap( 'fixed TABLE_SIZE entries, never overflows' )
+			next_code.append( first_code.__getitem__( j ).unwrap( 'j < TABLE_SIZE' ))
 			j += 1
 
 	codes: UnsafeList[u16] = UnsafeList[u16]( n )
@@ -100,13 +100,13 @@ def _canonical_codes_from_lengths( code_lengths: UnsafeList[u8] ) -> Result[Unsa
 		while sym < n:
 			length: u8 = code_lengths.__getitem__( sym ).unwrap( 'sym < n' )
 			if length == 0:
-				codes.append( u16( 0 )).unwrap( 'bounded by n, never overflows' )
+				codes.append( u16( 0 ))
 			else:
 				with compiler.wrap_arithmetic:
 					len_idx: usize = usize( length )
 					c: u32 = next_code.__getitem__( len_idx ).unwrap( 'len_idx <= MAX_BITS' )
 					next_code.__setitem__( len_idx, c + 1 ).unwrap( 'len_idx <= MAX_BITS' )
-				codes.append( u16( c )).unwrap( 'bounded by n, never overflows' )
+				codes.append( u16( c ))
 			sym += 1
 	return Result.Ok( codes )
 
@@ -172,7 +172,7 @@ class HuffmanDecoder:
 		i: usize = 0
 		with compiler.wrap_arithmetic:
 			while i < TABLE_SIZE:
-				offs.append( u16( 0 )).unwrap( 'fixed TABLE_SIZE entries, never overflows' )
+				offs.append( u16( 0 ))
 				i += 1
 		bits: u32 = 1
 		with compiler.wrap_arithmetic:
@@ -193,7 +193,7 @@ class HuffmanDecoder:
 		k: usize = 0
 		with compiler.wrap_arithmetic:
 			while k < total_used:
-				symbols.append( u16( 0 )).unwrap( 'sized to total_used, never overflows' )
+				symbols.append( u16( 0 ))
 				k += 1
 
 		sym: usize = 0
@@ -270,14 +270,14 @@ def build_code_lengths_from_frequencies( freqs: UnsafeList[u32], max_code_length
 		while sym < n:
 			f: u32 = freqs.__getitem__( sym ).unwrap( 'sym < n' )
 			if f > 0:
-				used.append( u16( sym )).unwrap( 'at most n symbols, n fits comfortably' )
+				used.append( u16( sym ))
 			sym += 1
 
 	lengths: UnsafeList[u8] = UnsafeList[u8]( n )
 	zi: usize = 0
 	with compiler.panic_arithmetic( 'bounded by n, cannot overflow' ):
 		while zi < n:
-			lengths.append( u8( 0 )).unwrap( 'bounded by n, never overflows' )
+			lengths.append( u8( 0 ))
 			zi += 1
 
 	used_count: usize = len( used )
@@ -302,10 +302,10 @@ def build_code_lengths_from_frequencies( freqs: UnsafeList[u32], max_code_length
 		while li < used_count:
 			leaf_sym: u16 = used.__getitem__( li ).unwrap( 'li < used_count' )
 			leaf_freq: u32 = freqs.__getitem__( usize( leaf_sym )).unwrap( 'leaf_sym < n' )
-			weight.append( leaf_freq ).unwrap( 'sized to capacity, never overflows' )
-			left_child.append( i32( -1 )).unwrap( 'sized to capacity, never overflows' )
-			right_child.append( i32( -1 )).unwrap( 'sized to capacity, never overflows' )
-			active.append( True ).unwrap( 'sized to capacity, never overflows' )
+			weight.append( leaf_freq )
+			left_child.append( i32( -1 ))
+			right_child.append( i32( -1 ))
+			active.append( True )
 			li += 1
 
 	node_count: usize = used_count
@@ -333,10 +333,10 @@ def build_code_lengths_from_frequencies( freqs: UnsafeList[u32], max_code_length
 			active.__setitem__( usize( b ), False ).unwrap( 'b valid index' )
 			with compiler.wrap_arithmetic:
 				new_weight: u32 = a_w + b_w
-			weight.append( new_weight ).unwrap( 'sized to capacity, never overflows' )
-			left_child.append( a ).unwrap( 'sized to capacity, never overflows' )
-			right_child.append( b ).unwrap( 'sized to capacity, never overflows' )
-			active.append( True ).unwrap( 'sized to capacity, never overflows' )
+			weight.append( new_weight )
+			left_child.append( a )
+			right_child.append( b )
+			active.append( True )
 			node_count += 1
 			step += 1
 
@@ -347,14 +347,14 @@ def build_code_lengths_from_frequencies( freqs: UnsafeList[u32], max_code_length
 	di: usize = 0
 	with compiler.panic_arithmetic( 'bounded by capacity, cannot overflow' ):
 		while di < capacity:
-			depth.append( u8( 0 )).unwrap( 'sized to capacity, never overflows' )
+			depth.append( u8( 0 ))
 			di += 1
 
 	node_stack:  UnsafeList[i32] = UnsafeList[i32]()
 	depth_stack: UnsafeList[u8]  = UnsafeList[u8]()
 	with compiler.panic_arithmetic( 'root < capacity <= 2*used_count-1, well within i32 range' ):
-		node_stack.append( i32( root )).unwrap( 'x' )
-	depth_stack.append( u8( 0 )).unwrap( 'x' )
+		node_stack.append( i32( root ))
+	depth_stack.append( u8( 0 ))
 	max_depth: u8 = 0
 	while len( node_stack ) > 0:
 		with compiler.panic_arithmetic( 'len > 0, just checked' ):
@@ -372,10 +372,10 @@ def build_code_lengths_from_frequencies( freqs: UnsafeList[u32], max_code_length
 		else:
 			with compiler.wrap_arithmetic:
 				child_depth: u8 = d + 1
-			node_stack.append( lc ).unwrap( 'x' )
-			depth_stack.append( child_depth ).unwrap( 'x' )
-			node_stack.append( rc ).unwrap( 'x' )
-			depth_stack.append( child_depth ).unwrap( 'x' )
+			node_stack.append( lc )
+			depth_stack.append( child_depth )
+			node_stack.append( rc )
+			depth_stack.append( child_depth )
 
 	if max_depth > max_code_length:
 		return Result.Err( HuffmanError.CodeTooLong( None ))

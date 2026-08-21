@@ -190,3 +190,6 @@ def main() -> i32:
 		compressed = bytes.fromhex( hex_str )
 		decompressed = zlib.decompress( compressed, -15 )
 		self.assertEqual( decompressed, original )
+
+if __name__ == '__main__':
+	unittest.main()

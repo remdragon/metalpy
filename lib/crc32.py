@@ -17,7 +17,7 @@ def _build_table() -> UnsafeList[u32]:
 				else:
 					v = v >> 1
 				bit += 1
-			table.append( v ).unwrap( 'fixed 256-entry table, never overflows' )
+			table.append( v )
 			i += 1
 	return table
 

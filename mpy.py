@@ -194,7 +194,9 @@ def main() -> None:
 	no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
 	if args.crt:
 		no_crt = False
-	no_crt = linker_c.resolve_no_crt( no_crt, args.asan )
+	if args.asan and no_crt:
+		print( 'WARNING - --asan requires the C runtime - forcing CRT linking (no_crt=True request ignored)', file = sys.stderr )
+		no_crt = False
 	try:
 		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
 	except CompileError:
@@ -222,7 +224,13 @@ def main() -> None:
 		obj_path = Path( tmp ) / 'generated.o'
 		src_path.write_text( c_source, encoding = 'utf-8' )
 
-		compile_result = cc.compile( src_path, obj_path, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, cflags = args.cflags )
+		compile_result = cc.compile( src_path, obj_path, verbose = args.v,
+			no_crt = no_crt,
+			debug = bool( active_target['debug'] ),
+			asan = args.asan,
+			cflags = args.cflags,
+			warnings = args.show_warnings,
+		)
 		if compile_result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
 			print( compile_result.stdout, file = sys.stderr )

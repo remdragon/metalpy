@@ -165,5 +165,5 @@ class RawDict:
 	def insert_new( self, hash: u64, key_ptr: Ptr[None], value_ptr: Ptr[None] ) -> None:
 		pos: usize = self._lower_bound( hash )
 		entry_idx: usize = len( self.__entries )
-		self.__entries.append( RawEntry( hash = hash, key_ptr = key_ptr, value_ptr = value_ptr )).unwrap( 'RawDict: append overflow' )
-		self.__indices.insert( pos, RawIndex( hash = hash, entry_idx = entry_idx )).unwrap( 'RawDict: insert overflow' )
+		self.__entries.append( RawEntry( hash = hash, key_ptr = key_ptr, value_ptr = value_ptr ))
+		self.__indices.insert( pos, RawIndex( hash = hash, entry_idx = entry_idx ))
