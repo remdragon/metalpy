@@ -77,3 +77,22 @@ BinaryReadWriter|StrReadWriter since we can't know at compile time which one
 they're choosing. We could however, implement a special case in type_resolver.py
 to catch literal strings passed to open() and swap it out with a more type-
 specific File opener method.
+
+================================================================================
+
+we need min() and max(). each needs to be an overload, for example:
+
+def min[T]( a: T, b: T ) -> T:
+	return a if a < b else b
+
+def min[T]( it: Iterator[T] ) -> T:
+	value: T = next( it )
+	for t in it:
+		value = min( value, t )
+	return value
+
+This is going to require defining a @protocol Iterator that can be implemented
+by list[T], tuple[T], slice[T], and any user classes that want to participate
+in this.
+
+Yes this is a break from python, but metalpy doesn't support *args
