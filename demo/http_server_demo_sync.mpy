@@ -1,59 +1,28 @@
 '''
-Synchronous demo server - thread-per-connection blocking I/O, NO reactor
-anywhere. Every accepted connection gets its own real OS thread, and that
-thread's read()/write() calls genuinely block the OS (tcp.py's own
-reactor-optional TcpConnection falls back to a real blocking wait when no
-Reactor is driving the current thread - see reactor.wait_for_signal's own
-docstring). This is the classic thread-per-connection model, useful as a
-stress-test BASELINE to compare against http_server_demo_async.mpy's
-reactor-driven concurrency, not a "lightweight" version of it - a real OS
-thread per connection is comparatively expensive.
+Synchronous demo server - blocking I/O, NO reactor anywhere, dispatched
+onto a bounded threading.ThreadPool (lib/tcpserver.py's own default
+ConnectionDispatcher) rather than one OS thread per connection. Built on
+the same generic tcpserver.TcpServer + http.server.serve_sync() every
+sync TCP-based server in this codebase can now share, mirroring how
+http_server_demo_async.mpy already builds on reactor.Reactor +
+http.server.serve().
+
+See demo/http_server_demo_sync_unbounded.mpy for the older unbounded
+thread-per-connection baseline (still available as an explicit opt-in via
+tcpserver.ThreadPerConnectionDispatcher, for stress-test comparison
+against this bounded-pool default).
 '''
 
-import compiler
-import threading
-import socket
 import tcp
-from http.server import _handle_connection
+import socket
+from http.server import serve_sync
 from demo.http_server_demo_app import App
-
-
-class _ConnectionHandler:
-	__conn: tcp.TcpConnection
-	__app:  App
-
-	def __init__( self, conn: tcp.TcpConnection, app: App ) -> None:
-		self.__conn = conn
-		self.__app = app
-
-	def run( self ) -> None:
-		_handle_connection( self.__conn, self.__app.handle )
-
-
-class BareServer:
-	__listener: tcp.TcpListener
-	__app:      App
-
-	def __init__( self, listener: tcp.TcpListener, app: App ) -> None:
-		self.__listener = listener
-		self.__app = app
-
-	def run( self ) -> None:
-		while True:
-			match self.__listener.accept():
-				case Result.Ok( conn ):
-					handler: _ConnectionHandler = _ConnectionHandler( conn, self.__app )
-					t: threading.Thread = threading.Thread( handler.run )
-				case Result.Err( e ):
-					print( f'error accepting connection: {e}' )
-					return
 
 
 def main() -> i32:
 	listener: tcp.TcpListener = tcp.TcpListener.bind( '0.0.0.0', u16( 8080 )).unwrap( 'error binding 0.0.0.0:8080' )
 	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
-	print( f'listening on http://0.0.0.0:{addr.port} (sync, thread-per-connection)' )
+	print( f'listening on http://0.0.0.0:{addr.port} (sync, bounded thread pool)' )
 	app: App = App()
-	server: BareServer = BareServer( listener, app )
-	server.run()
+	serve_sync( listener, app.handle ).run()
 	return 0

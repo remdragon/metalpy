@@ -13,6 +13,8 @@
 
 import compiler
 import sys
+import socket
+import atomic
 
 if compiler.target.os == 'windows':
 	from windows.kernel32 import _SRWLOCK
@@ -376,3 +378,129 @@ class ThreadLocal[T]:
 		result: i32 = pthread_setspecific( self.__key, null )
 		if result != 0:
 			sys.panic( 'ThreadLocal.clear: pthread_setspecific failed' )
+
+
+# ---------------------------------------------------------------------------
+# ThreadPool — a fixed-size pool of daemon worker threads + a bounded,
+# round-robin submit() queue, for CPU-bound/blocking work a caller wants
+# bounded concurrency for without spawning an unbounded thread per job.
+#
+# Generalizes the private pool lib/asyncfile.py has used internally since
+# its own thread-pool-backed file I/O offload (_Pool/_PoolWorker/_Job
+# there) — same fixed-worker-array + round-robin submit() shape, but NOT
+# reactor-integrated: a job here is a plain Closure[[], None] side effect,
+# not a Result[usize,OSError]-wrapped payload a reactor.Worker waits on via
+# a CompletionHandle. asyncfile.py's own pool stays exactly as it is
+# (deliberately reactor-coupled) — this is a new, independent, public
+# primitive for any caller that just wants bounded thread concurrency. A
+# caller that needs a job's result back writes it into a field on its own
+# captured receiver and reads it after its own synchronization, the same
+# convention Thread itself already documents.
+# ---------------------------------------------------------------------------
+
+class _PoolJob:
+	work: Closure[[], None]
+
+	def __init__( self, work: Closure[[], None] ) -> None:
+		self.work = work
+
+
+class _PoolWorker:
+	__jobs:          list[_PoolJob]
+	__wake_read:     socket.Socket
+	__wake_write:    socket.Socket
+	__shutting_down: atomic.Atomic[bool]
+
+	def __init__( self ) -> None:
+		self.__jobs = list[_PoolJob]()
+		( read_side, write_side ) = socket.make_loopback_pair()
+		self.__wake_read = read_side
+		self.__wake_write = write_side
+		self.__shutting_down = atomic.Atomic[bool]( False )
+
+	def submit( self, job: _PoolJob ) -> None:
+		self.__jobs.append( job ).unwrap( '_PoolWorker.submit: queue overflow' )
+		poke: bytes = b'x'
+		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.submit: wake failed' )
+
+	def request_shutdown( self ) -> None:
+		self.__shutting_down.store( True )
+		poke: bytes = b'x'
+		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.request_shutdown: wake failed' )
+
+	def run_forever( self ) -> None:
+		''' blocks (a genuine, thread-blocking recv - no Poller, this thread
+		has nothing else to do while idle) until a poke arrives, then drains
+		and runs every job currently queued - same "at least one byte means
+		check the queue" discipline asyncfile._PoolWorker/reactor.Worker's
+		own wake-drain already use. Exits once shutdown has been requested
+		AND the queue is fully drained - a job submitted right before
+		shutdown still runs to completion, matching reactor.Reactor.
+		shutdown()'s own "does not reject work already queued" contract. '''
+		buf: bytearray = bytearray( usize( 64 ))
+		while True:
+			self.__wake_read.recv( buf.get_ptr(), usize( 64 )).unwrap( '_PoolWorker.run_forever: wake recv failed' )
+			while True:
+				match self.__jobs.pop():
+					case Result.Ok( job ):
+						work: Closure[[], None] = job.work
+						work()
+					case Result.Err( _ ):
+						break
+			if self.__shutting_down.load() and self.__jobs.__len__() == 0:
+				return
+
+
+class ThreadPool:
+	__workers: list[_PoolWorker]
+	__threads: list[Thread]
+	__next:    usize
+
+	def __init__( self, size: usize ) -> None:
+		''' spawns `size` daemon worker threads immediately (Thread.
+		__init__ starts them - there is no separate .run() to call, unlike
+		reactor.Reactor). Required, no default - matches reactor.Reactor.
+		__init__(num_workers)'s own convention exactly. '''
+		self.__workers = list[_PoolWorker]()
+		self.__threads = list[Thread]()
+		self.__next = 0
+		i: usize = 0
+		while i < size:
+			w: _PoolWorker = _PoolWorker()
+			self.__workers.append( w ).unwrap( 'ThreadPool.__init__: worker list overflow' )
+			t: Thread = Thread( w.run_forever )
+			self.__threads.append( t ).unwrap( 'ThreadPool.__init__: thread list overflow' )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+	def submit( self, work: Closure[[], None] ) -> None:
+		''' round-robin across workers - same (idx+1) % len idiom as
+		reactor.Reactor.spawn(). '''
+		idx: usize = self.__next
+		with compiler.panic_arithmetic( 'ThreadPool.submit: pool size is zero' ):
+			self.__next = ( idx + 1 ) % self.__workers.__len__()
+		w: _PoolWorker = self.__workers.__getitem__( idx ).unwrap( 'ThreadPool.submit: index in bounds by construction' )
+		w.submit( _PoolJob( work ))
+
+	def shutdown( self, wait: bool = True ) -> None:
+		''' requests every worker to stop once its queue drains - callable
+		from any thread, mirrors reactor.Reactor.shutdown()'s own "request,
+		don't reject already-queued work" contract. wait=True (default)
+		additionally joins every worker thread before returning; wait=False
+		returns immediately and workers finish asynchronously. '''
+		n: usize = self.__workers.__len__()
+		i: usize = 0
+		while i < n:
+			w: _PoolWorker = self.__workers.__getitem__( i ).unwrap( 'ThreadPool.shutdown: worker index in bounds by construction' )
+			w.request_shutdown()
+			with compiler.wrap_arithmetic:
+				i = i + 1
+		if not wait:
+			return
+		n_threads: usize = self.__threads.__len__()
+		i = 0
+		while i < n_threads:
+			joining: Thread = self.__threads.__getitem__( i ).unwrap( 'ThreadPool.shutdown: thread index in bounds by construction' )
+			joining.join()
+			with compiler.wrap_arithmetic:
+				i = i + 1

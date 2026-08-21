@@ -28,6 +28,7 @@ import compiler
 import sys
 import reactor
 import tcp
+import tcpserver
 import io
 from http.client import HTTPHeaders, parse_headers
 from urllib.parse import urlsplit, parse_qsl, SplitResult
@@ -498,3 +499,15 @@ def serve( listener: tcp.TcpListener, handler: Closure[[Request], Response], r: 
 	tcp_test.py's own spawn-then-run() shape. '''
 	loop: _AcceptLoop = _AcceptLoop( listener, handler, r )
 	r.spawn( loop.run )
+
+def serve_sync( listener: tcp.TcpListener, handler: Closure[[Request], Response], dispatcher: tcpserver.ConnectionDispatcher|None = None ) -> tcpserver.TcpServer:
+	''' the sync counterpart to serve() - same _handle_connection loop,
+	just dispatched per tcpserver.ConnectionDispatcher's own strategy
+	(default: a bounded threading.ThreadPool - see tcpserver.TcpServer's
+	own default) instead of one fiber per connection. Doesn't block: call
+	.run() on the TcpServer this returns, mirroring serve()/r.run()'s own
+	build-then-drive split - there's just no separate reactor to hand off
+	to here, the caller drives the TcpServer directly. '''
+	h: Closure[[Request], Response] = handler
+	on_connection: Closure[[tcp.TcpConnection], None] = lambda conn: _handle_connection( conn, h )
+	return tcpserver.TcpServer( listener, on_connection, dispatcher )
