@@ -116,17 +116,19 @@ def _quote_impl( s: str, safe: str, space_as_plus: bool ) -> str:
 	i = 0
 	with compiler.wrap_arithmetic:
 		while i < n:
-			b: u8 = data[i]
-			if space_as_plus and b == _SPACE:
+			# distinct name from the sizing loop's own `b` above - a
+			# variable's type is only ever declared once per function
+			eb: u8 = data[i]
+			if space_as_plus and eb == _SPACE:
 				out_ptr[o] = _PLUS
 				o += 1
-			elif _is_unreserved_byte( b ) or _is_safe_byte( b, safe ):
-				out_ptr[o] = b
+			elif _is_unreserved_byte( eb ) or _is_safe_byte( eb, safe ):
+				out_ptr[o] = eb
 				o += 1
 			else:
 				out_ptr[o] = _PERCENT
-				out_ptr[o+1] = hex_ptr[ usize( b >> 4 ) ]
-				out_ptr[o+2] = hex_ptr[ usize( b & 0x0F ) ]
+				out_ptr[o+1] = hex_ptr[ usize( eb >> 4 ) ]
+				out_ptr[o+2] = hex_ptr[ usize( eb & 0x0F ) ]
 				o += 3
 			i += 1
 
@@ -192,17 +194,19 @@ def _unquote_impl( s: str, plus_as_space: bool ) -> Result[str, UrlParseError]:
 	i = 0
 	with compiler.wrap_arithmetic:
 		while i < n:
-			b: u8 = data[i]
-			if b == _PERCENT:
+			# distinct name from the sizing loop's own `b` above - a
+			# variable's type is only ever declared once per function
+			eb: u8 = data[i]
+			if eb == _PERCENT:
 				hi: u8 = _hex_digit_value( data[i+1] ).unwrap( '_unquote_impl: re-scan after first-pass validation' )
 				lo: u8 = _hex_digit_value( data[i+2] ).unwrap( '_unquote_impl: re-scan after first-pass validation' )
 				out_ptr[o] = ( hi << 4 ) | lo
 				i += 3
-			elif plus_as_space and b == _PLUS:
+			elif plus_as_space and eb == _PLUS:
 				out_ptr[o] = _SPACE
 				i += 1
 			else:
-				out_ptr[o] = b
+				out_ptr[o] = eb
 				i += 1
 			o += 1
 

@@ -761,9 +761,13 @@ class Worker:
 		while to_start > 0:
 			match self.__pending_tasks.pop():
 				case Result.Ok( task ):
-					f: fiber.Fiber = self.__take_idle_fiber()
-					f.start( task )
-					self.__requeue_by_state( f )
+					# distinct name from the unpark loop's own `f` above -
+					# a variable's type is only ever declared once per
+					# function, even though these two match-arm bindings
+					# are otherwise unrelated
+					idle_fiber: fiber.Fiber = self.__take_idle_fiber()
+					idle_fiber.start( task )
+					self.__requeue_by_state( idle_fiber )
 					progressed = True
 				case Result.Err( _ ):
 					pass
@@ -847,8 +851,11 @@ class Reactor:
 		n_threads: usize = self.__threads.__len__()
 		i = 0
 		while i < n_threads:
-			t: threading.Thread = self.__threads.__getitem__( i ).unwrap( 'Reactor.run: thread index in bounds by construction' )
-			t.join()
+			# distinct name from the spawn loop's own `t` above - a
+			# variable's type is only ever declared once per function (no
+			# block scoping), so reusing `t` here would be a redeclaration
+			joining: threading.Thread = self.__threads.__getitem__( i ).unwrap( 'Reactor.run: thread index in bounds by construction' )
+			joining.join()
 			with compiler.wrap_arithmetic:
 				i = i + 1
 

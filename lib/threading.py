@@ -98,14 +98,15 @@ class FastLock:
 	@compiler.target( os = not 'windows' )
 	def acquire( self, blocking: bool = True ) -> Result[None, LockError]:
 		from posix.pthread import pthread_mutex_lock, pthread_mutex_trylock
+		result: i32
 		if blocking:
-			result: i32 = pthread_mutex_lock( self.__lock )
+			result = pthread_mutex_lock( self.__lock )
 			if result != 0:
 				return Result.Err( LockError() )
 			self.__locked = True
 			return Result.Ok( None )
 		else:
-			result: i32 = pthread_mutex_trylock( self.__lock )
+			result = pthread_mutex_trylock( self.__lock )
 			if result != 0:
 				return Result.Err( LockError() )
 			self.__locked = True

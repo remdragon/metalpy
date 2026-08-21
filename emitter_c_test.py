@@ -8665,11 +8665,11 @@ def main() -> i32:
 	j: usize = 0
 	with compiler.wrap_arithmetic:
 		while j < 50:
-			key: i32 = compiler.cast( i32, j )
-			r: Result[i32,KeyError] = d.__getitem__( key )
+			lookup_key: i32 = compiler.cast( i32, j )
+			r: Result[i32,KeyError] = d.__getitem__( lookup_key )
 			if r.is_err():
 				return 2
-			if r.unwrap( 'x' ) != key * 2:
+			if r.unwrap( 'x' ) != lookup_key * 2:
 				return 3
 			j += 1
 	return 0
@@ -19900,22 +19900,22 @@ class DelRedeclareRealCompileTests( test_support.RealCompileMixin, CompilerTestC
 	back correctly, proving the second binding is real and independent,
 	not silently aliasing the first.
 
-	SAME type both times only, deliberately: attempting this with a
-	GENUINELY different type (e.g. i32 then str) surfaced a real, separate,
-	CONFIRMED emitter bug while writing this test - emitter_c.py's own
-	`declared: set[str]` local-declaration tracking (_emit_instruction's
-	ir.Assign handling) is keyed by the C name alone, with no way to tell
-	"already declared, same Variable" apart from "already declared, a
+	Includes the genuinely-different-type case (i32 then str), which used
+	to be a real, confirmed emitter bug: emitter_c.py's own local-
+	declaration tracking was keyed by the C name alone, with no way to
+	tell "already declared, same Variable" apart from "already declared, a
 	DIFFERENT Variable object that happens to share the same source-level
-	name" (exactly what del-then-redeclare-with-a-different-type produces,
-	now that lowering.py accepts it - see lowering_test.py's own
-	test_del_then_redeclare_with_a_genuinely_different_type_is_allowed,
-	which is correct at ITS level; this is a lower, separate layer). The
-	second binding silently reuses the FIRST binding's own C variable
-	instead of getting a fresh, distinctly-named one - confirmed via a
-	real repro producing genuinely invalid C (a struct pointer assigned
-	into an int32_t). Flagged as a known, unfixed, real bug - not
-	attempted in this pass; see this task's own final report. '''
+	name" (exactly what del-then-redeclare-with-a-different-type produces)
+	- the second binding silently reused the FIRST binding's own C
+	variable instead of getting a fresh, distinctly-named one, producing
+	genuinely invalid C (a struct pointer assigned into an int32_t). FIXED
+	via Variable.needs_uid_suffix/uid (mpy_types.py) - emitter_c.py now
+	detects the type/volatility mismatch and gives the second binding its
+	own '$uid'-suffixed C identifier, while a SAME-type redeclaration (the
+	overwhelmingly common case - e.g. the same `x: u32 = ...` repeated
+	once per arm of a plain if/elif/else chain, see lib/builtins/
+	__File.py's own `creation` local) still shares one piece of C storage
+	exactly as before. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -19934,6 +19934,22 @@ def main() -> i32:
 	x: i32 = 42
 	if x != 42:
 		return 1
+	return 0
+''' ),
+			# the genuinely-different-type case - see this class's own
+			# docstring for the real emitter bug this used to hit (the two
+			# bindings' C variables colliding); del between them must give
+			# the second one (str) its own storage, independent of the
+			# first (i32) - both reads below must see the CORRECT value
+			( 'del_then_redeclare_with_different_type', '''
+def main() -> i32:
+	x: i32 = 7
+	if x != 7:
+		return 1
+	del x
+	x: str = 'hello'
+	if x != 'hello':
+		return 2
 	return 0
 ''' ),
 			# ties directly to the match-arm-binding-reuse diagnostic: del e
@@ -19961,6 +19977,80 @@ def main() -> i32:
 		case Result.Ok( v ):
 			if v != 7:
 				return 3
+	return 0
+''' ),
+		] )
+
+
+class AnnotatedLocalRedeclaredAcrossBranchesRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' a variable's explicit type annotation (`x: T = ...`) is only ever
+	given ONCE per function - even a same-type redeclaration once per arm
+	of a plain if/elif/else chain, with no del in between, is a genuine
+	compile error now (see lowering.py's _stmt_AnnAssign and
+	test_annotated_redeclaration_across_branches_is_a_compile_error in
+	lowering_test.py for the direct diagnostic check). The VALID way to
+	get a value out of an if/elif/else chain is what lib/builtins/
+	__File.py's own `creation` local actually does: declare the local
+	BARE once, before the chain, then a plain (un-annotated) `result =
+	...` per arm - INFERRED-type reassignment, not a second declaration,
+	so it's allowed to repeat across branches (see _stmt_Assign's own
+	"reuse existing" path). This class exercises exactly that corrected
+	pattern as a real compile-and-run check: each arm below is reached
+	via a DIFFERENT runtime condition, so this only passes if the merged
+	control flow really does share one piece of storage across all three
+	arms - a naive "give every local its own storage" fix would instead
+	read back whichever arm's OWN uninitialized storage happened to
+	follow it in memory. '''
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'first_arm', '''
+def classify( n: i32 ) -> i32:
+	result: i32
+	if n < 0:
+		result = -1
+	elif n == 0:
+		result = 0
+	else:
+		result = 1
+	return result
+
+def main() -> i32:
+	if classify( -5 ) != -1:
+		return 1
+	return 0
+''' ),
+			( 'second_arm', '''
+def classify( n: i32 ) -> i32:
+	result: i32
+	if n < 0:
+		result = -1
+	elif n == 0:
+		result = 0
+	else:
+		result = 1
+	return result
+
+def main() -> i32:
+	if classify( 0 ) != 0:
+		return 1
+	return 0
+''' ),
+			( 'third_arm', '''
+def classify( n: i32 ) -> i32:
+	result: i32
+	if n < 0:
+		result = -1
+	elif n == 0:
+		result = 0
+	else:
+		result = 1
+	return result
+
+def main() -> i32:
+	if classify( 5 ) != 1:
+		return 1
 	return 0
 ''' ),
 		] )

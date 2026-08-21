@@ -603,10 +603,25 @@ _C_KEYWORDS: frozenset[str] = frozenset([
 	'_Static_assert', '_Thread_local',
 ])
 
-def _c_local_name( stem: str ) -> str:
-	''' return a C-safe local variable name. C keywords get a leading
-	underscore; everything else passes through unchanged. '''
-	return f'_{stem}' if stem in _C_KEYWORDS else stem
+def _c_local_name( var: Variable ) -> str:
+	''' return this local's own C identifier. C keywords get a leading
+	underscore. var.needs_uid_suffix - set by lowering.py, only at a
+	genuinely fresh declaration that follows an earlier `del` of the same
+	stem (see its own docstring) - appends var.uid ('$' can't appear in a
+	source identifier, same reasoning as _temp_name) so that Variable
+	never collides at the C level with whatever the old, deleted binding
+	left behind (see del_reuse_and_emitter_naming_bug). Every other local
+	(parameters, an ordinary reassignment reusing the SAME live binding
+	across if/elif/else arms, __return_value and other compiler-
+	synthesized slots) keeps its bare stem - lowering.py guarantees two
+	DIFFERENT Variable objects only ever share a bare, un-suffixed stem
+	when they're genuinely meant to (an inferred, non-annotated re-
+	assignment reusing an existing binding); a same-scope, no-del
+	REdeclaration (a second explicit `x: T = ...` for an already-live x)
+	is rejected as a compile error before it ever reaches here - see
+	_stmt_AnnAssign's own doc. '''
+	base = f'_{var.stem}' if var.stem in _C_KEYWORDS else var.stem
+	return f'{base}${var.uid}' if var.needs_uid_suffix else base
 
 def _temp_name( temp_id: int ) -> str:
 	''' the C name for a compiler-synthesized ir.Temp, e.g. for id=5, "$t5" -
@@ -1292,7 +1307,7 @@ def _function_prototype( function: Function ) -> str:
 	if _has_self( function ):
 		params.append( f'{_self_c_type(function.cls)} self' )
 	for p in ( function.parameters or [] ):
-		params.append( _declarator( p.type, _c_local_name( p.stem )))
+		params.append( _declarator( p.type, _c_local_name( p )))
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
 		# the real OS/CRT entry point always calls main with (argc, argv,
@@ -1358,9 +1373,9 @@ def _emit_operand( op: ir.Operand ) -> str:
 		ret, params = _function_pointer_c_type( fn_type )
 		return f'({_fn_ptr_cast_type(ret, params, stars = depth)}){mangle_function_qualname(op.fn)}'
 	if isinstance( op, Variable ):
-		# locals (parameters, stack locals) use bare stem; globals
+		# locals (parameters, stack locals) use _c_local_name; globals
 		# need the full mangled qualname (cross-TU visibility)
-		return _c_local_name( op.stem ) if not op.is_global else mangle_qualname( op.qualname )
+		return _c_local_name( op ) if not op.is_global else mangle_qualname( op.qualname )
 	raise NotImplementedError( f'_emit_operand: unsupported operand {op!r}' )
 
 # stems wider than plain C `int` - a bare, un-cast literal like `1` silently
@@ -2412,12 +2427,22 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# this module synthesizes one inline at each local's first assignment
 	# (see the ir.Assign branch below) - pre-seed with every parameter
 	# (already declared via the signature itself, must never be
-	# re-declared) so only genuine first-time locals trigger it
+	# re-declared) so only genuine first-time locals trigger it. Keyed by
+	# each Variable's own _c_local_name (already uid-suffixed where
+	# lowering.py decided that's needed - see Variable.needs_uid_suffix)
+	# rather than by bare stem: lowering.py guarantees two DIFFERENT
+	# Variable objects only ever render to the SAME name here when
+	# they're genuinely meant to share one piece of C storage (an
+	# inferred, non-annotated reassignment reusing an existing binding,
+	# e.g. across if/elif/else arms) - a same-scope, no-del REdeclaration
+	# is rejected as a compile error before it ever reaches emission (see
+	# _stmt_AnnAssign's own doc), so this set no longer needs to reason
+	# about type compatibility itself.
 	declared: set[str] = set()
 	if _has_self( function ):
 		declared.add( 'self' )
 	for p in ( function.parameters or [] ):
-		declared.add( _c_local_name( p.stem ))
+		declared.add( _c_local_name( p ))
 	# __return_value (ir.OrJump's own return_slot - see Lowering.
 	# _return_value_var) is referenced two ways neither of which goes
 	# through the ordinary "declare on first Assign" mechanism below: a
@@ -2461,7 +2486,7 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		for instr in fn.instructions
 	)
 	if needs_return_value and not _returns_void_in_c( function.return_type ):
-		name = _c_local_name( '__return_value' )
+		name = '__return_value' # bare, not _c_local_name(var) - __return_value's own real Variable object (self._return_value_var) is never independently redeclared/deleted within a function, so needs_uid_suffix is always False for it; a no-Variable-in-hand fallback string is fine here for exactly that reason
 		# deliberately NOT zero-initialized (`= {0}`) despite a branch
 		# chain compiled from a match/if-elif over every variant of a
 		# union (or similarly exhaustive-at-the-metalpy-level shape) being
@@ -2496,18 +2521,23 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		# function shape per instantiation/overload, and every call site
 		# already passes it uniformly. (void)param silences -Wunused-
 		# parameter without an attribute (MSVC doesn't support
-		# __attribute__ and doesn't warn on this by default anyway) -
-		# _c_local_name() itself never collides with a real local, so this
-		# text search is safe. Destructors are exempted: their only
+		# __attribute__ and doesn't warn on this by default anyway).
+		# `(?!\$)` matters now that a genuine local sharing a parameter's
+		# stem gets a '$uid' suffix (_c_local_name) - without it, a bare
+		# `\bname\b` search would count as "used" merely by matching the
+		# unsuffixed PREFIX of that unrelated local's own suffixed
+		# occurrence (e.g. parameter `x` against a later `del x; x: T2 =
+		# ...`-redeclared local emitted as `x$7` - see del_reuse_and_
+		# emitter_naming_bug). Destructors are exempted: their only
 		# "parameter" is __obj, never named self in the C signature itself
 		# (self is a real local, cast from __obj, just above)
 		body_text = '\n'.join( lines[1:] )
 		void_marks: list[str] = []
-		if _has_self( function ) and not re.search( r'\bself\b', body_text ):
+		if _has_self( function ) and not re.search( r'\bself\b(?!\$)', body_text ):
 			void_marks.append( 'self' )
 		for p in ( function.parameters or [] ):
-			name = _c_local_name( p.stem )
-			if not re.search( rf'\b{re.escape(name)}\b', body_text ):
+			name = _c_local_name( p )
+			if not re.search( rf'\b{re.escape(name)}\b(?!\$)', body_text ):
 				void_marks.append( name )
 		for name in reversed( void_marks ):
 			lines.insert( 1, f'\t(void){name};' )
@@ -2562,13 +2592,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# (guaranteed by lowering.py to be a genuinely flat/unconditional
 		# point - never nested inside one of THIS module's own hand-emitted
 		# C `{ }` blocks)
-		name = _c_local_name( instr.variable.stem )
+		name = _c_local_name( instr.variable )
 		declared.add( name )
 		return [ f'\t{_declarator( instr.variable.type, name, volatile = instr.variable.is_volatile )};' ]
 	if isinstance( instr, ir.Assign ):
 		src = _emit_operand( instr.src )
 		if isinstance( instr.dest, Variable ) and not instr.dest.is_global:
-			name = _c_local_name( instr.dest.stem )
+			name = _c_local_name( instr.dest )
 			if name not in declared:
 				declared.add( name )
 				return [ f'\t{_declarator( instr.dest.type, name, volatile = instr.dest.is_volatile )} = {src};' ] + _mark_used_if_none( instr.dest )
@@ -3382,7 +3412,7 @@ def _vtable_slot_c_type( owner: RCClass|CStruct, slot: Function ) -> tuple[str,l
 	ret = 'void' if _returns_void_in_c( slot.return_type ) else c_type( slot.return_type )
 	params = [ f'{_self_c_type(owner)} self' ]
 	for p in ( slot.parameters or [] ):
-		params.append( _declarator( p.type, _c_local_name( p.stem )))
+		params.append( _declarator( p.type, _c_local_name( p )))
 	return ret, params
 
 def emit_interface_vtbl_struct( owner: CStruct ) -> str:

@@ -1725,6 +1725,24 @@ class FunctionLowering:
 		self._temp_id = 0
 		self._label_id = 0
 		self._pending_temps: list[ir.Temp] = []
+		# every stem ever handed to _mark_fresh_local_declared - unlike
+		# fn.names (which loses an entry on del), this NEVER shrinks. Lets a
+		# genuinely fresh declaration (one reached with no LIVE binding for
+		# its own stem - _declare_local's own callers all pre-check that)
+		# tell "truly first-ever declaration of this name" (needs no C-name
+		# disambiguation) apart from "a fresh declaration following an
+		# earlier del of this same name" (needs its own, uid-suffixed C
+		# identifier - see Variable.needs_uid_suffix's own docstring and
+		# del_reuse_and_emitter_naming_bug). Pre-seeded with every real
+		# parameter's own stem: a parameter IS a Variable (Parameter
+		# subclasses it) and del DOES accept one (_stmt_Delete's own
+		# isinstance check doesn't exclude Parameter) - `def f(x: i32): del
+		# x; x: str = 'hi'` must give the second x its own identifier
+		# too, exactly like any other del-then-redeclare, or it would
+		# silently collide with the C parameter itself in the function
+		# signature. 'self' is added the same way, just below, once its
+		# own Parameter exists (not yet constructed this early).
+		self._ever_declared_stems: set[str] = { p.stem for p in ( fn.parameters or [] )} if fn is not None else set()
 		self._current_fn = fn
 		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
 		self._loop_depth = 0
@@ -1837,6 +1855,7 @@ class FunctionLowering:
 							self_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ fn.cls ] )
 						self_param = Parameter( stem = 'self', qualname = f'{fn.qualname}.self', file = fn.file, line = fn.line, type = self_type )
 						fn.add_name( 'self', self_param )
+						self._ever_declared_stems.add( 'self' ) # see _ever_declared_stems' own docstring - del accepts self too, same as any other parameter
 						# fn.cls may be a Specialization for a monomorphized
 						# generic-class __init__ (see Lowering._lower_generic_
 						# construction_args) - unwrap to the real RCClass for
@@ -2431,6 +2450,20 @@ class FunctionLowering:
 		self._label_id += 1
 		return label
 
+	def _mark_fresh_local_declared( self, stem: str ) -> bool:
+		''' called at every genuinely fresh local declaration - one reached
+		with no LIVE binding for `stem` already in fn.names (every call
+		site here already confirmed that itself, via _existing_local_or_
+		none/_stmt_AnnAssign's own check, before getting here). Returns
+		True if `stem` needs its own disambiguated C identifier
+		(Variable.needs_uid_suffix) because it was declared before AND has
+		since been del'd (only del removes a live name from fn.names
+		without also going through here again) - False for a genuinely
+		first-ever declaration. '''
+		needs_suffix = stem in self._ever_declared_stems
+		self._ever_declared_stems.add( stem )
+		return needs_suffix
+
 	# --- statements ------------------------------------------------------------
 
 	def _lower_stmt( self, node: ast.stmt ) -> None:
@@ -2976,6 +3009,35 @@ class FunctionLowering:
 		# real - see that block's own comment for why both restrictions
 		# are load-bearing, not incidental.
 		self.lowering.schedule( var_type )
+		# an explicit type annotation is a DECLARATION, not just an
+		# assignment - a variable's type is only ever given once. Unlike a
+		# bare `x = value` (_stmt_Assign, where the type is INFERRED from
+		# whichever assignment reaches it first, so reassigning/re-
+		# entering it via a different branch is ordinary, expected reuse
+		# of the same binding), redeclaring an already-live name via a
+		# SECOND `x: T = ...` is always rejected here - regardless of
+		# whether T matches the original annotation, and regardless of
+		# whether the two occurrences are in mutually exclusive branches
+		# (e.g. one `x: T = ...` per arm of an if/elif/else chain - see
+		# this fix's own commit message for why: a variable's type is
+		# declared exactly once, no matter how many source-level branches
+		# happen to reach it). `del x` first is the only way to
+		# legitimately redeclare x's type. Confirmed via a real repro: this
+		# used to construct a FRESH Variable unconditionally, with no
+		# existing-binding check at all, so `x: i32 = 1; x: str = 'hi'`
+		# (no del) silently succeeded, each occurrence getting its own
+		# independent Variable object sharing a stem - undiagnosed at the
+		# source level, and (before Variable.needs_uid_suffix existed)
+		# producing outright invalid C at the emitter level too - see
+		# del_reuse_and_emitter_naming_bug.
+		existing = self._existing_local_or_none( node.target.id, node, 'cannot assign to it' )
+		if existing is not None:
+			self.lowering.discovery.fail(
+				f'{node.target.id!r} already has a declared type - a variable can only be given an '
+				f'explicit type annotation once. Use a plain `{node.target.id} = ...` (no annotation) to '
+				f'reassign it, or `del {node.target.id}` first to redeclare it with a fresh type',
+				node,
+			)
 		var = Variable(
 			stem = node.target.id,
 			qualname = f'{fn.qualname}.{node.target.id}',
@@ -2983,6 +3045,7 @@ class FunctionLowering:
 			line = node.lineno,
 			type = var_type,
 			is_volatile = is_volatile,
+			needs_uid_suffix = self._mark_fresh_local_declared( node.target.id ),
 		)
 		fn.add_name( var.stem, var ) # scoped to the whole function body regardless of node.value (no block scoping - see cfg.py's own module docstring) - a bare declaration (node.value is None) deliberately does NOT mark it live in self._cfg (see below); a later real assignment does, via assign()'s own unconditional self._live.add()
 		if node.value is not None:
@@ -3184,15 +3247,58 @@ class FunctionLowering:
 		return root, attr_node.attr, array_type, index
 
 	def _existing_local_or_none( self, target_id: str, node: ast.AST, context: str ) -> Variable|None:
-		''' find_name_or_none, but treating a previously-BROKEN entry as if
-		it weren't there at all - free to redeclare cleanly via
-		_declare_local below, same as a genuinely first assignment, since
-		nothing usable was ever produced for it. Shared by _stmt_Assign,
-		_expr_NamedExpr (walrus), and _bind_loop_target - all three mirror
-		the same "reuse existing, else declare fresh" rule (see their own
-		comments). `context` only feeds the not-a-variable error message,
-		which differs slightly per caller. '''
-		existing = self.lowering.discovery.find_name_or_none( target_id )
+		''' is target_id ALREADY a genuine binding this assignment should
+		reuse - fn.names (the CURRENT function's own scope) first, falling
+		through to the enclosing MODULE's own top-level names (never an
+		enclosing CLASS scope, and never builtins/intrinsics) if not found
+		there. Treats a previously-BROKEN entry as if it weren't there at
+		all - free to redeclare cleanly via _declare_local below, same as a
+		genuinely first assignment, since nothing usable was ever produced
+		for it. Shared by _stmt_Assign, _stmt_AnnAssign, _expr_NamedExpr
+		(walrus), and _bind_loop_target - all four mirror the same "reuse
+		existing, else declare fresh" rule (see their own comments).
+		`context` only feeds the not-a-variable error message, which
+		differs slightly per caller.
+
+		This exact two-scope search (not the full find_name_or_none walk,
+		and not fn.names alone) is shaped by three real, confirmed cases:
+
+		1. fn.names alone breaks `global x; x = value` (or `x: T = value`)
+		reassigning a MODULE-level global from inside a function -
+		_stmt_Global is deliberately a no-op (see its own comment) that
+		relies ENTIRELY on this kind of lookup falling through to module
+		scope; skipping that fallback makes the reassignment look like a
+		brand-new LOCAL instead, silently shadowing the real global. A
+		local genuinely colliding with an unrelated MODULE-level name -
+		e.g. `head` inside http.client._build_request_head, this module's
+		OWN head() verb helper - is correctly rejected the same way (fixed
+		by renaming the local, not by widening this lookup further).
+
+		2. The full find_name_or_none walk (module_context's scope_stack,
+		innermost first) ALSO includes the enclosing CLASS scope for a
+		method body, and builtins/intrinsics at the very end - so a
+		genuinely fresh local shadowing an unrelated CLASS MEMBER (e.g.
+		`byte_len: usize = ...` as a local inside str._from_owned_cstr,
+		despite str ALSO having an instance method literally named
+		byte_len) or an intrinsic TYPE name (a local literally named `u64`
+		or `u32`, deliberately exercised by emitter_c_test.py's own
+		UnionReceiverDispatchCoercionTests) would incorrectly find that
+		outer name and reject the shadowing declaration as "not a
+		variable, cannot assign to it" - confirmed regressions once
+		_stmt_AnnAssign started calling this at all (previously it never
+		checked for an existing binding, so neither case ever reached
+		here). module.names is NOT builtins/intrinsics (Module keeps all
+		three as separate dicts - see its own fields) so this search
+		reaches real module-level globals without ever touching those. '''
+		existing = self._current_fn.names.get( target_id )
+		if existing is None:
+			# module_stack[-1], not _find_module_for(self._current_fn) - the
+			# latter linear-scans every module by file match, and this is a
+			# hot path (called on every bare-Name assignment); module_
+			# context() already keeps the CURRENTLY active module on top of
+			# this same stack for the whole time a statement is being
+			# lowered, the identical source find_name_or_none itself reads
+			existing = self.lowering.discovery.module_stack[-1].names.get( target_id )
 		if existing is None or existing.broken:
 			return None
 		if not isinstance( existing, Variable ):
@@ -3218,13 +3324,14 @@ class FunctionLowering:
 		range()'s implicit literal start) - every other caller leaves it
 		None, inferring purely from the RHS. '''
 		fn = self._current_fn
+		needs_uid_suffix = self._mark_fresh_local_declared( target_id )
 		try:
 			operand = lower_rhs( default_type )
 		except CompileError:
-			broken = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True )
+			broken = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True, needs_uid_suffix = needs_uid_suffix )
 			fn.add_name( broken.stem, broken )
 			raise
-		var = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type )
+		var = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type, needs_uid_suffix = needs_uid_suffix )
 		fn.add_name( var.stem, var )
 		self.lowering.schedule( var.type )
 		return var, operand
@@ -3507,7 +3614,7 @@ class FunctionLowering:
 							self._emit( instr )
 						self._emit( ir.Assign( dest = existing, src = final ))
 					else:
-						var = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = elem.type )
+						var = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = elem.type, needs_uid_suffix = self._mark_fresh_local_declared( elt.id ))
 						fn.add_name( var.stem, var )
 						self.lowering.schedule( var.type )
 						for instr in self._cfg_assign( var, elem, is_alias = True, node = node ):
@@ -5544,16 +5651,23 @@ class FunctionLowering:
 			self._emit( instr )
 		self._emit( ir.Jump( target = continue_label ))
 
-	def _declare_hidden_local( self, stem: str, type: Type, node: ast.AST ) -> Variable:
+	def _declare_hidden_local( self, stem: str, type: Type, node: ast.AST, *, user_facing: bool = False ) -> Variable:
 		# compiler-synthesized locals (for-loop scaffolding: the once-
 		# evaluated iterable, its length, the hidden index counter) - real
 		# named Variables (not anonymous Temps) registered into the
 		# function's flat names dict, the same way `self` gets synthesized
 		# in lower_function, so synthetic ast.Name references to them
 		# resolve normally through the existing _expr_Name/_stmt_Assign
-		# machinery instead of duplicating it
+		# machinery instead of duplicating it. user_facing defaults False -
+		# every caller except the fallible for-loop's own bare loop-target
+		# rebind passes an already-unique, '__'-prefixed synthesized stem
+		# (a per-loop counter baked directly into the name), so it can
+		# never collide with itself and needs no del-tracking; that one
+		# caller passes the user's own source-level target name, which can
+		# (see _mark_fresh_local_declared/needs_uid_suffix's own docstrings)
 		fn = self._current_fn
-		var = Variable( stem = stem, qualname = f'{fn.qualname}.{stem}', file = fn.file, line = getattr( node, 'lineno', None ), type = type )
+		needs_uid_suffix = self._mark_fresh_local_declared( stem ) if user_facing else False
+		var = Variable( stem = stem, qualname = f'{fn.qualname}.{stem}', file = fn.file, line = getattr( node, 'lineno', None ), type = type, needs_uid_suffix = needs_uid_suffix )
 		fn.add_name( stem, var )
 		# every caller unconditionally assigns this right after declaring it
 		# (no user code runs in between - see each call site's own next
@@ -5971,7 +6085,7 @@ class FunctionLowering:
 			# inferred as both remaining_error_type and full_error_type").
 			result_cls = self.lowering.discovery.find_name( 'Result', node )
 			target_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ elem_type, remaining_error_type ] )
-			self._declare_hidden_local( node.target.id, target_type, node )
+			self._declare_hidden_local( node.target.id, target_type, node, user_facing = True )
 
 		start_label = self._new_label( 'for_start' )
 		continue_label = self._new_label( 'for_continue' )
@@ -7100,7 +7214,7 @@ class FunctionLowering:
 		# _declare_local's callback-based lowering (operand is already
 		# lowered above). is_alias=False: operand is a fresh Allocate
 		# result, same as any other first-time construction
-		var = Variable( stem = node.name, qualname = f'{enclosing.qualname}.{node.name}', file = enclosing.file, line = node.lineno, type = operand.type )
+		var = Variable( stem = node.name, qualname = f'{enclosing.qualname}.{node.name}', file = enclosing.file, line = node.lineno, type = operand.type, needs_uid_suffix = self._mark_fresh_local_declared( node.name ))
 		enclosing.add_name( var.stem, var )
 		self.lowering.schedule( var.type )
 		for instr in self._cfg_assign( var, operand, is_alias = False, node = node ):

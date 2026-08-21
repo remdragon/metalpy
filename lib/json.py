@@ -668,34 +668,37 @@ def _dump_value( value: JSONValue ) -> Result[str, JSONError]:
 		case JSONValue.String( s ):
 			return Result.Ok( _json_escape_string( s ))
 		case JSONValue.Array( arr ):
-			# `count`, not `n` - `n` is already bound to an `int` by the
-			# Int( n ) arm above; the two arms otherwise share the SAME C
-			# variable slot by name within this one function, so reusing
-			# `n` here with a different type (usize) crashed C compilation
-			# outright (int-to-pointer conversion error) - a real bug in
-			# this module's own code, found and fixed during development.
-			pieces: list[str] = list[str]()
-			i: usize = 0
-			count: usize = len( arr )
-			while i < count:
-				elem: JSONValue = arr.__getitem__( i ).unwrap( 'dumps: index in bounds by construction' )
+			# distinct names per arm (arr_*/obj_*), not shared ones - a
+			# variable's type is only ever declared once per function (no
+			# block scoping - see cfg.py's own module docstring), so a
+			# SECOND `pieces: list[str] = ...`/`i: usize = ...`/`count:
+			# usize = ...` in the Object arm below would be a genuine
+			# redeclaration error even though the two arms are mutually
+			# exclusive and each returns before the other could ever run.
+			# `count`, not `n` for the same underlying reason - `n` is
+			# already bound to an `int` by the Int( n ) arm above.
+			arr_pieces: list[str] = list[str]()
+			arr_i: usize = 0
+			arr_count: usize = len( arr )
+			while arr_i < arr_count:
+				elem: JSONValue = arr.__getitem__( arr_i ).unwrap( 'dumps: index in bounds by construction' )
 				piece: str = _dump_value( elem ).or_return()
-				pieces.append( piece ).unwrap( 'dumps: append failed' )
+				arr_pieces.append( piece ).unwrap( 'dumps: append failed' )
 				with compiler.panic_arithmetic( 'walking a list of known length index-by-index cannot overflow usize' ):
-					i += 1
-			return Result.Ok( str( '[' ) + str( ',' ).join( pieces ) + str( ']' ))
+					arr_i += 1
+			return Result.Ok( str( '[' ) + str( ',' ).join( arr_pieces ) + str( ']' ))
 		case JSONValue.Object( obj ):
-			pieces: list[str] = list[str]()
-			i: usize = 0
-			count: usize = len( obj )
-			while i < count:
-				k: str = obj.key_at( i ).unwrap( 'dumps: index in bounds by construction' )
-				v: JSONValue = obj.value_at( i ).unwrap( 'dumps: index in bounds by construction' )
+			obj_pieces: list[str] = list[str]()
+			obj_i: usize = 0
+			obj_count: usize = len( obj )
+			while obj_i < obj_count:
+				k: str = obj.key_at( obj_i ).unwrap( 'dumps: index in bounds by construction' )
+				v: JSONValue = obj.value_at( obj_i ).unwrap( 'dumps: index in bounds by construction' )
 				entry: str = _json_escape_string( k ) + str( ':' ) + _dump_value( v ).or_return()
-				pieces.append( entry ).unwrap( 'dumps: append failed' )
+				obj_pieces.append( entry ).unwrap( 'dumps: append failed' )
 				with compiler.panic_arithmetic( 'walking a dict of known length index-by-index cannot overflow usize' ):
-					i += 1
-			return Result.Ok( str( '{' ) + str( ',' ).join( pieces ) + str( '}' ))
+					obj_i += 1
+			return Result.Ok( str( '{' ) + str( ',' ).join( obj_pieces ) + str( '}' ))
 
 
 def _json_escape_string( s: str ) -> str:
@@ -1002,18 +1005,21 @@ def _flatten_into( value: JSONValue, prefix: str, out: dict[str, JSONValue] ) ->
 				with compiler.panic_arithmetic( 'walking a list of known length index-by-index cannot overflow usize' ):
 					i += 1
 		case JSONValue.Object( obj ):
-			n: usize = len( obj )
-			if n == 0:
+			# distinct names from the Array arm's own n/i above - a
+			# variable's type is only ever declared once per function
+			obj_n: usize = len( obj )
+			if obj_n == 0:
 				out.__setitem__( prefix, value )
 				return
-			i: usize = 0
-			while i < n:
-				k: str = obj.key_at( i ).unwrap( 'flatten: index in bounds by construction' )
-				v: JSONValue = obj.value_at( i ).unwrap( 'flatten: index in bounds by construction' )
-				child_path: str = k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
-				_flatten_into( v, child_path, out )
+			obj_i: usize = 0
+			while obj_i < obj_n:
+				k: str = obj.key_at( obj_i ).unwrap( 'flatten: index in bounds by construction' )
+				v: JSONValue = obj.value_at( obj_i ).unwrap( 'flatten: index in bounds by construction' )
+				# distinct name from the Array arm's own child_path above
+				obj_child_path: str = k if prefix.byte_len() == 0 else prefix + str( '.' ) + k
+				_flatten_into( v, obj_child_path, out )
 				with compiler.panic_arithmetic( 'walking a dict of known length index-by-index cannot overflow usize' ):
-					i += 1
+					obj_i += 1
 		case _:
 			out.__setitem__( prefix, value )
 

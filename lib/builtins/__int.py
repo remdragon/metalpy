@@ -160,9 +160,12 @@ class int:
 		if length == 0:
 			return Result.Err( IntError.InvalidDigit( None ))
 
-		is_negative: bool = cstr[0] == _ASCII_MINUS
+		# negative, not is_negative - int.is_negative() is a real instance
+		# method, and this language has no local-shadows-outer-scope
+		# semantics (see _existing_local_or_none's own comment)
+		negative: bool = cstr[0] == _ASCII_MINUS
 		with compiler.panic_arithmetic( 'a leading sign character is at most one byte within the string\'s own length' ):
-			start: usize = 1 if is_negative else 0
+			start: usize = 1 if negative else 0
 
 			# Skip leading zeros, but always leave at least one digit
 			# character behind (so "0" and "-0" still parse to zero
@@ -194,7 +197,7 @@ class int:
 			__num_allocated = num_digits,
 			__is_negative = False,
 		)
-		result.__is_negative = is_negative and not result.is_zero()
+		result.__is_negative = negative and not result.is_zero()
 		return Result.Ok( result )
 
 	def clone( self ) -> int:

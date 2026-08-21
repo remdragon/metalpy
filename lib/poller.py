@@ -218,11 +218,13 @@ class Poller:
 		if rc > 0:
 			i = 0
 			while i < n:
-				slot: Ptr[WSAPOLLFD] = _elem_at( buf, i )
-				revents: i16 = slot.revents
+				# distinct name from the fill loop's own `slot` above - a
+				# variable's type is only ever declared once per function
+				ready_slot: Ptr[WSAPOLLFD] = _elem_at( buf, i )
+				revents: i16 = ready_slot.revents
 				if revents != 0:
 					out.append( ReadyEvent(
-						fd = slot.fd,
+						fd = ready_slot.fd,
 						readable = ( revents & ( POLLRDNORM | POLLERR | POLLHUP )) != 0,
 						writable = ( revents & POLLWRNORM ) != 0,
 					)).unwrap( 'Poller.wait: result list overflow' )
