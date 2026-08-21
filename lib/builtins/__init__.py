@@ -38,6 +38,10 @@ class BorrowError: pass
 # _lower_eq_dispatch/_classify_leaf_pair_eq) produces Result[bool,TypeError]
 # purely as a tag, same empty-marker shape as the others above
 class TypeError: pass
+# os.path.commonpath()/relpath()'s mismatched-root / mixed-absolute-and-
+# relative failure - real Python raises ValueError; Result[str, ValueError]
+# instead, per this codebase's Result convention
+class ValueError: pass
 # not an operation-failure marker like the others above - the generator-
 # exhaustion sentinel every Iterator[Result[T,StopIteration]]/Generator[T,E]
 # (E always includes this) produces in its own Result's error channel once

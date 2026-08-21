@@ -8,23 +8,13 @@ themselves don't know or care which concurrency model is running them.
 
 import compiler
 import io
+import os
 import asyncfile
 from datetime import datetime
 from fs import SEEK_SET, SEEK_END
 from http.server import Request, Response
 
-
-def _is_safe_relative_path( path: str ) -> bool:
-	''' rejects any '..' path segment outright - simplest correct check,
-	not full canonicalization. '''
-	segments: list[str] = path.split( '/' )
-	n: usize = segments.__len__()
-	i: usize = 0
-	for i in range( n ):
-		segment: str = segments.__getitem__( i ).unwrap( '_is_safe_relative_path: index in bounds by construction' )
-		if segment == '..':
-			return False
-	return True
+_STATIC_BASE: str = 'demo/www'
 
 def _read_static_file( file_path: str ) -> Result[bytes, OSError|ValueError]:
 	reader: BinaryReader = asyncfile.AsyncFile.binary_reader( file_path ).or_return()
@@ -42,10 +32,12 @@ def _serve_static( path: str ) -> Response:
 	''' resolves path against the www/ subfolder next to this file (i.e.
 	demo/www, assuming the program runs from the repo root) and serves it
 	via async file I/O - the point being to exercise that path under the
-	reactor too, not just sockets. '''
-	if not _is_safe_relative_path( path ):
+	reactor too, not just sockets. Rejects any request whose normalized
+	path escapes demo/www, via os.path.is_relative_to (provably correct,
+	not a hand-rolled '..'-segment scan). '''
+	file_path: str = os.path.join( _STATIC_BASE, path )
+	if not os.path.is_relative_to( os.path.normpath( file_path ), os.path.normpath( _STATIC_BASE )):
 		return Response.text( 'Forbidden\n', 403, 'Forbidden' )
-	file_path: str = 'demo/www' + path
 	match _read_static_file( file_path ):
 		case Result.Ok( content ):
 			return Response.bytes_( content, 'text/html; charset=utf-8', 200, 'OK' )

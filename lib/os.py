@@ -5,10 +5,20 @@ listdir: Windows FindFirstFileA/FindNextFileA/FindClose; POSIX opendir(3)/
 	readdir(3)/closedir(3) (lib/posix/dirent.py). Excludes '.'/'..', matching
 	Python's own os.listdir().
 
-path.join/isdir/splitext/abspath/normpath: built entirely on str's own
-	public methods (find/rfind/partition/rpartition/split/join/removeprefix/
-	removesuffix/strip) - no raw byte-offset slicing, so these stay correct
-	on non-ASCII path components.
+path.join/isdir/splitext/abspath/normpath/basename/dirname/isabs/commonpath/
+	relpath/is_relative_to: built entirely on str's own public methods
+	(find/rfind/partition/rpartition/split/join/removeprefix/removesuffix/
+	strip) - no raw byte-offset slicing, so these stay correct on non-ASCII
+	path components.
+
+path.is_relative_to is purely lexical (normpath-based) - it never touches
+	the filesystem or cwd, and never fails; a root/drive mismatch just
+	compares unequal and returns False. This matches real
+	pathlib.PurePath.is_relative_to()'s own actual behavior, and is meant as
+	the primitive a future pathlib module can delegate to. commonpath/
+	relpath mirror CPython's own functions (which raise ValueError on
+	mismatched absolute/relative input or cross-drive Windows paths) via
+	Result[str, ValueError], per this codebase's Result convention.
 '''
 
 import compiler
@@ -125,6 +135,48 @@ def _is_abs( p: str ) -> bool:
 	return p.startswith( '/' )
 
 
+if compiler.target.os == 'windows':
+	sep: str = '\\'
+else:
+	sep: str = '/'
+
+
+@compiler.target( os = 'windows' )
+def _splitroot( p: str ) -> tuple[str, str]:
+	# same root-detection shape as normpath's own inline block below,
+	# factored out for reuse by dirname/commonpath/relpath/is_relative_to.
+	# Used on both raw paths (dirname) and already-normpath'd ones (every
+	# other caller, via _path_parts) - so unlike normpath's own inline
+	# block, this recognizes forward-slash UNC/drive separators too,
+	# matching _is_abs above.
+	if p.startswith( '\\\\' ):
+		return ( '\\\\', p.removeprefix( '\\\\' ))
+	if p.startswith( '//' ):
+		return ( '//', p.removeprefix( '//' ))
+	if len( p ) >= 2 and p.__getitem__( 1 ).unwrap_or( '' ) == ':':
+		drive: str = p.__getitem__( 0 ).unwrap_or( '' )
+		return ( drive + ':\\', p.removeprefix( drive + ':' ).removeprefix( '\\' ).removeprefix( '/' ))
+	return ( '', p )
+
+
+@compiler.target( os = not 'windows' )
+def _splitroot( p: str ) -> tuple[str, str]:
+	if p.startswith( '/' ):
+		return ( '/', p.removeprefix( '/' ))
+	return ( '', p )
+
+
+def _path_parts( p: str ) -> tuple[str, list[str]]:
+	''' root + ordered list of normalized path segments, built entirely on
+	normpath - lexical only, never touches the filesystem/cwd. e.g.
+	"a/b/../c" -> ("", ["a","c"]); "C:\\a\\b" -> ("C:\\", ["a","b"]). '''
+	normalized: str = path.normpath( p )
+	root, rest = _splitroot( normalized )
+	if rest == '' or rest == '.':
+		return ( root, list[str]() )
+	return ( root, rest.split( sep ))
+
+
 class path:
 
 	@staticmethod
@@ -133,7 +185,6 @@ class path:
 			return b
 		if a.endswith( '/' ) or a.endswith( '\\' ):
 			return a + b
-		sep: str = '\\' if compiler.target.os == 'windows' else '/'
 		return a + sep + b
 
 	@compiler.target( os = 'windows' )
@@ -182,10 +233,8 @@ class path:
 	@staticmethod
 	def normpath( p: str ) -> str:
 		if compiler.target.os == 'windows':
-			sep: str = '\\'
 			norm: str = p.replace( '/', '\\' )
 		else:
-			sep: str = '/'
 			norm: str = p
 
 		root: str = ''
@@ -234,3 +283,128 @@ class path:
 			return path.normpath( p )
 		cwd: str = _getcwd().unwrap( 'os.path.abspath: could not determine current directory' )
 		return path.normpath( path.join( cwd, p ))
+
+	@staticmethod
+	def basename( p: str ) -> str:
+		# same double-rpartition shape as splitext's own basename step above
+		_, _, after_slash = p.rpartition( '/' )
+		_, backslash_sep, after_backslash = after_slash.rpartition( '\\' )
+		return after_backslash if backslash_sep != '' else after_slash
+
+	@staticmethod
+	def dirname( p: str ) -> str:
+		root, rest = _splitroot( p )
+		before_slash, slash_sep, after_slash = rest.rpartition( '/' )
+		before_backslash, backslash_sep, after_backslash = after_slash.rpartition( '\\' )
+		if backslash_sep != '':
+			head: str = before_slash + slash_sep + before_backslash + backslash_sep
+		else:
+			head = before_slash + slash_sep
+		if head == '':
+			return root
+		if head.strip( '/\\' ) == '':
+			# head is nothing but separator characters (POSIX '/' root, or
+			# the separator right after a drive/UNC root) - keep it whole,
+			# matching CPython's own "don't rstrip a bare root to nothing"
+			return root + head
+		return root + head.rstrip( '/\\' )
+
+	@staticmethod
+	def isabs( p: str ) -> bool:
+		return _is_abs( p )
+
+	@staticmethod
+	def commonpath( paths: list[str] ) -> Result[str, ValueError]:
+		if len( paths ) == 0:
+			return Result.Err( ValueError() )
+
+		first: str = paths.__getitem__( 0 ).unwrap( 'os.path.commonpath: index in bounds by construction' )
+		common_root, common_parts = _path_parts( first )
+
+		idx: usize = 1
+		with compiler.panic_arithmetic( 'bounded by len(paths), cannot overflow' ):
+			while idx < len( paths ):
+				p: str = paths.__getitem__( idx ).unwrap( 'os.path.commonpath: index in bounds by construction' )
+				idx += 1
+				root, parts = _path_parts( p )
+				if root != common_root:
+					# covers both "mixed absolute/relative" (one root is ''
+					# and the other isn't) and a differing Windows drive/
+					# UNC share - CPython raises ValueError for both; one
+					# check here covers both too
+					return Result.Err( ValueError() )
+
+				limit: usize = len( common_parts ) if len( common_parts ) < len( parts ) else len( parts )
+				j: usize = 0
+				while j < limit:
+					a: str = common_parts.__getitem__( j ).unwrap( 'os.path.commonpath: index in bounds by construction' )
+					b: str = parts.__getitem__( j ).unwrap( 'os.path.commonpath: index in bounds by construction' )
+					if a != b:
+						break
+					j += 1
+
+				new_common: list[str] = list[str]()
+				k: usize = 0
+				while k < j:
+					new_common.append( common_parts.__getitem__( k ).unwrap( 'os.path.commonpath: index in bounds by construction' )).unwrap( 'os.path.commonpath: append failed' )
+					k += 1
+				common_parts = new_common
+
+		return Result.Ok( common_root + sep.join( common_parts ))
+
+	@staticmethod
+	def relpath( target: str, start: str = '.' ) -> Result[str, ValueError]:
+		# unlike is_relative_to, relpath legitimately resolves against cwd
+		# (matches real CPython os.path.relpath's own behavior)
+		start_root, start_parts = _path_parts( path.abspath( start ))
+		target_root, target_parts = _path_parts( path.abspath( target ))
+		if start_root != target_root:
+			return Result.Err( ValueError() )  # e.g. cross-drive on Windows
+
+		limit: usize = len( start_parts ) if len( start_parts ) < len( target_parts ) else len( target_parts )
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by limit, cannot overflow' ):
+			while i < limit:
+				a: str = start_parts.__getitem__( i ).unwrap( 'os.path.relpath: index in bounds by construction' )
+				b: str = target_parts.__getitem__( i ).unwrap( 'os.path.relpath: index in bounds by construction' )
+				if a != b:
+					break
+				i += 1
+
+		rel_parts: list[str] = list[str]()
+		with compiler.panic_arithmetic( 'bounded by i <= len(start_parts), cannot underflow or overflow' ):
+			up_count: usize = len( start_parts ) - i
+			k: usize = 0
+			while k < up_count:
+				rel_parts.append( '..' ).unwrap( 'os.path.relpath: append failed' )
+				k += 1
+			j: usize = i
+			while j < len( target_parts ):
+				rel_parts.append( target_parts.__getitem__( j ).unwrap( 'os.path.relpath: index in bounds by construction' )).unwrap( 'os.path.relpath: append failed' )
+				j += 1
+
+		if len( rel_parts ) == 0:
+			return Result.Ok( '.' )
+		return Result.Ok( sep.join( rel_parts ))
+
+	@staticmethod
+	def is_relative_to( target: str, start: str ) -> bool:
+		# purely lexical (normpath-based, via _path_parts) - never touches
+		# the filesystem/cwd, never raises; a root/drive mismatch just
+		# compares unequal and returns False. Matches real
+		# pathlib.PurePath.is_relative_to()'s own actual behavior.
+		target_root, target_parts = _path_parts( target )
+		start_root, start_parts = _path_parts( start )
+		if target_root != start_root:
+			return False
+		if len( start_parts ) > len( target_parts ):
+			return False
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by len(start_parts) <= len(target_parts), cannot overflow' ):
+			while i < len( start_parts ):
+				a: str = start_parts.__getitem__( i ).unwrap( 'os.path.is_relative_to: index in bounds by construction' )
+				b: str = target_parts.__getitem__( i ).unwrap( 'os.path.is_relative_to: index in bounds by construction' )
+				if a != b:
+					return False
+				i += 1
+		return True
