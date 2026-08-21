@@ -1,5 +1,5 @@
 # asyncfile_test.py — real compile+link+run coverage for lib/asyncfile.py:
-# AsyncFile's factories inject this module's AsyncFileOps implementation
+# AsyncFile's factories inject this module's FileOpsInterface implementation
 # into an ordinary BinaryReader/BinaryWriter/BinaryReadWriter (lib/builtins/
 # __File.py), plus the thread pool that implementation is built on.
 
@@ -81,7 +81,7 @@ def main() -> i32:
 		via plain File.binary_reader() (never touching lib/asyncfile.py at
 		all) must keep calling read_raw() directly even when constructed
 		and used from inside a Reactor-driven fiber - only AsyncFile's own
-		factories inject the pool-backed AsyncFileOps. '''
+		factories inject the pool-backed FileOpsInterface. '''
 		self._run( '''
 import compiler
 import reactor

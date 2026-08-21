@@ -15,7 +15,7 @@ from fs import (
 from io import Reader, Writer, Seekable
 
 
-# AsyncFileOps - injection point for reactor-aware file I/O (lib/
+# FileOpsInterface - injection point for reactor-aware file I/O (lib/
 # asyncfile.py) - a small, deliberately dependency-free ABSTRACT interface
 # (no reactor/socket/threading import - just two method shapes), so
 # BinaryReader/BinaryWriter/BinaryReadWriter's own read()/write() never
@@ -26,7 +26,7 @@ from io import Reader, Writer, Seekable
 # never pulls in the reactor/socket/threading dependency graph at all.
 # read()/write() take the raw fd directly (not a BinaryReader/Writer
 # instance) so the implementer stays equally decoupled from this module.
-class AsyncFileOps:
+class FileOpsInterface:
 	@abstractmethod
 	def do_read( self, fd: FD, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		...
@@ -35,19 +35,12 @@ class AsyncFileOps:
 		...
 
 
-# _SyncFileOps - the default AsyncFileOps every BinaryReader/BinaryWriter/
+# _SyncFileOps - the default FileOpsInterface every BinaryReader/BinaryWriter/
 # BinaryReadWriter starts with: a null-object implementation that just
 # calls read_raw()/write_raw() directly, so read()/write() below can be a
 # single unconditional virtual-dispatch call with NO `is not None` branch
-# at all - deliberately, not just for style: a real, confirmed compiler
-# bug means narrowing an `AsyncFileOps|None` field set via a setter (not
-# inline in the same expression) does not actually enable the virtual call
-# afterward ("X is not callable on NoneType", even though the field is
-# provably non-None at that point - see reactor_asyncfile task notes).
-# __aio staying NON-optional (always some real AsyncFileOps, defaulting to
-# this one) sidesteps that gap entirely rather than working around it with
-# a branch that doesn't reliably compile.
-class _SyncFileOps( AsyncFileOps ):
+# at all
+class _SyncFileOps( FileOpsInterface ):
 	@virtual
 	def do_read( self, fd: FD, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		return read_raw( fd, buf, count )
@@ -77,14 +70,14 @@ else:
 
 class BinaryReader( Reader, Seekable ):
 	__fd: FD
-	__aio: AsyncFileOps   # defaults to _sync_ops - see its own docstring
+	__ops: FileOpsInterface   # defaults to _sync_ops - see its own docstring
 
 	def __del__( self ) -> None:
 		if self.__fd != INVALID_FD:
 			close_raw( self.__fd ).is_ok() # a destructor can't propagate close() failure - deliberately ignored, not silently unchecked
 
 	def read( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
-		return self.__aio.do_read( self.__fd, buf, count )
+		return self.__ops.do_read( self.__fd, buf, count )
 
 	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
 		return seek_raw( self.__fd, offset, whence )
@@ -97,13 +90,13 @@ class BinaryReader( Reader, Seekable ):
 	def fd( self ) -> FD:
 		return self.__fd
 
-	def _set_aio( self, aio: AsyncFileOps ) -> None:
-		self.__aio = aio
+	def _set_ops( self, aio: FileOpsInterface ) -> None:
+		self.__ops = aio
 
 	@private
 	@staticmethod
 	def _from_fd( fd: FD ) -> BinaryReader:
-		return BinaryReader.__allocate__( __fd = fd, __aio = _sync_ops )
+		return BinaryReader.__allocate__( __fd = fd, __ops = _sync_ops )
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +105,14 @@ class BinaryReader( Reader, Seekable ):
 
 class BinaryWriter( Writer, Seekable ):
 	__fd: FD
-	__aio: AsyncFileOps   # defaults to _sync_ops - see its own docstring
+	__ops: FileOpsInterface   # defaults to _sync_ops - see its own docstring
 
 	def __del__( self ) -> None:
 		if self.__fd != INVALID_FD:
 			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 
 	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
-		return self.__aio.do_write( self.__fd, buf, count )
+		return self.__ops.do_write( self.__fd, buf, count )
 
 	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
 		return seek_raw( self.__fd, offset, whence )
@@ -132,13 +125,13 @@ class BinaryWriter( Writer, Seekable ):
 	def fd( self ) -> FD:
 		return self.__fd
 
-	def _set_aio( self, aio: AsyncFileOps ) -> None:
-		self.__aio = aio
+	def _set_ops( self, aio: FileOpsInterface ) -> None:
+		self.__ops = aio
 
 	@private
 	@staticmethod
 	def _from_fd( fd: FD ) -> BinaryWriter:
-		return BinaryWriter.__allocate__( __fd = fd, __aio = _sync_ops )
+		return BinaryWriter.__allocate__( __fd = fd, __ops = _sync_ops )
 
 
 # ---------------------------------------------------------------------------
@@ -147,17 +140,17 @@ class BinaryWriter( Writer, Seekable ):
 
 class BinaryReadWriter( Reader, Writer, Seekable ):
 	__fd: FD
-	__aio: AsyncFileOps   # defaults to _sync_ops - see its own docstring
+	__ops: FileOpsInterface   # defaults to _sync_ops - see its own docstring
 
 	def __del__( self ) -> None:
 		if self.__fd != INVALID_FD:
 			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 
 	def read( self, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
-		return self.__aio.do_read( self.__fd, buf, count )
+		return self.__ops.do_read( self.__fd, buf, count )
 
 	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
-		return self.__aio.do_write( self.__fd, buf, count )
+		return self.__ops.do_write( self.__fd, buf, count )
 
 	def seek( self, offset: i64, whence: i32 ) -> Result[i64, OSError]:
 		return seek_raw( self.__fd, offset, whence )
@@ -170,13 +163,13 @@ class BinaryReadWriter( Reader, Writer, Seekable ):
 	def fd( self ) -> FD:
 		return self.__fd
 
-	def _set_aio( self, aio: AsyncFileOps ) -> None:
-		self.__aio = aio
+	def _set_ops( self, aio: FileOpsInterface ) -> None:
+		self.__ops = aio
 
 	@private
 	@staticmethod
 	def _from_fd( fd: FD ) -> BinaryReadWriter:
-		return BinaryReadWriter.__allocate__( __fd = fd, __aio = _sync_ops )
+		return BinaryReadWriter.__allocate__( __fd = fd, __ops = _sync_ops )
 
 
 # ---------------------------------------------------------------------------

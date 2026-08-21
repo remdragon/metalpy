@@ -1,5 +1,5 @@
 '''
-The reactor-aware AsyncFileOps implementation, plus AsyncFile - a thin
+The reactor-aware FileOpsInterface implementation, plus AsyncFile - a thin
 namespace that hands back an ordinary BinaryReader/BinaryWriter/
 BinaryReadWriter (lib/builtins/__File.py) with this module's own
 implementation injected into its __aio hook.
@@ -15,7 +15,7 @@ real, non-IOCP producer of that exact same signal shape).
 Because BinaryReader/BinaryWriter/BinaryReadWriter's own read()/write()
 already branch on __aio being set, there's no separate Async* class here
 at all - AsyncFile.binary_reader()/binary_writer()/binary_read_writer()
-just call File's own factories and inject this module's AsyncFileOps
+just call File's own factories and inject this module's FileOpsInterface
 implementation. Plain File.binary_reader() (no reactor dependency at all)
 and AsyncFile.binary_reader() (this module) both return the exact same
 BinaryReader type - only whichever caller wants reactor-aware dispatch
@@ -150,13 +150,13 @@ _pool: _Pool = _Pool( _POOL_SIZE )
 
 
 # ---------------------------------------------------------------------------
-# _ReactorAsyncFileOps — the AsyncFileOps implementation this whole module
+# _ReactorAsyncFileOps — the FileOpsInterface implementation this whole module
 # exists to provide. Stateless (a single shared instance, _ops below) -
 # every real per-operation state lives in the CompletionHandle/_Job each
 # call constructs fresh.
 # ---------------------------------------------------------------------------
 
-class _ReactorAsyncFileOps( AsyncFileOps ):
+class _ReactorAsyncFileOps( FileOpsInterface ):
 	@virtual
 	def do_read( self, fd: fs.FD, buf: Ptr[u8], count: usize ) -> Result[usize, OSError]:
 		w: reactor.Worker|None = reactor.current_worker()
@@ -188,13 +188,13 @@ class _ReactorAsyncFileOps( AsyncFileOps ):
 		return handle.take()
 
 
-_ops: _ReactorAsyncFileOps = _ReactorAsyncFileOps()
+_async_ops: _ReactorAsyncFileOps = _ReactorAsyncFileOps()
 
 
 # ---------------------------------------------------------------------------
 # AsyncFile — namespace with static factory methods, mirrors
 # lib/builtins/__File.py's own File namespace exactly, just injecting
-# _ops into the BinaryReader/BinaryWriter/BinaryReadWriter File's own
+# _async_ops into the BinaryReader/BinaryWriter/BinaryReadWriter File's own
 # factories already build (open() itself stays synchronous - see this
 # module's own header comment).
 # ---------------------------------------------------------------------------
@@ -204,7 +204,7 @@ class AsyncFile:
 	@staticmethod
 	def binary_reader( path: str ) -> Result[BinaryReader, OSError]:
 		r: BinaryReader = File.binary_reader( path ).or_return()
-		r._set_aio( _ops )
+		r._set_ops( _async_ops )
 		return Result.Ok( r )
 
 	@staticmethod
@@ -215,7 +215,7 @@ class AsyncFile:
 		exists: bool|None = None,
 	) -> Result[BinaryWriter, OSError]:
 		w: BinaryWriter = File.binary_writer( path, append, truncate, exists ).or_return()
-		w._set_aio( _ops )
+		w._set_ops( _async_ops )
 		return Result.Ok( w )
 
 	@staticmethod
@@ -226,5 +226,5 @@ class AsyncFile:
 		exists: bool|None = None,
 	) -> Result[BinaryReadWriter, OSError]:
 		rw: BinaryReadWriter = File.binary_read_writer( path, append, truncate, exists ).or_return()
-		rw._set_aio( _ops )
+		rw._set_ops( _async_ops )
 		return Result.Ok( rw )
