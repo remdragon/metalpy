@@ -1,0 +1,37 @@
+import atomic
+import compiler
+import socket
+import threading
+import tcp
+from http.server import Request, Response, _handle_connection
+
+class App:
+	def handle( self, req: Request ) -> Response:
+		if req.path == '/echo':
+			return Response.text( 'you asked for ' + req.path )
+		return Response.text( 'nope', 404, 'Not Found' )
+
+class BareServer:
+	__listener: tcp.TcpListener
+	__app:      App
+	
+	def __init__( self, listener: tcp.TcpListener, app: App ):
+		self.__listener = listener
+		self.__app = app
+	
+	def run( self ):
+		match self.__listener.accept():
+			case Result.Ok( conn ):
+				_handle_connection( conn, self.__app.handle )
+			case Result.Err( _ ):
+				print( 'error accepting connection' )
+
+def main() -> i32:
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '127.0.0.1', u16( 0 )).unwrap( 'error binding default port' )
+	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
+	print( f'listening on port {addr.port()!r}' )
+	app: App = App()
+
+	server: BareServer = BareServer( listener, app )
+	t_server: threading.Thread = threading.Thread( server.run )
+	t_server.join()
