@@ -21003,5 +21003,87 @@ def main() -> i32:
 		self.assertEqual( len( self.discovery.errors.errors ), 1 )
 		self.assertIn( "'this_name_does_not_exist' is not defined", str( self.discovery.errors.errors[0] ))
 
+
+class DeferImplicitCastTempDedupTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' Fix for a gcc-only compile bug found while building lib/csv.py:
+	`defer( sys.free( ptr ))` where ptr: Ptr[u8], in a function with 2+
+	return points, produced a genuine gcc compile error - "redeclaration
+	of '$tN' with no linkage". cfg.py's defer replay (_replay()/
+	build_epilogue_ladder()) splices the SAME ir.DeclareTemp instruction
+	(for the implicit Ptr[u8]->Ptr[None] cast sys.free needs on a
+	non-Windows target - lib/sys.py has two free() overloads, only the
+	non-Windows one needs a cast from a bare Ptr[u8] argument) into
+	multiple return/unwind sites within one flat, un-block-scoped C
+	function body. This never reproduced on clang/MSVC - Windows's
+	sys.free(Ptr[u8]) overload needs no cast at all, so the temp this bug
+	depends on is never created there - so the compile-error side can only
+	be proven via METALPY_CC=gcc (WSL-only in this environment, see
+	project memory linker_c_validate_all_compilers.md). The structural
+	assertion below (no duplicate temp declaration in the emitted C text)
+	is host-independent and always runs; the compile+run assertion passes
+	trivially on clang/MSVC (nothing to catch there) and is the real proof
+	when run under gcc. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_defer_free_two_return_points( self ) -> None:
+		source = '''
+class MyErr:
+	pass
+
+def check( flag: bool ) -> Result[i32, MyErr]:
+	if flag:
+		return Result.Ok( 1 )
+	return Result.Err( MyErr() )
+
+def make_and_check( flag: bool ) -> Result[i32, MyErr]:
+	out: Ptr[u8] = sys.alloc[u8]( 8 )
+	defer( sys.free( out ))
+	out[0] = 42
+	match check( flag ):
+		case Result.Ok( v ):
+			with compiler.wrap_arithmetic:
+				total: i32 = i32( out[0] ) + v
+			return Result.Ok( total )
+		case Result.Err( e ):
+			return Result.Err( e )
+
+def main() -> i32:
+	match make_and_check( True ):
+		case Result.Ok( v ):
+			if v != 43:
+				return 1
+		case Result.Err( e ):
+			return 2
+	match make_and_check( False ):
+		case Result.Ok( v ):
+			return 3
+		case Result.Err( e ):
+			pass
+	return 0
+'''
+		self.compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+
+		# structural check: no duplicate `void* $tN;` declaration inside
+		# make_and_check's own function body (the two defer-replay sites'
+		# cast temp must be deduped, not repeated)
+		mangled = emitter_c.mangle_qualname( '__main__.make_and_check' )
+		def_sig = f'{mangled}( bool flag ) {{'
+		start = c_source.index( def_sig )
+		end = c_source.index( '\n}', start )
+		body = c_source[ start:end ]
+		import re
+		decls = re.findall( r'void\* (\$t\d+);', body )
+		self.assertEqual( len( decls ), len( set( decls )), f'duplicate temp declaration(s) in make_and_check: {decls}' )
+
+		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = self.compiler )
+
+
 if __name__ == '__main__':
 	unittest.main()
