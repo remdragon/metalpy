@@ -20,7 +20,7 @@ def _read_static_file( file_path: str ) -> Result[bytes, OSError|ValueError]:
 	reader: BinaryReader = asyncfile.AsyncFile.binary_reader( file_path ).or_return()
 	size: i64 = reader.seek( i64( 0 ), SEEK_END ).or_return()
 	if size < 0:
-		return ValueError( 'negative file size' )
+		return Result.Err( ValueError() )
 	reader.seek( i64( 0 ), SEEK_SET ).or_return()
 	with compiler.panic_arithmetic( 'a real static file fits well within usize' ):
 		n: usize = usize( size )
