@@ -38,6 +38,10 @@ class OsPathPureTests( test_support.RealCompileMixin, unittest.TestCase ):
 		# a lone backslash would be parsed as (the start of) an escape
 		# sequence rather than a literal separator byte
 		sep = '\\\\' if os.name == 'nt' else '/'
+		# same doubled-backslash-for-embedding trick as `sep` above, for an
+		# OS-appropriate absolute-path prefix (drive letter on Windows,
+		# root slash on POSIX) - lets one case cover both platforms
+		abs_prefix = 'C:\\\\' if os.name == 'nt' else '/'
 		cases = [
 			( 'join_no_trailing_sep', f'''
 import os
@@ -198,6 +202,244 @@ def main() -> i32:
 			return 2
 	return 0
 ''' ),
+			( 'basename_with_separators', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.basename( 'a{sep}b{sep}c' )
+	if result != 'c':
+		return 1
+	return 0
+''' ),
+			( 'basename_trailing_separator', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.basename( 'a{sep}b{sep}' )
+	if result != '':
+		return 1
+	return 0
+''' ),
+			( 'basename_no_separator', '''
+import os
+
+def main() -> i32:
+	result: str = os.path.basename( 'file.txt' )
+	if result != 'file.txt':
+		return 1
+	return 0
+''' ),
+			( 'dirname_with_separators', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.dirname( 'a{sep}b{sep}c' )
+	if result != 'a{sep}b':
+		return 1
+	return 0
+''' ),
+			( 'dirname_trailing_separator', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.dirname( 'a{sep}b{sep}' )
+	if result != 'a{sep}b':
+		return 1
+	return 0
+''' ),
+			( 'dirname_root_is_kept_whole', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.dirname( '{sep}a' )
+	if result != '{sep}':
+		return 1
+	return 0
+''' ),
+			( 'dirname_no_separator', '''
+import os
+
+def main() -> i32:
+	result: str = os.path.dirname( 'a' )
+	if result != '':
+		return 1
+	return 0
+''' ),
+			( 'isabs_true_for_platform_absolute_path', f'''
+import os
+
+def main() -> i32:
+	if not os.path.isabs( '{abs_prefix}a' ):
+		return 1
+	return 0
+''' ),
+			( 'isabs_false_for_relative_path', '''
+import os
+
+def main() -> i32:
+	if os.path.isabs( 'a' ):
+		return 1
+	return 0
+''' ),
+			( 'os_sep_matches_platform_separator', f'''
+import os
+
+def main() -> i32:
+	if os.sep != '{sep}':
+		return 1
+	return 0
+''' ),
+			( 'commonpath_relative', f'''
+import os
+
+def main() -> i32:
+	paths: list[str] = list[str]()
+	paths.append( 'a{sep}b{sep}c' ).unwrap( 'append failed' )
+	paths.append( 'a{sep}b{sep}d' ).unwrap( 'append failed' )
+	result: str = os.path.commonpath( paths ).unwrap( 'commonpath failed' )
+	if result != 'a{sep}b':
+		return 1
+	return 0
+''' ),
+			( 'commonpath_absolute', f'''
+import os
+
+def main() -> i32:
+	paths: list[str] = list[str]()
+	paths.append( '{abs_prefix}a{sep}b{sep}c' ).unwrap( 'append failed' )
+	paths.append( '{abs_prefix}a{sep}b{sep}d' ).unwrap( 'append failed' )
+	result: str = os.path.commonpath( paths ).unwrap( 'commonpath failed' )
+	if result != '{abs_prefix}a{sep}b':
+		return 1
+	return 0
+''' ),
+			( 'commonpath_mixed_absolute_and_relative_is_an_error', f'''
+import os
+
+def main() -> i32:
+	paths: list[str] = list[str]()
+	paths.append( 'a{sep}b' ).unwrap( 'append failed' )
+	paths.append( '{abs_prefix}a{sep}b' ).unwrap( 'append failed' )
+	match os.path.commonpath( paths ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			return 0
+''' ),
+			( 'commonpath_empty_list_is_an_error', '''
+import os
+
+def main() -> i32:
+	paths: list[str] = list[str]()
+	match os.path.commonpath( paths ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			return 0
+''' ),
+			( 'relpath_descends_into_child', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.relpath( 'a{sep}b{sep}c', 'a{sep}b' ).unwrap( 'relpath failed' )
+	if result != 'c':
+		return 1
+	return 0
+''' ),
+			( 'relpath_ascends_to_parent', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.relpath( 'a', 'a{sep}b' ).unwrap( 'relpath failed' )
+	if result != '..':
+		return 1
+	return 0
+''' ),
+			( 'relpath_of_identical_paths_is_dot', f'''
+import os
+
+def main() -> i32:
+	result: str = os.path.relpath( 'a{sep}b', 'a{sep}b' ).unwrap( 'relpath failed' )
+	if result != '.':
+		return 1
+	return 0
+''' ),
+			( 'is_relative_to_identical_paths', f'''
+import os
+
+def main() -> i32:
+	if not os.path.is_relative_to( 'a{sep}b', 'a{sep}b' ):
+		return 1
+	return 0
+''' ),
+			( 'is_relative_to_child_of_parent', f'''
+import os
+
+def main() -> i32:
+	if not os.path.is_relative_to( 'a{sep}b', 'a' ):
+		return 1
+	return 0
+''' ),
+			( 'is_relative_to_sibling_directories_is_false', f'''
+import os
+
+def main() -> i32:
+	if os.path.is_relative_to( 'a{sep}b', 'a{sep}c' ):
+		return 1
+	return 0
+''' ),
+			( 'is_relative_to_trailing_slash_both_directions', f'''
+import os
+
+def main() -> i32:
+	if not os.path.is_relative_to( 'a{sep}b{sep}', 'a{sep}b' ):
+		return 1
+	if not os.path.is_relative_to( 'a{sep}b', 'a{sep}b{sep}' ):
+		return 2
+	return 0
+''' ),
+			( 'is_relative_to_mismatched_relative_vs_absolute_is_false', f'''
+import os
+
+def main() -> i32:
+	if os.path.is_relative_to( 'a', '{abs_prefix}a' ):
+		return 1
+	return 0
+''' ),
+			( 'is_relative_to_agrees_with_manual_dirname_walk', f'''
+import os
+
+def _is_ancestor_via_dirname_walk( child: str, candidate_parent: str ) -> bool:
+	current: str = os.path.normpath( child )
+	target: str = os.path.normpath( candidate_parent )
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 64:
+			if current == target:
+				return True
+			parent: str = os.path.dirname( current )
+			if parent == current:
+				return False
+			current = parent
+			i += 1
+	return False
+
+def main() -> i32:
+	# webchat Method 4 (manual dirname-walk), reimplemented here with the
+	# now-real os.path.dirname primitive, cross-checked against
+	# os.path.is_relative_to on the same pairs
+	true_parent: bool = _is_ancestor_via_dirname_walk( 'a{sep}b{sep}c', 'a{sep}b' )
+	if not true_parent:
+		return 1
+	if true_parent != os.path.is_relative_to( 'a{sep}b{sep}c', 'a{sep}b' ):
+		return 2
+	sibling_mismatch: bool = _is_ancestor_via_dirname_walk( 'a{sep}b{sep}c', 'a{sep}x' )
+	if sibling_mismatch:
+		return 3
+	if sibling_mismatch != os.path.is_relative_to( 'a{sep}b{sep}c', 'a{sep}x' ):
+		return 4
+	return 0
+''' ),
 		]
 		if os.name == 'nt':
 			cases.append(( 'normpath_normalizes_forward_slash_to_backslash', '''
@@ -206,6 +448,46 @@ import os
 def main() -> i32:
 	result: str = os.path.normpath( 'a/./b' )
 	if result != 'a\\\\b':
+		return 1
+	return 0
+''' ))
+			cases.append(( 'dirname_drive_root_is_kept_whole', '''
+import os
+
+def main() -> i32:
+	result: str = os.path.dirname( 'C:\\\\a' )
+	if result != 'C:\\\\':
+		return 1
+	return 0
+''' ))
+			cases.append(( 'commonpath_cross_drive_is_an_error', '''
+import os
+
+def main() -> i32:
+	paths: list[str] = list[str]()
+	paths.append( 'C:\\\\a' ).unwrap( 'append failed' )
+	paths.append( 'D:\\\\b' ).unwrap( 'append failed' )
+	match os.path.commonpath( paths ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			return 0
+''' ))
+			cases.append(( 'relpath_cross_drive_is_an_error', '''
+import os
+
+def main() -> i32:
+	match os.path.relpath( 'D:\\\\a', 'C:\\\\a' ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			return 0
+''' ))
+			cases.append(( 'is_relative_to_cross_drive_is_false', '''
+import os
+
+def main() -> i32:
+	if os.path.is_relative_to( 'D:\\\\a', 'C:\\\\a' ):
 		return 1
 	return 0
 ''' ))
