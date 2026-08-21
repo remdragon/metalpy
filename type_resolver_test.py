@@ -357,6 +357,51 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIn( 'x = __match_subj_0.data.v_Bar', src )
 		self.assertIn( 'z = __match_subj_0.data.v_Baz', src )
 
+	def test_match_on_union_receiver_dispatch_call_is_exhaustive( self ) -> None:
+		# _type_of_expr's ast.Call branch only ever looked up an attribute
+		# on the UNION's OWN synthesized .names (Ok/Err-style member
+		# constructors) - a method every LEAF defines independently (e.g.
+		# `(reader: A|B).seek(...)`, dispatched by tag at runtime, exactly
+		# lib/builtins/__File.py's BinaryReader|BinaryWriter shape) fell
+		# through to None. That left this match's own subj_type
+		# unresolved, so the exhaustiveness pre-pass below couldn't tell
+		# the match covers both Result members and baked in a real,
+		# spurious `elif` (with no reachable trailing else) instead of an
+		# unconditional else - confirmed via a real generated-C repro,
+		# clang -Wreturn-type/MSVC C4715 on a non-void function that
+		# provably always returns. Fixed by also checking each union
+		# leaf's own same-named method (mirroring lowering.py's real
+		# Lowering._resolve_callee / _resolve_union_receiver_members,
+		# which already handles this correctly for the REAL call - this
+		# pass just never reused it for TYPE INFERENCE).
+		mod = self._import( '\n'.join([
+			'class MyError: pass',
+			'',
+			'class A:',
+			'	def seek( self, offset: i64 ) -> Result[i64,MyError]:',
+			'		return Result.Ok( offset )',
+			'',
+			'class B:',
+			'	def seek( self, offset: i64 ) -> Result[i64,MyError]:',
+			'		return Result.Err( MyError() )',
+			'',
+			'def _seek( target: A|B, offset: i64 ) -> Result[None,MyError]:',
+			'	match target.seek( offset ):',
+			'		case Result.Ok( _ ):',
+			'			return Result.Ok( None )',
+			'		case Result.Err( _ ):',
+			'			return Result.Err( MyError() )',
+		]))
+		fn = self._resolved_fn( mod, '_seek' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'match ', src )
+		# both Result members are explicitly matched - provably exhaustive,
+		# so the last case (Err) must splice in as a plain, unconditional
+		# else, never a redundant re-check of the tag it's already ruled out
+		self.assertNotIn( 'elif __match_subj_0.tag == 1', src )
+		self.assertIn( 'else:', src )
+
 	def test_match_bare_wildcard_binds_unconditionally( self ) -> None:
 		mod = self._import( '\n'.join([
 			'@union',
