@@ -4363,6 +4363,16 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 				# windows_no_crt, per this block's own comment above.
 				if not windows_no_crt:
 					prelude += '\t__metalpy_init();\n'
+				if not lf.function.parameters and not has_argv_globals:
+					# argc/argv are declared regardless (the real OS/CRT
+					# calling convention, see _function_prototype) but go
+					# unread when nothing reaches sys.argv - mark them
+					# explicitly unused. emit_function's own (void)-marking
+					# (unused_parameter_warning_fixed) only walks
+					# function.parameters; argc/argv are synthesized
+					# straight into the C signature here, never a MetalPy-
+					# level parameter, so they need their own marking.
+					prelude += '\t(void)argc; (void)argv;\n'
 				if prelude:
 					src = src.replace( '{\n', '{\n' + prelude, 1 )
 			parts.append( src )

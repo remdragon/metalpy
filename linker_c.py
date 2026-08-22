@@ -175,7 +175,7 @@ class CcTool:
 		# fuzzing performance)
 		want_debug_info = debug or asan
 		if self.name == 'cl':
-			cmd = [ self.path, '/nologo', '/std:c11' ]
+			cmd = [ self.path, '/nologo', '/std:c11', '/experimental:c11atomics' ]
 			if warnings:
 				cmd += [ '/W4', '/wd4701' ]
 			cmd += [ '-c', str( src ), f'/Fo:{obj}' ]
