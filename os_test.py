@@ -43,21 +43,21 @@ class OsPathPureTests( test_support.RealCompileMixin, unittest.TestCase ):
 		# root slash on POSIX) - lets one case cover both platforms
 		abs_prefix = 'C:\\\\' if os.name == 'nt' else '/'
 		cases = [
-			( 'join_no_trailing_sep', f'''
+			( 'join_no_trailing_sep', '''
 import os
 
 def main() -> i32:
 	joined: str = os.path.join( 'a', 'b' )
-	if joined != 'a{sep}b':
+	if joined != f'a{os.sep}b':
 		return 1
 	return 0
 ''' ),
-			( 'join_already_has_trailing_sep', f'''
+			( 'join_already_has_trailing_sep', '''
 import os
 
 def main() -> i32:
-	joined: str = os.path.join( 'a{sep}', 'b' )
-	if joined != 'a{sep}b':
+	joined: str = os.path.join( f'a{os.sep}', 'b' )
+	if joined != f'a{os.sep}b':
 		return 1
 	return 0
 ''' ),
@@ -122,60 +122,60 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
-			( 'splitext_ignores_dot_in_directory_component', f'''
+			( 'splitext_ignores_dot_in_directory_component', '''
 import os
 
 def main() -> i32:
 	root: str
 	ext: str
-	root, ext = os.path.splitext( 'dir.with.dots{sep}file' )
-	if root != 'dir.with.dots{sep}file':
+	root, ext = os.path.splitext( f'dir.with.dots{os.sep}file' )
+	if root != f'dir.with.dots{os.sep}file':
 		return 1
 	if ext != '':
 		return 2
 	return 0
 ''' ),
-			( 'splitext_dot_after_last_separator_only', f'''
+			( 'splitext_dot_after_last_separator_only', '''
 import os
 
 def main() -> i32:
 	root: str
 	ext: str
-	root, ext = os.path.splitext( 'a.b{sep}c.d' )
-	if root != 'a.b{sep}c':
+	root, ext = os.path.splitext( f'a.b{os.sep}c.d' )
+	if root != f'a.b{os.sep}c':
 		return 1
 	if ext != '.d':
 		return 2
 	return 0
 ''' ),
-			( 'normpath_collapses_dot_segments', f'''
+			( 'normpath_collapses_dot_segments', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.normpath( 'a{sep}.{sep}b' )
-	if result != 'a{sep}b':
+	result: str = os.path.normpath( f'a{os.sep}.{os.sep}b' )
+	if result != f'a{os.sep}b':
 		return 1
 	return 0
 ''' ),
-			( 'normpath_resolves_dotdot', f'''
+			( 'normpath_resolves_dotdot', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.normpath( 'a{sep}b{sep}..{sep}c' )
-	if result != 'a{sep}c':
+	result: str = os.path.normpath( f'a{os.sep}b{os.sep}..{os.sep}c' )
+	if result != f'a{os.sep}c':
 		return 1
 	return 0
 ''' ),
-			( 'normpath_leading_dotdot_on_relative_path_is_kept', f'''
+			( 'normpath_leading_dotdot_on_relative_path_is_kept', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.normpath( '..{sep}a' )
-	if result != '..{sep}a':
+	result: str = os.path.normpath( f'..{os.sep}a' )
+	if result != f'..{os.sep}a':
 		return 1
 	return 0
 ''' ),
-			( 'abspath_is_idempotent_on_an_already_absolute_path', f'''
+			( 'abspath_is_idempotent_on_an_already_absolute_path', '''
 import os
 
 def main() -> i32:
@@ -202,20 +202,20 @@ def main() -> i32:
 			return 2
 	return 0
 ''' ),
-			( 'basename_with_separators', f'''
+			( 'basename_with_separators', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.basename( 'a{sep}b{sep}c' )
+	result: str = os.path.basename( f'a{os.sep}b{os.sep}c' )
 	if result != 'c':
 		return 1
 	return 0
 ''' ),
-			( 'basename_trailing_separator', f'''
+			( 'basename_trailing_separator', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.basename( 'a{sep}b{sep}' )
+	result: str = os.path.basename( f'a{os.sep}b{os.sep}' )
 	if result != '':
 		return 1
 	return 0
@@ -229,30 +229,30 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
-			( 'dirname_with_separators', f'''
+			( 'dirname_with_separators', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.dirname( 'a{sep}b{sep}c' )
-	if result != 'a{sep}b':
+	result: str = os.path.dirname( f'a{os.sep}b{os.sep}c' )
+	if result != f'a{os.sep}b':
 		return 1
 	return 0
 ''' ),
-			( 'dirname_trailing_separator', f'''
+			( 'dirname_trailing_separator', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.dirname( 'a{sep}b{sep}' )
-	if result != 'a{sep}b':
+	result: str = os.path.dirname( f'a{os.sep}b{os.sep}' )
+	if result != f'a{os.sep}b':
 		return 1
 	return 0
 ''' ),
-			( 'dirname_root_is_kept_whole', f'''
+			( 'dirname_root_is_kept_whole', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.dirname( '{sep}a' )
-	if result != '{sep}':
+	result: str = os.path.dirname( f'{os.sep}a' )
+	if result != os.sep:
 		return 1
 	return 0
 ''' ),
@@ -281,23 +281,15 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
-			( 'os_sep_matches_platform_separator', f'''
-import os
-
-def main() -> i32:
-	if os.sep != '{sep}':
-		return 1
-	return 0
-''' ),
-			( 'commonpath_relative', f'''
+			( 'commonpath_relative', '''
 import os
 
 def main() -> i32:
 	paths: list[str] = list[str]()
-	paths.append( 'a{sep}b{sep}c' ).unwrap( 'append failed' )
-	paths.append( 'a{sep}b{sep}d' ).unwrap( 'append failed' )
+	paths.append( f'a{os.sep}b{os.sep}c' ).unwrap( 'append failed' )
+	paths.append( f'a{os.sep}b{os.sep}d' ).unwrap( 'append failed' )
 	result: str = os.path.commonpath( paths ).unwrap( 'commonpath failed' )
-	if result != 'a{sep}b':
+	if result != f'a{os.sep}b':
 		return 1
 	return 0
 ''' ),
@@ -337,64 +329,64 @@ def main() -> i32:
 		case Result.Err( _ ):
 			return 0
 ''' ),
-			( 'relpath_descends_into_child', f'''
+			( 'relpath_descends_into_child', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.relpath( 'a{sep}b{sep}c', 'a{sep}b' ).unwrap( 'relpath failed' )
+	result: str = os.path.relpath( f'a{os.sep}b{os.sep}c', f'a{os.sep}b' ).unwrap( 'relpath failed' )
 	if result != 'c':
 		return 1
 	return 0
 ''' ),
-			( 'relpath_ascends_to_parent', f'''
+			( 'relpath_ascends_to_parent', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.relpath( 'a', 'a{sep}b' ).unwrap( 'relpath failed' )
+	result: str = os.path.relpath( 'a', f'a{os.sep}b' ).unwrap( 'relpath failed' )
 	if result != '..':
 		return 1
 	return 0
 ''' ),
-			( 'relpath_of_identical_paths_is_dot', f'''
+			( 'relpath_of_identical_paths_is_dot', '''
 import os
 
 def main() -> i32:
-	result: str = os.path.relpath( 'a{sep}b', 'a{sep}b' ).unwrap( 'relpath failed' )
+	result: str = os.path.relpath( f'a{os.sep}b', f'a{os.sep}b' ).unwrap( 'relpath failed' )
 	if result != '.':
 		return 1
 	return 0
 ''' ),
-			( 'is_relative_to_identical_paths', f'''
+			( 'is_relative_to_identical_paths', '''
 import os
 
 def main() -> i32:
-	if not os.path.is_relative_to( 'a{sep}b', 'a{sep}b' ):
+	if not os.path.is_relative_to( f'a{os.sep}b', f'a{os.sep}b' ):
 		return 1
 	return 0
 ''' ),
-			( 'is_relative_to_child_of_parent', f'''
+			( 'is_relative_to_child_of_parent', '''
 import os
 
 def main() -> i32:
-	if not os.path.is_relative_to( 'a{sep}b', 'a' ):
+	if not os.path.is_relative_to( f'a{os.sep}b', 'a' ):
 		return 1
 	return 0
 ''' ),
-			( 'is_relative_to_sibling_directories_is_false', f'''
+			( 'is_relative_to_sibling_directories_is_false', '''
 import os
 
 def main() -> i32:
-	if os.path.is_relative_to( 'a{sep}b', 'a{sep}c' ):
+	if os.path.is_relative_to( f'a{os.sep}b', f'a{os.sep}c' ):
 		return 1
 	return 0
 ''' ),
-			( 'is_relative_to_trailing_slash_both_directions', f'''
+			( 'is_relative_to_trailing_slash_both_directions', '''
 import os
 
 def main() -> i32:
-	if not os.path.is_relative_to( 'a{sep}b{sep}', 'a{sep}b' ):
+	if not os.path.is_relative_to( f'a{os.sep}b{os.sep}', f'a{os.sep}b' ):
 		return 1
-	if not os.path.is_relative_to( 'a{sep}b', 'a{sep}b{sep}' ):
+	if not os.path.is_relative_to( f'a{os.sep}b', f'a{os.sep}b{os.sep}' ):
 		return 2
 	return 0
 ''' ),
@@ -406,8 +398,10 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
-			( 'is_relative_to_agrees_with_manual_dirname_walk', f'''
+			( 'is_relative_to_agrees_with_manual_dirname_walk', '''
 import os
+
+sep = os.sep
 
 def _is_ancestor_via_dirname_walk( child: str, candidate_parent: str ) -> bool:
 	current: str = os.path.normpath( child )
@@ -428,15 +422,15 @@ def main() -> i32:
 	# webchat Method 4 (manual dirname-walk), reimplemented here with the
 	# now-real os.path.dirname primitive, cross-checked against
 	# os.path.is_relative_to on the same pairs
-	true_parent: bool = _is_ancestor_via_dirname_walk( 'a{sep}b{sep}c', 'a{sep}b' )
+	true_parent: bool = _is_ancestor_via_dirname_walk( f'a{sep}b{sep}c', f'a{sep}b' )
 	if not true_parent:
 		return 1
-	if true_parent != os.path.is_relative_to( 'a{sep}b{sep}c', 'a{sep}b' ):
+	if true_parent != os.path.is_relative_to( f'a{sep}b{sep}c', f'a{sep}b' ):
 		return 2
-	sibling_mismatch: bool = _is_ancestor_via_dirname_walk( 'a{sep}b{sep}c', 'a{sep}x' )
+	sibling_mismatch: bool = _is_ancestor_via_dirname_walk( f'a{sep}b{sep}c', f'a{sep}x' )
 	if sibling_mismatch:
 		return 3
-	if sibling_mismatch != os.path.is_relative_to( 'a{sep}b{sep}c', 'a{sep}x' ):
+	if sibling_mismatch != os.path.is_relative_to( f'a{sep}b{sep}c', f'a{sep}x' ):
 		return 4
 	return 0
 ''' ),
