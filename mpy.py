@@ -60,8 +60,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'build with AddressSanitizer (requires the C runtime - forces CRT linking for a program that would otherwise build freestanding/no-CRT)' )
 	p.add_argument( '--crt', action = 'store_true',
 		help = 'force CRT linking even if the program itself never uses a \'c\' extern (normally: no_crt = \'c\' not in compiler.extern_libs) - e.g. to get __chkstk/other CRT-only support routines without adding a throwaway extern call' )
-	p.add_argument( '--show-warnings', action = 'store_true',
-		help = 'print compiler warnings even on a successful build (off by default - the shared builtins runtime currently emits pre-existing warnings on every build)' )
+	p.add_argument( '--hide-warnings', action = 'store_true',
+		help = 'suppress compiler warnings on an otherwise-successful build (shown by default)' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
@@ -230,7 +230,7 @@ def main() -> None:
 			debug = bool( active_target['debug'] ),
 			asan = args.asan,
 			cflags = args.cflags,
-			warnings = args.show_warnings,
+			warnings = not args.hide_warnings,
 		)
 		if compile_result.returncode != 0:
 			print( f'mpy: {cc.name} compile failed:', file = sys.stderr )
@@ -240,12 +240,12 @@ def main() -> None:
 				src_path.rename( c_path )
 				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
-		elif args.show_warnings and compile_result.stdout.strip():
+		elif not args.hide_warnings and compile_result.stdout.strip():
 			# build succeeded but the compiler still had something to say (e.g.
-			# -Wall/-Wextra or /W4 warnings) - opt-in only: the shared builtins
-			# runtime currently emits warnings of its own on every build, so
-			# printing this unconditionally would make --show-warnings the
-			# only way to ever get quiet output again
+			# -Wall/-Wextra or /W4 warnings) - shown by default: the shared
+			# builtins runtime and every reachable stdlib module now compile
+			# warning-free, so a warning here means the USER's own program
+			# triggered it. --hide-warnings opts back out to quiet output.
 			print( f'mpy: {cc.name} compile warnings:', file = sys.stderr )
 			print( compile_result.stdout, file = sys.stderr )
 
@@ -269,7 +269,7 @@ def main() -> None:
 				src_path.rename( c_path )
 				print( f'mpy: generated C kept at {c_path}', file = sys.stderr )
 			sys.exit( 1 )
-		elif args.show_warnings and link_result.stdout.strip():
+		elif not args.hide_warnings and link_result.stdout.strip():
 			print( f'mpy: {cc.name} link warnings:', file = sys.stderr )
 			print( link_result.stdout, file = sys.stderr )
 
