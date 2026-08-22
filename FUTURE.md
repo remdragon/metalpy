@@ -164,5 +164,34 @@ need to take a careful look at this commit on master:
 
 9a464b8bc2488863bcac6f04a5adcaeb1eb7701a
 
-it clobbered my mpy.py --hide-warnings flag and I'm pretty sure some other
-enhancements were lost too
+it clobbered my mpy.py --hide-warnings flag introduced after a bug of significant
+bug fixes in 6d5b3907245bc8b12402a09612a50a08d658792f and I'm concerned some of
+those bug fixes got lost
+
+================================================================================
+
+support direct dict creation, this would be nice in termcolor.py:
+
+_color_codes: dict[str,str] = {
+	'black':   '30',
+	'red':     '31',
+	'green':   '32',
+	'yellow':  '33',
+	'blue':    '34',
+	'magenta': '35',
+	'cyan':    '36',
+	'white':   '37',
+	# 'grey' maps to bright-black (90), not plain black (30) - plain
+	# black is invisible on the common dark-terminal-background case
+	# this is meant for (dim status/debug output).
+	'grey':    '90',
+}
+
+================================================================================
+
+grap.mpy would like to initial it's attributes like this:
+
+class Grap:
+	unicode = recursive = caseless = zip = one = error_suppress = False
+
+================================================================================
