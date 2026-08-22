@@ -160,16 +160,6 @@ These two things should be the same, why is the 2nd producing an automatic .or_r
 
 ================================================================================
 
-need to take a careful look at this commit on master:
-
-9a464b8bc2488863bcac6f04a5adcaeb1eb7701a
-
-it clobbered my mpy.py --hide-warnings flag introduced after a bug of significant
-bug fixes in 6d5b3907245bc8b12402a09612a50a08d658792f and I'm concerned some of
-those bug fixes got lost
-
-================================================================================
-
 support direct dict creation, this would be nice in termcolor.py:
 
 _color_codes: dict[str,str] = {
