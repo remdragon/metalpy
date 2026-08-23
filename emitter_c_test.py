@@ -21493,6 +21493,135 @@ def main() -> i32:
 ''' ),
 		])
 
+	def test_match_same_name_reuse_narrowing_inside_generator( self ) -> None:
+		''' Regression for a DISTINCT bug from test_match_on_fallible_call_
+		subject_crossing_a_yield/test_match_arm_binding_crossing_a_yield
+		above (both about a promoted field's own trailing decref reading
+		garbage post-resume) - this one is about the same-name-reuse
+		NARROWING feature (`match x: case T(x): ...` - rebinding a name to
+		itself narrows its existing binding instead of shadowing it with a
+		fresh one) being silently non-functional for any generator at all.
+		visit_Match's own `original_subject_name = node.subject.id if
+		isinstance(node.subject, ast.Name) else None` ran LATE (during the
+		synthesized $$__next__/$$__resume__ method's own normal
+		resolution), well AFTER _GeneratorNameRenamer's earlier whole-body
+		rename pass had already rewritten node.subject from a plain
+		ast.Name into `self.<attr>` whenever the subject is a promoted
+		local/parameter - true for essentially every generator local,
+		since _collect_generator_locals requires one. isinstance(node.
+		subject, ast.Name) then always came back False, so the reuse-
+		narrowing branch never fired and `case T(x):` silently fell back
+		to ordinary extract-and-bind, leaving x's own type stuck at the
+		wider union - confirmed via a real repro that failed to compile at
+		all (`Result[Box,IndexError] has no attribute 'v'`), not just a
+		silent behavior change. Fixed in two parts (type_resolver.py):
+		1. _reserve_generator_match_subject_fields (already runs EARLY,
+		   before the rename pass, to reserve promoted subject fields) now
+		   also tags ANY qualifying match's ORIGINAL bare-Name subject
+		   (`node.generator_original_subject_name`), unconditionally, not
+		   just when an arm crosses a yield - the rename-timing gap applies
+		   to every generator match regardless of yield-crossing.
+		   visit_Match reads this tag back before falling to its own
+		   (now rename-broken) isinstance check.
+		2. Once the reuse shape is correctly recognized again, a SECOND,
+		   more subtle gap surfaced: _match_union_member built the narrow-
+		   marker keyed by the bare source name ('x'), but every actual
+		   READ of that name in the arm's own body was ALREADY renamed to
+		   `self.x` - a distinct synthetic 'self::x' key by this file's own
+		   _narrow_subject_key/_attribute_chain_key convention (already
+		   used elsewhere for `self.field is not None:` narrowing) - so the
+		   two never matched and the narrowing was invisible to any read.
+		   Fixed by deriving the narrow-marker's key/attr_base/attr_hops
+		   from _narrow_subject_key(node.subject) - node.subject already
+		   reflects whatever CURRENT form (bare name or self.<attr>) the
+		   original subject has, generalizing for free (a bare ast.Name
+		   still resolves to the plain, unchanged key). '''
+		self.assert_programs_run([
+			( 'match_same_name_reuse_narrows_promoted_local_then_yields_field', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( i: usize ) -> Result[Box, IndexError]:
+	with compiler.wrap_arithmetic:
+		if i >= 3:
+			return Result.Err( IndexError())
+		return Result.Ok( Box( v = i32( i )))
+
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			r: Result[Box, IndexError] = maybe( i )
+			match r:
+				case Result.Ok( r ):
+					yield r.v
+				case Result.Err( _ ):
+					return
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		count: usize = 0
+		for v in gen():
+			total += v
+			count += 1
+		if count != 3:
+			return 1
+		if total != 0 + 1 + 2:
+			return 2
+		return 0
+''' ),
+			# stress the RC ownership path specifically: the narrowed field
+			# holds a REAL retained reference (Result.Ok(b)'s own wrap
+			# constructor retains its argument, a real copy not a move) -
+			# a shared Box threaded through several resumed calls, checking
+			# compiler.refcount() before/after full exhaustion catches
+			# either a leak (narrowing skips a needed release) or a
+			# double-free (narrowing releases something it doesn't own),
+			# not just "does it compile and return the right sum"
+			( 'match_same_name_reuse_narrowing_no_rc_leak_across_resumes', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( b: Box, i: usize ) -> Result[Box, IndexError]:
+	with compiler.wrap_arithmetic:
+		if i >= 3:
+			return Result.Err( IndexError())
+		return Result.Ok( b )
+
+def gen( b: Box ) -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			r: Result[Box, IndexError] = maybe( b, i )
+			match r:
+				case Result.Ok( r ):
+					yield r.v
+				case Result.Err( _ ):
+					return
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b: Box = Box( v = i32( 7 ))
+		before: usize = compiler.refcount( b )
+		total: i32 = 0
+		for v in gen( b ):
+			total += v
+		after: usize = compiler.refcount( b )
+		if before != after:
+			return 1
+		if total != 7 + 7 + 7:
+			return 2
+		return 0
+''' ),
+		])
+
 	def test_match_arm_scalar_binding_reused_after_its_own_yield( self ) -> None:
 		''' A RELATED but distinct bug from test_match_arm_binding_crossing_
 		a_yield above: that one is about a promoted binding's own trailing
