@@ -1,0 +1,592 @@
+# Thread-safe module globals and instance fields — closing the "naive racy code corrupts memory" gap
+
+## Status
+
+Proposed. Not implemented. No code changes accompany this document. Do not
+attempt without a dedicated worktree/session — this touches `cfg.py`,
+`emitter_c.py`, and `ObjectHeader`'s own layout, three of the most
+central, heavily-shared pieces of the compiler.
+
+## Context
+
+`lib/datetime.py`'s `localtz()` used to cache the system timezone via a bare
+`if __localtz is None: __localtz = ZoneInfo()`, no lock. Under a real
+thread-per-connection HTTP server (`lib/tcpserver.py`'s
+`ThreadPerConnectionDispatcher`) hitting this on a fresh process with ~150
+concurrent connections, every thread saw `None` at once, each independently
+constructed its own `ZoneInfo`, and all raced to store into the same global
+— a crash (`Illegal instruction`, zero output) confirmed via direct repro,
+fixed by wrapping the whole check-then-set in a `threading.FastLock`
+(commit `c45b255`, this worktree).
+
+That fix is correct but narrow: it requires the library author to notice
+the race and hand-write a lock. The same shape existed independently in
+`lib/termcolor.py`'s `_codes()` — found by grepping for the pattern after
+the first bug, not because anyone was looking for it. Two independent
+authors wrote the identical bug the identical way. This document is about
+closing the gap at the language level instead: make it structurally
+impossible for this class of code to corrupt memory, whether or not the
+author knew to reach for a lock.
+
+## The soundness gap, precisely
+
+`retain_object`/`release_object` (`emitter_c.py`'s `_PROLOGUE_RETAIN`/
+`_PROLOGUE_RELEASE`) already use `atomic_fetch_add`/`atomic_fetch_sub` on
+`ObjectHeader.ref_count`. That makes it safe for two threads to both hold a
+pointer to the *same* object and both incref/decref it concurrently — but
+it says nothing about the *variable or field slot* that holds the pointer
+in the first place. A global or a field is an ordinary, non-atomic memory
+location; reading and writing it from multiple threads with no
+synchronization is a plain data race, independent of whether the objects
+it ever points to are individually memory-safe.
+
+This isn't hypothetical or specific to hand-written library code — the
+compiler's *own* generated sequence for `global X; X = new_value` (an
+RC-typed global) already has this exact shape today. `cfg.py:1758-1782`
+(`assign()`, in the `if dest.is_global:` branch) emits, in order:
+
+1. `Incref(new_value)` (if not already independently owned)
+2. `Decref(X)` — reads `X`'s **current** value first, to release whatever
+   was there before the overwrite (`cfg.py:1781`, comment: *"reads dest's
+   CURRENT (pre-overwrite) value"*)
+3. `Assign(dest=X, src=new_value)` — the actual store
+
+Steps 2 and 3 are two separate, unsynchronized reads/writes of the same raw
+C global. Two threads racing this sequence concurrently can double-decref
+the same old object, or decref a value the other thread already
+overwrote. This is a **general, already-present hazard for every RC-typed
+global reassignment in the language**, not something specific to
+`localtz()` — `localtz()` is simply the one instance that happened to get
+hit hard enough, in a syscall-heavy enough construction path, to
+manifest as a real crash.
+
+## Prerequisite: field-visibility enforcement doesn't exist today — and must be added as part of this plan
+
+Cost mitigation #2 (below, the `__private`-field write-once exemption)
+reasons that a double-underscore field's assignments are provably
+confined to methods textually inside its own defining class, per
+`SYNTAX.md:132`'s documented visibility rule. That reasoning is only
+sound if the compiler actually *enforces* the rule. It does not, today —
+confirmed directly with a minimal repro:
+
+```python
+class Box:
+	__secret: i32
+	def __init__( self ) -> None:
+		self.__secret = 42
+
+def main() -> i32:
+	b: Box = Box()
+	b.__secret = 99          # SYNTAX.md says this should be a compile error
+	return b.__secret
+```
+
+compiles and runs cleanly — the built executable exits `99`, not `42`.
+Nothing in `lowering.py`'s attribute-resolution path checks visibility at
+all for an ordinary `GetAttr`/`SetAttr`. The only existing enforcement of
+`SYNTAX.md`'s privacy rules is narrowly scoped to `Class.__allocate__()`
+calls (`lowering.py:11698`, via `Type.in_private_scope()`,
+`mpy_types.py:178`) — a genuinely different code path from ordinary field
+access, and one that doesn't generalize to `_protected` fields at all:
+`in_private_scope`'s own docstring defines it as "`scope` IS this class
+itself" (`mpy_types.py:178-183`) — same-class-only, with no "or a
+subclass" variant for the protected tier.
+
+This isn't a pre-existing bug this document happens to notice in
+passing — **it's a hole this specific plan would open into a new
+soundness gap if left unaddressed.** Cost mitigation #2 tells the
+compiler "skip locking a `__private` field, because nothing outside its
+own class can write to it" — but nothing outside its own class is
+actually stopped from writing to it today. Ship that exemption without
+also shipping the enforcement, and a `__field` its own author reasonably
+assumes is write-once-after-`__init__` becomes an *unlocked*,
+externally-writable race — reintroducing exactly the class of memory
+corruption this whole document exists to close, just relocated from
+"nobody thought to add a lock" to "the compiler assumed a privacy
+boundary that nothing actually enforces."
+
+**Enforcing `SYNTAX.md`'s `_protected`/`__private` field-access rules is
+therefore a required, in-scope deliverable of this plan, not a
+separately tracked nice-to-have — and it must land before Part B's
+write-once exemption ships, not alongside it (the exemption is unsound
+without it).** Concretely:
+
+- Extend field-access resolution (wherever `obj.field`/`self.field`
+  becomes an `ir.GetAttr`/`ir.SetAttr` — the same chokepoint Part B.3
+  already needs to touch for locking) to reject, at compile time, any
+  read *or* write of a `__private` field from a method whose own class
+  isn't the field's defining class — reusing `Type.in_private_scope()`
+  (`mpy_types.py:178`), the exact same check `__allocate__()` already
+  performs, just applied to ordinary attribute access instead of one
+  special-cased call form.
+- Add the missing `_protected` counterpart — "is the accessing method's
+  own class the defining class, or a (possibly indirect) subclass of
+  it" — as a new sibling method on the same `ScopeMixin`/`Type` machinery
+  `in_private_scope` already lives on, not a one-off check bolted onto
+  the field-access call site.
+- Audit `lib/` for any code that (knowingly or not) already reaches past
+  a `_`/`__` boundary the way the repro above does, before turning this
+  on — enforcing a rule that was previously unenforced can break existing
+  callers; this needs its own pass over the standard library, not an
+  assumption that nothing relies on the current gap.
+
+**Enforcement is not itself a thread-safety fix, and must not be read as
+one.** It narrows *who can write a field* to "this class's own methods" —
+it says nothing about what happens when two of that class's own methods
+run concurrently, on the same instance, on two different threads. A
+`__private` field mutated by more than one method is exactly as exposed
+to a race as a public one unless something actually locks the access:
+`__localtz` and `_color_codes` (the two real bugs that motivated this
+whole document) were already private-by-convention and that alone did
+nothing to protect them — `FastLock` did. Enforcement only pays for one
+narrow thing in this plan: making cost mitigation #2 below (the
+write-once-after-`__init__` exemption, which applies *only* to a field
+never reassigned outside `__init__`) a sound compile-time check instead of
+an unsound guess. Any private field written by more than one method still
+needs, and — once Part B ships — automatically gets, the exact same
+per-object lock a public or protected field gets; visibility tier and
+"is this access thread-safe" are orthogonal questions in this design,
+before and after enforcement lands.
+
+## Design goal (the bar this proposal has to clear)
+
+Naive, unsynchronized-looking code — `if self.x is None: self.x = Foo()`,
+a bare `global X; X = Y()`, `self.count += 1` from two threads — must never
+be able to corrupt memory, double-free, or read freed memory, no matter how
+many threads touch it concurrently. It **may** still do redundant work
+(construct-and-discard extra objects) or produce a logically-surprising
+result (a lost update on a `+=`) — those are accepted, explicit
+consequences of the "no interprocedural escape analysis" decision below,
+not soundness bugs. The bar is *memory safety*, not *linearizability of
+arbitrary user logic* — that stays `FastLock`'s/`Lazy[T]`'s job (see
+"Relationship to `Lazy[T]`" below).
+
+## Scope
+
+**In scope:**
+- Module-level global variables of RC type (`Variable.is_global == True`
+  and `variable.type.is_rc()`, per `mpy_types.py:80-87`).
+- Instance fields of RC type (`ir.GetAttr`/`ir.SetAttr` targets whose
+  `attr.type.is_rc()`).
+- Plain scalar globals/fields (`i32`, `bool`, `f64`, …) — lighter
+  treatment, not a full lock (Part C).
+
+**Confirmed out of scope — no work needed:**
+- **Class-level "shared across every instance" variables do not exist in
+  this compiler.** Investigated directly: a class-body assignment
+  (`class Foo: shared = None`) goes through the *same* discovery-time
+  handler as any instance-attribute declaration
+  (`discovery.py:1338-1364`/`1553-1630`) and is appended to
+  `scope.attributes` — an ordinary per-instance field whose default is
+  **re-evaluated fresh at every single construction**
+  (`lowering.py:2271-2288`, `_emit_construction_defaults`), never a shared
+  storage location. `emit_rcclass` (`emitter_c.py:3191-3220`) never emits
+  a `static` slot for a class-body variable. `ClassName.attr` as an
+  expression (the only way real Python would let code read/write a
+  genuinely shared class variable) isn't even legal today — a bare class
+  name used as a value hits `discovery.fail("... is not a value ...")`
+  (`lowering.py:7111-7116`). There is nothing to fix here now; if real
+  class-level shared storage is ever added later, it will need the
+  identical treatment this document gives module globals.
+
+**Deliberately out of scope:**
+- Local variables and function parameters — live on one thread's own stack
+  frame, never reachable from another thread except by first escaping
+  through a global or a field (covered above).
+- Atomicity of multi-statement/multi-field invariants — this proposal
+  guarantees single-access memory safety only. A caller who needs "these
+  two fields always change together" still needs an explicit `FastLock`.
+
+## Design principle: lock the access, not the statement
+
+Every individual global/field **read** and every individual global/field
+**write** is its own, self-contained critical section — acquire, do the
+one read-and-retain or decref-and-store, release. Nothing spans more than
+one such access. This is the same granularity `localtz()`'s hand-written
+fix uses for the write, generalized automatically to every access:
+
+- A compound "check, then construct, then store" sequence (the
+  `localtz()` shape) is **not** made atomic as a whole by this proposal —
+  multiple threads can still both observe "not yet set" and both
+  construct. That's the accepted "degrades to redundant work" outcome.
+  What's no longer possible is a torn/racing view of the slot itself, or a
+  read racing a free.
+- This granularity also avoids the two failure modes a coarser design
+  would introduce: locking a whole *method* would make ordinary method
+  calls into critical sections users can't reason about (and risks
+  deadlock on any reentrant/recursive access to the same object); locking
+  a whole *process* (see "Alternatives rejected" below) defeats the actual
+  point of this compiler's real-OS-thread model.
+
+## Part A — module-level globals
+
+### A.1 What needs a lock
+
+Not every global — only ones that are (a) RC-typed and (b) ever the
+`dest` of an `ir.Assign` from inside a function body (i.e. genuinely
+reassigned via `global X; X = ...`, not just initialized once at module
+load). A global that's only ever written by its own module-level
+initializer (`compiler.py:20-23`'s `LoweredGlobal.instructions`) is
+provably single-write, happening before any thread the program spawns
+even exists — no lock needed. Existing examples in `lib/` that would fall
+into this "no lock needed" bucket today: `reactor.py`'s
+`_current_worker: threading.ThreadLocal[Worker] = threading.ThreadLocal[Worker]()`
+and `_thread_deadline`, `socket.py`'s `_wsa_state`/`_wsa_error` (already
+`Atomic[T]`, out of scope here regardless), `datetime.py`'s
+`__localtz_lock`/`termcolor.py`'s `_color_codes_lock` themselves.
+
+This "was this `Variable` ever an `ir.Assign` dest outside its own init
+instructions" check does not exist today (confirmed: `_stmt_Global` is a
+no-op, `lowering.py:2951-2960`; nothing currently records reassignment
+anywhere), but is a straightforward new walk over every lowered
+`Function`'s instructions — directly modeled on the *existing*
+`_referenced_global_qualnames`/`_transitive_global_reads_by_function`
+walkers `emitter_c.py:3799-3957` already uses for global-init dependency
+ordering (a `dataclasses.fields()`-driven generic instruction walk), just
+checking `ir.Assign.dest is <that Variable>` instead of arbitrary operand
+reads.
+
+### A.2 The lock itself: a paired raw primitive, not a `FastLock`
+
+`FastLock` (`lib/threading.py:35-150`) is itself an `RCClass` — heap
+allocated via `sys.alloc`, with its inner OS lock *also* heap-allocated
+inside `__init__`. Using one `FastLock` per protected global would mean
+two nested heap allocations happening as part of module-global
+initialization, before the very system this document is trying to make
+safe is itself safe to construct. Don't reuse `FastLock`; emit a bare,
+paired synchronization primitive per protected global instead, following
+`FastLock`'s own per-platform `LockOpaque` choice
+(`lib/threading.py:19-32`: Windows `_SRWLOCK`, POSIX `pthread_mutex_t`).
+
+This is cheaper than it sounds, and mostly falls out of existing
+machinery:
+
+- **Windows**: `_SRWLOCK` is a plain `@cstruct` (`lib/windows/kernel32.py`)
+  whose all-zero state is already a valid, unlocked SRWLOCK per Win32's
+  own documented contract (no `InitializeSRWLock` call exists or is used
+  anywhere in this codebase). A module-scope `_lockN: _SRWLOCK` (default
+  all-zero-Const construction) hits `emitter_c.py:3745-3789`'s **existing**
+  `_global_init_is_all_zero_value_type` fast path — a plain
+  `TYPE name = {0};` file-scope declaration with **no init-function call
+  at all** (`emitter_c.py:3959-3978`, excluded from the topological
+  global-init graph at `emitter_c.py:3920-3923`). This needs zero new
+  emitter machinery on Windows — the fast path is already there, just
+  unused for this purpose today.
+- **POSIX**: `pthread_mutex_t` is *not* a `@cstruct` (it's an opaque
+  `compiler.c_type(...)`, `lib/threading.py:25`), and unlike SRWLOCK,
+  zero-initializing a `pthread_mutex_t` is not a portable guarantee (glibc
+  happens to tolerate it; `FastLock`'s own POSIX `__init__` calls
+  `pthread_mutex_init()` explicitly rather than relying on zero-init,
+  `lib/threading.py:49-62`). A raw per-global POSIX lock needs to go
+  through the *general* callable-global-init path
+  (`_emit_global_init_fn`/`_topologically_sort_globals`,
+  `emitter_c.py:3980-4010`) so `__metalpy_init()` genuinely calls
+  `pthread_mutex_init()` once. This is a real, asymmetric extra cost on
+  POSIX that doesn't exist on Windows — flagged as an open question below
+  (a lighter, portably-zero-init-safe primitive, e.g. a raw futex-based
+  spinlock, may be worth building instead of reusing `pthread_mutex_t`
+  specifically for this purpose).
+
+### A.3 Where to insert acquire/release
+
+`cfg.py:1758-1782`'s existing `if dest.is_global:` branch is the exact,
+already-present hook: it already knows it's building the special RC
+lifecycle sequence for a global write; wrap steps 2-3 (the "decref old,
+overwrite" pair) in `acquire(lockN)` / `release(lockN)`. The read side
+(`_emit_operand`'s `Variable`/`is_global` branch, `emitter_c.py:1375-1378`,
+reached from every place a global appears as an `Operand`) needs the
+paired read-side wrap: acquire, load the pointer, `retain_object`, release,
+then use the now-independently-owned value. Because `Incref`/`Decref` take
+a generic `Operand` with no special-casing in `ir.py` itself (confirmed:
+`ir.py:561-579`), and because a global operand already carries `.is_global`
+all the way through instruction selection, this is a matter of teaching
+`cfg.py`'s existing global-aware branch and `emitter_c.py`'s existing
+`_emit_operand` chokepoint to consult the lock table built in A.1, not
+inventing new IR.
+
+## Part B — instance fields
+
+### B.1 One lock per object, not one per field
+
+Embed the lock in `ObjectHeader` itself (`emitter_c.py`'s
+`_PROLOGUE_HEADER`, currently `_Atomic int32_t ref_count` +
+`const __metalpy_ObjectVtbl* vtable`), shared across every field of that
+object. A lock per *field* would mean N locks per object for an N-field
+class — more memory, and no real concurrency win, since most contended
+cases involve one thread mutating several fields of the same object in
+sequence anyway (worse: per-field locks reintroduce the exact
+lock-ordering hazard a single per-object lock avoids for same-object
+multi-field access). One lock per object also composes with A: every
+`ObjectHeader`-bearing global already gets its own dedicated lock from
+Part A, so there's no need to *also* embed a lock inside the pointee for
+the global case — Part A and Part B protect two different kinds of slot
+(the variable/field storage location vs. the object's own fields), not
+the same thing twice.
+
+### B.2 Memory cost — the real open question
+
+A Windows `SRWLOCK` is a single pointer-sized zero-init word (per A.2) —
+adding one to every `ObjectHeader` is close to free (12-16 bytes today →
+20-24). A POSIX `pthread_mutex_t` is up to 40 bytes on glibc — adding
+*that* to every single RC object in the language is a large, blanket
+memory-size regression, not just a POSIX/Windows asymmetry in
+initialization cost (A.2) but now in **steady-state object size** for
+every object in the language, always, regardless of whether it's ever
+touched by more than one thread. This is the single biggest open decision
+in this whole proposal (see "Open questions").
+
+### B.3 Where to insert acquire/release
+
+`ir.GetAttr`/`ir.SetAttr` (`emitter_c.py:2817-2822`) are the sole IR
+shapes for field read/write — a small, single chokepoint, structurally
+identical in shape to Part A's global chokepoints, just unconditional
+today (no `is_global`-style branch exists for fields at all; every
+RCClass instance goes through the identical zero-synchronization codegen
+regardless of sharing). Wrap each `GetAttr` (for an RC-typed field) in
+acquire-the-receiver's-header-lock / read+retain / release; each `SetAttr`
+in acquire / decref-old+store-new / release — the same read/write shape as
+Part A, just keyed off `instr.obj`'s own embedded lock instead of a
+per-global static. This applies uniformly to every RC-typed field
+regardless of its visibility tier (public, `_protected`, `__private`) —
+visibility controls who can reach a field, not whether concurrent access
+to it needs a lock, and those are independent questions (see "Cost
+mitigations" #2 below for the one narrow, visibility-dependent exemption:
+a field proven never reassigned outside `__init__`).
+
+### B.4 Reentrancy hazard, specific to fields (not globals)
+
+Because field access can appear inside a method that's already executing
+*on* the object whose lock it's about to (re-)acquire — e.g. a method that
+calls another method on `self`, or a getter called from within a setter —
+a naive per-access exclusive lock risks a same-thread deadlock the moment
+two accesses to the same object's fields nest inside one call stack
+(SRWLOCK and `pthread_mutex_t`'s default type are both **non-reentrant**;
+`FastLock` inherits that). Since this proposal locks single
+*accesses* (B.3), not whole *methods*, most ordinary code is fine — the
+lock is held only for the duration of one field read or write, released
+immediately, not across the call into another method. But a getter that
+returns `self.field` while a caller already holds this exact object's
+lock from an *enclosing* GetAttr/SetAttr sequence being emitted
+inline/optimized in a way that widens the critical section would be a
+real hazard to rule out explicitly during implementation, not assumed
+away — flagged as a required verification item, not resolved here.
+
+## Part C — scalar (non-RC) globals and fields
+
+A plain scalar global/field write is a single store with no companion
+retain/release bookkeeping — the read-then-retain-vs-write-then-free
+hazard that motivates a full lock for RC types doesn't apply. This
+codebase already has the right-sized primitive: `atomic.Atomic[T]`
+(`lib/atomic.py`) and the underlying `ir.AtomicLoad`/`ir.AtomicStore`/
+`ir.AtomicRMW` instructions (`emitter_c.py:2906-2919`). Route scalar
+global/field access through an atomic load/store instead of the Part
+A/B lock — cheaper, and sufficient: it rules out torn reads/writes and
+compiler-reordering UB, which is all that's needed once there's no
+refcount to keep consistent. (A `+=` on a scalar field from two threads
+can still race to a lost update — same accepted "degrades to a wrong
+but non-corrupting result" bar as the RC case, not a memory-safety
+issue.)
+
+## Cost mitigations
+
+1. **Whole-program on/off switch — the biggest lever, and the practical
+   answer to "escape analysis is impossible".** Precise per-object escape
+   analysis ("does *this* object ever reach a second thread") needs
+   interprocedural reasoning this compiler doesn't have and, per this
+   document's own conclusion (echoing the discussion that produced it),
+   isn't worth building. But a much coarser, **whole-program** question is
+   both decidable and cheap: *does this program construct a
+   `threading.Thread` anywhere at all, reachable from `main()`?* If not,
+   nothing can race, full stop — by definition, not by analysis of any
+   individual object. If the compiler's own discovery/scheduling never
+   reaches a `Thread.__init__` call site, skip emitting *all* of Part
+   A/B/C's locking machinery for the whole program, falling back to
+   today's raw codegen everywhere. This is coarse (a program that spawns
+   one thread anywhere pays the cost everywhere, not just near that
+   thread) but sound, requires no new "does this escape" reasoning at
+   all, and directly protects the (likely still-common) single-threaded
+   program from paying anything. Confirmed today `Thread`/`CreateThread`/
+   `pthread_create` are ordinary opaque `@extern` FFI with zero
+   compiler-recognized syntax (`lib/threading.py:174-201`) — this switch
+   would need the compiler to specifically recognize a construction of
+   `lib/threading.py`'s own `Thread` class (a new, narrow, one-off
+   special case, not a general escape-analysis feature).
+2. **Write-once-after-`__init__` exemption — only sound for `__private`
+   fields, and only once the "Prerequisite" section above actually ships.**
+   A field assigned only in `__init__` and never reassigned by any other
+   method is safe to read lock-free forever after construction,
+   since construction happens on a single thread before the object can
+   have been published anywhere. But whether that check can stay a cheap,
+   purely-syntactic, single-class-body scan depends entirely on this
+   language's field-visibility tier (`SYNTAX.md:132`): a double-underscore
+   `__field` is genuinely private — referenceable, and therefore
+   assignable, *only* from methods textually inside that one class body
+   (the same restriction `Class.__allocate__()` itself already enforces,
+   `SYNTAX.md:559`) — so "never reassigned outside `__init__`" really is a
+   one-class-body check there, no interprocedural reasoning needed. A
+   single-underscore `_field` (protected) is visible to every subclass,
+   which this whole-program AOT compiler *can* enumerate (it discovers the
+   full class hierarchy reachable from `main()`), but "never reassigned"
+   then means walking every method of every discovered subclass, not one
+   class body — a real, bounded, but much bigger check than the private
+   case, and one that needs to be redone (or invalidated) if a later
+   compilation unit/subclass the checker didn't see could exist, which
+   shouldn't happen for a true whole-program build but is worth confirming
+   explicitly rather than assuming. A bare `field` (public) needs the
+   equivalent check across literally every function the compiler
+   discovers, not just a class family — the most expensive tier, and
+   plausibly not worth building the exemption for at all versus just
+   locking public fields unconditionally. Net: implement this exemption
+   for `__private` fields first (cheap, unconditionally sound); treat
+   `_protected`/public fields as a separate, larger follow-on decision,
+   not the same "purely syntactic" claim. Whether the identical
+   private/protected split applies to module *globals* too (i.e. can a
+   double-underscore global only ever be reassigned via `global X` from
+   within its own defining module, the way a private field can only be
+   reassigned from within its own defining class?) wasn't confirmed during
+   this investigation and needs checking before assuming A.1's global
+   exemption is as unconditionally cheap as stated there.
+3. **"Pull into a local" is already the idiom, for free.** A field/global
+   read into a local already produces an independently owned, freshly
+   increfed reference under this compiler's existing convention (verified
+   directly: reading a module global into a caller-side local increfs it,
+   confirmed via a real `compiler.refcount()` test during this
+   investigation). A hot loop that would otherwise re-touch
+   `self.field`/a global N times only needs to pay the lock once —
+   `let snapshot = self.field` up front, then work off `snapshot` — no new
+   language feature, just the existing binding idiom.
+4. **Read-write lock semantics (open question, not committed).** Most
+   accesses to most shared state are reads. SRWLOCK natively supports
+   shared/exclusive acquisition (`AcquireSRWLockShared` alongside the
+   exclusive calls `FastLock`/A.2 already use); a POSIX `pthread_rwlock_t`
+   equivalent exists too, at the same `pthread_mutex_t`-vs-something-else
+   sizing tradeoff as B.2. Worth prototyping once A/B land, not a
+   precondition for landing them.
+
+## Relationship to `Lazy[T]`/`Once[T]`
+
+This document and the (separately proposed, not yet built) `threading.
+Lazy[T]`/`Once[T]` primitive solve different problems and both remain
+useful once this lands: this document guarantees a bare
+`if x is None: x = Foo()` can't corrupt memory; it does **not** stop
+multiple threads from redundantly constructing `Foo()` on first touch.
+`Lazy[T]` is what avoids the redundant work, for the (common, but not
+universal) "compute once, cache forever" shape specifically. Once Part A
+ships, `Lazy[T]`'s own internal check-then-set becomes safe by
+construction too — it's just no longer the *only* thing standing between
+a lazy-init site and a crash.
+
+## Alternatives considered and rejected
+
+- **Precise per-object escape analysis** ("does this specific object ever
+  become reachable from a second OS thread"). Rejected: needs genuinely
+  new interprocedural reachability tracking through closures, RC
+  assignment, and opaque `@extern` calls (`Thread`/`CreateThread` carry
+  zero compiler-recognized semantics today — confirmed directly, see Part
+  A.3/Part B's investigation) — a much bigger, more fragile feature than
+  the blanket lock it would be trying to avoid, and still wouldn't help
+  the actual bug class this document targets (module globals are
+  unconditionally "escaped" by construction — there's nothing for an
+  escape analysis to determine there). The whole-program on/off switch
+  above (cost mitigation #1) captures the one coarse, sound, cheap version
+  of "don't pay for single-threaded programs" that's actually buildable.
+- **A single process-wide lock (GIL-style), matching CPython's own
+  accepted tradeoff.** Rejected specifically *for this compiler*: the
+  entire reason `lib/threading.py`'s real `Thread`, `lib/reactor.py`, and
+  `lib/tcpserver.py`'s `ThreadPerConnectionDispatcher` exist is to give
+  genuinely parallel OS threads — the demo this document's motivating bug
+  came from depends on 150 connections truly running in parallel. A
+  single global lock would silently take that away for every program that
+  ever touches a shared global or field, which given `global` statements
+  are rare (7 occurrences across all of `lib/`, vs. 2,330 `self.`
+  accesses — see Part B's frequency evidence) but field access is
+  everywhere, would in practice serialize nearly all real work. Per-object
+  (Part B) and per-global (Part A) locks preserve inter-object parallelism
+  instead — two threads each owning their own object never contend at
+  all.
+
+## Open questions (need an explicit decision before implementation)
+
+1. **POSIX lock primitive for `ObjectHeader`** — embedding a full
+   `pthread_mutex_t` (≤40 bytes on glibc) in every object is a much larger
+   per-object cost than Windows' `SRWLOCK` (pointer-sized). Worth
+   designing a lighter, portably-zero-init-safe primitive (a raw
+   futex-based spinlock/mutex, sized like a plain `_Atomic int`) purpose-
+   built for this, rather than reusing `pthread_mutex_t` as-is. This is
+   the single biggest cost unknown in the whole proposal.
+2. **Does the reentrancy hazard in B.4 actually occur** in real generated
+   code once GetAttr/SetAttr access is genuinely single-instruction-wide,
+   or only in a hypothetical inlined/optimized shape? Needs to be
+   confirmed with real generated C, not assumed either way, before this
+   is considered safe to ship.
+3. **Lock-ordering deadlock across two different globals/objects** — a
+   function that touches global A then global B, racing against another
+   thread's function that touches B then A, is a classic ordering
+   deadlock independent of anything in this document (true of any
+   fine-grained locking scheme). Worth an explicit statement of what
+   guarantee (if any) this proposal makes here — likely "none, same as
+   any other language with fine-grained locks," but say so.
+4. **Read-write lock semantics** (cost mitigation #4) — prototype and
+   measure before committing either way.
+5. **Whether the whole-program on/off switch (cost mitigation #1) should
+   itself be user-overridable** (e.g. a compiler flag to force it on for
+   a program that spawns threads via some path the compiler can't see,
+   like a raw `@extern` callback the OS itself invokes on a new thread
+   outside of `lib/threading.py`'s own `Thread` entirely) — flag as a
+   real gap: this switch is sound only for the "threads are spawned via
+   `lib/threading.py`'s `Thread`" path; any other way a program's C code
+   could end up running on a second OS thread (a raw signal handler, an
+   externally-provided callback invoked from a worker thread inside a
+   linked C library) would silently bypass detection. Needs an explicit
+   escape hatch/flag, not a silent assumption that `Thread` is the only
+   door.
+
+## Verification plan for any future attempt
+
+1. Work in a fresh `EnterWorktree` worktree (never reuse this one or any
+   other named one — see this repo's `CLAUDE.md`).
+2. Resolve the open questions above explicitly before writing code,
+   especially #1 (POSIX primitive) and #5 (detection escape hatch) —
+   both change the shape of the implementation, not just its edges.
+3. Before touching `cfg.py`/`emitter_c.py`: write a minimal repro program
+   exercising the `Incref(new)/Decref(old)/Assign` global-write race
+   described in "The soundness gap, precisely" above under real
+   concurrent load (mirroring `datetime_test.py`'s
+   `test_localtz_concurrent_init_stress`, this worktree) — confirm it's
+   real and reproducible on today's codegen before changing anything,
+   the same way this worktree's own investigation did for `localtz()`.
+4. Land Part A (globals) first, independently verified, before Part B
+   (fields) — Part A is the concrete, already-motivated piece; Part B is
+   the larger, costlier generalization and should not block on or be
+   entangled with Part A landing. Within Part B, land the "Prerequisite"
+   section's `_protected`/`__private` field-access enforcement — including
+   the standard-library audit it calls for — *before* the write-once
+   exemption (cost mitigation #2); do not ship the exemption first "and
+   add enforcement later," since that ordering leaves the exact unlocked
+   gap the Prerequisite section describes, even if only briefly.
+5. Regression-test the enforcement itself with a negative-compile case
+   modeled directly on the repro in the "Prerequisite" section above (a
+   `__private` field written from outside its own class must become a
+   compile error, not silently succeed) — plus the equivalent case for
+   `_protected` access from a non-subclass. Confirm the *existing*,
+   narrower `__allocate__()` privacy check (`lowering.py:11698`) still
+   passes unchanged, since the new field-access check reuses the same
+   `Type.in_private_scope()` machinery and must not regress it.
+6. Multi-compiler verification (MSVC, clang, WSL gcc) for every stage —
+   this touches `emitter_c.py`'s core object/global emission directly,
+   exactly the class of change that has previously shipped regressions
+   caught only by a non-default compiler (see this repo's own memory
+   notes on `linker_c.py`-adjacent compiler coverage). The POSIX-specific
+   lock-primitive decision (open question #1) makes the WSL/gcc leg
+   non-optional here, not just routine.
+7. Run the full suite (`python tests.py`) after each stage, and loop it
+   20-30x — this is exactly the kind of RC/refcounting-adjacent,
+   concurrency-adjacent change where one green run proves nothing (see
+   this repo's own memory notes on RC/concurrency changes).
+8. Real concurrent-load regression coverage specifically for the
+   `localtz()`/`termcolor._codes()` shape, migrated to rely on the new
+   automatic protection instead of (or in addition to) their own
+   hand-written `FastLock`, to prove the general mechanism actually
+   subsumes the specific fix that motivated this document.
+9. Commit, then merge into `master` via the shared-checkout exception in
+   `CLAUDE.md`.
