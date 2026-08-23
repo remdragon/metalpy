@@ -34,16 +34,18 @@
 #                     different erase/ordering semantics (swap-and-pop,
 #                     stable IDs). Untouched by this split.
 #
-# A raw borrowed view (slice[T]) into the buffer is UnsafeList[T].as_slice()
-# only, deliberately not the same shape on list[T] - the view's own validity
-# window ("don't use it past the next mutation") is meaningless once the
-# lock that made "the next mutation" observable has already been released.
-# list[T] instead offers borrow_slice()/release_borrow(): an atomic borrow
-# COUNT (see borrow_slice()'s own comment) that append/insert/erase_at/pop
-# check and refuse to proceed against while nonzero - the same "an
-# outstanding export blocks a resize" contract Python's own memoryview/
-# buffer protocol enforces over bytearray, just via a plain counter instead
-# of PEP 3118's own export-count machinery.
+# A raw borrowed view (slice[T]) into the buffer is a plain, untracked
+# UnsafeList[T][a:b]/.as_slice() only - the view's own validity window
+# ("don't use it past the next mutation") is meaningless once the lock that
+# made "the next mutation" observable has already been released. list[T]
+# instead threads an atomic borrow COUNT (__borrows below) through every
+# slice[T] it hands out via list[T][a:b] - slice[T]'s own __init__/__del__
+# atomically increment/decrement it, tied to the returned view's own RC
+# lifetime (RAII - see slice[T]'s class comment, lib/builtins/__init__.py) -
+# and append/insert/erase_at/pop check it and refuse to proceed while
+# nonzero, the same "an outstanding export blocks a resize" contract Python's
+# own memoryview/buffer protocol enforces over bytearray, just via a plain
+# counter instead of PEP 3118's own export-count machinery.
 
 import compiler
 import sys
@@ -255,10 +257,20 @@ class UnsafeList[T]:
 		self.__raw._insert_at( idx, compiler.cast( Ptr[None], compiler.addrof( val )))
 
 	# Access element by position. Returns a copy (with incref if RC).
+	@overload
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
 		val: T = self._read_element( self.__raw._ptr_at( idx ).or_return())
 		compiler.incref( val )
 		return Result.Ok( val )
+
+	# x[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a
+	# borrowed slice[T] view, infallible/clamping like every other
+	# __getitem__(PySlice) overload (see _resolve_pyslice_bounds). No
+	# borrow-count protection (borrow_addr=None) - UnsafeList[T] stays
+	# unguarded/single-owner by construction, unlike list[T] below.
+	@overload
+	def __getitem__( self, s: PySlice ) -> slice[T]:
+		return self._slice_view( s, None )
 
 	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
@@ -269,18 +281,34 @@ class UnsafeList[T]:
 		compiler.decref( old )
 		return Result.Ok( None )
 
+	# Shared by __getitem__(PySlice) above and list[T].__getitem__(PySlice)
+	# below (module-private, not class-private, so list[T] - in this same
+	# file - can call it too): builds a borrowed slice[T] view over
+	# [start,stop) after clamping s against this buffer's own real length.
+	# borrow_addr is threaded through unchanged to slice[T]'s own __init__,
+	# which does the actual atomic increment (RAII, tied to the returned
+	# slice[T]'s own RC lifetime) - see slice[T]'s class comment. _slot_ptr,
+	# not _ptr_at - the latter is bounds-checked against __len and would
+	# fail on start == len() (e.g. an empty tail slice); _resolve_pyslice_
+	# bounds already guarantees 0 <= start <= stop <= len() on its own.
+	def _slice_view( self, s: PySlice, borrow_addr: Ptr[usize]|None ) -> slice[T]:
+		( start, stop ) = _resolve_pyslice_bounds( s, self.__raw.len() )
+		with compiler.panic_arithmetic( '_resolve_pyslice_bounds guarantees start <= stop, cannot underflow' ):
+			length: usize = stop - start
+		return slice[T](
+			ptr = compiler.cast( ConstPtr[None], self.__raw._slot_ptr( start )),
+			length = length,
+			borrow_addr = borrow_addr,
+		)
+
 	# A borrowed slice[T] view over the WHOLE buffer - "don't outlive the
 	# next mutation" borrow contract (insert/remove/append may reallocate or
-	# shift the buffer): slice[T]'s own _ptr is untyped (ConstPtr[None]),
-	# and slice.get_unchecked/_element_size already do the same
-	# compiler.is_rc(T) handle-vs-value branch UnsafeList's own
-	# _read_element does. _slot_ptr(0), not _ptr_at(0) - the latter is
-	# bounds-checked against __len and would fail on an empty list; a
-	# zero-length slice is still well-formed (nothing can dereference
-	# through it, since every real read goes through an index < len()
-	# check first).
+	# shift the buffer). Thin wrapper over _slice_view (0..len(), no borrow
+	# tracking) kept for its existing external callers (RawDict._lower_
+	# bound, bisect.py's own callers) - equivalent to self[:] via slice
+	# syntax, just without needing a PySlice constructed by hand.
 	def as_slice( self ) -> slice[T]:
-		return slice[T]( _ptr = compiler.cast( ConstPtr[None], self.__raw._slot_ptr( 0 )), __len = self.__raw.len() )
+		return self._slice_view( PySlice( start = 0, stop = None ), None )
 
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
@@ -316,7 +344,7 @@ class UnsafeList[T]:
 class list[T]:
 	__inner:   UnsafeList[T]
 	__lock:    threading.FastLock
-	__borrows: usize  # see borrow_slice()'s own comment
+	__borrows: usize  # atomic borrow count - see __getitem__(PySlice)'s own comment and slice[T]'s class comment (lib/builtins/__init__.py)
 
 	def __init__( self, initial_capacity: usize = 8 ) -> None:
 		self.__inner   = UnsafeList[T]( initial_capacity )
@@ -348,17 +376,33 @@ class list[T]:
 			self.__inner.insert( idx, val )
 
 	# Access element by position. Returns a copy (with incref if RC).
+	@overload
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
 		with self.__lock:
 			return self.__inner.__getitem__( idx )
+
+	# x[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a
+	# borrowed slice[T] view whose own __init__/__del__ atomically
+	# increment/decrement __borrows for as long as the returned slice[T]
+	# itself stays alive (RAII) - replaces the old borrow_slice()/
+	# release_borrow() manual pairing entirely; see slice[T]'s own class
+	# comment. Infallible/clamping like every other __getitem__(PySlice)
+	# overload (see _resolve_pyslice_bounds) - never returns BorrowError
+	# the way append/insert/erase_at/pop do, since reading a borrowed view
+	# doesn't itself need to check __borrows (it's the thing INCREMENTING
+	# that counter, not something the counter guards against).
+	@overload
+	def __getitem__( self, s: PySlice ) -> slice[T]:
+		with self.__lock:
+			return self.__inner._slice_view( s, compiler.addrof( self.__borrows ))
 
 	# Overwrite the element at idx. Increfs val and decrefs the value it
 	# replaces. NOT gated on __borrows: unlike append/insert/erase_at/pop,
 	# this never reallocates or shifts anything - it's a fixed-offset write,
 	# which can't invalidate a borrowed slice[T]'s own pointer or length
 	# (whether the WRITE itself races logically with a concurrent reader is
-	# a separate, pre-existing category of hazard borrow_slice() was never
-	# meant to solve either - see its own comment).
+	# a separate, pre-existing category of hazard __getitem__(PySlice) was
+	# never meant to solve either - see its own comment).
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
 		with self.__lock:
 			return self.__inner.__setitem__( idx, val )
@@ -391,42 +435,6 @@ class list[T]:
 			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
 				return Result.Err( BorrowError() )
 			return self.__inner.erase_at( idx )
-
-	# Borrow a read-only slice[T] view over the WHOLE buffer, valid until the
-	# matching release_borrow() call. Unlike UnsafeList[T].as_slice() (safe
-	# there because nothing else can touch an UnsafeList concurrently by
-	# construction), a raw view into a LOCKED list[T]'s buffer would
-	# otherwise dangle the instant this method returns and the lock
-	# releases: another thread's append/insert/erase_at/pop could reallocate
-	# or shift the buffer with no way for the borrower to ever know. Tracked
-	# via an atomic borrow COUNT instead of holding the lock for the view's
-	# whole lifetime (which would serialize every reader against every
-	# other reader for no reason - multiple concurrent borrows are perfectly
-	# safe, only a MUTATION racing a live borrow isn't): every mutator that
-	# could invalidate a view checks this count FIRST (while holding the
-	# lock, so the check itself is race-free) and refuses with BorrowError
-	# rather than proceeding, the same "an outstanding export blocks a
-	# resize" contract Python's own memoryview/buffer protocol enforces
-	# over bytearray. Caller MUST pair this with release_borrow() (typically
-	# via defer(), the same idiom every method here already uses for
-	# __lock) - there is no automatic release: slice[T] is a plain @cstruct,
-	# not an RCClass, so it has no __del__ to hook one into. Does NOT keep
-	# this list[T] object itself alive - a slice[T] holds no reference back
-	# to its origin, so destructing (not just mutating) the list while a
-	# borrow is outstanding is still the caller's own responsibility to
-	# avoid, exactly as it already is for UnsafeList[T].as_slice().
-	def borrow_slice( self ) -> slice[T]:
-		with self.__lock:
-			view: slice[T] = self.__inner.as_slice()
-			compiler.atomic_add( compiler.addrof( self.__borrows ), 1 )
-			return view
-
-	# Ends a borrow started by borrow_slice() - see its own comment. Safe to
-	# call without holding __lock: this only needs to be atomic with respect
-	# to the CHECK append/insert/erase_at/pop make against the same counter,
-	# not with the rest of the container's own state.
-	def release_borrow( self ) -> None:
-		compiler.atomic_sub( compiler.addrof( self.__borrows ), 1 )
 
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> Result[None, BorrowError]:

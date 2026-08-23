@@ -13,6 +13,12 @@
 # compile, because the OTHER, never-taken-at-runtime branch is still
 # monomorphized and still needs T and K comparable. Same split Rust's
 # binary_search/binary_search_by_key uses for the identical reason.
+#
+# Every arr.get_unchecked(mid) call below is transient/inline (never bound
+# to a name) - that's fine because get_unchecked returns an owned value for
+# RC T, so its own incref and the compiler's automatic scope-exit decref on
+# the unnamed temp cancel out net zero, exactly like a bare borrow would,
+# with no extra code needed here.
 
 def bisect_right[T]( arr: slice[T], x: T ) -> usize:
 	lo: usize = 0

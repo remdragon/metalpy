@@ -6028,20 +6028,24 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
-			# real cross-thread stress test for list[T].borrow_slice()/
-			# release_borrow(): N threads hammer append() on a list while the
-			# MAIN thread holds a borrow_slice() view, then releases it - a
-			# closed-form accounting check (every attempt is EITHER blocked
-			# with BorrowError OR succeeds, counted separately, and the two
-			# counts plus the list's own final length must all agree exactly)
-			# proves the borrow genuinely serializes against real concurrent
-			# mutation attempts, not just single-threaded reasoning. The
-			# busy-wait on `started` (same pattern independent_per_thread_
-			# slots above already uses) maximizes the chance every hammering
-			# thread has actually begun racing before the main thread
-			# releases the borrow - without it, a slow thread start could let
-			# every attempt land AFTER release, proving nothing.
-			( 'borrow_slice_blocks_concurrent_mutation_from_other_threads', '''
+			# real cross-thread stress test for list[T][a:b] slice syntax's
+			# RAII borrow tracking: N threads hammer append() on a list while
+			# the MAIN thread holds a live slice[T] view, then lets it go
+			# (del view) - a closed-form accounting check (every attempt is
+			# EITHER blocked with BorrowError OR succeeds, counted
+			# separately, and the two counts plus the list's own final
+			# length must all agree exactly) proves the borrow genuinely
+			# serializes against real concurrent mutation attempts, not just
+			# single-threaded reasoning - and that releasing it happens
+			# automatically via slice[T].__del__ (RAII), with no manual
+			# release call, unlike the old borrow_slice()/release_borrow()
+			# API this replaces. The busy-wait on `started` (same pattern
+			# independent_per_thread_slots above already uses) maximizes the
+			# chance every hammering thread has actually begun racing before
+			# the main thread drops the view - without it, a slow thread
+			# start could let every attempt land AFTER the view's __del__,
+			# proving nothing.
+			( 'slice_syntax_blocks_concurrent_mutation_and_unblocks_on_del', '''
 import threading
 import atomic
 
@@ -6058,7 +6062,7 @@ class Hammerer:
 	def run( self ) -> None:
 		self.started.fetch_add( 1 )
 		i: i32 = 0
-		while i < 500:
+		while i < 20000:
 			if self.target.append( 1 ).is_ok():
 				self.ok.fetch_add( 1 )
 			else:
@@ -6072,7 +6076,7 @@ def main() -> i32:
 	blocked = atomic.Atomic[i32]( 0 )
 	ok      = atomic.Atomic[i32]( 0 )
 
-	view: slice[i32] = l.borrow_slice()
+	view: slice[i32] = l[0:l.__len__()]
 
 	threads: list[threading.Thread] = list[threading.Thread]()
 	t: i32 = 0
@@ -6084,8 +6088,25 @@ def main() -> i32:
 
 	while started.load() < 4:
 		pass
+	# also wait for real, observed contention (not just thread startup)
+	# before releasing - under extreme scheduler oversubscription (e.g. 16
+	# parallel test shards, each spawning their own threads), a bare
+	# `started.load() < 4` busy-wait can race: all 4 hammering threads can
+	# run their ENTIRE workload to completion in one scheduling burst
+	# before this thread's own busy-wait ever gets a chance to notice and
+	# release, making `blocked` a coin flip instead of a near-certainty.
+	# 20000 iterations/thread (vs the smaller count this used to have)
+	# makes that one-uninterrupted-burst scenario far less likely on its
+	# own already; waiting for a real blocked count on top removes the
+	# remaining race on THAT assertion specifically.
+	while blocked.load() < 100:
+		pass
 
-	l.release_borrow()
+	# view's own length, captured before `del` ends its lifetime - the
+	# borrow-count decrement (unblocking every hammering thread) happens
+	# right here, inside del, entirely automatically
+	view_len: usize = view.__len__()
+	del view
 
 	i: usize = 0
 	while i < 4:
@@ -6094,7 +6115,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			i += 1
 
-	if len( view ) != 0:
+	if view_len != 0:
 		return 1
 	if blocked.load() == 0:
 		return 2
@@ -6102,7 +6123,7 @@ def main() -> i32:
 		return 3
 	with compiler.wrap_arithmetic:
 		total: i32 = blocked.load() + ok.load()
-	if total != 2000:
+	if total != 80000:
 		return 4
 	if l.__len__() != usize( ok.load() ):
 		return 5
@@ -9536,6 +9557,110 @@ def main() -> i32:
 		return 3
 	return 0
 ''' ),
+			# get_unchecked's own Incref for RC T, bound to a named local -
+			# above's 'apple'/'banana'/'cherry' are all string LITERALS, which
+			# compile to immortal (ref_count == METALPY_IMMORTAL_REFCOUNT)
+			# static objects whose Incref/Decref are silent no-ops (see
+			# emitter_c.py's retain_object/release_object) - that masks this
+			# entire bug class. heap_str() builds a genuine, normally-
+			# refcounted heap string at runtime instead - concatenating two
+			# CONSTANT strings (e.g. 'heap_' + 'string') gets constant-folded
+			# back into a single immortal literal (confirmed empirically),
+			# but 'heap_' + str(n) can't be, since n is a plain i32 parameter.
+			( 'get_unchecked_increfs_rc_element_bound_to_local', '''
+def heap_str( n: i32 ) -> str:
+	return 'heap_' + str( n )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: str = heap_str( 1 )
+		arr: UnsafeList[str] = UnsafeList[str]()
+		arr.append( x )
+		s: slice[str] = arr.as_slice()
+		before: usize = compiler.refcount( x )
+		got: str = s.get_unchecked( 0 )
+		after: usize = compiler.refcount( x )
+		if after != before + 1:
+			return 1
+		if got != x:
+			return 2
+		compiler.decref( got )
+		restored: usize = compiler.refcount( x )
+		if restored != before:
+			return 3
+	return 0
+''' ),
+			# same non-literal-heap-string setup, but the read is INLINE
+			# (never bound to a name) - the exact shape lib/bisect.py's own
+			# get_unchecked calls use. get_unchecked's own Incref and the
+			# compiler's automatic scope-exit Decref on the unnamed temp
+			# holding the comparison's operand must cancel out net zero.
+			( 'get_unchecked_inline_read_is_refcount_neutral', '''
+def heap_str( n: i32 ) -> str:
+	return 'inline_' + str( n )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		x: str = heap_str( 1 )
+		arr: UnsafeList[str] = UnsafeList[str]()
+		arr.append( x )
+		s: slice[str] = arr.as_slice()
+		before: usize = compiler.refcount( x )
+		if s.get_unchecked( 0 ) != x:
+			return 1
+		after: usize = compiler.refcount( x )
+		if after != before:
+			return 2
+	return 0
+''' ),
+			# bisect_left/bisect_right over an RC element type (str) end to
+			# end - every prior bisect test here uses a non-RC T (i32/Node),
+			# so this is the first real exercise of bisect.py's inline
+			# get_unchecked calls against RC elements.
+			( 'bisect_left_and_right_over_rc_elements', '''
+import bisect
+
+def heap_str( n: i32 ) -> str:
+	return 'item_' + str( n )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		arr: UnsafeList[str] = UnsafeList[str]()
+		arr.append( heap_str( 1 ) )
+		arr.append( heap_str( 2 ) )
+		arr.append( heap_str( 2 ) )
+		arr.append( heap_str( 3 ) )
+		s: slice[str] = arr.as_slice()
+		target: str = heap_str( 2 )
+		if bisect.bisect_left( s, target ) != 1:
+			return 1
+		if bisect.bisect_right( s, target ) != 3:
+			return 2
+	return 0
+''' ),
+			# repeated named-local + explicit compiler.decref reads over many
+			# iterations with a fresh heap (non-literal) string each time -
+			# mirrors FStringTests' own repeated_fstring_construction_does_
+			# not_leak_or_double_free stress shape; a leak grows memory
+			# silently but a double-free/UAF here crashes the process,
+			# turning a wrong exit code into a hard failure.
+			( 'repeated_slice_get_unchecked_read_does_not_leak_or_double_free', '''
+def heap_str( n: i32 ) -> str:
+	return 'value_' + str( n )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		for i in range( 1000 ):
+			x: str = heap_str( 7 )
+			arr: UnsafeList[str] = UnsafeList[str]()
+			arr.append( x )
+			s: slice[str] = arr.as_slice()
+			got: str = s.get_unchecked( 0 )
+			if got != heap_str( 7 ):
+				return 1
+			compiler.decref( got )
+	return 0
+''' ),
 			( 'bisect_left_and_right_direct_comparison', '''
 import bisect
 
@@ -12024,10 +12149,16 @@ def main() -> i32:
 
 
 class SliceSyntaxTests( test_support.RealCompileMixin, CompilerTestCase ):
-	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - PLAN_POSIX_FEATURE.md's scope,
-	str/bytearray only (list[T] slicing deferred - no real caller). Byte-
-	offset semantics, not Python's real Unicode-codepoint offsets - see
-	_lower_slice_subscript's own docstring on why. '''
+	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - dispatches through an ordinary
+	__getitem__(PySlice) overload (lowering.py's _lower_slice_subscript),
+	so any type declaring one supports slice syntax; str/bytearray/
+	memoryview are the built-in ones. str's slicing is byte-offset, not
+	this codebase's own Unicode-codepoint s[i] convention - see
+	_lower_slice_subscript's own docstring on why. Infallible, matching
+	real Python's own slice semantics exactly: out-of-range bounds clamp
+	silently rather than raising (see StrSliceClampingTests /
+	BytearraySliceClampingTests below) - unlike single-element s[i], which
+	DOES error on an out-of-range index. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -12101,6 +12232,53 @@ def main() -> i32:
 		tz: str = target_path[idx+9:]
 	if tz != "America/New_York":
 		return 1
+	return 0
+''' ),
+			# clamping, not Result::Err - matches real Python's own slice
+			# semantics exactly (s[a:1000000] never raises, even though
+			# s[1000000] on its own would)
+			( 'str_slice_out_of_range_bounds_clamp', '''
+def main() -> i32:
+	s: str = "hello"
+	if s[2:1000] != "llo":
+		return 1
+	if s[1000:2000] != "":
+		return 2
+	if s[4:1] != "":
+		return 3
+	if s[0:1000] != "hello":
+		return 4
+	return 0
+''' ),
+			( 'bytearray_slice_out_of_range_bounds_clamp', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 1
+	p[1] = 2
+	p[2] = 3
+	if len( b[1:1000] ) != 2:
+		return 1
+	if len( b[1000:2000] ) != 0:
+		return 2
+	if len( b[2:1] ) != 0:
+		return 3
+	return 0
+''' ),
+			( 'memoryview_slice_out_of_range_bounds_clamp', '''
+def main() -> i32:
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 10
+	p[1] = 20
+	p[2] = 30
+	with memoryview( b ) as mv:
+		if len( mv[1:1000] ) != 2:
+			return 1
+		if len( mv[1000:2000] ) != 0:
+			return 2
+		if len( mv[2:1] ) != 0:
+			return 3
 	return 0
 ''' ),
 		] )
@@ -12654,6 +12832,63 @@ def main() -> i32:
 		] )
 
 
+class GenericClassOverloadMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' discovery.py's _get_or_create_specialization cached its result keyed
+	purely by a STRING (base.qualname + args' qualnames) - found while
+	giving list[T]/UnsafeList[T] a second __getitem__ overload (PySlice, for
+	slice syntax) alongside their existing single-index one. monomorphize.
+	py's _substituted_overload (used whenever a generic class's own
+	@overload group gets specialized, e.g. list[T].__getitem__ specialized
+	for list[i32]) calls this once per implementation in the group via its
+	own sub_impl - but two DISTINCT Function objects (the two @overload
+	leaves) share the exact same qualname (Python has no notion of "which
+	overload" baked into a qualname), so the second leaf's own
+	specialization request silently hit the cache under the SAME key the
+	first leaf's request had already populated, returning the FIRST leaf's
+	monomorphized Function instead of creating its own. Confirmed via a real
+	repro: list[i32].__getitem__(PySlice) resolved to the SAME (usize-
+	taking) implementation as list[i32].__getitem__(usize), regardless of
+	which overload should have matched. Fixed by keying the cache on
+	(id(base), name) instead of name alone - base is always the same
+	singleton object for genuine reuse (e.g. list[i32] requested from two
+	different call sites), so this only ever changes behavior for the
+	actual collision case (two distinct Functions sharing a qualname). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'generic_class_overload_leaves_specialize_independently', '''
+class Box[T]:
+	value: T
+
+	def __init__( self, value: T ) -> None:
+		self.value = value
+
+	@overload
+	def describe( self, flag: usize ) -> str:
+		return 'usize'
+
+	@overload
+	def describe( self, flag: bool ) -> str:
+		return 'bool'
+
+def main() -> i32:
+	b: Box[i32] = Box[i32]( 42 )
+	if b.describe( usize( 1 ) ) != 'usize':
+		return 1
+	if b.describe( True ) != 'bool':
+		return 2
+	if b.value != 42:
+		return 3
+	return 0
+''' ),
+		] )
+
+
 class OverloadedDunderComparisonExtraSitesRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' companion to OverloadedDunderComparisonTests (int.__eq__/__ne__(i32)
 	above): that fix landed FunctionLowering._find_eq_method_for_arg,
@@ -12733,6 +12968,101 @@ def main() -> i32:
 		return 1
 	if a == c:
 		return 2
+	return 0
+''' ),
+		] )
+
+
+class OverloadedGetitemDispatchTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' __getitem__ has its own, SEPARATE Overload-blindness gap from the
+	comparison dunders above (_find_method's own `isinstance(found,
+	Function)` check returns None for an Overload group, silently breaking
+	every one of __getitem__'s call sites the instant a type gains a second
+	__getitem__ overload) - found while adding slice-syntax support
+	(container[a:b] as a second __getitem__ overload alongside the existing
+	single-index one). Three call sites share this gap: plain `x[i]` reads
+	(_expr_Subscript), `x[i] += y` (_stmt_AugAssign's Subscript target), and
+	`for v in x:` over an indexable with no __iter__ (_lower_for_over_
+	indexable). Fixed via a new _find_indexlike_getitem helper (NOT
+	_find_dunder_for_arg, which needs the caller to already know the exact
+	argument type to match against - an ordinary index's own type is instead
+	INFERRED FROM __getitem__'s declared parameter type, so there's no
+	arg_type to match against yet at the point this needs to run; a real
+	repro during development, a @cstruct with def __getitem__(self, i: i32),
+	broke when this first required an exact usize match instead of picking
+	whichever candidate is Scalar-typed at all). RangeKey (a plain @cstruct,
+	not a Scalar) stands in for the eventual real second leaf (PySlice, not
+	added yet) - it only needs to NOT be a Scalar, to confirm the fix
+	structurally prefers the Scalar (index-like) leaf over a compound one,
+	the same shape the real slice-syntax feature will need. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'overloaded_getitem_still_resolves_at_every_call_site', '''
+@cstruct
+class RangeKey:
+	lo: i32
+
+class IndexBox:
+	a: i32
+	b: i32
+	c: i32
+
+	def __init__( self ) -> None:
+		self.a = 10
+		self.b = 20
+		self.c = 30
+
+	@overload
+	def __getitem__( self, i: usize ) -> i32:
+		if i == 0:
+			return self.a
+		if i == 1:
+			return self.b
+		return self.c
+
+	@overload
+	def __getitem__( self, key: RangeKey ) -> i32:
+		return key.lo
+
+	def __setitem__( self, i: usize, value: i32 ) -> None:
+		if i == 0:
+			self.a = value
+		elif i == 1:
+			self.b = value
+		else:
+			self.c = value
+
+	def __len__( self ) -> usize:
+		return 3
+
+def main() -> i32:
+	x: IndexBox = IndexBox()
+	# plain x[i] read (_expr_Subscript)
+	if x[0] != 10 or x[1] != 20 or x[2] != 30:
+		return 1
+	# x[i] += y (_stmt_AugAssign's Subscript target)
+	with compiler.panic_arithmetic( 'overloaded_getitem_still_resolves_at_every_call_site: overflow' ):
+		x[0] += 5
+	if x[0] != 15:
+		return 2
+	# for v in x: over an indexable with no __iter__ (_lower_for_over_indexable)
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in x:
+			total += v
+	if total != 15 + 20 + 30:
+		return 3
+	# the OTHER overload leaf (compound arg type) still resolves too, via
+	# ordinary method-call overload resolution - confirms the Overload
+	# group itself is intact, not just the index leaf
+	if x.__getitem__( RangeKey( lo = 99 )) != 99:
+		return 4
 	return 0
 ''' ),
 		] )

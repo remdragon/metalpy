@@ -617,20 +617,37 @@ list class
 		variant confirming no leak/double-free) - repeat-run 10x via
 		PowerShell with zero flakiness.
 
-	slice[T] (builtins/__init__.py) is a borrowed view (_ptr/__len only, no
-		owning storage) - any function that snapshots a slice's .len() once
-		and then indexes it across multiple statements (e.g. str.concat's
-		two `for i in range(count): part = parts.get_unchecked(i)` loops)
-		is reading through a pointer that another thread could be mutating
-		or freeing concurrently, even though get_unchecked's own bound
-		(i < count) can never itself be violated. Fixing this for real needs
-		either an owned-copy path (slice[T].clone() -> list[T], or similar -
-		but slice has no allocator/capacity of its own to build that from,
-		and list[T] has no constructor that takes a slice/iterable either)
-		or real ownership/borrow tracking that proves the slice can't be
-		mutated for the duration of the call - this is really the same
-		unsolved problem as incref/decref/move[T] above, not a one-off bug
-		in str.concat specifically
+	slice[T] (builtins/__init__.py) is a borrowed view (_ptr/__len, plus a
+		real RC lifecycle now - see below) - RESOLVED for list[T]: slice[T]
+		is a plain (non-@cstruct) generic RCClass whose __init__/__del__
+		atomically increment/decrement an optional __borrow_addr pointer
+		(RAII, tied to the slice's own RC lifetime), replacing the old
+		manual, unpaired-call-prone list[T].borrow_slice()/release_borrow().
+		list[T][a:b] (or .as_slice()) wires this to list[T]'s own __borrows
+		counter, which append/insert/erase_at/pop/clear already check and
+		refuse to proceed against while nonzero - so a list[T]-sourced
+		slice[T] genuinely blocks concurrent mutation for as long as it's
+		alive, verified via a real cross-thread stress test
+		(emitter_c_test.py's slice_syntax_blocks_concurrent_mutation_and_
+		unblocks_on_del). STILL OPEN for UnsafeList[T] specifically
+		(deliberately unguarded, single-owner by design - no __borrows field
+		at all, so UnsafeList[T][a:b]/.as_slice() always pass borrow_addr=
+		None): a function that snapshots a slice's .len() once and then
+		indexes it across multiple statements (e.g. str.concat's own
+		`for i in range(count): part = parts.get_unchecked(i)` loop, fed by
+		UnsafeList[str].as_slice()) is reading through a pointer that
+		another thread could in principle be mutating or freeing
+		concurrently - not applicable to UnsafeList's own real callers today
+		(all single-threaded), but still a real gap if that assumption is
+		ever violated. Fixing THAT for real would mean giving UnsafeList[T]
+		its own borrow tracking too (a real design/perf tradeoff - UnsafeList
+		exists specifically to skip that cost) or real ownership/borrow-
+		checking at the type level - same unsolved problem as incref/decref/
+		move[T] above, not a one-off gap in str.concat specifically. Element-
+		level RC correctness (as opposed to the view/buffer question above)
+		is unrelated and already fine: get_unchecked() returns an owned,
+		correctly-refcounted ELEMENT for RC T on its own (increfs
+		internally), regardless of which flavor of slice[T] it came from.
 
 	generic list[T] method calls (e.g. xs.append(...)) used to fail in the
 		old emitter.py's _transpile_call ("could not resolve receiver class

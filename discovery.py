@@ -230,7 +230,7 @@ class Discovery( ast.NodeVisitor ):
 		# looked up by qualname from outside, only reused when the exact same
 		# combination is seen again
 		self._unions: dict[str,TaggedUnion] = {}
-		self._specializations: dict[str,Specialization] = {}
+		self._specializations: dict[tuple[int,str],Specialization] = {}
 		self._moves: dict[str,Move] = {}
 		self._copies: dict[str,Copy] = {}
 		self._callables: dict[str,CallableType] = {}
@@ -1246,18 +1246,38 @@ class Discovery( ast.NodeVisitor ):
 		)
 
 	def _get_or_create_specialization( self, base: Type, args: list[Type] ) -> Specialization:
-		key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'
-		if spec := self._specializations.get( key ):
+		# the DICT key is (id(base), name_key), not name_key alone - two
+		# DISTINCT Function objects sharing a qualname (any two leaves of an
+		# @overload group - Python has no notion of "which overload" baked
+		# into a qualname) would otherwise collide here and silently share
+		# one cached Specialization, confirmed via a real repro:
+		# _substituted_overload's own sub_impl (monomorphize.py) calls this
+		# once per implementation when substituting an @overload group
+		# declared inside a generic class - list[T].__getitem__'s two
+		# leaves (idx: usize, s: PySlice) both qualname to
+		# 'builtins.list.__getitem__', so the SECOND leaf's own
+		# monomorphization request silently returned the FIRST leaf's
+		# already-cached Specialization instead of creating its own - every
+		# caller of list[i32].__getitem__ then resolved to the SAME (usize-
+		# taking) implementation regardless of which overload should have
+		# matched. name_key alone still becomes .stem/.qualname below (kept
+		# human-readable/stable for error messages and any genuine class-
+		# specialization reuse, e.g. list[i32] requested from two different
+		# call sites correctly still hits the same cached Specialization,
+		# since `base` there is always the same singleton class object).
+		name_key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'
+		cache_key = ( id( base ), name_key )
+		if spec := self._specializations.get( cache_key ):
 			return spec
 		spec = Specialization(
-			stem = key,
-			qualname = key,
+			stem = name_key,
+			qualname = name_key,
 			file = base.file,
 			line = base.line,
 			base = base,
 			args = args,
 		)
-		self._specializations[key] = spec
+		self._specializations[cache_key] = spec
 		return spec
 
 	# --- imports --------------------------------------------------------------
