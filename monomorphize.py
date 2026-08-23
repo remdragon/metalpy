@@ -1,7 +1,7 @@
 # stdlib imports:
 import copy
 from dataclasses import replace
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 # local imports:
 from discovery import Discovery
@@ -9,6 +9,8 @@ from errors import RedundantCompilationError
 from mpy_types import Type, TypeVar, Specialization, TaggedUnion, CUnion, ClassLike, RCClass, Function, Overload, Variable, CallableType, ClosureType, TupleType, GeneratorType, by_value_dependency
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage, build_member_constructor
+if TYPE_CHECKING:
+	from type_resolver import TypeResolver
 
 '''
 Monomorphization - giving a concrete generic instantiation (sys.alloc[u8],
@@ -37,6 +39,12 @@ class Monomorphizer:
 		self.schedule = schedule
 		self._union_storage = union_storage
 		self._tuple_storage = tuple_storage
+		# set by TypeResolver.__init__ right after constructing this
+		# Monomorphizer (a back-reference - TypeResolver itself constructs
+		# and owns this instance, so it can't be passed in up front here).
+		# Needed only for monomorphized_function's own generator-pass-
+		# through check below - see that method's own comment.
+		self.type_resolver: 'TypeResolver|None' = None
 		# no separate memo tables here - the monomorphized result (Function
 		# or ClassLike, whichever matches spec.base's own kind) is cached
 		# directly on spec.monomorphized (see mpy_types.py's Specialization)
@@ -239,6 +247,24 @@ class Monomorphizer:
 				file = substituted_elem.file, line = substituted_elem.line,
 				elem_type = substituted_elem, error_type = substituted_error,
 			)
+		if isinstance( t, TupleType ):
+			# a TypeVar CONTAINED inside a tuple annotation (e.g. enumerate[T,
+			# S:Iterable[T]]'s own `-> Generator[tuple[isize,T],StopIteration]`)
+			# - distinct from the TypeVar branch above, which only handles T
+			# itself BEING bound to a whole tuple. Without this, tuple[isize,T]
+			# passed straight through unchanged (no branch here recognized
+			# TupleType at all) - confirmed by a real repro: a generic
+			# generator's own promoted field stayed typed with the abstract,
+			# unbound T, "type parameter inferred as both X and Y" once
+			# something concrete was later constructed against it. Same
+			# recursive-rebuild-and-intern shape as every other branch here,
+			# through discovery._get_or_create_tuple_type (TupleType's own
+			# canonicalizing constructor - mirrors _get_or_create_specialization/
+			# _get_or_create_callable_type).
+			substituted_elems = [ self.substitute_type_params( e, type_params, args ) for e in t.elem_types ]
+			if all( se is e for se, e in zip( substituted_elems, t.elem_types )):
+				return t
+			return self.discovery._get_or_create_tuple_type( substituted_elems )
 		if isinstance( t, TaggedUnion ) and t.file is None:
 			# an ANONYMOUS union (T|None, synthesized by discovery.py's own
 			# _get_or_create_union - file is None only for these, never for
@@ -328,6 +354,42 @@ class Monomorphizer:
 			substituted_cls = self.discovery._get_or_create_specialization( base.cls, spec.args )
 		type_params = type_params or []
 		monomorphized = self._build_monomorphized_function( base, type_params, spec.args, spec.qualname, substituted_cls )
+		if isinstance( monomorphized.return_type, GeneratorType ) and self.type_resolver is not None:
+			# base itself is a delegating wrapper (-> Generator[T,E]/
+			# Iterator[...], no yield of its own - e.g. a @protocol
+			# Iterable[T].__iter__ method, or iter() itself) reached via
+			# this, the ORDINARY monomorphization path (every type param
+			# already bound through plain argument unification - no return-
+			# only inference needed) rather than _infer_return_only_type_
+			# params (which has its own identical fix, needed there
+			# separately since THAT path builds its own provisional copy
+			# out-of-band, before this method ever sees it). Confirmed
+			# necessary by a real repro: min[T,S:Iterable[T]](seq:S)'s own
+			# body calling `it = iter(seq)` saw the bare abstract
+			# GeneratorType here (T's substitution alone was never enough),
+			# once TypeVar T became ordinarily inferable via S's own bound
+			# instead of return-only (see Lowering._unify_type_param's
+			# TypeVar-bound reverse-unification) - that change moved this
+			# exact call from the return-only path (already fixed) onto
+			# this one (not yet, until now).
+			# origin_type_param_stems threaded through here too, same as
+			# ensure_resolved's own Specialization branch (type_resolver.
+			# py) - this is now a THIRD call site that can be the FIRST
+			# to reach a given monomorphized generator function (this
+			# method runs from monomorphize_class's own method-
+			# substitution loop, which neither of the other two call
+			# sites goes through), and ensure_generator_synthesized's own
+			# memoization means whichever caller gets there first is the
+			# only one whose origin_type_param_stems is ever consulted -
+			# omitting it here let PLAN_GENERATORS.md's own Phase 3
+			# rejection (a generic generator body referencing its own
+			# type param outside an annotation) silently not fire,
+			# confirmed by a real regression: the intentional, clear
+			# "not supported yet" compile error was replaced by a raw,
+			# confusing "name 'T' is not defined" from deeper inside
+			# _build_generator_next_function instead.
+			origin_stems = [ tv.stem for tv in base.type_params ] if base.type_params else None
+			self.type_resolver.ensure_generator_synthesized( monomorphized, origin_stems )
 		spec.monomorphized = monomorphized
 		return monomorphized
 
@@ -539,6 +601,24 @@ class Monomorphizer:
 				substituted_names[member.stem] = self.monomorphized_function( method_spec )
 
 			extra: dict = {}
+			if isinstance( base, RCClass ) and base.protocols:
+				# a declared generic-protocol conformance (class list[T]
+				# (Sequence[T]):, entry = Specialization(Sequence, [T]) where
+				# T is THIS class's own type param) needs the SAME
+				# substitution as .attributes/.methods just above, or a
+				# monomorphized Real[i32]'s own .protocols would still read
+				# Box[Real.T] (the abstract, unsubstituted typevar) instead
+				# of Box[i32] - confirmed by a real repro, TypeVar.
+				# bound_satisfied_by's own structural comparison against a
+				# caller's concrete protocol bound would otherwise never
+				# match. A bare (non-generic-protocol) entry - still a plain
+				# Protocol, not a Specialization - has nothing to substitute.
+				extra['protocols'] = [
+					self.discovery._get_or_create_specialization(
+						entry.base, [ self.substitute_type_params( a, type_params, spec.args ) for a in entry.args ],
+					) if isinstance( entry, Specialization ) else entry
+					for entry in base.protocols
+				]
 			if isinstance( base, RCClass ) and isinstance( base.base, Specialization ):
 				# a generic ancestor parameterized by THIS class's own type
 				# params (class Bar[T](Real[T]): pass, base.base = Real[T]) -

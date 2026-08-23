@@ -12,7 +12,7 @@ from errors import CompileError
 from monomorphize import Monomorphizer
 from mpy_types import (
 	CallableType, CEnum, ClassLike, ClosureType, CStruct, CUnion, Function, GeneratorType, Module, Name, Overload,
-	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
+	Parameter, Protocol, RCClass, Scalar, Specialization, TaggedUnion, Type,
 	TupleType, TypeVar, Variable,
 )
 import overload_resolution
@@ -174,6 +174,7 @@ class TypeResolver:
 		# comment on why)
 		self.tuple_storage = TupleStorage( discovery, self.schedule ) # PLAN_TUPLE.md - same "depends on nothing but Discovery + schedule" shape as union_storage above
 		self.monomorphizer = Monomorphizer( discovery, self.schedule, self.union_storage, self.tuple_storage )
+		self.monomorphizer.type_resolver = self # back-reference - see Monomorphizer.__init__'s own comment on this field
 		# keyed by id(fn.node), not id(fn) - the SAME shared AST body object
 		# is reused by every monomorphized copy of a generic function (see
 		# resolve_function_body's own docstring)
@@ -2713,6 +2714,7 @@ class TypeResolver:
 		if id( fn ) in self._generators_synthesized:
 			return
 		if not self._function_contains_yield( fn ):
+			self._try_synthesize_generator_passthrough( fn )
 			return
 		self._generators_synthesized.add( id( fn ))
 
@@ -2859,6 +2861,83 @@ class TypeResolver:
 
 			self._rewrite_generator_constructor( fn, backing_cls, locals_decl, defer_sites, send_type )
 			fn.return_type = backing_cls
+
+	def _try_synthesize_generator_passthrough( self, fn: Function ) -> None:
+		''' a function/method declared `-> Iterator[T]`/`Generator[T,E]`
+		that doesn't itself contain yield, but whose ENTIRE body is a
+		single `return G(...)` delegating to a real generator call, never
+		got its own declared return type resolved past the bare, abstract
+		GeneratorType annotation - so a caller consuming ITS result (a for
+		loop, `.__next__()`) couldn't find a real backing class to dispatch
+		against (confirmed via a real repro and documented at lib/re.py's
+		own finditer() comment: "an Iterator[T] value merely returned/
+		passed through a non-generator function... has no usable
+		__next__"). This is exactly the shape needed for a @protocol
+		Iterable[T].__iter__ method to delegate to a free-function
+		generator (methods can't contain yield themselves - see the
+		fn.cls rejection above) - e.g. `def __iter__(self) -> Iterator[T,
+		StopIteration]: return _sequence_iter(self)`.
+
+		Deliberately narrow (single-statement `return Call(...)` body
+		only, same "any doubt, bail" scoping this file's other generator-
+		adjacent passes use) rather than a general dataflow pass. Reuses
+		_resolve_expr_type_for_desugar (built for exactly this "type an
+		arbitrary expression from AST alone" need) to resolve the call's
+		real type - which recursively calls back into
+		ensure_generator_synthesized for the callee, so a multi-level
+		delegation chain (iter() -> SomeClass.__iter__() -> the actual
+		yield-containing free function) resolves transitively, in
+		whichever order each link is first reached. '''
+		if id( fn ) in self._generators_synthesized:
+			return
+		if not isinstance( fn.return_type, GeneratorType ):
+			return
+		if fn.type_params:
+			# same "skip the still-abstract template" posture as the
+			# real-generator branch above - a delegating wrapper that is
+			# ITSELF still generic (its own T unbound) can't have its
+			# body's call target resolved yet; only a concrete
+			# monomorphized copy reaches here with real parameter types
+			return
+		body = fn.node.body
+		if len( body ) != 1 or not isinstance( body[0], ast.Return ) or not isinstance( body[0].value, ast.Call ):
+			return
+		# NOT memoized into _generators_synthesized until AFTER a successful
+		# resolution below (unlike the real-generator branch above, which
+		# memoizes unconditionally first) - a method reached from WITHIN its
+		# own enclosing generic class's monomorphize_class (e.g. list[T].
+		# __iter__, resolved as part of building list[i32] itself) can't yet
+		# resolve `self`'s own type correctly (list[i32] isn't finished
+		# being built - its own .protocols substitution, needed to reverse-
+		# unify a nested generic call's type param through self's bound,
+		# isn't done yet either), so this attempt silently comes back
+		# unresolved (still GeneratorType) - confirmed by a real repro. If
+		# memoized as "done" anyway, a LATER, correctly-timed retry (e.g.
+		# lower_function's own unconditional call, once list[i32] genuinely
+		# is finished) would be a permanent no-op instead of the second
+		# chance that actually succeeds - leaving fn.return_type wrong
+		# forever. Safe to attempt more than once: idempotent either way,
+		# and this whole branch is a no-op already-memoized generator check,
+		# never itself mutating anything until it definitely resolves.
+		# resolve_function_body must run first: _resolve_expr_type_for_desugar
+		# reuses _type_of_expr, whose Call-handling only correctly resolves a
+		# call to a GENERIC function (bare-inferred OR explicit-subscript,
+		# either shape) via node.resolved_callee - tagged by an EARLIER real
+		# .visit() pass over fn's body (resolve_function_body's own
+		# _ReferenceResolver), never computed by _type_of_expr itself when
+		# called standalone (see _resolve_expr_type_for_desugar's own
+		# docstring - it deliberately never runs .visit()). Without this,
+		# a bare `return _sequence_iter(self)` (S: Sequence[T]) resolved as
+		# the STILL-ABSTRACT template's own return type (T unbound) every
+		# time - confirmed via a real repro. Idempotent/memoized by id(fn.
+		# node), safe to call unconditionally here even on a retry.
+		self.resolve_function_body( fn )
+		module = self._find_module_for( fn )
+		with self.discovery.module_context( module ):
+			resolved = self._resolve_expr_type_for_desugar( fn, body[0].value )
+		if resolved is not None and not isinstance( resolved, GeneratorType ):
+			fn.return_type = resolved
+			self._generators_synthesized.add( id( fn ))
 
 	def _schedule_rcclass_destructor_deps( self, cls: RCClass ) -> None:
 		''' the emitter always synthesizes a destructor for every
@@ -5178,7 +5257,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# False here, same as any other "not this pass's to resolve or
 		# report" case, letting lowering.py's own Lowering._check_type_param_
 		# bounds raise the real error with full node/context
-		return all( tv.bound_satisfied_by( arg ) for tv, arg in zip( type_params, args ))
+		return all( tv.bound_satisfied_by( arg, type_params, args, self.resolver ) for tv, arg in zip( type_params, args ))
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type] ) -> bool:
 		# ported from Lowering._unify_type_param, minus the discovery.fail()
@@ -5194,6 +5273,34 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if existing is not None and existing is not actual and not self.resolver._same_type( existing, actual ):
 				return False
 			bindings[ id( declared )] = actual
+			if isinstance( declared.bound, Specialization ) and isinstance( declared.bound.base, Protocol ):
+				# mirrors Lowering._unify_type_param's identical reverse-
+				# unification-through-a-parametrized-protocol-bound branch -
+				# see its own comment for the full "why". Needed here too,
+				# not just in lowering.py: this pass's own resolved_callee
+				# tagging (visit_Call) runs BEFORE lowering.py ever sees the
+				# same call, and if THIS copy leaves a bound-only type param
+				# unbound where lowering.py's fixed copy wouldn't, downstream
+				# generator-pass-through resolution reached from this pass's
+				# own bound-checking sees a genuinely different (incomplete)
+				# picture than lowering.py's - confirmed by a real repro.
+				base = actual.base if isinstance( actual, Specialization ) else actual
+				if isinstance( base, TupleType ):
+					base = base.backing
+				skip_reentrant = isinstance( actual, Specialization ) and id( actual ) in self.resolver.monomorphizer._building
+				if isinstance( actual, Specialization ) and isinstance( base, RCClass ) and not skip_reentrant:
+					# _building guard - see mpy_types.py's identical guard on
+					# TypeVar.bound_satisfied_by for the full "why".
+					base = self.resolver.monomorphizer.monomorphize_class( actual )
+				if isinstance( base, RCClass ) and not skip_reentrant:
+					# skip_reentrant gates the whole lookup - see Lowering.
+					# _unify_type_param's identical, more-detailed comment on
+					# why a wrong bind is worse than none here.
+					for entry in base.protocols:
+						if isinstance( entry, Specialization ) and entry.base is declared.bound.base:
+							for b_arg, e_arg in zip( declared.bound.args, entry.args ):
+								self._unify_type_param( type_params, b_arg, e_arg, bindings )
+							break
 			return True
 		if isinstance( declared, Specialization ):
 			# _as_specialization, not a bare isinstance(actual, Specialization)

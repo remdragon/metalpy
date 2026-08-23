@@ -9,6 +9,7 @@ from typing import Callable, Union, TYPE_CHECKING
 from errors import RedundantCompilationError
 if TYPE_CHECKING:
 	import ir
+	import type_resolver
 
 # backs Variable.uid - see its own comment
 _variable_uid_counter = count()
@@ -245,19 +246,112 @@ class TypeVar( Type ):
 	# own copy reports the real error) - deliberately NOT in discovery.py's
 	# _get_or_create_specialization, a low-level shared cache/builder with no
 	# AST node/error-location available.
-	bound: 'Protocol|None' = None
+	# a Specialization here (e.g. Sequence[T], where T is the SAME
+	# generic's own sibling type param - S: Sequence[T]) is a parametrized
+	# protocol bound - see bound_satisfied_by below for how the sibling
+	# T gets resolved to something concrete before checking.
+	bound: 'Protocol|Specialization|None' = None
 
-	def bound_satisfied_by( self, concrete: Type ) -> bool:
+	def bound_satisfied_by(
+		self, concrete: Type,
+		type_params: 'list[TypeVar]|None' = None,
+		args: 'list[Type]|None' = None,
+		resolver: 'type_resolver.TypeResolver|None' = None,
+	) -> bool:
 		''' True if `concrete` may be substituted for this TypeVar. Always
-		true when unbound. When bound to a Protocol, `concrete` must be an
-		RCClass that has ALREADY had its own conformance verified - this is
-		just a membership check against RCClass.protocols, not re-doing the
-		structural verification discovery.py's _validate_protocol_conformance
-		already did once, at that class's own definition. '''
+		true when unbound. When bound to a bare Protocol, `concrete` must be
+		an RCClass that has ALREADY had its own conformance verified - this
+		is just a membership check against RCClass.protocols, not re-doing
+		the structural verification discovery.py's _validate_protocol_
+		conformance already did once, at that class's own definition.
+
+		When bound to a Specialization-of-Protocol (S: Sequence[T]) - a
+		PARAMETRIZED bound - `type_params`/`args`/`resolver` are required:
+		`type_params`/`args` are THIS call site's full, already-resolved
+		zip of every sibling type param this generic declares (confirmed
+		available at every real call site by the time bound-checking runs -
+		see lowering.py's _finish_generic_call), used to substitute the
+		bound's own args (e.g. T -> the concrete element type this call
+		site bound T to) via resolver.monomorphizer.substitute_type_params -
+		the SAME substitution primitive monomorphization itself uses, not
+		new machinery. The result is compared structurally (resolver.
+		_same_type, not `==` - see that method's own docstring for why a
+		bare dataclass equality is unsafe/wrong here) against `concrete`'s
+		own declared protocol-conformance Specializations - already
+		substituted/concrete themselves (Monomorphizer.monomorphize_class
+		substitutes a generic class's OWN declared protocol args, e.g.
+		list[i32]'s `Sequence[T]` conformance reads back as `Sequence[i32]`,
+		at the same point/via the same mechanism .attributes/.methods are -
+		see its own comment), so no second substitution is needed on that
+		side. '''
 		if self.bound is None:
 			return True
 		base = concrete.base if isinstance( concrete, Specialization ) else concrete
-		return isinstance( base, RCClass ) and self.bound in base.protocols
+		if isinstance( base, TupleType ):
+			# tuple[...] isn't an RCClass - its declared protocol
+			# conformance (for homogeneous tuples) lives on its lazily-
+			# synthesized backing RCClass instead (see tuple_storage.py)
+			base = base.backing
+		if (
+			isinstance( concrete, Specialization ) and isinstance( base, RCClass ) and resolver is not None
+			and id( concrete ) not in resolver.monomorphizer._building
+		):
+			# `concrete` may still be a bare, not-yet-monomorphized
+			# Specialization (e.g. an explicit type argument like Box[T]
+			# written inside another generic call's own subscript, never
+			# separately eagerly resolved) - unwrapping to .base alone would
+			# read the ABSTRACT class's own unsubstituted .protocols
+			# (confirmed by a real repro: Box[i32] via an explicit `_helper
+			# [T, Box[T]](...)` call site read back `Sequence[Box.T]`,
+			# never `Sequence[i32]`). monomorphize_class is idempotent
+			# (spec.monomorphized short-circuits) and is the single place
+			# .protocols actually gets substituted - same "force it, don't
+			# duplicate the substitution" posture the rest of this method
+			# already takes for base.protocols itself.
+			#
+			# _building guard: monomorphize_class's OWN top-of-function
+			# short-circuit (`if spec.monomorphized is not None: return`)
+			# only catches an ALREADY-FINISHED spec - re-entering THIS SAME
+			# spec while it's still mid-construction (concrete's own class
+			# building its own methods, one of which - e.g. a Sequence-
+			# conforming class's own __iter__ - reaches back here to check
+			# ITS OWN class's conformance) would otherwise rebuild it from
+			# scratch, unboundedly, confirmed by a real repro (RecursionError
+			# via monomorphize_class -> monomorphized_function ->
+			# ensure_generator_synthesized -> resolve_function_body ->
+			# another generic call -> back into THIS check -> monomorphize_
+			# class again, same still-building spec). Skipping in that rare
+			# reentrant case falls back to the abstract base's own
+			# unsubstituted .protocols below - a possibly-imprecise bound
+			# check for that one call, not a crash; every non-reentrant call
+			# (the overwhelming majority) still gets the fully-substituted
+			# version.
+			base = resolver.monomorphizer.monomorphize_class( concrete )
+		if not isinstance( base, RCClass ):
+			return False
+		if not isinstance( self.bound, Specialization ):
+			return self.bound in base.protocols
+		assert resolver is not None and type_params is not None and args is not None, (
+			f'a parametrized protocol bound ({self.bound.qualname}) requires the caller to pass '
+			f'(type_params, args, resolver) - see bound_satisfied_by\'s own docstring'
+		)
+		concrete_bound = resolver.monomorphizer.substitute_type_params( self.bound, type_params, args )
+		# base.protocols is already fully substituted/concrete here - a
+		# generic RCClass's OWN declared protocol conformance is substituted
+		# by Monomorphizer.monomorphize_class at the same point/via the same
+		# mechanism .attributes/.methods are (see its own comment) - `base`
+		# is already the monomorphized class by the time bound-checking
+		# runs (every real caller resolves `concrete` first), never the
+		# still-abstract template, so there is no second substitution to do
+		# here at all - just compare structurally.
+		for entry in base.protocols:
+			if not isinstance( entry, Specialization ) or entry.base is not concrete_bound.base:
+				continue
+			if len( entry.args ) == len( concrete_bound.args ) and all(
+				resolver._same_type( a, b ) for a, b in zip( entry.args, concrete_bound.args )
+			):
+				return True
+		return False
 
 @dataclass( kw_only = True, repr = False )
 class Specialization( Type ):
@@ -869,6 +963,14 @@ class Protocol( Type, ScopeMixin ): # @protocol class Foo:
 	methods: list['Function|Overload'] = field( default_factory = list )
 	names: dict[str,Name] = field( default_factory = dict )
 	resolve: Callable[[],None]|None = None
+	# @protocol Foo[T]: - None for a non-generic protocol (the overwhelming
+	# majority, still fully supported unchanged). Mirrors RCClass/CStruct/
+	# CUnion/TaggedUnion's own type_params field - see discovery.py's
+	# _parse_ClassDef_Protocol (populates this) and _parse_ClassDef_RCClass's
+	# base-list loop (a conforming class now records a Specialization of
+	# THIS protocol, carrying its own concrete-or-still-typevar args, in
+	# RCClass.protocols instead of the bare Protocol below).
+	type_params: 'list[TypeVar]|None' = None
 
 	def is_rc( self ) -> bool: return False
 	def is_rc_pointer( self ) -> bool: return False
@@ -894,7 +996,11 @@ class RCClass( Type, InheritanceChainMixin ): # normal ref-counted class
 	# chain_lookup/vtable at all. discovery.py's _validate_protocol_
 	# conformance checks and splices against this list once, at this class's
 	# own definition.
-	protocols: list[Protocol] = field( default_factory = list )
+	# a Specialization entry here (e.g. Sequence[T], T still this class's OWN
+	# unbound type param) is a generic protocol's declared conformance,
+	# carrying the args this class declared it with - see Protocol's own
+	# type_params field and _parse_ClassDef_RCClass's base-list loop.
+	protocols: 'list[Protocol|Specialization]' = field( default_factory = list )
 	type_params: list[TypeVar]|None = None # if not None, this is a generic class
 	attributes: list[Variable] = field( default_factory = list )
 	methods: list['Function|Overload'] = field( default_factory = list )

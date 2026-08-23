@@ -1289,8 +1289,26 @@ class Discovery( ast.NodeVisitor ):
 		# specialization reuse, e.g. list[i32] requested from two different
 		# call sites correctly still hits the same cached Specialization,
 		# since `base` there is always the same singleton class object).
+		#
+		# id(base) alone doesn't cover every collision: a TypeVar ARGUMENT
+		# (not base) can ALSO share a qualname across two DISTINCT objects -
+		# any two sibling @overload declarations of the same generic
+		# function/method produce their own independent T (same qualname
+		# text, e.g. 'mod.foo.T', since qualname is scope-name-based and
+		# Python has no "which overload" concept baked into it - identical
+		# to the base-collision case documented just above, one level down).
+		# Confirmed via a real repro: a bound TypeVar's parametrized bound
+		# (S: Iterable[T]) resolved via this method for one overload leaf,
+		# then silently reused a SIBLING leaf's own cached Specialization
+		# (Iterable,[T]) - wrong T object entirely, so S's own reverse-
+		# unification bound the sibling's T instead of this leaf's own,
+		# leaving the real T permanently unbound. Disambiguate by identity
+		# for any TypeVar arg (never itself safely qualname-cacheable -
+		# only a genuinely CONCRETE arg, e.g. list[i32], is safe to reuse by
+		# qualname text across unrelated call sites).
+		arg_key = tuple( id( a ) if isinstance( a, TypeVar ) else a.qualname for a in args )
 		name_key = f'{base.qualname}[{",".join( a.qualname for a in args )}]'
-		cache_key = ( id( base ), name_key )
+		cache_key = ( id( base ), arg_key )
 		if spec := self._specializations.get( cache_key ):
 			return spec
 		spec = Specialization(
@@ -1788,30 +1806,43 @@ class Discovery( ast.NodeVisitor ):
 			packed = kw.value.value
 		return packed
 
-	def _parse_type_params( self, type_params: list[ast.type_param], owner: RCClass|CStruct|CUnion|TaggedUnion|Function ) -> None:
+	def _parse_type_params( self, type_params: list[ast.type_param], owner: RCClass|CStruct|CUnion|TaggedUnion|Function|Protocol ) -> None:
 		if not type_params:
 			return
 		owner.type_params = []
-		for type_param in type_params:
-			if not isinstance( type_param, ast.TypeVar ):
-				self.fail( f'unsupported {type_param=} in {owner.qualname}', type_param )
-			bound: Protocol|None = None
-			if type_param.bound is not None:
-				resolved_bound = self.visit( type_param.bound )
-				if not isinstance( resolved_bound, Protocol ):
-					self.fail( f'TypeVar(bound=...) is only supported with a @protocol type in {owner.qualname}', type_param )
-				bound = resolved_bound
-			if type_param.default_value is not None:
-				self.fail( f'TypeVar(default_value=not None) not supported in {owner.qualname}', type_param )
-			tv = TypeVar(
-				stem = type_param.name,
-				qualname = f'{owner.qualname}.{type_param.name}',
-				file = owner.file,
-				line = owner.line,
-				bound = bound,
-			)
-			owner.type_params.append( tv )
-			owner.add_name( type_param.name, tv )
+		# pushed so a LATER type param's own bound can reference an EARLIER
+		# one from the same declaration (S: Sequence[T], both in [T, S:
+		# Sequence[T]]) - each is added to owner.names below as soon as it's
+		# built, so by the time S's bound is visited, T is already a real
+		# name in owner's own scope. Safe to nest even when a caller (e.g.
+		# _parse_ClassDef_RCClass, for a class's own type params referenced
+		# by a LATER base-class expression) later pushes the same owner
+		# again for a different reason - scope_context is a plain push/pop.
+		with self.scope_context( owner ):
+			for type_param in type_params:
+				if not isinstance( type_param, ast.TypeVar ):
+					self.fail( f'unsupported {type_param=} in {owner.qualname}', type_param )
+				bound: Protocol|Specialization|None = None
+				if type_param.bound is not None:
+					resolved_bound = self.visit( type_param.bound )
+					# a parametrized bound (S: Sequence[T]) resolves to a
+					# Specialization wrapping the protocol, via the same generic
+					# visit_Subscript path any Sequence[T] reference goes through
+					# (see Protocol.type_params) - bare Protocol unaffected
+					if not ( isinstance( resolved_bound, Protocol ) or ( isinstance( resolved_bound, Specialization ) and isinstance( resolved_bound.base, Protocol ))):
+						self.fail( f'TypeVar(bound=...) is only supported with a @protocol type in {owner.qualname}', type_param )
+					bound = resolved_bound
+				if type_param.default_value is not None:
+					self.fail( f'TypeVar(default_value=not None) not supported in {owner.qualname}', type_param )
+				tv = TypeVar(
+					stem = type_param.name,
+					qualname = f'{owner.qualname}.{type_param.name}',
+					file = owner.file,
+					line = owner.line,
+					bound = bound,
+				)
+				owner.type_params.append( tv )
+				owner.add_name( type_param.name, tv )
 
 	def _shallow_class_body_scan( self,
 		class_obj: ClassLike|Protocol,
@@ -2249,7 +2280,14 @@ class Discovery( ast.NodeVisitor ):
 			with self.scope_context( class_obj ):
 				for base_node in node.bases:
 					base = self.visit( base_node )
-					if isinstance( base, Protocol ):
+					if isinstance( base, Protocol ) or ( isinstance( base, Specialization ) and isinstance( base.base, Protocol )):
+						# Specialization-of-Protocol (e.g. Sequence[T], T
+						# still THIS class's own unbound type param) - a
+						# generic protocol's declared conformance. Stored as-
+						# is (not unwrapped to the bare Protocol) so the args
+						# it was declared with survive for later substitution
+						# - see mpy_types.py's TypeVar.bound_satisfied_by and
+						# _validate_protocol_conformance below.
 						class_obj.protocols.append( base )
 						continue
 					base_cls = base.base if isinstance( base, Specialization ) else base
@@ -2291,6 +2329,12 @@ class Discovery( ast.NodeVisitor ):
 		scope.add_name( class_obj.stem, class_obj )
 
 		try:
+			# own type params must be in scope before the body resolves -
+			# same ordering _parse_ClassDef_RCClass uses (see its own
+			# comment). None for the overwhelming majority of (non-generic)
+			# protocols - _parse_type_params is a no-op when node.type_params
+			# is empty.
+			self._parse_type_params( node.type_params, class_obj )
 			unresolved = self._shallow_class_body_scan( class_obj, node.body )
 		except CompileError:
 			class_obj.broken = True # see _parse_ClassDef_CEnum's own comment
