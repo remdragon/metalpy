@@ -61,6 +61,10 @@ missing features that block the task at hand. Strongly prefer fixing bugs or
 missing features immediately (in a separate session or background task if
 necessary) instead of working around them.
 
+When working on existing code, especially in the lib folder, keep an eye out for
+code that is ugly or is working around current or past bugs and clean them up
+if you can, otherwise draw my attention to them.
+
 ## Comments
 
 Comments should be as concise as possible and not explain things that should
