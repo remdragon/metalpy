@@ -23,7 +23,7 @@ from demo.http_server_demo_app import App
 
 
 def main() -> i32:
-	listener: tcp.TcpListener = tcp.TcpListener.bind( '0.0.0.0', u16( 8080 )).unwrap( 'error binding 0.0.0.0:8080' )
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '0.0.0.0', u16( 8080 )).unwrap( lambda e: f'error binding 0.0.0.0:8080: {e}' )
 	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
 	workers: u32 = sys.cpu_count()
 	r: reactor.Reactor = reactor.Reactor( usize( workers ))

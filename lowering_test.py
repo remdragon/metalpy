@@ -2718,6 +2718,66 @@ class Tests( unittest.TestCase ):
 		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
 		self.assertEqual( call.kwargs, { 'x': ir.Const( type = i32, value = 5 ) } )
 
+	# --- bare lambda arguments to overloaded calls ------------------------------
+
+	def test_overload_lambda_arg_resolves_via_unique_callable_candidate( self ) -> None:
+		code = '\n'.join([
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: Ptr[Callable[[i32],i32]] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( lambda v: v )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call = next( i for i in fn.instructions if isinstance( i, ir.Call ) )
+		# resolved to the SECOND foo (the Callable-typed candidate), not the
+		# first (i32) - a lambda can never plausibly satisfy the i32 one
+		group = self.discovery.modules['__test__'].get_local( 'foo' )
+		self.assertIs( call.target, group.implementations[1] )
+		self.assertIsNotNone( self.compiler.lowering._type_resolver._callable_type_of( call.args[0].type ) )
+
+	def test_overload_lambda_arg_no_callable_candidate_falls_through_to_inference_error( self ) -> None:
+		# no candidate at all is callable-shaped - unaffected by the new
+		# lambda-matching branch, still reaches _expr_Lambda's own
+		# pre-existing "no expected Callable[...] context" error, exactly as
+		# it did before a lambda was ever handled specially here
+		code = '\n'.join([
+			'def foo( x: i32 ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: u8 ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( lambda v: v )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'cannot infer lambda parameter types', self.discovery.errors.errors[0] )
+
+	def test_overload_lambda_arg_ambiguous_between_callable_candidates_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def foo( x: Ptr[Callable[[i32],i32]] ) -> None:',
+			'	pass',
+			'',
+			'def foo( x: Ptr[Callable[[u8],u8]] ) -> None:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	foo( lambda v: v )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'ambiguous lambda argument', self.discovery.errors.errors[0] )
+
 	# --- generic function monomorphization (Name[T](...)) ----------------------
 
 	def test_generic_function_call_monomorphizes( self ) -> None:

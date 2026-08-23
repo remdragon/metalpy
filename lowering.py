@@ -8287,7 +8287,29 @@ class FunctionLowering:
 		# call site) is what actually makes it a real, emitted function
 		self.lowering.schedule( synthetic )
 
-		dest = self._new_temp( expected_type or closure_type )
+		# expected_type is preferred over closure_type itself ONLY when it's
+		# actually the same closure type reached through a different
+		# representation (e.g. a generic substitution's own fresh
+		# Specialization vs this call's already-monomorphized one - the
+		# exact duality _same_type exists for). Blindly trusting ANY
+		# expected_type here (the previous behavior) let a genuine mismatch
+		# (e.g. a capturing lambda passed where a non-capturing Ptr[Callable
+		# [...]]-typed parameter is declared) silently bake the WRONG type
+		# onto this Allocate's own dest - emitter_c.py then read that dest
+		# type back off (not closure_type) to decide how to build the
+		# object header/vtable, and crashed on its own internal
+		# `assert isinstance(concrete_cls, RCClass)` instead of failing
+		# cleanly. Falling back to closure_type here for any genuine
+		# mismatch instead lets the ordinary post-hoc _check_assignable
+		# machinery in _lower_expr/_coerce_or_check_operand (which every
+		# _expr_Lambda caller already goes through) catch and report it the
+		# same clean way the non-capturing (Ptr[Callable[...]]) path
+		# already does
+		dest_type = (
+			expected_type if expected_type is not None and self.lowering._type_resolver._same_type( expected_type, closure_type )
+			else closure_type
+		)
+		dest = self._new_temp( dest_type )
 		self._emit( ir.Allocate( dest = dest, cls = closure_type, fields = { 'fn': fn_erased, 'self': env_erased } ))
 		return dest
 
@@ -8655,8 +8677,23 @@ class FunctionLowering:
 		assert append_fn is not None, 'internal compiler error: list[T] has no append method'
 		self.lowering._ensure_resolved( append_fn )
 		self.lowering.schedule( append_fn.return_type )
-		unwrap_fn = self.lowering._find_method( append_fn.return_type, 'unwrap' )
-		assert unwrap_fn is not None, 'internal compiler error: list[T].append does not return a Result with unwrap()'
+		# _find_method only ever returns a plain Function (deliberately
+		# None for an Overload group - see its own docstring), but
+		# Result.unwrap is one now (a str/Ptr[Callable[[E],str]] overload) -
+		# mirror _find_method's own lookup (chain_lookup for a CStruct/
+		# RCClass, else the raw .names dict - Result itself is a
+		# TaggedUnion, neither) and take the group's own (single, real)
+		# implementation, same idiom _lower_call's compiler.__raw_free__
+		# handling already uses for sys.free
+		resolved_result_type = self.lowering._ensure_resolved( append_fn.return_type )
+		if isinstance( resolved_result_type, ( CStruct, RCClass )):
+			raw_unwrap = resolved_result_type.chain_lookup( 'unwrap' )
+		else:
+			names = getattr( resolved_result_type, 'names', None )
+			raw_unwrap = names.get( 'unwrap' ) if isinstance( names, dict ) else None
+		raw_unwrap = self.lowering._resolve_scalar_name( raw_unwrap )
+		unwrap_fn = raw_unwrap.implementations[0] if isinstance( raw_unwrap, Overload ) else raw_unwrap
+		assert isinstance( unwrap_fn, Function ), 'internal compiler error: list[T].append does not return a Result with unwrap()'
 		self.lowering._ensure_resolved( unwrap_fn )
 		self.lowering.schedule( unwrap_fn.return_type )
 		errmsg_node = ast.Constant( value = 'list literal: append failed' )
@@ -10956,6 +10993,8 @@ class FunctionLowering:
 				self._emit( instr )
 
 	def _lower_overload_arg( self, expr: ast.expr, position: int|None, kw_name: str|None, candidates: list[Function], node: ast.AST ) -> ir.Operand:
+		if isinstance( expr, ast.Lambda ):
+			return self._lower_overload_lambda_arg( expr, position, kw_name, candidates, node )
 		if not isinstance( expr, ast.Constant ):
 			return self._lower_expr( expr, None )
 		compatible_stems = self.lowering._LITERAL_COMPATIBLE_STEMS.get( type( expr.value ) )
@@ -11080,6 +11119,65 @@ class FunctionLowering:
 				node,
 			)
 		return self._lower_expr( expr, None ) # no candidate's parameter type is even plausible for this literal's kind - falls through to the existing error
+
+	def _lower_overload_lambda_arg( self, expr: ast.Lambda, position: int|None, kw_name: str|None, candidates: list[Function], node: ast.AST ) -> ir.Operand:
+		# mirrors _lower_overload_arg's own literal-argument handling above,
+		# for the same reason: a bare `lambda ...: ...` has no type of its
+		# own before a specific overload candidate is picked either -
+		# _expr_Lambda needs a concrete Ptr[Callable[...]]/Closure[...]
+		# expected_type up front to infer its parameter types. Scan
+		# candidates for the ones whose declared parameter type at this
+		# position is actually callable-shaped (the same two-check
+		# CallableType-or-ClosureType test _expr_Lambda itself uses), and
+		# use it unambiguously if exactly one candidate qualifies - e.g.
+		# Result[T,E].unwrap's `errmsg: str` vs `errmsg: Ptr[Callable[[E],
+		# str]]` candidates: only the latter is callable-shaped, so this
+		# always resolves without ambiguity for that call
+		def _callable_shape( t: Type ) -> Type|None:
+			fn_type = self.lowering._type_resolver._callable_type_of( t )
+			if fn_type is None and isinstance( t, ClosureType ):
+				fn_type = t
+			return fn_type
+
+		candidate_types: list[Type] = []
+		for fn in candidates:
+			real_fn = fn.bound_to if fn.bound_to is not None else fn # same stub redirect as the literal path above - see its own comment
+			if real_fn.parameters is None:
+				continue
+			param = (
+				real_fn.parameters[position] if position is not None and position < len( real_fn.parameters ) else
+				next( ( p for p in real_fn.parameters if p.stem == kw_name ), None )
+			)
+			if param is None or param.type is None:
+				continue
+			if _callable_shape( param.type ) is not None:
+				matched_type = param.type
+			else:
+				# not directly callable-shaped - but a union-typed param
+				# (e.g. Result[T,E].unwrap's own `errmsg: str|Ptr[Callable[
+				# [E],str]]` implementation, once E substitutes concretely) can still
+				# unambiguously accept a lambda through exactly one of its own
+				# leaves, mirroring the literal path's identical union-leaf
+				# handling above (same rationale: the lambda is lowered
+				# against the matched LEAF's own narrow type, not the whole
+				# union, so the resulting operand's static type stays exactly
+				# as unambiguous as the lambda itself is)
+				leaves = param.type.leaves()
+				callable_leaves = [ leaf for leaf in leaves if _callable_shape( leaf ) is not None ]
+				if len( callable_leaves ) != 1:
+					continue
+				matched_type = callable_leaves[0]
+			if not any( t is matched_type for t in candidate_types ):
+				candidate_types.append( matched_type )
+		if len( candidate_types ) == 1:
+			return self._lower_expr( expr, candidate_types[0] )
+		if len( candidate_types ) > 1:
+			self.lowering.discovery.fail(
+				f'ambiguous lambda argument {ast.unparse(expr)} - matches more than one overload candidate type '
+				f'({", ".join( t.qualname for t in candidate_types )}): {ast.unparse(node)}',
+				node,
+			)
+		return self._lower_expr( expr, None ) # no candidate's parameter type is callable-shaped - falls through to _expr_Lambda's own "no expected Callable[...] context" error
 
 	def _check_rcclass_fully_implemented( self, target_cls: RCClass, node: ast.AST, label: str ) -> None:
 		''' RCClass analog of the CStruct-interface stub-body check just
