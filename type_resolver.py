@@ -3634,6 +3634,36 @@ class TypeResolver:
 				node,
 			)
 
+	def _require_chained_result_return( self, node: ast.AST, result_cls: ClassLike, error_classes: list[ClassLike], alternatives: str, fn: Function|None = None ) -> None:
+		''' Same coverage/widening contract as _require_result_return, but for
+		several fallible steps chained in one statement (AugAssign's Subscript-
+		target get+set, e.g.) - checks the UNION of every step's own error type
+		against the enclosing function's return type in ONE pass, so a caller
+		missing coverage for more than one step's error sees every gap at once
+		instead of failing at whichever step happens to be checked first.
+		Mathematically equivalent to calling _require_result_return once per
+		error class (covering E1 AND separately covering E2 is the same
+		requirement as covering E1|E2) - this exists purely for the combined
+		error message and to front-load the legality check ahead of any of the
+		chain's own Call/OrJump emission. '''
+		return_type = fn.return_type if fn is not None else None
+		spec = self._as_specialization( return_type )
+		wanted_leaves: list[Type] = []
+		for error_cls in error_classes:
+			wanted_leaves.extend( self._atomic_leaves( error_cls ))
+		covered = False
+		if fn is not None and spec is not None and spec.base is result_cls and len( spec.args ) == 2:
+			fn_error_leaves = self._atomic_leaves( spec.args[1] )
+			covered = all( leaf in fn_error_leaves for leaf in wanted_leaves )
+		if not covered:
+			want = ' | '.join( sorted( { leaf.stem for leaf in wanted_leaves } ))
+			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
+			self.discovery.fail(
+				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
+				f'(or a wider union covering it) ({where}) - {alternatives}',
+				node,
+			)
+
 	def _resolve_sys_function( self, name: str ) -> Function:
 		''' resolve and cache a real stdlib function (sys.panic, sys.alloc,
 		sys.free, ...) — reached via discovery.import_name rather than

@@ -2449,13 +2449,14 @@ def main() -> i32:
 	return 0
 ''' ),
 			# d[1] += 5 through a real __getitem__/__setitem__ pair (dict[K,V]) -
-			# both fallible, auto-consumed exactly like an ordinary d[1] read/
-			# write already is, and both driven off the SAME index operand
-			# (lowered once). main() itself can't return Result (the C entry
-			# point's signature is fixed - see emitter_c._is_entry_point), so
-			# the dict logic lives in a helper that does, mirroring how every
-			# other real-run test needing a fallible operation at top level
-			# already structures this (see
+			# both fallible, auto-consumed exactly like an ordinary d[1] = v
+			# write already is (a plain d[1] READ no longer auto-consumes -
+			# see .or_return() below), and both driven off the SAME index
+			# operand (lowered once). main() itself can't return Result (the C
+			# entry point's signature is fixed - see emitter_c._is_entry_point),
+			# so the dict logic lives in a helper that does, mirroring how
+			# every other real-run test needing a fallible operation at top
+			# level already structures this (see
 			# UnionAsUnconstructedResultErrorTypeTests above)
 			( 'subscript_target_with_real_getitem_setitem_methods', '''
 def helper() -> Result[i32, KeyError]:
@@ -2463,7 +2464,7 @@ def helper() -> Result[i32, KeyError]:
 	d[1] = 10
 	with compiler.wrap_arithmetic:
 		d[1] += 5
-	v: i32 = d[1]
+	v: i32 = d[1].or_return()
 	return Result.Ok( v )
 
 def main() -> i32:
@@ -2471,6 +2472,65 @@ def main() -> i32:
 	if v != 15:
 		return 1
 	return 0
+''' ),
+			# a NON-RC (i32) list element - no __iadd__ ever applies (i32
+			# isn't RC), so this is the ordinary get->combine->set fallback
+			# path, confirming real list[i32] indexed += still computes the
+			# right value and leaves the list's own length/other slots intact.
+			# Both __getitem__/__setitem__ are fallible (Result[_,IndexError]),
+			# so - like the dict[K,V] case above - the += lives in a helper
+			# that can actually return Result
+			( 'subscript_target_list_i32_element_augassign_fallback', '''
+def helper() -> Result[i32, IndexError]:
+	x: list[i32] = list[i32]()
+	x.append( 10 ).unwrap( 'x' )
+	x.append( 20 ).unwrap( 'x' )
+	with compiler.wrap_arithmetic:
+		x[0] += 5
+	if x.__getitem__( 0 ).unwrap( 'x' ) != 15:
+		return Result.Ok( 1 )
+	if x.__getitem__( 1 ).unwrap( 'x' ) != 20:
+		return Result.Ok( 2 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	return helper().unwrap( 'x' )
+''' ),
+			# an RC-class list element defining __iadd__ - takes the new
+			# shortcut (__getitem__ + __iadd__, __setitem__ skipped entirely).
+			# Looping 50 times is enough for a missing/extra incref-decref
+			# around the shortcut (the exact "read old, maybe skip a step"
+			# shape prior RC bugs in this file have come from) to reliably
+			# corrupt the heap or leak, matching this class's own
+			# attribute_target_rc_value_replaced_in_a_loop precedent above.
+			# __getitem__ is still fallible even on the shortcut path (its
+			# own single Result is still auto-consumed, unchanged), so this
+			# also lives in a Result-returning helper
+			( 'subscript_target_list_rc_element_iadd_shortcut', '''
+class Counter:
+	n: i32
+
+	def __iadd__( self, v: i32 ) -> None:
+		with compiler.wrap_arithmetic:
+			self.n = self.n + v
+
+def helper() -> Result[i32, IndexError]:
+	x: list[Counter] = list[Counter]()
+	x.append( Counter( n = 0 )).unwrap( 'x' )
+	i: i32 = 0
+	while i < 50:
+		x[0] += 1
+		with compiler.wrap_arithmetic:
+			i += 1
+	c: Counter = x.__getitem__( 0 ).unwrap( 'x' )
+	if c.n != 50:
+		return Result.Ok( 1 )
+	if x.__len__() != 1:
+		return Result.Ok( 2 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	return helper().unwrap( 'x' )
 ''' ),
 		] )
 
@@ -17377,7 +17437,7 @@ class ByteArrayScalarIndexingRealCompileTests( test_support.RealCompileMixin, Co
 def helper() -> Result[i32, IndexError]:
 	buf: bytearray = bytearray( 4 )
 	buf[0] = 65
-	x: u8 = buf[0]
+	x: u8 = buf[0].or_return()
 	if x != 65:
 		return Result.Ok( 1 )
 	return Result.Ok( 0 )

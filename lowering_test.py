@@ -339,6 +339,148 @@ class Tests( unittest.TestCase ):
 		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
 		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Box.__getitem__', '__test__.Box.__setitem__' ] )
 
+	def test_augassign_attribute_target_with_iadd_skips_setattr( self ) -> None:
+		# a field whose RC-class type defines a matching __iadd__ - old
+		# aliases the SAME heap object the field already points to (a plain
+		# GetAttr read), so SetAttr is skipped entirely: only the GetAttr (to
+		# fetch old) plus one Call (__iadd__ itself) should appear
+		code = '\n'.join([
+			'class Counter:',
+			'	n: i32',
+			'',
+			'	def __iadd__( self, v: i32 ) -> None:',
+			'		self.n = v',
+			'',
+			'class Foo:',
+			'	x: Counter',
+			'',
+			'def main( f: Foo, v: i32 ) -> None:',
+			'	f.x += v',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertNotIn( 'SetAttr', kinds )
+		self.assertIn( 'GetAttr', kinds )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Counter.__iadd__' ] )
+
+	def test_augassign_subscript_target_with_iadd_skips_setitem( self ) -> None:
+		# an RC-class element type defining a matching __iadd__ - old
+		# already went through __getitem__'s own incref, so it's a genuine
+		# extra owned reference to the SAME heap object the container's slot
+		# stores; __setitem__ is skipped entirely
+		code = '\n'.join([
+			'class Counter:',
+			'	n: i32',
+			'',
+			'	def __iadd__( self, v: i32 ) -> None:',
+			'		self.n = v',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: Counter',
+			'',
+			'	def __getitem__( self, i: usize ) -> Counter:',
+			'		return self.y',
+			'',
+			'	def __setitem__( self, i: usize, v: Counter ) -> None:',
+			'		self.y = v',
+			'',
+			'def main( b: Box, v: i32 ) -> None:',
+			'	b[0] += v',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Box.__getitem__', '__test__.Counter.__iadd__' ] )
+
+	def test_augassign_subscript_target_merged_result_coverage_names_both_errors( self ) -> None:
+		# no __iadd__ applies (i32 element - not RC) - the fallback get-
+		# >combine->set path's two independently-fallible Results (different
+		# error types on __getitem__ vs __setitem__) are checked TOGETHER in
+		# one message, not one-at-a-time
+		code = '\n'.join([
+			'class GetError: pass',
+			'class SetError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,GetError]:',
+			'		return Result.__allocate__( x = self.y )',
+			'',
+			'	def __setitem__( self, i: usize, v: i32 ) -> Result[bool,SetError]:',
+			'		self.y = v',
+			'		return Result.__allocate__( x = True )',
+			'',
+			'def main( b: Box ) -> None:',
+			'	with compiler.wrap_arithmetic:',
+			'		b[0] += 5',
+			'	return',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( self.discovery.errors.errors )
+		err = self.discovery.errors.errors[0]
+		self.assertIn( 'GetError', err )
+		self.assertIn( 'SetError', err )
+
+	def test_augassign_name_target_with_iadd_dispatches_to_method( self ) -> None:
+		# a bare RC-class Name target with a matching __iadd__ - dispatches
+		# straight to it, no reassignment of the name at all
+		code = '\n'.join([
+			'class Counter:',
+			'	n: i32',
+			'',
+			'	def __iadd__( self, v: i32 ) -> None:',
+			'		self.n = v',
+			'',
+			'def main( c: Counter, v: i32 ) -> None:',
+			'	c += v',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Counter.__iadd__' ] )
+
+	def test_augassign_name_target_rc_without_iadd_falls_back_to_add_and_reassign( self ) -> None:
+		# an RC-class target with no matching __iadd__ still needs the
+		# ordinary x = x + y behavior - reproduced manually (not via the
+		# synthesized-BinOp delegation a non-RC/undeclared target uses),
+		# since `right` is already lowered by the time __iadd__'s absence is
+		# discovered and re-lowering node.value would double-evaluate it
+		code = '\n'.join([
+			'class Vector:',
+			'	x: i32',
+			'',
+			'	def __add__( self, other: Vector ) -> Vector:',
+			'		return other',
+			'',
+			'def main( v: Vector, w: Vector ) -> None:',
+			'	v += w',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) ]
+		self.assertEqual( [ c.target.qualname for c in calls ], [ '__test__.Vector.__add__' ] )
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) ]
+		self.assertTrue( assigns ) # v is reassigned to the __add__ result
+
 	def test_bare_assign_to_new_name_infers_type_from_rhs( self ) -> None:
 		# no annotation at all - x's type comes from y's, same as if it had
 		# been written `x: i32 = y`
@@ -1582,6 +1724,67 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		self._lower_main()
 		self.assertIn( 'unsupported binary operator', self.discovery.errors.errors[0] )
+
+	def test_binop_with_unconsumed_result_operand_is_rejected( self ) -> None:
+		# Result[T,E] is itself a @union - without this guard, an unconsumed
+		# b[i] (Result[i32,MyError], since x[i] no longer auto-consumes)
+		# would silently decompose into per-leaf (T, E) arithmetic instead
+		# of erroring - see _reject_unconsumed_result_operand
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = self.y )',
+			'',
+			'def foo( b: Box, i: usize ) -> i32:',
+			'	v: i32 = b[i] + 1',
+			'	return v',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'consume it first', self.discovery.errors.errors[0] )
+
+	def test_eq_with_unconsumed_result_operand_is_rejected( self ) -> None:
+		# same guard, ==/!= path (_lower_eq_or_ne) - a fallible comparison's
+		# own Result is left unconsumed on purpose (see its docstring), but
+		# an unrelated unconsumed Result flowing INTO a comparison operand
+		# must still be rejected, not silently decomposed as a union
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = self.y )',
+			'',
+			'def foo( b: Box, i: usize ) -> bool:',
+			'	return b[i] == b[i]',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'consume it first', self.discovery.errors.errors[0] )
 
 	def test_unaryop_invert_is_unconditional( self ) -> None:
 		# ~ has no overflow concept - always a single opcode, works fine in
@@ -3965,8 +4168,10 @@ class Tests( unittest.TestCase ):
 	def test_for_over_indexable_shape( self ) -> None:
 		# for v in <obj>: where obj's type declares both __len__ and
 		# __getitem__ desugars to a counter-based while, reusing
-		# _expr_Subscript's own __getitem__ resolution (with its Result
-		# auto-unwrap) for the per-iteration bind
+		# _expr_Subscript's own __getitem__ resolution for the per-iteration
+		# bind - tagged is_for_loop_element_read so it keeps auto-consuming
+		# a fallible Result there specifically (see test below), even though
+		# ordinary user-written `x[i]` no longer does
 		code = '\n'.join([
 			'@cstruct',
 			'class Box:',
@@ -3997,6 +4202,73 @@ class Tests( unittest.TestCase ):
 		self.assertNotIn( 'OrReturn', kinds )
 		self.assertNotIn( 'OrJump', kinds )
 
+	def test_for_over_indexable_fallible_len_is_rejected( self ) -> None:
+		# __len__() is compiler-synthesized here (no source position to
+		# attach .unwrap()/.or_return() to) and expected to always be
+		# infallible in practice - a fallible one is a hard compile error,
+		# not an auto-propagate
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	_len: usize',
+			'',
+			'	def __len__( self ) -> Result[usize,MyError]:',
+			'		return Result.__allocate__( x = self._len )',
+			'',
+			'	def __getitem__( self, i: usize ) -> i32:',
+			'		return 1',
+			'',
+			'def main( b: Box ) -> None:',
+			'	for v in b:',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'infallible __len__', self.discovery.errors.errors[0] )
+
+	def test_for_over_indexable_fallible_getitem_still_auto_consumes( self ) -> None:
+		# unlike ordinary user-written x[i], the for-loop's own per-iteration
+		# bind keeps auto-consuming __getitem__'s Result - __getitem__ is
+		# expected to always be fallible in practice (IndexError/KeyError),
+		# and this read is compiler-synthesized with no source position for
+		# the user to attach .unwrap()/.or_return() to
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	_len: usize',
+			'',
+			'	def __len__( self ) -> usize:',
+			'		return self._len',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = 1 )',
+			'',
+			'def main( b: Box ) -> Result[i32,MyError]:',
+			'	for v in b:',
+			'		x: i32 = v',
+			'	return Result( x = 0 )',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'OrReturn', kinds )
+
 	def test_for_over_indexable_missing_dunders_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'class Box:',
@@ -4012,10 +4284,41 @@ class Tests( unittest.TestCase ):
 		self.assertIn( '__len__', self.discovery.errors.errors[0] )
 		self.assertIn( '__getitem__', self.discovery.errors.errors[0] )
 
-	def test_subscript_with_getitem_resolves_and_consumes_result( self ) -> None:
-		# obj[i] is sugar for obj.__getitem__(i).or_return() whenever
-		# __getitem__ can fail (mirrors slice.__getitem__'s real signature,
-		# Result[T,IndexError])
+	def test_subscript_with_getitem_returning_result_is_not_auto_consumed( self ) -> None:
+		# obj[i] is plain sugar for obj.__getitem__(i), nothing more - when
+		# __getitem__ is fallible the caller gets the raw Result[T,E] back
+		# and must consume it explicitly, exactly like ==/!= already does;
+		# no auto-.or_return() sugar (that's reserved for checked arithmetic)
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = self.y )',
+			'',
+			'def foo( b: Box, i: usize ) -> i32:',
+			'	v: i32 = b[i]',
+			'	return v',
+		])
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'expected intrinsics.i32, got __test__.Result', self.discovery.errors.errors[0] )
+
+	def test_subscript_with_getitem_returning_result_consumed_explicitly_still_works( self ) -> None:
+		# the explicit-consumption escape hatch: b[i].or_return() still
+		# works exactly like get_result().or_return() already does, since
+		# b[i] now hands back the raw Result for the user to consume
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -4031,8 +4334,8 @@ class Tests( unittest.TestCase ):
 			'		return Result.__allocate__( x = self.y )',
 			'',
 			'def foo( b: Box, i: usize ) -> Result[i32,MyError]:',
-			'	v: i32 = b[i]',
-			'	return Result.Err( MyError() )',
+			'	v: i32 = b[i].or_return()',
+			'	return Result( x = v )',
 		])
 		self._import( code )
 		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
@@ -4041,11 +4344,38 @@ class Tests( unittest.TestCase ):
 		fn = self.compiler._lower( foo_fn )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertIn( 'OrReturn', kinds )
-		# Box.__getitem__'s own real body (calling Box.__allocate__/Result.__allocate__
-		# from inside itself) is unaffected - only the *call site* `b[i]` goes
-		# through this new path, not Box.__getitem__'s own internals
 		getitem_errors = [ e for e in self.discovery.errors.errors if 'b[i]' in e or '__getitem__' in e ]
 		self.assertEqual( getitem_errors, [] )
+
+	def test_slice_subscript_with_getitem_returning_result_is_not_auto_consumed( self ) -> None:
+		# x[a:b] is the same plain sugar as x[i] - _lower_slice_subscript
+		# stopped auto-consuming too, mirroring _expr_Subscript's own change
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	y: i32',
+			'',
+			'	def __getitem__( self, s: PySlice ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = self.y )',
+			'',
+			'def foo( b: Box ) -> i32:',
+			'	v: i32 = b[0:1]',
+			'	return v',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		self.compiler._lower( foo_fn )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'expected intrinsics.i32, got __test__.Result', self.discovery.errors.errors[0] )
 
 	def test_subscript_with_getitem_returning_non_result_two_arg_generic_is_not_consumed( self ) -> None:
 		# _maybe_consume_result (Stage 4: now routed through _result_shape)
