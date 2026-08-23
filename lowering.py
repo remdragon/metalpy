@@ -12363,6 +12363,11 @@ class FunctionLowering:
 
 			if target_cls.type_params:
 				self_type, init, args, kwargs = self._lower_generic_construction_args( node, target_cls, init, expected_type )
+				# see _fill_generic_call_defaults's own docstring - the
+				# non-generic branch below gets this for free from
+				# _lower_call_args; a generic class's own __init__ needs it
+				# applied explicitly, same as any other generic call target
+				self._fill_generic_call_defaults( init, args, kwargs )
 			else:
 				self.lowering.schedule( target_cls )
 				self.lowering._ensure_resolved( init )
@@ -13381,6 +13386,36 @@ class FunctionLowering:
 		# yet (no general type-checking pass exists), same as every other
 		# call site in this file today
 
+	def _fill_generic_call_defaults( self, monomorphized: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> None:
+		# _lower_inferred_generic_call/_lower_overload_generic_call's own
+		# argument lowering (lower_and_unify, and the Overload group's own
+		# _lower_overload_arg) only ever populates args/kwargs from what the
+		# CALL SITE actually wrote - unlike the plain (non-generic) call path
+		# (_lower_call_args) and the concrete-Overload-candidate path (below
+		# in _lower_overload_generic_call's caller), neither of which ever
+		# reaches a still-generic target, so omitted-but-defaulted parameters
+		# were never filled in here at all. Confirmed via a real repro: a
+		# bare generic call omitting a defaulted argument (`def take[S](seq:
+		# S, pad: i32 = 99): ...` called as `take(x)`) reached emitter_c.py's
+		# _emit_call_args with no 'pad' entry in instr.kwargs, crashing with
+		# a bare KeyError. Mirrors _lower_call_args's identical tail, against
+		# monomorphized's own already-substituted parameter types (never
+		# target's abstract, still-TypeVar ones) so a default expression
+		# mentioning a type param (`start: T = 0`) lowers against the real,
+		# concrete T.
+		given = { p.stem for i, p in enumerate( monomorphized.parameters or [] ) if i < len( args ) }
+		given.update( kwargs.keys() )
+		for param in monomorphized.parameters or []:
+			if param.stem not in given and param.default is not None:
+				# see resolve_parameter_default's own docstring for why this
+				# is needed - a construction call embedded in the default
+				# otherwise never gets its __init__ eagerly pre-resolved
+				self.lowering._type_resolver.resolve_parameter_default( monomorphized, param )
+				with self.lowering.discovery.module_context( self.lowering._find_module_for( monomorphized )):
+					with self.lowering.discovery.scope_context( monomorphized ):
+						default_operand = self._lower_expr( param.default, param.type )
+				kwargs[param.stem] = default_operand
+
 	def _finish_generic_call( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# shared tail of _lower_inferred_generic_call (extracted verbatim,
 		# unchanged) and _lower_overload_generic_call below - once `bindings`
@@ -13428,11 +13463,13 @@ class FunctionLowering:
 			inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 			self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 			spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
+			self._fill_generic_call_defaults( monomorphized, args, kwargs )
 			return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result, already_compiled = True )
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 		self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self.lowering._monomorphized_function( spec )
+		self._fill_generic_call_defaults( monomorphized, args, kwargs )
 		if monomorphized.is_inline:
 			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
@@ -13910,6 +13947,7 @@ class FunctionLowering:
 		self.lowering._check_type_param_bounds( node, class_type_params, cls_args, cls.qualname if cls else target.qualname )
 		method_spec = self.lowering.discovery._get_or_create_specialization( target, cls_args )
 		monomorphized = self.lowering._monomorphized_function( method_spec )
+		self._fill_generic_call_defaults( monomorphized, args, kwargs )
 		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
