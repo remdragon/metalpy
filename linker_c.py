@@ -828,20 +828,27 @@ def detect_cc() -> CcTool|None:
 	if METALPY_CC in ( 'msvc', '' ):
 		if os.environ.get( 'VCINSTALLDIR', None ):
 			return CcTool( 'cl', 'cl' )
-		# vcvars64 has not been run - try to auto-detect it via vswhere
-		print( 'WARNING - vcvars64 not run - trying to auto-detect it (this is slow)', file = sys.stderr )
-		vswhere = Path( r'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' )
-		if vswhere.is_file():
-			args = [ str( vswhere ), '-latest', '-products', '*', '-all', '-find', r'VC\Auxiliary\Build\vcvars64.bat' ]
-			result = subprocess.run( args, capture_output = True, text = True )
-			vcvars64 = result.stdout.strip()
-			if vcvars64:
-				print( f'vcvars64 path={vcvars64}', file = sys.stderr )
-				output = subprocess.check_output( f'"{vcvars64}" && set', shell = True, text = True )
-				for line in output.splitlines():
-					if '=' in line:
-						k, _, v = line.partition( '=' )
-						os.environ[k] = v
-				return CcTool( 'cl', 'cl' )
+		# vcvars64 has not been run - PATH already has it whenever this
+		# shell descends from a Developer Command Prompt (VsDevCmd.bat adds
+		# VC's own Auxiliary\Build dir), so try that first - it's an
+		# ordinary shutil.which(), no subprocess spawn at all. Only fall
+		# back to the slow vswhere-based search (a real VS install lookup)
+		# when PATH doesn't already have it.
+		vcvars64 = shutil.which( 'vcvars64' )
+		if vcvars64 is None:
+			print( 'WARNING - vcvars64 not on PATH - trying to auto-detect it via vswhere (this is slow)', file = sys.stderr )
+			vswhere = Path( r'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' )
+			if vswhere.is_file():
+				args = [ str( vswhere ), '-latest', '-products', '*', '-all', '-find', r'VC\Auxiliary\Build\vcvars64.bat' ]
+				result = subprocess.run( args, capture_output = True, text = True )
+				vcvars64 = result.stdout.strip() or None
+		if vcvars64:
+			print( f'vcvars64 path={vcvars64}', file = sys.stderr )
+			output = subprocess.check_output( f'"{vcvars64}" && set', shell = True, text = True )
+			for line in output.splitlines():
+				if '=' in line:
+					k, _, v = line.partition( '=' )
+					os.environ[k] = v
+			return CcTool( 'cl', 'cl' )
 
 	return None
