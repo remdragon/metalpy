@@ -32,7 +32,7 @@ thread-hop for a first cut (a future revision could pool these too if a
 real workload shows otherwise).
 
 The pool itself is a fixed-size set of daemon threads, started at
-module/import time (see _pool's own comment).
+module/import time (see pool's own comment).
 '''
 
 import compiler
@@ -146,7 +146,13 @@ class _Pool:
 # ordering gap in _topologically_sort_globals, fixed by a concurrent
 # session's own unrelated work, commit 0e82361/81d91d1) - reverified via
 # the original repro before removing the workaround here.
-_pool: _Pool = _Pool( _POOL_SIZE )
+#
+# Public (not module-private) despite being an implementation detail
+# ordinary AsyncFile callers never touch directly - this module's own
+# white-box concurrency tests (asyncfile_test.py) submit jobs to it
+# directly, bypassing the higher-level read()/write() API, specifically to
+# exercise the pool's own dispatch/concurrency behavior in isolation.
+pool: _Pool = _Pool( _POOL_SIZE )
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +170,7 @@ class _ReactorAsyncFileOps( FileOpsInterface ):
 			return fs.read_raw( fd, buf, count )
 		handle: reactor.CompletionHandle = reactor.CompletionHandle()
 		work: Closure[[], Result[usize, OSError]] = lambda: fs.read_raw( fd, buf, count )
-		_pool.submit( _Job( handle = handle, work = work, waiter = w ))
+		pool.submit( _Job( handle = handle, work = work, waiter = w ))
 		match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
 			case Result.Ok( _ ):
 				pass
@@ -179,7 +185,7 @@ class _ReactorAsyncFileOps( FileOpsInterface ):
 			return fs.write_raw( fd, buf, count )
 		handle: reactor.CompletionHandle = reactor.CompletionHandle()
 		work: Closure[[], Result[usize, OSError]] = lambda: fs.write_raw( fd, buf, count )
-		_pool.submit( _Job( handle = handle, work = work, waiter = w ))
+		pool.submit( _Job( handle = handle, work = work, waiter = w ))
 		match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
 			case Result.Ok( _ ):
 				pass

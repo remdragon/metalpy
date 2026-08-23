@@ -49,11 +49,11 @@ class FastLock:
 	@compiler.target( os = not 'windows' )
 	def __init__( self ) -> None:
 		from posix.pthread import pthread_mutex_init
-		# sys._alloc returns Ptr[u8] — pthread_mutex_init expects
+		# sys.alloc_raw returns Ptr[u8] — pthread_mutex_init expects
 		# pthread_mutex_t*, but void*/u8* implicitly converts there;
 		# we zero the raw bytes before init for defense-in-depth
 		mutex_size: usize = compiler.sizeof( LockOpaque )
-		raw: Ptr[u8] = sys._alloc( mutex_size )
+		raw: Ptr[u8] = sys.alloc_raw( mutex_size )
 		sys.memzero( raw, mutex_size )
 		self.__lock = raw
 		result: i32 = pthread_mutex_init( self.__lock, None )

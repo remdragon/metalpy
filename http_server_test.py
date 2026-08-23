@@ -8,8 +8,8 @@
 # Two sub-programs, per PLAN_HTTP_SERVER.md's own "exercised both bare-
 # thread and inside a Reactor" requirement (matching tcp_test.py's own dual
 # coverage of TcpConnection/TcpListener):
-#   - bare_thread: calls http.server's own (module-private) _handle_connection
-#     directly from a plain threading.Thread, no Reactor anywhere - proves
+#   - bare_thread: calls http.server's own handle_connection directly from a
+#     plain threading.Thread, no Reactor anywhere - proves
 #     the request-parsing/keep-alive loop itself is reactor-optional, the
 #     same property tcp.py's own TcpConnection/TcpListener already have.
 #   - reactor: the real public entry point (serve() + reactor.Reactor),
@@ -46,7 +46,7 @@ import tcp
 import socket
 from socket import Socket
 from http.client import HTTPConnection, _Connection, Response as ClientResponse
-from http.server import Request, Response, _handle_connection
+from http.server import Request, Response, handle_connection
 
 class App:
 	def handle( self, req: Request ) -> Response:
@@ -67,7 +67,7 @@ class BareServer:
 	def run( self ) -> None:
 		match self.__listener.accept():
 			case Result.Ok( conn ):
-				_handle_connection( conn, self.__app.handle )
+				handle_connection( conn, self.__app.handle )
 				self.__flag.store( 1 )
 			case Result.Err( _ ):
 				self.__flag.store( 2 )

@@ -53,7 +53,7 @@ class HTTPError:
 	# when read() returns 0) - expected, not an error; kept as its own
 	# HTTPError member (rather than a Request|None return) so
 	# _read_one_request can stay Result[Request, HTTPError] and
-	# _handle_connection can tell it apart from UnexpectedEOF (a close
+	# handle_connection can tell it apart from UnexpectedEOF (a close
 	# mid-request, which IS a real error) via ordinary Result.Err(HTTPError.
 	# X(_)) matching - see lib/http/client.py's _read_chunked_body for the
 	# same "match a specific Err variant, fall through for the rest" shape.
@@ -446,7 +446,12 @@ def _write_best_effort_error( conn: tcp.TcpConnection, status_code: u16, reason:
 		case Result.Err( _ ):
 			pass
 
-def _handle_connection( conn: tcp.TcpConnection, handler: Closure[[Request], Response] ) -> None:
+# the per-connection request loop serve()/serve_sync() both run workers
+# through - public (not module-private) since a caller building its own
+# accept/dispatch loop (e.g. this module's own bare-thread test coverage)
+# legitimately needs to drive it directly, without going through either
+# higher-level entry point's own pooling/threading policy.
+def handle_connection( conn: tcp.TcpConnection, handler: Closure[[Request], Response] ) -> None:
 	buf: _RequestBuffer = _RequestBuffer()
 	while True:
 		match _read_one_request( conn, buf ):
@@ -487,7 +492,7 @@ class _AcceptLoop:
 			match self.__listener.accept():
 				case Result.Ok( conn ):
 					h: Closure[[Request], Response] = self.__handler
-					self.__reactor.spawn( lambda: _handle_connection( conn, h ))
+					self.__reactor.spawn( lambda: handle_connection( conn, h ))
 				case Result.Err( _ ):
 					return
 
@@ -501,11 +506,11 @@ def serve( listener: tcp.TcpListener, handler: Closure[[Request], Response], r: 
 	r.spawn( loop.run )
 
 def serve_sync( listener: tcp.TcpListener, handler: Closure[[Request], Response], dispatcher: tcpserver.ConnectionDispatcher|None = None ) -> tcpserver.TcpServer:
-	''' the sync counterpart to serve() - same _handle_connection loop,
+	''' the sync counterpart to serve() - same handle_connection loop,
 	just dispatched per tcpserver.ConnectionDispatcher's own strategy
 	(default: one OS thread per connection - see tcpserver.TcpServer's
 	own default and tcpserver.ThreadPoolDispatcher's own docstring for
-	why a bounded pool is NOT safe to default to here: _handle_connection
+	why a bounded pool is NOT safe to default to here: handle_connection
 	loops for a keep-alive connection's whole lifetime, so a fixed pool
 	would only ever serve as many CONCURRENT connections as it has
 	workers, starving the rest) instead of one fiber per connection.
@@ -514,5 +519,5 @@ def serve_sync( listener: tcp.TcpListener, handler: Closure[[Request], Response]
 	separate reactor to hand off to here, the caller drives the
 	TcpServer directly. '''
 	h: Closure[[Request], Response] = handler
-	on_connection: Closure[[tcp.TcpConnection], None] = lambda conn: _handle_connection( conn, h )
+	on_connection: Closure[[tcp.TcpConnection], None] = lambda conn: handle_connection( conn, h )
 	return tcpserver.TcpServer( listener, on_connection, dispatcher )

@@ -583,6 +583,23 @@ At module scope, `import`/`from...import`, `class`/`def` definitions (including 
 
 A global variable's initializer is **not** restricted to a compile-time constant — it can call ordinary functions at real program-startup time; the compiler synthesizes a `__metalpy_init_<name>()` function per initializer, called before `main()` runs.
 
+**Module/Package Visibility**: a module-level function or global whose name starts with `__` (and does **not** also end with `__` — a real dunder like `__init__`/`__str__` is unaffected) is **module-private**: accessible only from the same defining file, never from another module even within the same package. One starting with a single `_` (and not `__`) is **package-private**: accessible from its own defining module, any sibling module in the same package, and any subpackage at any depth — but not from outside that package (a module with no enclosing package of its own has no wider namespace to grant access to, so package-privacy there degenerates to module-privacy). This is enforced at both `from module import _name` (the import itself fails) and `module._name`/`module._name()` (a qualified attribute access or call). This is a **new**, compiler-enforced semantic distinct from the class-level Field Visibility convention above (which remains its own, separately-scoped rule) — Python's own underscore convention carries no such enforcement.
+
+```metalpy
+# lib/pkg/a.py
+def __helper() -> i32:      # module-private - only lib/pkg/a.py itself can call this
+	return 1
+def _shared() -> i32:       # package-private - lib/pkg/* and any lib/pkg/**/* subpackage can call this
+	return 2
+
+# lib/pkg/b.py (sibling module, same package)
+from pkg.a import _shared   # fine - same package
+from pkg.a import __helper  # compile error - module-private to pkg/a.py
+
+# some unrelated top-level module
+from pkg.a import _shared   # compile error - outside pkg's own package
+```
+
 ```metalpy
 MAX_RETRIES: i32 = 3               # compile-time constant - fine
 HANDLE: TypeAlias = Ptr[None]      # TypeAlias - just an ordinary AnnAssign
