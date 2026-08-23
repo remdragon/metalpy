@@ -345,7 +345,7 @@ class list[T]:
 		with self.__lock:
 			if compiler.atomic_load( compiler.addrof( self.__borrows )) != 0:
 				return Result.Err( BorrowError() )
-			self.__inner.insert( idx, val )
+			return self.__inner.insert( idx, val )
 
 	# Access element by position. Returns a copy (with incref if RC).
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
