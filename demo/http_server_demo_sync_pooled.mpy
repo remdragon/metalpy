@@ -1,0 +1,45 @@
+'''
+Synchronous demo server - blocking I/O, NO reactor anywhere, dispatched
+onto a FIXED-size threading.ThreadPool (tcpserver.ThreadPoolDispatcher)
+instead of the safe thread-per-connection default (see
+demo/http_server_demo_sync.mpy).
+
+WARNING - this is a cautionary/comparison example, not a recommended
+pattern: a bounded pool cannot safely serve a keep-alive protocol like
+HTTP/1.1. _handle_connection loops handling requests for as long as its
+connection stays open, so a pool of N workers can only ever have N
+connections ALIVE at once - every connection beyond N sits queued behind
+whichever N happened to arrive first and NEVER gets served while those N
+remain open, rather than being queued briefly and then served. Confirmed
+with a real concurrent load test: with N worker threads, N clients get
+served indefinitely while the rest time out having never received a
+single byte back. See tcpserver.ThreadPoolDispatcher's own docstring for
+the full explanation - this is the same reason Python's own socketserver
+module never shipped a bounded-pool mixin, only ThreadingMixIn (unbounded)
+or a real event loop (this codebase's own http_server_demo_async.mpy).
+
+Run this to see the failure yourself: start it, then hit it with more
+concurrent long-lived HTTP clients than the pool has workers (e.g.
+`hey -z 10s -c 100 http://localhost:8080/` with a small pool) - requests
+beyond the pool size will time out rather than just queue briefly.
+'''
+
+import tcp
+import socket
+import tcpserver
+import threading
+from http.server import serve_sync
+from demo.http_server_demo_app import App
+
+_POOL_SIZE: usize = usize( 8 )
+
+
+def main() -> i32:
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '0.0.0.0', u16( 8080 )).unwrap( 'error binding 0.0.0.0:8080' )
+	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
+	print( f'listening on http://0.0.0.0:{addr.port} (sync, {_POOL_SIZE.__str__()}-worker thread pool - see this file\'s own module docstring for its known limitation)' )
+	app: App = App()
+	pool: threading.ThreadPool = threading.ThreadPool( _POOL_SIZE )
+	dispatcher: tcpserver.ConnectionDispatcher = tcpserver.ThreadPoolDispatcher( pool )
+	serve_sync( listener, app.handle, dispatcher ).run()
+	return 0

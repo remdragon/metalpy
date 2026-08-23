@@ -20,8 +20,6 @@ already uses for reactor-aware file I/O - not a base class TcpServer
 itself extends.
 '''
 
-import compiler
-import sys
 import tcp
 import threading
 
@@ -29,7 +27,15 @@ import threading
 class ConnectionDispatcher:
 	''' how a freshly-accepted connection actually gets run against
 	on_connection - inline on the accept loop's own thread, one new OS
-	thread per connection, or handed to a bounded ThreadPool. '''
+	thread per connection, or handed to a bounded ThreadPool.
+
+	IMPORTANT for on_connection callbacks that loop for the life of the
+	connection (e.g. lib/http/server.py's own _handle_connection, which
+	keeps handling requests on the SAME connection until it closes -
+	HTTP/1.1 keep-alive): the dispatcher's own concurrency unit is one
+	CONNECTION, for its ENTIRE lifetime, not one discrete unit of work.
+	See ThreadPoolDispatcher's own docstring for why that specifically
+	rules it out as a default for a keep-alive protocol. '''
 	@abstractmethod
 	def dispatch( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
 		...
@@ -76,10 +82,14 @@ class _ConnectionJob:
 class ThreadPerConnectionDispatcher( ConnectionDispatcher ):
 	''' one real, unbounded, fire-and-forget OS thread per accepted
 	connection (threading.Thread starts immediately - there is nothing to
-	join, this is deliberately fire-and-forget). An explicit opt-in
-	stress-test baseline - NOT the default, since unbounded thread
-	creation under a connection flood is exactly what ThreadPoolDispatcher
-	exists to bound. '''
+	join, this is deliberately fire-and-forget). THE DEFAULT (see
+	TcpServer.__init__) - the correct choice for a connection-oriented
+	protocol whose handler runs for the connection's whole lifetime (e.g.
+	HTTP/1.1 keep-alive): each connection gets its own thread for as long
+	as it stays open, so one slow/idle client can never block another.
+	Costs a real OS thread per concurrent connection - see
+	ThreadPoolDispatcher below for why that's NOT bounded via a fixed
+	pool instead. '''
 	@virtual
 	def dispatch( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
 		job: _ConnectionJob = _ConnectionJob( conn, on_connection )
@@ -87,9 +97,30 @@ class ThreadPerConnectionDispatcher( ConnectionDispatcher ):
 
 
 class ThreadPoolDispatcher( ConnectionDispatcher ):
-	''' the default dispatch strategy (see TcpServer.__init__) - submits
-	each connection onto a bounded threading.ThreadPool instead of
-	spawning an unbounded thread per connection. '''
+	''' submits each connection onto a bounded threading.ThreadPool
+	instead of spawning a thread per connection.
+
+	NOT SAFE as a default for a connection-oriented protocol whose
+	handler loops for the connection's lifetime (HTTP/1.1 keep-alive
+	included) - confirmed by a real repro, not just reasoning: a pool of
+	N workers can only ever have N connections ALIVE at once, because
+	each occupies its worker for as long as the connection stays open,
+	not just for one request. Every connection beyond N sits queued
+	behind whichever N connections happened to arrive first, and stays
+	stuck there for as long as those N remain open - under sustained
+	concurrent keep-alive load (the exact case a real HTTP client like
+	`hey` exercises) this is starvation, not backpressure: excess
+	connections get accepted, then time out having never received a
+	single byte back, while the first N clients are served indefinitely.
+	This is also why Python's own socketserver never shipped a bounded-
+	pool mixin - only ThreadingMixIn (unbounded, like
+	ThreadPerConnectionDispatcher) or a real event loop are sound for a
+	persistent-connection protocol.
+
+	Correct use: a protocol/handler that does a BOUNDED, short-lived unit
+	of work per dispatch() call and returns - e.g. request-then-close,
+	or any handler that itself hands off to something else and returns
+	promptly rather than looping for the connection's own lifetime. '''
 	__pool: threading.ThreadPool
 
 	def __init__( self, pool: threading.ThreadPool ) -> None:
@@ -99,17 +130,6 @@ class ThreadPoolDispatcher( ConnectionDispatcher ):
 	def dispatch( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
 		job: _ConnectionJob = _ConnectionJob( conn, on_connection )
 		self.__pool.submit( job.run )
-
-
-def _default_pool_size() -> usize:
-	''' cpu_count()*4, not cpu_count() - unlike reactor.Reactor's own
-	CPU-sized worker count, these threads block on connection I/O rather
-	than doing CPU work, so a larger multiplier is the right heuristic
-	here. A starting guess, not a tuned value - pass an explicit
-	ThreadPoolDispatcher( threading.ThreadPool( n )) for a different size. '''
-	with compiler.wrap_arithmetic:
-		n: u32 = sys.cpu_count() * u32( 4 )
-	return usize( n )
 
 
 class TcpServer:
@@ -129,7 +149,7 @@ class TcpServer:
 		self.__listener = listener
 		self.__on_connection = on_connection
 		if dispatcher is None:
-			self.__dispatcher = ThreadPoolDispatcher( threading.ThreadPool( _default_pool_size() ))
+			self.__dispatcher = ThreadPerConnectionDispatcher()
 		else:
 			d: ConnectionDispatcher = dispatcher
 			self.__dispatcher = d
