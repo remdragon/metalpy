@@ -283,6 +283,12 @@ def WaitForSingleObject(
 ) -> u32:
 	...
 
+@extern('kernel32', 'Sleep')
+def Sleep(
+	dwMilliseconds: u32,
+) -> None:
+	...
+
 @extern('kernel32', 'SetFilePointerEx')
 def SetFilePointerEx(
 	hFile: HANDLE,
