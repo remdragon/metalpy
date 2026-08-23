@@ -1749,6 +1749,42 @@ class CFGState:
 			return []
 		instructions: list[ir.Instruction] = []
 		if is_alias:
+			# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: reading a global's
+			# CURRENT value (src here) needs the same protection writing one
+			# does - _incref_instructions shares _refcount_instructions with
+			# _decref_instructions (see that method's own comment), so for a
+			# union-typed global (e.g. ZoneInfo|None) this ALSO isn't a bare
+			# ir.Incref, it's the same tag-check+extract+retain sequence,
+			# which only whoever is CONSTRUCTING it (here) can bound.
+			#
+			# Opens the critical section here (Acquire only - the matching
+			# Release is emitted by lowering.py's _cfg_assign, AFTER the
+			# trailing ir.Assign it emits, not here) for the SAME reason the
+			# write side's Decref+Assign have to share one critical section:
+			# `ir.Assign(dest=b, src=X)` is ITS OWN, SEPARATE textual read of
+			# X in the generated C (`b = X;`), not a reuse of whatever value
+			# the Incref above just retained - confirmed the hard way, via a
+			# real crash under concurrent stress: retain_object(X) protected
+			# the INCREF, but the Assign's own independent read of X, right
+			# after the lock was released, could observe a DIFFERENT object
+			# than the one just retained if a writer swapped X in between -
+			# leaking the retained object and under-retaining the one
+			# actually bound to `b`. Emitted UNCONDITIONALLY whenever src is
+			# simply a global (not gated on src.reassigned_outside_init,
+			# unlike the write side's own check in the `dest.is_global`
+			# branch below) - a READ can be lowered before the ONE write
+			# that will eventually mark this global as needing protection is
+			# (functions are lowered off a work queue in whatever order
+			# they're scheduled, not necessarily the order a human reads the
+			# source in), so reassigned_outside_init's FINAL value isn't
+			# reliably known yet at this point. emitter_c.py defers the real
+			# "does this end up mattering" decision to emission time instead
+			# (after every function has been lowered, so the fact is
+			# complete) - these markers become pure no-ops there for a
+			# global that turns out to never actually be reassigned
+			# anywhere.
+			if isinstance( src, Variable ) and src.is_global:
+				instructions.append( ir.AcquireGlobalLock( var = src ))
 			instructions += self._incref_instructions( dest.type, src ) # bump the new value first - safe even if src and dest already alias the same object
 		elif isinstance( src, ir.Temp ):
 			# ownership transfers from the temp's own (momentary) tracking
@@ -1778,6 +1814,32 @@ class CFGState:
 			# at ITS ASSIGNING FUNCTION's own exit would free the very
 			# value the global is supposed to keep alive for the NEXT
 			# call, a real use-after-free on the following read.)
+			#
+			# reaching this branch at all means a real `global X; X = ...`
+			# reassignment (lower_global()'s own initializer path emits its
+			# ir.Assign directly, never through this method - see
+			# Variable.reassigned_outside_init's own comment) - flip the
+			# flag PLAN_THREAD_SAFE_SHARED_STATE.md's emitter-side lock
+			# insertion (emitter_c.py) keys off of, unconditionally: a
+			# global only needs protecting once ANY function reassigns it,
+			# regardless of how many do.
+			dest.reassigned_outside_init = True
+			# ir.AcquireGlobalLock/ReleaseGlobalLock bracket the ONE critical
+			# section a protected global's reassignment needs: releasing its
+			# CURRENT value and (later, in lowering.py's _cfg_assign, which
+			# emits the actual ir.Assign this method itself never does)
+			# overwriting it must happen as one atomic-with-respect-to-other-
+			# threads unit. Wrapping _decref_instructions' OWN output here -
+			# not reconstructing this boundary later by pattern-matching the
+			# emitted instructions - matters because that output isn't
+			# always a single bare ir.Decref: a union-typed global (e.g.
+			# ZoneInfo|None, localtz()'s own type) decrefs via a multi-
+			# instruction tag-gated sequence (Cmp/JumpIfFalse/GetAttr/Decref/
+			# Jump/Label), which only whoever is CONSTRUCTING it (here) can
+			# reliably bound - confirmed the hard way: an earlier, emission-
+			# time "look for an adjacent Decref+Assign" version of this
+			# mechanism silently never matched a union-typed global at all.
+			instructions.append( ir.AcquireGlobalLock( var = dest ))
 			instructions += self._decref_instructions( dest.type, dest ) # reads dest's CURRENT (pre-overwrite) value
 			return instructions
 		existing = self.bindings.get( dest.stem )

@@ -667,6 +667,103 @@ def mangle_qualname( qualname: str ) -> str:
 		.replace( '|', '$or$' )
 	)
 
+# ---------------------------------------------------------------------------
+# PLAN_THREAD_SAFE_SHARED_STATE.md Part A - automatic locking for a module-
+# level RC-typed global that's genuinely reassigned from inside a function
+# body (`global X; X = ...`), closing the same unsynchronized-read-check-
+# then-write race lib/datetime.py's localtz()/lib/termcolor.py's _codes()
+# used to have to guard by hand with a FastLock (see that plan's own
+# "The soundness gap, precisely" section). A global written only by its own
+# module-level initializer never needs this - Variable.reassigned_outside_
+# init only ever flips True from cfg.py's assign() `dest.is_global` branch,
+# which lower_global() (lowering.py) never reaches for a global's own
+# initializer (see that flag's own comment).
+#
+# The lock itself is a bare, paired `void*` global per protected variable -
+# not lib/threading.py's FastLock (an RCClass, itself heap-allocated, with
+# its OWN inner lock ALSO heap-allocated in __init__ - using one per
+# protected global would mean two nested heap allocations happening as
+# part of module-global initialization, before the very system this exists
+# to protect is itself safe to construct). SRWLOCK is documented by Win32
+# as a single opaque, pointer-sized value whose all-zero state IS already a
+# valid, unlocked lock (no InitializeSRWLock call exists anywhere in this
+# codebase) - a `void*` initialized to 0 is exactly that, no separate init
+# function needed. AcquireSRWLockExclusive/ReleaseSRWLockExclusive take a
+# `void**` here (not the real PSRWLOCK type) since SRWLOCK's own real
+# layout is just one pointer-sized slot (see windows/kernel32.py's own
+# _SRWLOCK comment) - void** is ABI-identical and avoids also declaring a
+# matching struct type for calls the emitter synthesizes directly, never
+# referenced by name from metalpy source (so never routed through the
+# ordinary @extern forward-declaration machinery on their own).
+def _needs_global_lock( var: Variable ) -> bool:
+	return var.is_global and var.reassigned_outside_init
+
+def _global_lock_name( var: Variable ) -> str:
+	return mangle_qualname( var.qualname ) + '$lock'
+
+# windows.kernel32._SRWLOCK's own mangled struct name - reused verbatim
+# (not an independent void**/opaque type of our own) so that a program
+# that ALSO happens to use lib/threading.py's FastLock somewhere (which
+# independently triggers a REAL `AcquireSRWLockExclusive(struct windows$
+# kernel32$_SRWLOCK*)` extern declaration, via the ordinary @extern
+# forward-declaration machinery) ends up with two IDENTICAL declarations
+# of the same two functions, not two CONFLICTING ones - confirmed as a
+# real compile error otherwise (clang: "conflicting types for
+# 'AcquireSRWLockExclusive'") the first time this collided with a test
+# that used both. Only ever used here as an incomplete (forward-tag-only)
+# pointer parameter type, never dereferenced or given a real variable of
+# this type - the lock global's own storage stays a plain `void*` (see
+# _global_lock_name's own declaration site), cast to this type only at
+# the two call sites that need it, so the real struct's full body is
+# never required to exist in this translation unit at all.
+_SRWLOCK_STRUCT_NAME = mangle_qualname( 'windows.kernel32._SRWLOCK' )
+
+def _global_lock_acquire( lock_name: str ) -> str:
+	return f'\tAcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
+
+def _global_lock_release( lock_name: str ) -> str:
+	return f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
+
+# set once, at the very top of emit_c() (which has `compiler` in scope) -
+# read from _emit_instruction/_emit_instructions, which do not. This is
+# genuinely whole-compilation-unit ambient state (every line emit_c() ever
+# produces in ONE call is for the SAME target OS - there is no scenario
+# where two DIFFERENT parts of one program compile for two different
+# targets), the same sense in which metalpy source's own `compiler.target.
+# os` is an ambient, not per-call, fact - a plain module global here
+# mirrors that rather than threading a new parameter through emit_function/
+# _emit_instruction's own long, already-established call chains for a
+# value that never actually varies within a single emit_c() call. Safe
+# across tests.py's own parallelism: shards are separate subprocesses (see
+# tests.py's own "worker subprocesses" sharding), each with independent
+# module state, and emit_c() calls never interleave within one process.
+_target_os: str|None = None
+
+def _global_lock_supported() -> bool:
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A ships Windows (SRWLOCK)
+	first - POSIX (pthread_mutex_t, needing a real pthread_mutex_init()
+	call, not zero-init-safe the way SRWLOCK is - see that plan's own A.3
+	POSIX-asymmetry note) is deliberately not implemented yet. Checked here,
+	not inside _needs_global_lock itself (which stays a pure "is this
+	global genuinely reassigned" fact, independent of what THIS pass of the
+	emitter can currently do about it) - keeps detection and platform-
+	support-status separate. False here means every one of this global's
+	accesses falls through to today's plain, unwrapped emission - exactly
+	the pre-existing (unprotected, not a regression) POSIX behavior. '''
+	return _target_os == 'windows'
+
+# the bare forward tag (no body) is always legal to repeat, even if the
+# real struct ALSO gets a full body defined elsewhere in this same
+# translation unit (C explicitly allows redeclaring an incomplete tag any
+# number of times - only a full body can't be repeated) - safe to emit
+# unconditionally here regardless of whether lib/threading.py's FastLock
+# is used anywhere else in this program.
+_PROLOGUE_GLOBAL_LOCK_WINDOWS = f'''\
+struct {_SRWLOCK_STRUCT_NAME};
+void AcquireSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
+void ReleaseSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
+'''
+
 def mangle_type( t: Type ) -> str:
 	''' union-aware entry point - call this (not mangle_qualname directly)
 	whenever mangling an actual Type object's own name. A synthesized
@@ -2529,8 +2626,7 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		# actual (diagnostic-suppression, zero behavior-risk) fix instead
 		lines.append( f'\t{_declarator( function.return_type, name )};' )
 		declared.add( name )
-	for instr in fn.instructions:
-		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
+	lines.extend( _emit_instructions( fn.instructions, function = function, declared = declared ))
 	if not function.is_destructor:
 		# a parameter whose body never reads it (self included - e.g.
 		# UnsafeList._read_element, whose is_rc(T) branch only ever touches
@@ -2562,6 +2658,24 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 			lines.insert( 1, f'\t(void){name};' )
 	lines.append( '}' )
 	return '\n'.join( lines )
+
+def _emit_instructions( instructions: list[ir.Instruction], *, function: Function|None, declared: set[str] ) -> list[str]:
+	''' walks a straight-line instruction list, emitting each via
+	_emit_instruction. A plain loop is enough - unlike an earlier version of
+	this function, PLAN_THREAD_SAFE_SHARED_STATE.md's Part A no longer
+	needs to be reconstructed here by pattern-matching adjacent
+	instructions: cfg.py's assign() and lowering.py's _cfg_assign now emit
+	real ir.AcquireGlobalLock/ir.ReleaseGlobalLock markers directly around
+	whatever a protected global's read or write actually expands to
+	(NOT always a single bare Incref/Decref - a union-typed global, e.g.
+	ZoneInfo|None, decrefs/increfs via a multi-instruction tag-check+
+	extract sequence, see cfg.py's own _refcount_instructions), so
+	_emit_instruction can just turn each marker into the matching acquire/
+	release call directly, with nothing to look ahead for. '''
+	lines: list[str] = []
+	for instr in instructions:
+		lines.extend( _emit_instruction( instr, function = function, declared = declared ))
+	return lines
 
 def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declared: set[str] ) -> list[str]:
 	# FuncStart/FuncEnd carry no independent C text of their own - the
@@ -2903,8 +3017,29 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# here (see test_widening_propagates_error)
 		return [ f'\tretain_object( (ObjectHeader*)({_emit_operand(instr.value)}) );' ]
 	if isinstance( instr, ir.Decref ):
-		# see ir.Incref's own comment just above for why this is a plain cast
+		# see ir.Incref's own comment just above for why this is a plain cast.
+		# Not lock-aware here (or in the Incref branch above) - a protected
+		# global's Incref/Decref is always bracketed by real
+		# ir.AcquireGlobalLock/ir.ReleaseGlobalLock markers cfg.py/
+		# lowering.py emit directly (see those branches below), which is
+		# what actually turns into the acquire/release calls; adding a
+		# second layer of locking here would double-lock a non-reentrant
+		# SRWLOCK (PLAN_THREAD_SAFE_SHARED_STATE.md's B.4).
 		return [ f'\trelease_object( (ObjectHeader*)({_emit_operand(instr.value)}) );' ]
+	if isinstance( instr, ir.AcquireGlobalLock ):
+		if not ( instr.var.reassigned_outside_init and _global_lock_supported() ):
+			# either this global turns out to never actually be reassigned
+			# anywhere (a read-side marker emitted before that fact was
+			# known - see cfg.py's own is_alias branch) or this platform
+			# doesn't support the lock yet (POSIX - see
+			# _global_lock_supported's own docstring) - a pure no-op either
+			# way, not a partial/best-effort lock
+			return []
+		return [ _global_lock_acquire( _global_lock_name( instr.var ))]
+	if isinstance( instr, ir.ReleaseGlobalLock ):
+		if not ( instr.var.reassigned_outside_init and _global_lock_supported() ):
+			return []
+		return [ _global_lock_release( _global_lock_name( instr.var ))]
 	if isinstance( instr, ir.DecrefDynamic ):
 		# instr.value is Ptr[None] (type-erased) - $header is always the
 		# FIRST member of every RCClass struct (emit_rcclass's own field-
@@ -3106,9 +3241,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 	# path - emitted via the same per-instruction dispatcher as the rest of the
 	# function body, so it can contain anything return_() can produce (Decref,
 	# tag-gated GetAttr/Cmp/JumpIfFalse/Jump/Label sequences, defer replays)
-	epilogue_lines: list[str] = []
-	for sub in instr.epilogue:
-		epilogue_lines.extend( _emit_instruction( sub, function = function, declared = declared ))
+	epilogue_lines = _emit_instructions( instr.epilogue, function = function, declared = declared )
 	if instr.inline_exit is not None:
 		# PLAN_INLINE.md early-return generalization - this OrReturn is
 		# .or_return()/checked-arithmetic's own inline-unwind path reached
@@ -4016,8 +4149,7 @@ def _emit_global_init_fn( g: LoweredGlobal ) -> str|None:
 	init_name = _global_init_fn_name( g )
 	lines = [ f'static void {init_name}( void ) {{' ]
 	declared: set[str] = set()
-	for instr in g.instructions:
-		lines.extend( _emit_instruction( instr, function = None, declared = declared ))
+	lines.extend( _emit_instructions( g.instructions, function = None, declared = declared ))
 	lines.append( '}' )
 	return '\n'.join( lines )
 
@@ -4093,6 +4225,21 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
 	reason to split output across files. '''
+	global _target_os
+	_target_os = compiler.disco.active_target['os']
+	locked_globals = [ g for g in compiler.globals if _needs_global_lock( g.variable ) ]
+	if locked_globals and _global_lock_supported():
+		# real kernel32.dll exports (SRWLOCK is a genuine Win32 primitive,
+		# not something this codebase invents) - registered the same way
+		# __metalpy_format_f64's own GetProcAddress dependency is, just
+		# below, so the ordinary `for lib in sorted(compiler.extern_libs):
+		# ...` linking loop every caller (mpy.py, test_support.py, ...)
+		# already runs picks up kernel32.lib/-lkernel32 with no changes
+		# needed there, even for a program that never itself references
+		# windows.kernel32 for anything else.
+		compiler.extern_libs.setdefault( 'kernel32', set() ).update((
+			'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive',
+		))
 	# __metalpy_format_f64 (PROLOGUE, always present) resolves ntdll's own
 	# exported _snprintf via GetProcAddress on Windows, to avoid linking
 	# msvcrt (see its own comment for why not a static ntdll.lib import).
@@ -4145,6 +4292,8 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		parts.append( _PROLOGUE_FLOAT_FORMAT )
 	if uses_parse_conv:
 		parts.append( _PROLOGUE_FLOAT_PARSE )
+	if locked_globals and _global_lock_supported():
+		parts.append( _PROLOGUE_GLOBAL_LOCK_WINDOWS )
 
 	# collect #include requirements from all modules whose symbols are
 	# compiled into this translation unit
@@ -4320,6 +4469,16 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# not dependency order - see _emit_global_init_fn's own docstring)
 	for g in compiler.globals:
 		parts.append( _emit_global_declaration( g ))
+	if _global_lock_supported():
+		# one bare, all-zero-initialized `void*` per protected global -
+		# SRWLOCK's own all-zero state is already a valid, unlocked lock
+		# (see _PROLOGUE_GLOBAL_LOCK_WINDOWS's own comment), so this needs
+		# no init function of its own, same as the existing all-zero
+		# value-type global fast path (_global_init_is_all_zero_value_type)
+		# these deliberately don't go through - they have no metalpy-level
+		# Variable/LoweredGlobal of their own to hang that machinery off.
+		for g in locked_globals:
+			parts.append( f'static void* {_global_lock_name( g.variable )} = 0;' )
 	for g in compiler.globals:
 		init_fn = _emit_global_init_fn( g )
 		if init_fn is not None:

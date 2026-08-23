@@ -2,10 +2,78 @@
 
 ## Status
 
-Proposed. Not implemented. No code changes accompany this document. Do not
-attempt without a dedicated worktree/session — this touches `cfg.py`,
-`emitter_c.py`, and `ObjectHeader`'s own layout, three of the most
-central, heavily-shared pieces of the compiler.
+**Part A (module globals) partially implemented, Windows only, direct
+reads/writes only.** Part B (instance fields, `ObjectHeader` growth) is
+still fully unimplemented - do not attempt without its own dedicated
+worktree/session, for the reasons this document's Part B section already
+gives.
+
+What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
+`ir.py`/`mpy_types.py`):
+- Detection: `Variable.reassigned_outside_init`, flipped by `cfg.py`'s
+  `assign()` the moment a `global X; X = ...` reassignment is lowered
+  (never for a global's own module-level initializer - `lower_global()`
+  bypasses `cfg.assign()` entirely, confirmed directly).
+- A per-global `SRWLOCK`-shaped lock (`static void*`, zero-init, no
+  separate init function - A.2/A.3's own design), synthesized only for
+  globals that end up needing one.
+- Real `ir.AcquireGlobalLock`/`ir.ReleaseGlobalLock` marker instructions
+  (not emission-time pattern-matching - an earlier version tried
+  reconstructing critical-section boundaries by looking for adjacent
+  `Decref`+`Assign` instructions at emission time and was confirmed
+  unsound: a union-typed global's decref/incref is a multi-instruction
+  tag-check+extract sequence, not a bare `Decref`/`Incref`, so the pattern
+  never matched the exact shape that caused the original bug).
+- **Confirmed correct under real concurrent stress** (40 OS threads, 8 of
+  them reassigning a global while 32 concurrently read it, 2000 iterations
+  each) for a **plain, non-Optional RC-typed global** - see
+  `thread_safe_globals_test.py`'s `test_concurrent_read_write_stress`.
+  Verified on clang and MSVC (both Windows targets); the mechanism is
+  gated off entirely on POSIX for now (`emitter_c.py`'s
+  `_global_lock_supported()`), confirmed via a real crash under WSL/gcc
+  while building the stress test - that target is genuinely unprotected
+  still, not silently broken by this change.
+- **Real bug found and fixed along the way, worth knowing about if you
+  touch this code**: protecting only the `Incref`/`Decref` is NOT enough.
+  `ir.Assign(dest=b, src=X)` is its own, independent textual read of `X`
+  in the generated C (`b = X;`) - it does not reuse whatever value an
+  adjacent `Incref`/`Decref` already touched. An earlier version of this
+  implementation closed the read-side lock *before* emitting that Assign;
+  under real concurrent load this let a writer swap the global in the gap
+  between them, retaining one object while binding to a different one -
+  confirmed via an actual crash, not reasoned about in the abstract. The
+  fix: the Assign has to be inside the *same* critical section as the
+  Incref/Decref, on both the read and write sides (see `lowering.py`'s
+  `_cfg_assign`).
+
+**What's confirmed NOT yet covered - do not assume otherwise:**
+- **Narrowed reads of a union-typed global** (`X: SomeClass|None`, `if X
+  is None: ...; return X` - **the exact shape `lib/datetime.py`'s
+  `localtz()` and `lib/termcolor.py`'s `_codes()` themselves use**).
+  Narrowing extracts the payload via a *separate* lowering.py code path
+  (`_expr_Name`'s/`_expr_Attribute`'s own narrowed-read rewrite, each with
+  its own inline copy - see `lowering.py:7341-7369`/`8716-8739`) that
+  produces a fresh `Temp` directly via two `ir.GetAttr` instructions,
+  bypassing `cfg.assign()`'s `is_alias` branch (and therefore this
+  document's lock markers) entirely. Confirmed directly: the union-typed
+  sanity check's write side is fully protected in the generated C: its
+  narrowed *read* is not.
+  **Do not remove `localtz()`'s/`_codes()`'s own `threading.FastLock` on
+  the assumption this mechanism now subsumes them - it does not yet.**
+  Closing this needs the narrowed extraction to perform its own protected
+  retain and signal "already owned" back to whichever of the 9
+  `_cfg_assign` call sites consumes it (so it takes the existing
+  `elif isinstance(src, ir.Temp):` ownership-transfer branch instead of
+  incref'ing again) - real, delicate RC-correctness surgery, not
+  attempted this pass given the risk of a rushed leak/double-free bug in
+  a widely-shared code path.
+- POSIX (`pthread_mutex_t`) - A.3's own documented asymmetry, not
+  attempted this pass; the whole mechanism is a no-op there today.
+- A.2's lock-free CAS publish path - not attempted; A.3's lock is used
+  unconditionally for every protected global this pass covers.
+- The write-once-at-init cost mitigations, `_protected`/`__private` field
+  enforcement, and everything in Part B - unimplemented, as originally
+  scoped.
 
 ## Context
 

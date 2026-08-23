@@ -3050,18 +3050,72 @@ class FunctionLowering:
 				self.lowering.discovery.fail( str( e ), node )
 			self._current_fn.add_name( alias.asname or alias.name, mod )
 
-	def _cfg_assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, node: ast.AST, track_result: bool = True, borrow: bool = False ) -> list[ir.Instruction]:
-		# thin wrapper around cfg.assign() - now that it can raise
-		# CompileError (see cfg.py's own unchecked-Result overwrite check),
-		# every one of its 7 call sites needs the same discovery.fail()
-		# conversion _stmt_If/loop_back_edge's own call sites already use,
-		# or the raised-but-unrecorded error would just be silently
-		# swallowed by the nearest enclosing per-statement `except
-		# CompileError: continue` recovery boundary
+	def _cfg_assign( self, dest: Variable, src: ir.Operand, *, is_alias: bool, node: ast.AST, track_result: bool = True, borrow: bool = False ) -> None:
+		# wrapper around cfg.assign() - now that it can raise CompileError
+		# (see cfg.py's own unchecked-Result overwrite check), every one of
+		# its 9 call sites needs the same discovery.fail() conversion
+		# _stmt_If/loop_back_edge's own call sites already use, or the
+		# raised-but-unrecorded error would just be silently swallowed by
+		# the nearest enclosing per-statement `except CompileError:
+		# continue` recovery boundary.
+		#
+		# Also owns emitting the trailing `ir.Assign(dest=dest, src=src)`
+		# itself now (every one of the 9 call sites used to emit this
+		# immediately after looping over this function's own returned
+		# instructions, with nothing interposed - the exact same two lines
+		# duplicated 9 times) - centralizing it here isn't just
+		# deduplication: it's what lets this method reliably close
+		# PLAN_THREAD_SAFE_SHARED_STATE.md's Part A critical section(s) too,
+		# on BOTH sides: cfg.py's assign() opens ir.AcquireGlobalLock for a
+		# write (`dest.is_global` branch, wrapping whatever _decref_
+		# instructions produces) AND for a read (`is_alias` branch, wrapping
+		# _incref_instructions) - in both cases the trailing Assign this
+		# method emits is ITS OWN separate textual read/write of the global
+		# in the generated C, not a reuse of whatever the Incref/Decref
+		# already touched, so it has to stay inside the SAME critical
+		# section (confirmed necessary the hard way: an earlier version
+		# that closed the read-side lock inside cfg.assign() itself, before
+		# this Assign, crashed under real concurrent stress - the Assign's
+		# own unprotected re-read of the global could see a DIFFERENT
+		# object than the one just retained). The matching
+		# ir.ReleaseGlobalLock(s) belong here, right after this Assign,
+		# since cfg.assign() itself never emits that Assign (see this
+		# method's own history).
 		try:
-			return self._cfg.assign( dest, src, is_alias = is_alias, track_result = track_result, borrow = borrow )
+			instructions = self._cfg.assign( dest, src, is_alias = is_alias, track_result = track_result, borrow = borrow )
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
+		for instr in instructions:
+			self._emit( instr )
+		self._emit( ir.Assign( dest = dest, src = src ))
+		if dest.is_global and dest.reassigned_outside_init:
+			# reassigned_outside_init only reads True here if THIS call just
+			# went through cfg.assign()'s RC global-write branch (it early-
+			# returns before ever reaching that branch for a non-RC dest.type,
+			# so the flag stays False in that case, correctly skipping this)
+			self._emit( ir.ReleaseGlobalLock( var = dest ))
+		if is_alias and isinstance( src, Variable ) and src.is_global and cfg.rc_leaves( dest.type ):
+			# the read-side counterpart - closes the critical section
+			# cfg.py's assign() opened (its own `is_alias` branch, see that
+			# comment) right after THIS Assign, which is its own separate
+			# textual read of src in the generated C (`dest = src;`), not a
+			# reuse of whatever the Incref inside cfg.assign() already
+			# retained - see that branch's own comment for the real crash
+			# this closes. Structurally unconditional otherwise here too
+			# (mirroring the Acquire) - emitter_c.py decides at emission
+			# time, once src.reassigned_outside_init's FINAL value is
+			# known, whether this becomes a real release or a no-op.
+			#
+			# The cfg.rc_leaves(dest.type) check is NOT optional: cfg.assign()
+			# itself early-returns `[]` before ever reaching its own
+			# `is_alias` branch when dest.type has no RC leaves (a plain
+			# scalar global, e.g. `x = G` for `G: i32`) - meaning no Acquire
+			# was ever emitted for that call. Without this same check here,
+			# a scalar global's read would get an orphaned Release with no
+			# matching Acquire - confirmed as a real bug via
+			# lowering_test.py's own test_reads_module_global, which
+			# expects a plain `Assign`, nothing else, for exactly this case.
+			self._emit( ir.ReleaseGlobalLock( var = src ))
 
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
 		if not isinstance( node.target, ast.Name ):
@@ -3181,9 +3235,7 @@ class FunctionLowering:
 			# own _ensure_resolved call), same as it always has.
 			if self.lowering._monomorphizer._is_concrete( var_type ):
 				var.type = self.lowering._ensure_resolved( var_type )
-			for instr in self._cfg_assign( var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
-				self._emit( instr )
-			self._emit( ir.Assign( dest = var, src = operand ))
+			self._cfg_assign( var, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node )
 
 	def _lower_attr_target_obj( self, value_node: ast.expr ) -> tuple[ir.Operand, Callable[[ir.Operand],None]|None]:
 		''' the object operand for an attribute assignment target
@@ -3548,9 +3600,7 @@ class FunctionLowering:
 					f"arm's own binding) with an incompatible type"
 				) if is_match_binding else None
 				operand = self._lower_expr( node.value, existing.type, context = context )
-				for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
-					self._emit( instr )
-				self._emit( ir.Assign( dest = existing, src = operand ))
+				self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node )
 			else:
 				# first assignment to a name with no prior declaration - same
 				# as an AnnAssign, but the type is inferred from the RHS
@@ -3579,9 +3629,7 @@ class FunctionLowering:
 				# inside a match arm). A non-Name subject (e.g. `match
 				# make():`) has no such original owner, so it keeps full
 				# ownership tracking unchanged (borrow=False there).
-				for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not is_match_subject, borrow = is_match_subject and is_alias ):
-					self._emit( instr )
-				self._emit( ir.Assign( dest = var, src = operand ))
+				self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not is_match_subject, borrow = is_match_subject and is_alias )
 				if getattr( node, 'is_match_binding', False ):
 					# type_resolver.py's _match_pattern: a `case T(name):`
 					# extracted payload. This language has no wildcard/discard
@@ -3772,16 +3820,12 @@ class FunctionLowering:
 						self._cfg.unnarrow( elt.id )
 						final = self._coerce_or_check_operand( elem, existing.type, node )
 						is_alias = not getattr( final, 'is_union_coerce_result', False )
-						for instr in self._cfg_assign( existing, final, is_alias = is_alias, node = node ):
-							self._emit( instr )
-						self._emit( ir.Assign( dest = existing, src = final ))
+						self._cfg_assign( existing, final, is_alias = is_alias, node = node )
 					else:
 						var = Variable( stem = elt.id, qualname = f'{fn.qualname}.{elt.id}', file = fn.file, line = getattr( node, 'lineno', None ), type = elem.type, needs_uid_suffix = self._mark_fresh_local_declared( elt.id ))
 						fn.add_name( var.stem, var )
 						self.lowering.schedule( var.type )
-						for instr in self._cfg_assign( var, elem, is_alias = True, node = node ):
-							self._emit( instr )
-						self._emit( ir.Assign( dest = var, src = elem ))
+						self._cfg_assign( var, elem, is_alias = True, node = node )
 			except CompileError:
 				for elt in target.elts:
 					if isinstance( elt, ast.Name ) and self.lowering.discovery.find_name_or_none( elt.id ) is None:
@@ -3848,9 +3892,7 @@ class FunctionLowering:
 				# aliasing, regardless of its operands)
 				result = self._lower_binop_values( node, existing, right, existing.type )
 				self._cfg.unnarrow( node.target.id )
-				for instr in self._cfg_assign( existing, result, is_alias = False, node = node ):
-					self._emit( instr )
-				self._emit( ir.Assign( dest = existing, src = result ))
+				self._cfg_assign( existing, result, is_alias = False, node = node )
 				return
 			# not RC (or not yet declared) - unchanged: synthesized x = x + y
 			read = ast.Name( id = node.target.id, ctx = ast.Load() )
@@ -7385,15 +7427,11 @@ class FunctionLowering:
 		if existing is not None:
 			self._cfg.unnarrow( target.id )
 			operand = self._lower_expr( node.value, existing.type )
-			for instr in self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node ):
-				self._emit( instr )
-			self._emit( ir.Assign( dest = existing, src = operand ))
+			self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node )
 			return existing
 		var, operand = self._declare_local( target.id, node, lambda expected: self._lower_expr( node.value, expected ))
 		is_alias = self.lowering._is_aliasing_expr( node.value, operand )
-		for instr in self._cfg_assign( var, operand, is_alias = is_alias, node = node ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = var, src = operand ))
+		self._cfg_assign( var, operand, is_alias = is_alias, node = node )
 		return var
 
 	def _collect_free_variables( self, roots: list[ast.AST], param_names: set[str], node: ast.AST ) -> list[tuple[str,Variable]]:
@@ -7673,9 +7711,7 @@ class FunctionLowering:
 		var = Variable( stem = node.name, qualname = f'{enclosing.qualname}.{node.name}', file = enclosing.file, line = node.lineno, type = operand.type, needs_uid_suffix = self._mark_fresh_local_declared( node.name ))
 		enclosing.add_name( var.stem, var )
 		self.lowering.schedule( var.type )
-		for instr in self._cfg_assign( var, operand, is_alias = False, node = node ):
-			self._emit( instr )
-		self._emit( ir.Assign( dest = var, src = operand ))
+		self._cfg_assign( var, operand, is_alias = False, node = node )
 
 	def _expr_Lambda( self, node: ast.Lambda, expected_type: Type|None ) -> ir.Operand:
 		# a lambda expression, capturing or not - see PLAN_LAMBDA.md/the

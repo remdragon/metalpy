@@ -579,6 +579,41 @@ class DecrefDynamic( Instruction ): # compiler.decref_dynamic(ptr) - releases a 
 		return f'DecrefDynamic( value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class AcquireGlobalLock( Instruction ):
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A - marks the START of the one
+	critical section a protected global's reassignment needs: releasing its
+	CURRENT value and overwriting it with the new one must happen as one
+	atomic-with-respect-to-other-threads unit, never as two separate lock
+	acquisitions (a reader could interleave in the gap otherwise - see that
+	plan's own worked reader-vs-writer interleaving). Emitted directly by
+	cfg.py's assign() (`dest.is_global` branch), wrapping whatever
+	_decref_instructions(dest.type, dest) produces - which for a union-typed
+	global (e.g. ZoneInfo|None) is a multi-instruction tag-gated sequence,
+	not a single bare Decref, so the boundary of "everything that needs
+	protecting" can only be known by whoever is CONSTRUCTING that sequence,
+	not reconstructed later by pattern-matching the emitted instructions
+	(confirmed unsound via a real test: the naive "look for an adjacent
+	Decref+Assign" version this replaced silently never matched a union-
+	typed global at all - exactly localtz()'s own shape, the bug that
+	motivated this whole mechanism). '''
+	var: Variable
+
+	def test_repr( self ) -> str:
+		return f'AcquireGlobalLock( var={self.var.qualname!r} )'
+
+@dataclass( kw_only = True )
+class ReleaseGlobalLock( Instruction ):
+	''' the matching END marker for AcquireGlobalLock - emitted by lowering.py's
+	_cfg_assign, immediately after the ir.Assign that overwrites the
+	global's slot (the actual store cfg.assign() itself never emits - see
+	_cfg_assign's own docstring for why both the RC-bookkeeping instructions
+	and this trailing Assign have to come from one function body). '''
+	var: Variable
+
+	def test_repr( self ) -> str:
+		return f'ReleaseGlobalLock( var={self.var.qualname!r} )'
+
+@dataclass( kw_only = True )
 class RefCount( Instruction ): # compiler.refcount(x) - reads x's current header refcount
 	dest: Temp
 	value: Operand
