@@ -2736,7 +2736,22 @@ class UnsafeDict[K, V]:
 				owned_value_ptr: Ptr[None] = self._store_value( value )
 				self.__raw.insert_new( h, owned_key_ptr, owned_value_ptr )
 
-class dict[K, V]:
+def _dict_key_iter[K, V]( d: dict[K, V] ) -> Generator[K, StopIteration]:
+	# dict.__iter__ walks KEYS (matches real Python) - not routed through
+	# the shared _sequence_iter[T,S:Sequence[T]] since dict[K,V] doesn't
+	# conform to Sequence[K] itself (its own __getitem__ takes a K key, not
+	# a usize index) - key_at(usize) is the index-based accessor instead.
+	# Same double-call, no-intermediate-local shape as _sequence_iter et al
+	# (see that comment for why).
+	i: usize = 0
+	while True:
+		if d.key_at( i ).is_err():
+			return
+		yield d.key_at( i ).unwrap( 'dict.__iter__: was just checked is_ok() above' )
+		with compiler.wrap_arithmetic:
+			i += 1
+
+class dict[K, V]( Iterable[K] ):
 	''' dict[K,V]: locked-by-default wrapper around UnsafeDict[K,V] - same
 	split as list[T]/UnsafeList[T] (see __list.py's own header comment):
 	dict[K,V] is the default most people reach for, so every operation
@@ -2777,6 +2792,9 @@ class dict[K, V]:
 	def __setitem__( self, key: K, value: V ) -> None:
 		with self.__lock:
 			self.__inner.__setitem__( key, value )
+
+	def __iter__( self ) -> Generator[K, StopIteration]:
+		return _dict_key_iter( self )
 
 	def with_lock( self, body: Closure[[UnsafeDict[K, V]], None] ) -> None:
 		# unlike list[T]'s own no-arg with_lock, body here takes the raw

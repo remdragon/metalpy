@@ -1734,6 +1734,18 @@ class Lowering:
 				self._unify_type_param( type_params, declared.elem_type, result_args[0], bindings, node, context_qualname )
 				self._unify_type_param( type_params, declared.error_type, result_args[1], bindings, node, context_qualname )
 			return
+		if isinstance( declared, TupleType ):
+			# a declared tuple[T,T]-shaped parameter - `actual` may be the
+			# bare TupleType itself (e.g. built fresh from an annotation) or
+			# its resolved backing RCClass (a real argument's already-
+			# resolved type carries the backing class, not the annotation
+			# object) - same bare-TupleType-vs-backing duality _same_type's
+			# own TupleType branch handles, via tuple_type_for's reverse lookup
+			actual_tuple = actual if isinstance( actual, TupleType ) else self._tuple_storage.tuple_type_for( actual )
+			if actual_tuple is not None and len( declared.elem_types ) == len( actual_tuple.elem_types ):
+				for d_elem, a_elem in zip( declared.elem_types, actual_tuple.elem_types ):
+					self._unify_type_param( type_params, d_elem, a_elem, bindings, node, context_qualname )
+			return
 
 	def _check_type_param_bounds( self, node: ast.AST, type_params: list[TypeVar], concrete_args: list[Type], context_qualname: str ) -> None:
 		# every call site that finishes substituting a concrete type for each
@@ -1783,6 +1795,8 @@ class Lowering:
 				or self._type_mentions_param( t.error_type, tv )
 				or ( t.send_type is not None and self._type_mentions_param( t.send_type, tv ))
 			)
+		if isinstance( t, TupleType ):
+			return any( self._type_mentions_param( e, tv ) for e in t.elem_types )
 		return False
 
 	def _param_referenced_type_params_for( self, target: Function ) -> frozenset[int]:

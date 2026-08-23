@@ -136,6 +136,48 @@ def main() -> i32:
 	return 0
 '''
 
+_DICT_ITERABLE_CONFORMANCE = '''
+def main() -> i32:
+	d: dict[i32, i32] = dict[i32, i32]()
+	d[10] = 100
+	d[20] = 200
+	d[30] = 300
+
+	if sum( d ) != 60: # walks KEYS, matching real python's dict.__iter__
+		return 1
+	if min( d ) != 10:
+		return 2
+	if max( d ) != 30:
+		return 3
+	count: isize = 0
+	with compiler.wrap_arithmetic:
+		for _k in iter( d ):
+			count += 1
+	if count != 3:
+		return 4
+	if not any( d ):
+		return 5
+	empty: dict[i32, i32] = dict[i32, i32]()
+	if any( empty ):
+		return 6
+	if not all( d ):
+		return 7
+	return 0
+'''
+
+_GENERIC_TUPLE_TYPED_PARAMETER_INFERENCE = '''
+def first_of[T]( t: tuple[T, T] ) -> T:
+	a, b = t
+	with compiler.wrap_arithmetic:
+		return a + b - b # use b so it is not "unused"
+
+def main() -> i32:
+	pair: tuple[i32, i32] = ( 3, 4 )
+	if first_of( pair ) != 3:
+		return 1
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile builtins-iteration tests' )
 class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
@@ -169,6 +211,24 @@ class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
 		by the new seq-taking overload sharing its name. '''
 		self.assert_programs_run([
 			( 'two_arg_min_max', _TWO_ARG_MIN_MAX_STILL_WORK ),
+		])
+
+	def test_dict_iterable_conformance( self ) -> None:
+		''' dict[K,V] conforms to Iterable[K] via its own key-walking
+		__iter__ (matches real python: dict.__iter__ walks keys) - NOT
+		Sequence[K], since dict's own __getitem__ takes a K key, not a
+		usize index. '''
+		self.assert_programs_run([
+			( 'dict_iterable_conformance', _DICT_ITERABLE_CONFORMANCE ),
+		])
+
+	def test_generic_tuple_typed_parameter_inference( self ) -> None:
+		''' T occurring only inside a tuple[T,T]-shaped parameter type
+		(not behind a Sequence[T]/Iterable[T] bound) must still be
+		inferable from a real tuple[i32,i32] argument - _unify_type_param
+		previously had no TupleType branch at all. '''
+		self.assert_programs_run([
+			( 'generic_tuple_typed_parameter_inference', _GENERIC_TUPLE_TYPED_PARAMETER_INFERENCE ),
 		])
 
 
