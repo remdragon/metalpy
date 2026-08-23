@@ -20,8 +20,15 @@ already uses for reactor-aware file I/O - not a base class TcpServer
 itself extends.
 '''
 
+import atomic
+import compiler
+import poller
+import reactor
+import socket
+import sys
 import tcp
 import threading
+from datetime import timedelta
 
 
 class ConnectionDispatcher:
@@ -104,10 +111,27 @@ class ThreadPoolDispatcher( ConnectionDispatcher ):
 class TcpServer:
 	''' a generic accept loop over a tcp.TcpListener: each accepted
 	connection is handed to on_connection via this server's own
-	ConnectionDispatcher. '''
+	ConnectionDispatcher.
+
+	Owns a persistent poller.Poller + wake-pair socket (the same self-pipe
+	idiom reactor.Worker uses, standalone - run() is meant to run on a raw
+	OS thread, not a reactor fiber, so there's no Worker to piggyback a
+	shutdown wake on). tcp.TcpListener.accept()'s own internal retry loop
+	is reactor-optional but NOT externally interruptible - with no Worker
+	driving this thread, it falls to reactor._blocking_wait_no_reactor,
+	which builds a fresh, throwaway, single-fd Poller on every retry with no
+	shutdown hook at all. run() uses TcpListener.try_accept() instead so it
+	can wait on ITS OWN poller, registered with both the listener fd and
+	the wake-read fd, making shutdown() (below) able to interrupt it. '''
 	__listener:      tcp.TcpListener
 	__on_connection: Closure[[tcp.TcpConnection], None]
 	__dispatcher:    ConnectionDispatcher
+	__poller:        poller.Poller
+	__wake_read:     socket.Socket
+	__wake_write:    socket.Socket
+	__wake_fd:       poller.SOCKET
+	__shutting_down: atomic.Atomic[bool]
+	__stopped:       atomic.Atomic[bool]
 
 	def __init__(
 		self,
@@ -122,15 +146,75 @@ class TcpServer:
 		else:
 			d: ConnectionDispatcher = dispatcher
 			self.__dispatcher = d
+		self.__poller = poller.Poller()
+		( wake_read, wake_write ) = socket.make_loopback_pair()
+		poller.set_nonblocking( wake_read.fileno() ).unwrap( 'TcpServer.__init__: set_nonblocking (wake read side) failed' )
+		poller.set_nonblocking( wake_write.fileno() ).unwrap( 'TcpServer.__init__: set_nonblocking (wake write side) failed' )
+		self.__wake_read = wake_read
+		self.__wake_write = wake_write
+		self.__wake_fd = wake_read.fileno()
+		self.__shutting_down = atomic.Atomic[bool]( False )
+		self.__stopped = atomic.Atomic[bool]( False )
+		self.__poller.register( self.__listener.fileno(), True, False ).unwrap( 'TcpServer.__init__: poller register (listener) failed' )
+		self.__poller.register( self.__wake_fd, True, False ).unwrap( 'TcpServer.__init__: poller register (wake fd) failed' )
 
 	def run( self ) -> None:
-		''' blocks forever: accept() then dispatcher.dispatch(conn,
-		on_connection) - naming matches reactor.Reactor.run() rather than
-		Python's serve_forever(), for consistency within this codebase. '''
+		''' blocks until shutdown() is called (or a real accept error):
+		waits on this server's own poller, dispatching a ready listener
+		fd via dispatcher.dispatch(conn, on_connection) and draining a
+		ready wake fd (its only job is to break the wait) - naming matches
+		reactor.Reactor.run() rather than Python's serve_forever(), for
+		consistency within this codebase. '''
 		while True:
-			match self.__listener.accept():
-				case Result.Ok( conn ):
-					self.__dispatcher.dispatch( conn, self.__on_connection )
+			if self.__shutting_down.load():
+				break
+			match self.__poller.wait( -1 ):
+				case Result.Ok( events ):
+					stop_now: bool = False
+					n: usize = events.__len__()
+					i: usize = 0
+					while i < n:
+						ev: poller.ReadyEvent = events.__getitem__( i ).unwrap( 'TcpServer.run: event index in bounds by construction' )
+						if ev.fd == self.__wake_fd:
+							buf: bytearray = bytearray( usize( 64 ))
+							self.__wake_read.recv( buf.get_ptr(), usize( 64 )).is_ok() # best-effort drain
+						elif ev.readable:
+							match self.__listener.try_accept():
+								case Result.Ok( conn ):
+									self.__dispatcher.dispatch( conn, self.__on_connection )
+								case Result.Err( e ):
+									if e != OSError.WouldBlock:
+										print( f'TcpServer.run: error accepting connection: {e}' )
+										stop_now = True
+						with compiler.wrap_arithmetic:
+							i = i + 1
+					if stop_now:
+						break
 				case Result.Err( e ):
-					print( f'TcpServer.run: error accepting connection: {e}' )
-					return
+					print( f'TcpServer.run: poller wait failed: {e}' )
+					break
+		self.__stopped.store( True )
+
+	def shutdown( self, wait: bool = True ) -> None:
+		''' requests run()'s accept loop to stop - idempotent, callable from
+		any thread, including while run() is blocked in its own poller.wait()
+		(possibly on a different thread). Does NOT reject already-dispatched
+		connections - matches reactor.Worker.request_shutdown()/threading.
+		ThreadPool.shutdown()'s own "request, don't reject in-flight work"
+		contract; only the accept loop itself stops. wait=True (default)
+		additionally blocks until run() has actually returned (a 1ms busy-
+		poll on an atomic flag - robust to any call ordering, e.g. shutdown()
+		called before run() ever starts, or after it already returned, both
+		just return immediately with no risk of ever blocking forever). '''
+		self.__shutting_down.store( True )
+		poke: bytes = b'x'
+		match self.__wake_write.send( poke.get_const_ptr(), usize( 1 )):
+			case Result.Ok( _n ):
+				pass
+			case Result.Err( e ):
+				if e != OSError.WouldBlock:
+					sys.panic( 'TcpServer.shutdown: wake-pair write failed unexpectedly' )
+		if not wait:
+			return
+		while not self.__stopped.load():
+			reactor.sleep( timedelta( milliseconds = 1 )).is_ok()

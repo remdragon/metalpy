@@ -92,12 +92,25 @@ class TcpListener:
 	def close( self ) -> None:
 		self.__sock.close()
 
+	def try_accept( self ) -> Result[TcpConnection, OSError]:
+		''' one non-blocking accept attempt - Err(OSError.WouldBlock) instead
+		of retrying/waiting when nothing is pending yet. Lets a caller (see
+		lib/tcpserver.py's TcpServer.run()) multiplex the listening fd
+		against its OWN additional fds (e.g. a shutdown wake-pair) via its
+		own Poller - something accept()'s own internal wait_for_signal()
+		retry loop below can't participate in. '''
+		match self.__sock.accept():
+			case Result.Ok( pair ):
+				( conn, _addr ) = pair
+				return TcpConnection._from_socket( conn )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	def accept( self ) -> Result[TcpConnection, OSError]:
 		while True:
-			match self.__sock.accept():
-				case Result.Ok( pair ):
-					( conn, _addr ) = pair
-					return TcpConnection._from_socket( conn )
+			match self.try_accept():
+				case Result.Ok( conn ):
+					return Result.Ok( conn )
 				case Result.Err( e ):
 					if e != OSError.WouldBlock:
 						return Result.Err( e )

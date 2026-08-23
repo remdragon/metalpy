@@ -19,6 +19,13 @@
 #     own worker count rather than spawning one thread per submission.
 #   - thread_pool_shutdown_wait_drains_queue: shutdown(wait=True) doesn't
 #     return until every already-queued job has actually run.
+#   - tcpserver_shutdown_stops_a_live_accept_loop: TcpServer.shutdown(wait=
+#     True) interrupts a run() loop genuinely blocked in its own
+#     poller.wait() on a different (real OS) thread, and blocks until that
+#     thread has actually returned.
+#   - tcpserver_shutdown_does_not_disrupt_an_in_flight_dispatch: shutdown()
+#     only stops the accept loop - a connection already dispatched before
+#     shutdown() was called still runs to completion.
 
 import unittest
 
@@ -203,6 +210,56 @@ def main() -> i32:
 	# has actually run - no busy-wait needed here, that's the property
 	# under test
 	if counter.completed.load() != 3:
+		return 1
+	return 0
+''' ),
+			( 'tcpserver_shutdown_stops_a_live_accept_loop', '''
+import tcp
+import threading
+import tcpserver
+
+class NullOnConnection:
+	def handle( self, conn: tcp.TcpConnection ) -> None:
+		pass
+
+def main() -> i32:
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '127.0.0.1', u16( 0 )).unwrap( 'bind' )
+	h: NullOnConnection = NullOnConnection()
+	server: tcpserver.TcpServer = tcpserver.TcpServer( listener, h.handle )
+	t: threading.Thread = threading.Thread( server.run )   # starts immediately, genuinely blocks in poller.wait()
+
+	server.shutdown( True )   # blocks until run()'s own thread has actually returned
+	t.join()                  # must return promptly - proves run()'s OS thread really exited, not just detached
+	return 0
+''' ),
+			( 'tcpserver_shutdown_does_not_disrupt_an_in_flight_dispatch', '''
+import atomic
+import tcp
+import socket
+import threading
+import tcpserver
+
+class Counter:
+	n: atomic.Atomic[i32]
+	def __init__( self ) -> None:
+		self.n = atomic.Atomic[i32]( 0 )
+	def bump( self, conn: tcp.TcpConnection ) -> None:
+		self.n.fetch_add( 1 )
+
+def main() -> i32:
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '127.0.0.1', u16( 0 )).unwrap( 'bind' )
+	addr: socket.SocketAddr = listener.getsockname().unwrap( 'getsockname' )
+	counter: Counter = Counter()
+	server: tcpserver.TcpServer = tcpserver.TcpServer( listener, counter.bump )
+	t: threading.Thread = threading.Thread( server.run )
+
+	client: tcp.TcpConnection = tcp.connect( '127.0.0.1', addr.port ).unwrap( 'connect' )
+	while counter.n.load() != 1:
+		pass   # wait for run()'s own accept loop to notice and dispatch it
+
+	server.shutdown( True )
+	t.join()
+	if counter.n.load() != 1:
 		return 1
 	return 0
 ''' ),
