@@ -228,12 +228,41 @@ reassigned via `global X; X = ...`, not just initialized once at module
 load). A global that's only ever written by its own module-level
 initializer (`compiler.py:20-23`'s `LoweredGlobal.instructions`) is
 provably single-write, happening before any thread the program spawns
-even exists — no lock needed. Existing examples in `lib/` that would fall
-into this "no lock needed" bucket today: `reactor.py`'s
-`_current_worker: threading.ThreadLocal[Worker] = threading.ThreadLocal[Worker]()`
-and `_thread_deadline`, `socket.py`'s `_wsa_state`/`_wsa_error` (already
-`Atomic[T]`, out of scope here regardless), `datetime.py`'s
-`__localtz_lock`/`termcolor.py`'s `_color_codes_lock` themselves.
+even exists — no Part A lock needed **for the slot itself**. Confirmed
+directly against real generated C for exactly this shape (a global with a
+non-trivial, heap-allocating constructor, mirroring `reactor.py`'s
+`_current_worker: threading.ThreadLocal[Worker] = threading.ThreadLocal[Worker]()`):
+its constructor call (`ThreadLocal.__init__`, including the `TlsAlloc()`
+syscall) is emitted into its own `__metalpy_init_<qualname>()` function,
+called unconditionally from `__metalpy_init()`, itself called at the very
+top of `main()` — before any user code runs and before any thread the
+program could spawn exists. So `_current_worker` (the *slot*) genuinely
+is single-write, exactly as claimed.
+
+**That is not the same claim as "no lock needed, full stop," and this
+document must not be read that way.** `_current_worker`/`_thread_deadline`
+are safe to use concurrently for a completely different reason that has
+nothing to do with being written once: the *slot* holds a reference to a
+`ThreadLocal[Worker]` object whose own per-thread payload is set
+continuously, throughout the program's whole life, from many different
+threads (every `Worker.run_until_idle()` call sets it, on whichever
+thread is driving that worker) — not once at startup. That's safe purely
+because `TlsGetValue`/`TlsSetValue` (Windows) and
+`pthread_getspecific`/`pthread_setspecific` (POSIX) are OS-guaranteed to
+be per-calling-thread: no two threads can ever race on the same
+underlying storage through these calls, by definition of what thread-
+local storage means — a property this document's locking scheme
+contributes nothing to and takes no credit for. `socket.py`'s
+`_wsa_state`/`_wsa_error` are a cleaner example of the *intended* "no
+lock needed" case (single-write slot, and the `Atomic[i32]` payload it
+holds is *also* safe on its own terms, already out of scope here) —
+listing `_current_worker` alongside it without this caveat conflates two
+different safety arguments and risks implying "reachable through a
+write-once global" is a general license to skip protecting whatever's on
+the other end of that reference, which is false: an ordinary *mutable*
+RC object (not one with TLS's own special per-thread isolation) sitting
+behind a write-once global still needs Part B's protection for its own
+fields, exactly as if it were reached any other way.
 
 This "was this `Variable` ever an `ir.Assign` dest outside its own init
 instructions" check does not exist today (confirmed: `_stmt_Global` is a
