@@ -83,6 +83,108 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 
 
 # ---------------------------------------------------------------------------
+# mkdir / rmdir / unlink / rename
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+def mkdir( dirpath: str ) -> Result[None, OSError]:
+	from windows.kernel32 import CreateDirectoryA, GetLastError
+	if not CreateDirectoryA( dirpath.get_cstr(), None ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def mkdir( dirpath: str ) -> Result[None, OSError]:
+	from crt import mkdir as _crt_mkdir, get_errno
+	if _crt_mkdir( compiler.cast( ConstPtr[None], dirpath.get_cstr() ), 0o777 ) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def rmdir( dirpath: str ) -> Result[None, OSError]:
+	from windows.kernel32 import RemoveDirectoryA, GetLastError
+	if not RemoveDirectoryA( dirpath.get_cstr() ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def rmdir( dirpath: str ) -> Result[None, OSError]:
+	from crt import rmdir as _crt_rmdir, get_errno
+	if _crt_rmdir( dirpath.get_cstr() ) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def unlink( filepath: str ) -> Result[None, OSError]:
+	from windows.kernel32 import DeleteFileA, GetLastError
+	if not DeleteFileA( filepath.get_cstr() ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def unlink( filepath: str ) -> Result[None, OSError]:
+	from crt import unlink as _crt_unlink, get_errno
+	if _crt_unlink( filepath.get_cstr() ) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def rename( src: str, dst: str ) -> Result[None, OSError]:
+	# MoveFileExA, not the plainer MoveFileA - see kernel32.py's own comment
+	# on MOVEFILE_REPLACE_EXISTING for why (POSIX rename(2)/os.rename replace
+	# an existing destination; plain MoveFileA fails instead).
+	from windows.kernel32 import MoveFileExA, GetLastError, MOVEFILE_REPLACE_EXISTING
+	if not MoveFileExA( src.get_cstr(), dst.get_cstr(), MOVEFILE_REPLACE_EXISTING ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def rename( src: str, dst: str ) -> Result[None, OSError]:
+	from crt import rename as _crt_rename, get_errno
+	if _crt_rename( src.get_cstr(), dst.get_cstr() ) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+# ---------------------------------------------------------------------------
+# getcwd / getenv
+# ---------------------------------------------------------------------------
+
+def getcwd() -> Result[str, OSError]:
+	return _getcwd()
+
+
+@compiler.target( os = 'windows' )
+def getenv( name: str ) -> str|None:
+	from windows.kernel32 import GetEnvironmentVariableA
+	buf_size: u32 = 4096
+	buf: Ptr[u8] = sys.alloc[u8]( usize( buf_size ))
+	defer( sys.free( buf ))
+	n: u32 = GetEnvironmentVariableA( name.get_cstr(), buf, buf_size )
+	if n == 0 or n >= buf_size:
+		# unset, or (rare) value too long for the 4096-byte buffer - both
+		# collapse to "not set" for this simple wrapper
+		return None
+	with compiler.panic_arithmetic( 'bounded by n < buf_size, cannot overflow' ):
+		size: usize = usize( n ) + 1
+	return str.from_cstr( compiler.cast( ConstPtr[u8], buf ), size ).unwrap( 'os.getenv: invalid UTF-8 in environment variable value' )
+
+@compiler.target( os = not 'windows' )
+def getenv( name: str ) -> str|None:
+	from crt import getenv as _crt_getenv
+	result: ConstPtr[u8] = _crt_getenv( name.get_cstr() )
+	if result is None:
+		return None
+	n: usize = sys.cstrlen( result, 4096 )
+	with compiler.panic_arithmetic( 'bounded by the 4096-byte cstrlen cap, cannot overflow' ):
+		size: usize = n + 1
+	return str.from_cstr( result, size ).unwrap( 'os.getenv: invalid UTF-8 in environment variable value' )
+
+
+# ---------------------------------------------------------------------------
 # os.path
 # ---------------------------------------------------------------------------
 
@@ -209,6 +311,49 @@ class path:
 			return False
 		mode: u32 = compiler.c_field( buf, 'st_mode', u32 )
 		return ( mode & S_IFMT ) == S_IFDIR
+
+	@compiler.target( os = 'windows' )
+	@staticmethod
+	def exists( p: str ) -> bool:
+		from windows.kernel32 import GetFileAttributesA, INVALID_FILE_ATTRIBUTES
+		return GetFileAttributesA( p.get_cstr() ) != INVALID_FILE_ATTRIBUTES
+
+	@compiler.target( os = not 'windows' )
+	@staticmethod
+	def exists( p: str ) -> bool:
+		from posix.stat import stat_t, stat
+		buf: Ptr[stat_t] = sys.alloc[stat_t]( 1 )
+		if buf is None:
+			return False
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		return stat( compiler.cast( ConstPtr[None], p.get_cstr() ), buf ) == 0
+
+	@compiler.target( os = 'windows' )
+	@staticmethod
+	def isfile( p: str ) -> bool:
+		# no full stat metadata on this platform (out of scope - see
+		# pathlib.py's own module docstring) - approximated as "exists and
+		# isn't a directory", which doesn't cleanly distinguish a regular
+		# file from a device/reparse-point the way POSIX S_ISREG does.
+		from windows.kernel32 import GetFileAttributesA, FILE_ATTRIBUTE_DIRECTORY, INVALID_FILE_ATTRIBUTES
+		attrs: u32 = GetFileAttributesA( p.get_cstr() )
+		if attrs == INVALID_FILE_ATTRIBUTES:
+			return False
+		return ( attrs & FILE_ATTRIBUTE_DIRECTORY ) == 0
+
+	@compiler.target( os = not 'windows' )
+	@staticmethod
+	def isfile( p: str ) -> bool:
+		from posix.stat import stat_t, stat, S_IFMT, S_IFREG
+		buf: Ptr[stat_t] = sys.alloc[stat_t]( 1 )
+		if buf is None:
+			return False
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		rc: i32 = stat( compiler.cast( ConstPtr[None], p.get_cstr() ), buf )
+		if rc != 0:
+			return False
+		mode: u32 = compiler.c_field( buf, 'st_mode', u32 )
+		return ( mode & S_IFMT ) == S_IFREG
 
 	@staticmethod
 	def splitext( p: str ) -> tuple[str, str]:

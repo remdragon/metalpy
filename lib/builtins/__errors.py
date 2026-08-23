@@ -24,6 +24,9 @@ class OSError: # windows version of base class for I/O errors
 	# (WSATRY_AGAIN, WSANO_RECOVERY, etc.) still falls to Other - see
 	# lib/socket.py's _resolve_v4/_resolve_v6 for the only current producer.
 	NameResolutionFailed = 11001 # WSAHOST_NOT_FOUND
+	AlreadyExists     = 183 # ERROR_ALREADY_EXISTS - os.mkdir() on an existing path
+	DirectoryNotEmpty = 145 # ERROR_DIR_NOT_EMPTY - os.rmdir() on a non-empty dir
+	NotADirectory     = 267 # ERROR_DIRECTORY - os.listdir() on a non-directory path
 	Other = _
 
 @compiler.target( os = not 'windows' )
@@ -50,4 +53,7 @@ class OSError: # linux version of base class for I/O errors
 	# real errno on any supported POSIX target (Linux's own errno.h tops out
 	# under 140) so it can never collide with a genuine OS-reported errno.
 	NameResolutionFailed = 1000
+	AlreadyExists     = 17 # EEXIST - os.mkdir() on an existing path
+	DirectoryNotEmpty = 39 # ENOTEMPTY (Linux value; macOS is 66) - os.rmdir() on a non-empty dir
+	NotADirectory     = 20 # ENOTDIR - os.listdir() on a non-directory path
 	Other = _
