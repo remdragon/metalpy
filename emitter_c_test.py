@@ -21375,6 +21375,190 @@ def main() -> i32:
 ''' ),
 		])
 
+	def test_match_arm_binding_crossing_a_yield( self ) -> None:
+		''' Regression for a real, confirmed uninitialized-memory bug,
+		SIBLING of test_match_on_fallible_call_subject_crossing_a_yield
+		above but for a match ARM'S OWN extracted binding (`case
+		Result.Ok(v): yield v`, v RC-typed), not the match SUBJECT: the
+		binding is built directly by _match_pattern (bypassing self.
+		visit()/visit_Assign), the SAME timing gap the subject had -
+		by the time _match_pattern actually runs (during the generator's
+		own synthesized $$__next__ method's normal resolution), the
+		backing class's field list is already final, so the binding
+		stayed an ordinary, non-promoted local even when its own arm
+		crosses a yield. Confirmed via a real generated-C trace that the
+		binding's own trailing release_object() is a REAL, necessary
+		release (Ok(v)'s own wrap-constructor genuinely retains its
+		argument, so v's own separately-owned reference still needs
+		releasing exactly once) placed at the enclosing if/elif's shared
+		exit block - reachable via a resume goto that skips straight over
+		v's own declaration, reading and releasing garbage on every
+		resumed call. Fixed by promoting a qualifying binding into a real
+		field on the generator's own backing class (type_resolver.py's
+		_reserve_generator_match_binding_fields/_walk_generator_match_
+		bindings/_match_pattern), mirroring the subject's own fix. '''
+		self.assert_programs_run([
+			( 'match_arm_binding_extracting_an_rc_class_element_then_yielding_it', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( lst: list[Box] ) -> Generator[Box, IndexError | StopIteration]:
+	i: usize = 0
+	while True:
+		match lst.__getitem__( i ):
+			case Result.Ok( v ):
+				yield v
+				with compiler.wrap_arithmetic:
+					i += 1
+			case Result.Err( _ ):
+				return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		lst: list[Box] = [ Box( 1 ), Box( 2 ), Box( 3 ) ]
+		g = gen( lst )
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v.v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 3:
+			return 1
+		if total != 6:
+			return 2
+		return 0
+''' ),
+			# a harder shape: BOTH arms bind a name AND cross their own
+			# yield (over-promotion posture - any case whose body contains
+			# a yield ANYWHERE gets its own binding(s) promoted, regardless
+			# of whether the bound name is itself referenced again after
+			# the yield), alternating Ok/Err across several resumed calls,
+			# exercising the live-flag-guarded reassignment/release for
+			# BOTH promoted bindings (v and e) many times each, not just
+			# once right before a terminating return
+			( 'match_arm_bindings_in_both_arms_alternating_ok_err_across_resumes', '''
+class Boom:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( i: usize ) -> Result[Box, Boom]:
+	with compiler.wrap_arithmetic:
+		if i == 1 or i == 3:
+			return Result.Err( Boom( v = i32( i )))
+		return Result.Ok( Box( v = i32( i )))
+
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			match maybe( i ):
+				case Result.Ok( v ):
+					yield v.v
+				case Result.Err( e ):
+					yield -e.v
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 5:
+			return 1
+		# 0 + (-1) + 2 + (-3) + 4
+		if total != 2:
+			return 2
+		return 0
+''' ),
+		])
+
+	def test_match_arm_scalar_binding_reused_after_its_own_yield( self ) -> None:
+		''' A RELATED but distinct bug from test_match_arm_binding_crossing_
+		a_yield above: that one is about a promoted binding's own trailing
+		RC decref reading garbage post-resume; THIS one is about the
+		binding's own VALUE surviving the resume at all, for a plain
+		SCALAR (non-RC) type - `case Result.Ok(v): yield v; ... uses v
+		again ...`. Before the fix, a scalar binding never got a trailing
+		decref generated for it at all (nothing to release), so this
+		specific shape never showed up in the original RC-decref repro -
+		but it's still broken for the same underlying reason: `v`'s own
+		declaration is skipped entirely by the post-yield resume goto (a
+		fresh $$__next__ call frame), so a SECOND yield in the same arm
+		that re-reads `v` reads whatever garbage happens to be on the
+		stack. Confirmed via a real repro + MSVC C4700 on the UNFIXED
+		code (this compiler's own over-promotion posture - promote
+		whenever the arm crosses a yield ANYWHERE, regardless of RC-ness -
+		incidentally already closes this too, verified by temporarily
+		reverting type_resolver.py to the commit before this fix and
+		re-running this exact repro: same C4700 on `v`, same generated-C
+		shape, gone once the fix is back). Runtime alone doesn't reliably
+		catch this (the stale stack slot often happens to still hold the
+		right value, matching this project's own established "doesn't
+		always manifest" pattern for uninitialized-memory bugs), so the
+		real assertion is the WARNING trace above (verified by hand, not
+		re-checked by this test itself) - this test's job is just to keep
+		exercising the shape end-to-end (compile+link+run) as a
+		regression tripwire, and to fail loudly if a future change
+		makes the runtime VALUE checks below wrong too. '''
+		self.assert_programs_run([
+			( 'match_arm_scalar_binding_read_across_two_yields_in_one_arm', '''
+def gen( lst: list[i32] ) -> Generator[i32, IndexError | StopIteration]:
+	i: usize = 0
+	while True:
+		match lst.__getitem__( i ):
+			case Result.Ok( v ):
+				yield v
+				with compiler.wrap_arithmetic:
+					yield v * 2
+				with compiler.wrap_arithmetic:
+					i += 1
+			case Result.Err( _ ):
+				return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		lst: list[i32] = [ 1, 2, 3 ]
+		g = gen( lst )
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 6:
+			return 1
+		# (1+2)+(2+4)+(3+6) = 3+6+9 = 18
+		if total != 18:
+			return 2
+		return 0
+''' ),
+		])
+
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
 		# level statement (preamble/tail) is supported for now, same start-
