@@ -275,9 +275,192 @@ ordering (a `dataclasses.fields()`-driven generic instruction walk), just
 checking `ir.Assign.dest is <that Variable>` instead of arbitrary operand
 reads.
 
-### A.2 The lock itself: a paired raw primitive, not a `FastLock`
+A third category sits between "written once at init" and "written
+repeatedly" and deserves its own treatment, not the same lock the
+repeatedly-written case needs: a global written **at most once at
+runtime**, via the `if X is None: X = compute()` shape — exactly
+`localtz()`'s own bug. Once such a global's first (and only) real write
+lands, it never changes again — a materially stronger guarantee than
+"reassigned somewhere," and one that admits a genuinely lock-free
+mechanism instead of a lock. See A.2 below.
 
-`FastLock` (`lib/threading.py:35-150`) is itself an `RCClass` — heap
+### A.2 The write-once-at-runtime case: a lock-free CAS publish, not a lock
+
+For a global whose only writer is a single `X = compute()` guarded by
+`if X is None:` (or any provably-single-winner publish, more generally),
+a plain `compare_exchange(expected=NULL, desired=new_value)` on the slot
+— no separate lock object at all — is not just viable, it's **strictly
+better** than A.3/A.4's lock: it removes the SRWLOCK/`pthread_mutex_t`
+memory cost and the POSIX init-order asymmetry (A.3) entirely, and it's
+genuinely lock-free rather than merely uncontended-fast. It's sound for a
+reason the general repeatedly-written case (A.3/A.4) does not share:
+because the slot never changes again after the winning CAS, no reader can
+ever race a `retain_object()` against a writer's decref-to-zero-and-free
+of the value it just loaded — there's no writer left to race against.
+Every losing thread's own redundantly-constructed value is simply
+`release_object`'d by that thread itself, never having been visible to
+anyone else — the same "degrades to redundant work, never corrupts"
+outcome this whole document is built around, achieved here with no lock
+at all.
+
+**A concrete representation blocker, confirmed directly, not assumed:**
+`ZoneInfo|None` — `localtz()`'s own `__localtz` global's actual declared
+type — compiles today to a real tagged struct
+(`struct $__u$$intrinsics$NoneType$$...$ZoneInfo { u8 tag; union { ... }
+data; }`, confirmed via `-c` inspection of real generated C for the
+identical shape: a bare `Box|None` global emits `.tag`/`.data` field
+accesses, not a single pointer read), not a bare nullable pointer. A
+single machine-word CAS can't atomically swap a multi-field struct. This
+is exactly the gap `PLAN_NULLABLE_POINTER_UNION.md` (already in this
+repo, unimplemented) proposes closing — a tagless, bare-pointer
+representation for a `T|None` union whose one non-`None` member is
+pointer-shaped — but that document explicitly scopes itself to
+`Ptr[T]`/`ConstPtr[T]` only (its own "Proposed semantics" section), not
+to `RCClass|None`. Whether extending it to cover `RCClass|None` too is
+easy (an RC reference is already represented as a bare, inherently-
+nullable pointer in its own non-`Optional` form — see this document's own
+earlier finding that a bare `Box`-typed global emits as a plain
+`struct Box* name`) or has its own complications wasn't investigated here
+and needs its own pass before this mechanism can ship. The alternative —
+a double-width CAS (`cmpxchg16b` on x86-64 / GCC-clang's `_Atomic
+__int128` / MSVC's `_InterlockedCompareExchange128`) operating directly
+on today's tagged-struct representation — sidesteps needing that other
+plan to land first, but its own portability across all three compilers
+this repo requires (MSVC's intrinsic is a different API shape from GCC/
+clang's `__int128`-based atomics, and this compiler's own `ir.AtomicRMW`/
+`AtomicStore` codegen, `emitter_c.py:2906-2919`, wasn't checked for
+whether it already supports a 16-byte atomic type at all) is unverified
+and is a real open question (see "Open questions" below), not a given.
+
+**Extending `PLAN_NULLABLE_POINTER_UNION.md` to `RCClass|None` is the
+better route of the two, but it doesn't make CAS work for every `T|None`
+shape — worth being precise about the boundary rather than overclaiming
+it.** It closes the gap for exactly the shape that caused the motivating
+bug and is almost certainly the common case in practice (`SomeClass|None`
+— one non-`None`, pointer-shaped member) by making `None` a real `(void*)
+0`, no tag at all — genuinely the more foundational fix, and worth landing
+independent of this document, not just as a means to unlock A.2 (see
+that other plan's own "Recommendation" section, which already reaches the
+same "do this as its own dedicated pass" conclusion for unrelated
+reasons: extern-boundary bridging, unconditional tag-byte cost). But it
+stays a two-tier representation, not a universal one: a union with *more
+than one* non-`None` member (`A|B|None`) has no spare bit pattern to
+self-encode "is this None" and stays a genuine tagged struct regardless
+of this change (`PLAN_NULLABLE_POINTER_UNION.md`'s own "Proposed
+semantics" section is explicit that this is unaffected) — A.2's lock-free
+publish only ever applies to a global/field whose type is the single-
+pointer-payload shape in the first place, so a `Worker|Reactor|None`-typed
+global would still need A.3's lock (or A.2's mechanism only kicks in once
+that specific global's own type qualifies, checked per-global, not
+assumed globally). Scalar payloads (`i32|None`) are also unaffected — no
+natural null sentinel exists for a plain scalar, a separate, still-open
+question `PLAN_NULLABLE_POINTER_UNION.md` itself declines to resolve.
+
+**Detection is also its own, separate question from A.1's.** A.1's
+"was this ever an `ir.Assign` dest" walk finds every reassignment; this
+mechanism additionally needs to recognize the *specific*
+"guarded-by-`is None`, single call site" shape (or prove a more general
+"assigned at most once, ever, on any path" fact) to know it's safe to use
+a lock-free publish instead of A.3/A.4's lock. Scope the first cut to the
+easily-recognized syntactic shape (one assignment site, textually guarded
+by `if <this var> is None:`) rather than attempting a fully general
+once-only proof — the same "don't over-reach past what's cheaply
+checkable" posture the rest of this document already takes (see A.1's
+own `__private`-vs-`_protected`-vs-public cost tiers).
+
+**The same idea applies symmetrically to Part B fields** — a `__private`
+field lazily computed on first *access* (not just in `__init__`, e.g. a
+memoizing getter) is the field-shaped version of this exact pattern, and
+should get the same lock-free CAS publish once the representation
+question above is resolved, rather than Part B's per-object lock.
+
+**`Lazy[T]`/`Once[T]`'s own internal implementation (see "Relationship to
+`Lazy[T]`/`Once[T]`" below) should be built on this CAS mechanism
+directly, not on `FastLock`** — once the representation question is
+resolved, `Lazy[T]` becomes the ergonomic wrapper around exactly this
+lock-free publish, not around a mutex.
+
+### A.3 The lock, for the genuinely-repeated-write case: a paired raw primitive, not a `FastLock`
+
+**Why this case can't go lock-free the same way A.2 does — precisely,
+not by assertion.** A.2's lock-free publish works because the value being
+replaced is always `NULL` — nothing is ever freed by the publishing CAS,
+so there's nothing for a concurrent reader to race. The moment a slot is
+genuinely reassigned more than once, that stops being true, and a bare
+CAS reopens a real gap even with the most natural-looking fix applied.
+Concretely: a reader confirming "the slot still holds `X`" via its own
+`CAS(&slot, X, X)` immediately before increffing does **not** help —
+that confirmation is a fact about the past instant it executed, not a
+reservation. There is still a real window between the confirming CAS
+succeeding and the reader's subsequent `retain_object(X)` call, and a
+writer's entire `CAS(&slot, X, Y)` + `decref(X)` sequence fits inside
+that window on real hardware (the reader can be preempted between the
+two steps for any duration):
+
+```
+slot = X, refcount(X) == 1, owned solely by the slot
+
+Reader R                                Writer W
+--------                                --------
+R1: ptr = atomic_load(&slot)  → X
+R2: CAS(&slot, X, X) succeeds
+    (proves "slot == X held at
+    this instant" — nothing more)
+                                         W1: old = atomic_load(&slot) → X
+                                         W2: CAS(&slot, X, Y) succeeds
+                                         W3: decref(X) → refcount 1→0
+                                             → X is freed
+R3: incref(ptr)  →  ptr points at
+    memory that no longer exists
+```
+
+The structural reason no amount of looping on `slot` alone can close
+this: `retain_object` necessarily dereferences `ptr` to touch
+`ptr->ref_count`, a *different* memory location than `slot`, and no
+atomic operation on `slot` can make a later dereference of `ptr` safe —
+the two locations aren't linked. Closing this lock-free needs one of two
+genuinely different mechanisms, not a cleverer loop:
+
+- **Defer the free** (hazard pointers / epoch-based reclamation) — a
+  writer's decref-to-zero doesn't call the destructor immediately; it
+  waits until no reader could still be mid-load.
+- **Make the reservation and the pointer read one atomic unit** — pack a
+  "readers currently in flight" count *into the same word as the pointer
+  itself*, so a reader's "reserve" is a single atomic RMW purely on
+  `slot`'s own combined `[pointer, count]` value, never dereferencing
+  `ptr` until after the reservation succeeds; the writer must wait for
+  that count to reach zero before it's allowed to actually free. This
+  needs a double-width CAS (`cmpxchg16b`/`_InterlockedCompareExchange128`,
+  128 bits) specifically because the pointer and the reservation count
+  have to live in one atomically-swappable unit — this is the actual,
+  structural reason wide CAS keeps coming up for this problem, not an
+  arbitrary implementation choice. Given this document already needs to
+  resolve a representation question for A.2's `RCClass|None` case (see
+  A.2 above), a future revision of A.3 built on split reference counting
+  is a legitimate lock-free upgrade path once that representation work
+  lands — recorded here as a real option, not attempted in this pass.
+  **Real availability caveat, not just a compiler-support checkbox:**
+  the x86-64 hardware side is close to a non-issue for this repo's actual
+  target matrix (`CMPXCHG16B` has been baseline on mainstream x86-64 CPUs
+  for a long time, and this compiler targets only Windows-x64/Linux-x64
+  across all three verified compilers today, no ARM) — but GCC/Clang
+  don't emit `cmpxchg16b` for a 16-byte atomic *by default*; without an
+  explicit `-mcx16` compile flag, both silently fall back to a
+  libatomic-backed, address-keyed **lock** for 128-bit atomics — i.e. the
+  exact thing this mechanism exists to avoid, reintroduced silently by a
+  missing build flag, with worse overhead than just using a real mutex
+  directly. MSVC's `_InterlockedCompareExchange128` has no equivalent
+  missing-flag trap but does require 16-byte alignment of its operand — a
+  real layout constraint on the `[pointer, count]` packing, not just a
+  performance nicety. None of this has been checked against this
+  compiler's own `ir.AtomicRMW`/`AtomicStore` codegen or build flags
+  (`linker_c.py`) — confirm `-mcx16` is actually wired into the
+  clang/gcc build recipe (and confirm it doesn't regress anything else)
+  before trusting a double-width CAS is genuinely lock-free rather than
+  quietly locked, on every one of the three compilers this repo requires.
+
+Absent one of those, A.3 uses an ordinary lock. `FastLock`
+(`lib/threading.py:35-150`) is itself an `RCClass` — heap
 allocated via `sys.alloc`, with its inner OS lock *also* heap-allocated
 inside `__init__`. Using one `FastLock` per protected global would mean
 two nested heap allocations happening as part of module-global
@@ -316,7 +499,7 @@ machinery:
   spinlock, may be worth building instead of reusing `pthread_mutex_t`
   specifically for this purpose).
 
-### A.3 Where to insert acquire/release
+### A.4 Where to insert acquire/release (the A.3 lock case)
 
 `cfg.py:1758-1782`'s existing `if dest.is_global:` branch is the exact,
 already-present hook: it already knows it's building the special RC
@@ -354,12 +537,12 @@ the same thing twice.
 
 ### B.2 Memory cost — the real open question
 
-A Windows `SRWLOCK` is a single pointer-sized zero-init word (per A.2) —
+A Windows `SRWLOCK` is a single pointer-sized zero-init word (per A.3) —
 adding one to every `ObjectHeader` is close to free (12-16 bytes today →
 20-24). A POSIX `pthread_mutex_t` is up to 40 bytes on glibc — adding
 *that* to every single RC object in the language is a large, blanket
 memory-size regression, not just a POSIX/Windows asymmetry in
-initialization cost (A.2) but now in **steady-state object size** for
+initialization cost (A.3) but now in **steady-state object size** for
 every object in the language, always, regardless of whether it's ever
 touched by more than one thread. This is the single biggest open decision
 in this whole proposal (see "Open questions").
@@ -487,7 +670,7 @@ issue.)
 4. **Read-write lock semantics (open question, not committed).** Most
    accesses to most shared state are reads. SRWLOCK natively supports
    shared/exclusive acquisition (`AcquireSRWLockShared` alongside the
-   exclusive calls `FastLock`/A.2 already use); a POSIX `pthread_rwlock_t`
+   exclusive calls `FastLock`/A.3 already use); a POSIX `pthread_rwlock_t`
    equivalent exists too, at the same `pthread_mutex_t`-vs-something-else
    sizing tradeoff as B.2. Worth prototyping once A/B land, not a
    precondition for landing them.
@@ -511,8 +694,8 @@ a lazy-init site and a crash.
   become reachable from a second OS thread"). Rejected: needs genuinely
   new interprocedural reachability tracking through closures, RC
   assignment, and opaque `@extern` calls (`Thread`/`CreateThread` carry
-  zero compiler-recognized semantics today — confirmed directly, see Part
-  A.3/Part B's investigation) — a much bigger, more fragile feature than
+  zero compiler-recognized semantics today — confirmed directly, see
+  "Cost mitigations" #1 above) — a much bigger, more fragile feature than
   the blanket lock it would be trying to avoid, and still wouldn't help
   the actual bug class this document targets (module globals are
   unconditionally "escaped" by construction — there's nothing for an
@@ -569,6 +752,14 @@ a lazy-init site and a crash.
    linked C library) would silently bypass detection. Needs an explicit
    escape hatch/flag, not a silent assumption that `Thread` is the only
    door.
+6. **`-mcx16` (or equivalent) must actually be wired into the GCC/Clang
+   build recipe** before A.3's future double-width-CAS upgrade path (see
+   A.3 above) can be trusted as genuinely lock-free on those two
+   compilers — without it, both silently fall back to a libatomic-backed
+   *lock* for 128-bit atomics, defeating the entire point. Not a blocker
+   for anything landing in this pass (A.3 uses an ordinary lock today),
+   but must be resolved, and verified against `linker_c.py`'s actual
+   flag set on all three compilers, before that upgrade is ever attempted.
 
 ## Verification plan for any future attempt
 
