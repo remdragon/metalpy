@@ -72,6 +72,30 @@ def _find_inline_body_reserved_name_reassignment( stmts: list[ast.stmt], reserve
 		finder.visit( stmt )
 	return found[0] if found else None
 
+# Identifiers that can never be used as a declared name (a module/class
+# attribute, a function parameter, or a function-local variable) anywhere in
+# a metalpy program - checked the first time each is seen as a Name in Store
+# context. NOT the same thing as emitter_c.py's own _C_KEYWORDS (the full
+# C89/C99/C11 keyword list, silently mangled by prefixing `_` for ordinary
+# locals/parameters - see _c_local_name there). 'inline' specifically can't
+# just be silently mangled that way: `_inline` is ITSELF a reserved
+# identifier under MSVC-compatible headers (a legacy `#define _inline
+# __inline` compatibility macro), so mangling only trades one collision for
+# another, surfacing as a confusing C-level syntax error far downstream
+# instead of a clear one at the user's own source line - confirmed via a
+# real repro (a local named `inline` mangled to `_inline`, which then still
+# failed to compile). Rejected here instead, the same way 'or_return' is
+# reserved below.
+RESERVED_C_IDENTIFIER_NAMES: frozenset[str] = frozenset([ 'inline' ])
+
+def reject_reserved_c_identifier( fail: Callable[[str, ast.AST], NoReturn], name: str, node: ast.AST ) -> None:
+	if name in RESERVED_C_IDENTIFIER_NAMES:
+		fail(
+			f'{name!r} is a reserved identifier and cannot be declared here - the generated C name for it '
+			f'would itself collide with a reserved C identifier',
+			node,
+		)
+
 def is_stub_body( body: list[ast.stmt] ) -> bool:
 	''' a bodyless `...`-only declaration - @overload's own stub convention,
 	reused elsewhere for "this signature has no real implementation yet"
@@ -1338,6 +1362,7 @@ class Discovery( ast.NodeVisitor ):
 	def visit_AnnAssign( self, node: ast.AnnAssign ) -> Variable|None:
 		if not isinstance( node.target, ast.Name ):
 			self.fail( f'unsupported AnnAssign target {node.target!r}', node )
+		reject_reserved_c_identifier( self.fail, node.target.id, node )
 		if isinstance( node.annotation, ast.Name ) and node.annotation.id == 'TypeAlias':
 			self._parse_type_alias( node )
 			return None
@@ -1611,6 +1636,7 @@ class Discovery( ast.NodeVisitor ):
 			# ordinary failure below, unchanged
 		if not isinstance( target, ast.Name ):
 			self.fail( f'unsupported Assign target {target!r}', node )
+		reject_reserved_c_identifier( self.fail, target.id, node )
 		module = self.module_stack[-1]
 		# folded eagerly, same as a function body (_make_function_resolver) -
 		# see the identical comment on visit_AnnAssign
@@ -3067,6 +3093,7 @@ class Discovery( ast.NodeVisitor ):
 								return
 							if arg.arg == 'cls' and fn.is_classmethod:
 								return
+							reject_reserved_c_identifier( self.fail, arg.arg, arg )
 							if arg.annotation is None:
 								self.fail( f'{fn.qualname} parameter {arg.arg!r} has no type annotation', arg )
 							param_type = self.visit( arg.annotation )

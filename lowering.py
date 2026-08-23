@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 import arithmetic_mode
 import cfg
 import ir
-from discovery import Discovery, is_stub_body
+from discovery import Discovery, is_stub_body, reject_reserved_c_identifier
 from errors import CompileError, RedundantCompilationError
 from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format_spec, validate_str_spec, validate_int_spec, validate_float_spec
 from mpy_types import (
@@ -3046,6 +3046,7 @@ class FunctionLowering:
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
 		if not isinstance( node.target, ast.Name ):
 			self.lowering.discovery.fail( f'unsupported AnnAssign target: {ast.unparse(node)}', node )
+		reject_reserved_c_identifier( self.lowering.discovery.fail, node.target.id, node )
 		fn = self._current_fn
 		# Volatile[T] resolves transparently to plain T (discovery.py's
 		# visit_Subscript strips it) - detected here, separately, by peeking
@@ -3378,6 +3379,7 @@ class FunctionLowering:
 		fallback when value_expr has no type of its own to infer from (e.g.
 		range()'s implicit literal start) - every other caller leaves it
 		None, inferring purely from the RHS. '''
+		reject_reserved_c_identifier( self.lowering.discovery.fail, target_id, node )
 		fn = self._current_fn
 		needs_uid_suffix = self._mark_fresh_local_declared( target_id )
 		try:

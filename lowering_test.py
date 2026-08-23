@@ -547,6 +547,70 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( self.discovery.errors.errors ), 1 )
 		self.assertIn( "'x' already has a declared type", str( self.discovery.errors.errors[0] ))
 
+	def test_inline_as_annotated_local_is_rejected( self ) -> None:
+		# 'inline' can't just be silently mangled to `_inline` the way the
+		# rest of emitter_c.py's own _C_KEYWORDS list safely can - `_inline`
+		# is ITSELF a reserved identifier under MSVC-compatible headers (a
+		# legacy `#define _inline __inline` compatibility macro), so
+		# mangling only trades one collision for another. Rejected here
+		# instead, at the metalpy source line, before it ever reaches the
+		# emitter.
+		code = '\n'.join([
+			'def main() -> None:',
+			'	inline: i32 = 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'inline' is a reserved identifier", str( self.discovery.errors.errors[0] ))
+
+	def test_inline_as_bare_local_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	inline = 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'inline' is a reserved identifier", str( self.discovery.errors.errors[0] ))
+
+	def test_inline_as_for_loop_target_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	for inline in range( 3 ):',
+			'		pass',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'inline' is a reserved identifier", str( self.discovery.errors.errors[0] ))
+
+	def test_inline_as_function_parameter_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'def f( inline: i32 ) -> i32:',
+			'	return inline',
+			'def main() -> None:',
+			'	f( 1 )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'inline' is a reserved identifier", str( self.discovery.errors.errors[0] ))
+
+	def test_inline_as_module_global_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'inline: i32 = 1',
+			'def main() -> None:',
+			'	return',
+		])
+		self._import( code )
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( "'inline' is a reserved identifier", str( self.discovery.errors.errors[0] ))
+
 	def test_annotated_redeclaration_across_branches_is_a_compile_error( self ) -> None:
 		# the if/elif/else-arm variant of the two tests above - even
 		# though the two arms are mutually exclusive at runtime (only one
