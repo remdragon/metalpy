@@ -910,7 +910,21 @@ class TypeResolver:
 				# duplicate match_clears_name's own "unchecked result"
 				# clearing (only ever meaningful for a bare-Name subject) for
 				# a promoted field write, which reaches a different branch of
-				# lowering.py's _stmt_Assign that doesn't consult it at all
+				# lowering.py's _stmt_Assign that doesn't consult it at all.
+				# Still tag the ORIGINAL name here, unconditionally (not
+				# gated on has_yield below - the same-name-reuse narrowing
+				# shape `match x: case T(x):` needs it regardless of whether
+				# this particular match crosses a yield): _GeneratorNameRenamer's
+				# whole-body rename pass runs later, before visit_Match's own
+				# (also-later) re-derivation of this same name off node.subject
+				# - by then node.subject is an ast.Attribute (self.x) whenever
+				# x is any promoted local/parameter, which is nearly always
+				# true inside a generator, so that re-derivation silently comes
+				# back None and the reuse-narrowing branch never fires. Tagging
+				# here, before the rename pass ever runs, lets visit_Match read
+				# the original name back regardless of what the rename did to
+				# node.subject.
+				node.generator_original_subject_name = node.subject.id
 				continue
 			has_yield = any(
 				isinstance( n, ( ast.Yield, ast.YieldFrom ))
@@ -7202,8 +7216,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# payload - see _match_pattern's own comment on why): lets a
 		# top-level `case T(x):` that reuses the ORIGINAL subject's own
 		# name (`match x: case T(x): ...`) be recognized as narrowing x
-		# itself, rather than binding a same-named-but-distinct value
-		original_subject_name = node.subject.id if isinstance( node.subject, ast.Name ) else None
+		# itself, rather than binding a same-named-but-distinct value.
+		# generator_original_subject_name (set early, before this
+		# generator's own whole-body rename pass ran - see
+		# _reserve_generator_match_subject_fields's own docstring) takes
+		# priority when present: by the time THIS method runs, node.subject
+		# may already have been rewritten from a plain ast.Name into
+		# `self.<attr>` (whenever the subject is a promoted local/
+		# parameter, which is nearly always true inside a generator),
+		# which would otherwise make the isinstance check below always
+		# come back False and silently disable this narrowing for every
+		# generator. Falls back to the isinstance check for an ordinary
+		# (non-generator) function, where no such tag is ever set and
+		# node.subject genuinely is still the original ast.Name.
+		original_subject_name = getattr( node, 'generator_original_subject_name', None )
+		if original_subject_name is None and isinstance( node.subject, ast.Name ):
+			original_subject_name = node.subject.id
 		# separate from original_subject_name above (which stays Name-only
 		# by design - it feeds _match_pattern's own `case T(x):` PATTERN-
 		# BINDING reuse, only ever meaningful for a bare Name subject to
@@ -7840,7 +7868,33 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# SUBSTITUTED member (str, not T) against the subject
 			# variable's own already-monomorphized type instead, the
 			# same pattern _coerce_into_union already uses.
-			return test, [ self._build_narrow_marker( inner_pattern.name, member, node ) ]
+			# node.subject (the ENCLOSING match statement's own subject,
+			# threaded through unchanged at every recursive level - see
+			# this method's own original_subject_name param comment) is
+			# whatever CURRENT expression form the original bare-Name
+			# subject now has - for a plain function that's still the
+			# same ast.Name it always was, but inside a generator whose
+			# subject name is a promoted local/parameter (nearly always
+			# true - see _reserve_generator_match_subject_fields's own
+			# docstring on why a bare-Name subject is never itself
+			# promoted, only aliased), _GeneratorNameRenamer's earlier
+			# whole-body pass has ALREADY rewritten it into `self.<attr>`
+			# by the time this runs. Building the narrow-marker/_narrowed
+			# key from inner_pattern.name alone (the plain source text)
+			# would then key it as a bare local ('r') while every actual
+			# READ of that name in the arm's own body (already renamed
+			# too) is `self.r` - a synthetic 'self::r' key, per
+			# _narrow_subject_key/_attribute_chain_key's own shared
+			# convention (see visit_If's identical field-narrowing use of
+			# _narrow_subject_key just above _build_narrow_marker's own
+			# definition) - so the two would never match and the
+			# narrowing would silently never be visible to later reads.
+			# _narrow_subject_key(node.subject) generalizes to both forms
+			# for free: a bare ast.Name still resolves to (name, None,
+			# None), unchanged from before.
+			key_info = self._narrow_subject_key( node.subject )
+			key, attr_base, attr_hops = key_info if key_info is not None else ( inner_pattern.name, None, None )
+			return test, [ self._build_narrow_marker( key, member, node, attr_base = attr_base, attr_hops = attr_hops ) ]
 		payload_expr = ast.Attribute(
 			value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
 			attr = f'v_{member.stem}',
