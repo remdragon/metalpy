@@ -695,10 +695,15 @@ class Discovery( ast.NodeVisitor ):
 		than pre-filtering itself: only ever fires for a genuine module-
 		level Function (target.cls is None - a class METHOD, even one
 		reached via a module-qualified path to its owning class, is a
-		different, not-yet-enforced convention) or a global Variable
-		(target.is_global) - never a class attribute, a local, a Type/
-		ClassLike, or anything else find_name/names.get() might hand back.
-		Also a no-op for an `@extern`-bound Function (target.extern_lib is
+		different, not-yet-enforced convention), a global Variable
+		(target.is_global), or a module-level class (target.module is not
+		None - RCClass/CStruct/CUnion/CEnum/TaggedUnion/Protocol all reach
+		here via the shared Type base, see Type.module's own comment; None
+		for every OTHER Type kind - Scalar, Specialization, a synthesized
+		anonymous union, ... - none of those have a real defining module)
+		- never a class attribute, a local, or anything else find_name/
+		names.get() might hand back. Also a no-op for an `@extern`-bound
+		Function (target.extern_lib is
 		not None) - a leading underscore there (e.g. crt.py's `_exit`,
 		binding the real `@extern('c', '_exit')` symbol) reflects the
 		FOREIGN library's own C symbol spelling, not a privacy declaration
@@ -737,6 +742,9 @@ class Discovery( ast.NodeVisitor ):
 		elif isinstance( target, Variable ):
 			if not target.is_global or _is_cexpr_bound_constant( target ):
 				return
+		elif isinstance( target, Type ):
+			if target.module is None:
+				return
 		else:
 			return
 		stem = target.stem
@@ -763,18 +771,35 @@ class Discovery( ast.NodeVisitor ):
 			return
 		# kind == 'package': accessible from the defining module's own
 		# package namespace at any depth (itself, siblings, subpackages) -
-		# NOT from a sibling package or an unrelated top-level module. A
-		# module with no enclosing package of its own (defining_module.
-		# package == '', e.g. a bare top-level lib/foo.py or the entry
-		# point) has no package to widen access to - degenerates to exactly
-		# the module-private boundary above for that case, deliberately
-		# (there's no meaningful "root package" grouping every top-level
-		# module together).
-		owning_namespace = defining_module.package or defining_module.qualname
-		if accessing_module.qualname == owning_namespace or accessing_module.qualname.startswith( owning_namespace + '.' ):
+		# NOT from a sibling package. A module with no enclosing package of
+		# its own (defining_module.package == '', e.g. a bare top-level
+		# lib/foo.py) is still meaningfully grouped with every OTHER bare
+		# top-level module - confirmed as a real false positive:
+		# lib/threading.py's FastLock genuinely needs lib/sys.py's own
+		# `_alloc`, and the two are no less "the same package" than two
+		# files that happen to share one subdirectory - both just sit
+		# directly under lib/ instead. The user's own entry point
+		# (__main__, also package == '') is deliberately EXCLUDED from
+		# this top-level grouping on BOTH sides - it's the caller's own
+		# application code, not part of whichever library package it
+		# happens to compile against; granting it (or granting FROM it)
+		# blanket top-level-sibling access would defeat package-privacy
+		# for the single most common case, a user program importing lib/
+		# modules directly.
+		if defining_module.package:
+			owning_namespace = defining_module.package
+			accessible = accessing_module.qualname == owning_namespace or accessing_module.qualname.startswith( owning_namespace + '.' )
+		else:
+			owning_namespace = 'the top level'
+			accessible = (
+				accessing_module.package == ''
+				and defining_module.qualname != '__main__'
+				and accessing_module.qualname != '__main__'
+			)
+		if accessible:
 			return
 		self.fail(
-			f'{target.qualname!r} is only accessible within its own package ({owning_namespace!r} and its '
+			f'{target.qualname!r} is only accessible within its own package ({owning_namespace} and its '
 			f'subpackages) - not accessible from {accessing_module.qualname}\n'
 			f'\tnote: a name starting with a single \'_\' is package-private',
 			ctx,
@@ -883,6 +908,15 @@ class Discovery( ast.NodeVisitor ):
 		if name_obj is None:
 			self.fail( f'{base.qualname} has no member {node.attr!r}', node )
 		assert isinstance( name_obj, Name )
+		# module-level `_x`/`__x` privacy (SYNTAX.md, extended to cover
+		# classes too) - this is discovery's own dotted-reference resolver,
+		# used for a TYPE-position dotted path (an annotation, a base
+		# class, a decorator argument, ...) - a single, sequential,
+		# non-reentrant pass (unlike TypeResolver._try_resolve_namespace,
+		# which has an unrelated re-probe consumer - see check_module_
+		# visibility's own comment), so self.module_stack[-1] is always
+		# correctly "whoever is doing the accessing" here.
+		self.check_module_visibility( name_obj, node, self.module_stack[-1] if self.module_stack else None )
 		return name_obj
 
 	def visit_BinOp( self, node: ast.BinOp ) -> TaggedUnion:
@@ -2188,6 +2222,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			value_type = value_type,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@enum {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2236,6 +2271,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			packed = packed,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@cstruct {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2271,6 +2307,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			is_interface = True,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if len( node.bases ) > 1:
 			self.fail(
@@ -2321,6 +2358,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			packed = packed,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@cunion {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2349,6 +2387,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@union {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2377,6 +2416,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.keywords:
 			self.fail( f'class {qualname} cannot have keywords ({node.keywords!r})', node )
@@ -2450,6 +2490,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@protocol {qualname} cannot have a base classes ({node.bases!r})', node )

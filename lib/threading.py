@@ -17,8 +17,8 @@ import socket
 import atomic
 
 if compiler.target.os == 'windows':
-	from windows.kernel32 import _SRWLOCK
-	LockOpaque: TypeAlias = _SRWLOCK
+	from windows.kernel32 import SRWLOCK
+	LockOpaque: TypeAlias = SRWLOCK
 	# a Win32 thread HANDLE is a void* (Ptr[None])
 	ThreadHandle: TypeAlias = Ptr[None]
 else:
@@ -33,7 +33,7 @@ else:
 
 
 class FastLock:
-	__lock: Ptr[LockOpaque]  # Ptr[_SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
+	__lock: Ptr[LockOpaque]  # Ptr[SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
 	__locked: bool
 
 	# ------------------------------------------------------------------
@@ -49,11 +49,11 @@ class FastLock:
 	@compiler.target( os = not 'windows' )
 	def __init__( self ) -> None:
 		from posix.pthread import pthread_mutex_init
-		# sys.alloc_raw returns Ptr[u8] — pthread_mutex_init expects
+		# sys._alloc returns Ptr[u8] — pthread_mutex_init expects
 		# pthread_mutex_t*, but void*/u8* implicitly converts there;
 		# we zero the raw bytes before init for defense-in-depth
 		mutex_size: usize = compiler.sizeof( LockOpaque )
-		raw: Ptr[u8] = sys.alloc_raw( mutex_size )
+		raw: Ptr[u8] = sys._alloc( mutex_size )
 		sys.memzero( raw, mutex_size )
 		self.__lock = raw
 		result: i32 = pthread_mutex_init( self.__lock, None )

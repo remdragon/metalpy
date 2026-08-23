@@ -193,7 +193,7 @@ class HTTPConnectionLoopbackTests( test_support.RealCompileMixin, unittest.TestC
 import threading
 from atomic import Atomic
 from socket import Socket
-from http.client import HTTPConnection, _Connection, Response, HTTPError
+from http.client import HTTPConnection, Connection, Response, HTTPError
 
 class EchoServer:
 	port: u16
@@ -231,7 +231,7 @@ def main() -> i32:
 	while not server.ready.load():
 		pass
 
-	conn: _Connection[Socket] = HTTPConnection.connect( '127.0.0.1', u16( 18765 )).unwrap( 'client connect' )
+	conn: Connection[Socket] = HTTPConnection.connect( '127.0.0.1', u16( 18765 )).unwrap( 'client connect' )
 	conn.request( 'GET', '/', None, None ).unwrap( 'client request' )
 	resp: Response = conn.getresponse().unwrap( 'client getresponse' )
 	conn.close()
@@ -257,7 +257,7 @@ def main() -> i32:
 import threading
 from atomic import Atomic
 from socket import Socket
-from http.client import HTTPConnection, _Connection, Response, HTTPError
+from http.client import HTTPConnection, Connection, Response, HTTPError
 
 class ChunkedServer:
 	port: u16
@@ -295,7 +295,7 @@ def main() -> i32:
 	while not server.ready.load():
 		pass
 
-	conn: _Connection[Socket] = HTTPConnection.connect( '127.0.0.1', u16( 18766 )).unwrap( 'client connect' )
+	conn: Connection[Socket] = HTTPConnection.connect( '127.0.0.1', u16( 18766 )).unwrap( 'client connect' )
 	conn.request( 'GET', '/', None, None ).unwrap( 'client request' )
 	resp: Response = conn.getresponse().unwrap( 'client getresponse' )
 	conn.close()
@@ -312,10 +312,10 @@ def main() -> i32:
 ''' ),
 			( 'connect_refused_surfaces_as_err', '''
 from socket import Socket
-from http.client import HTTPConnection, _Connection, HTTPError
+from http.client import HTTPConnection, Connection, HTTPError
 
 def main() -> i32:
-	result: Result[_Connection[Socket], HTTPError] = HTTPConnection.connect( '127.0.0.1', u16( 18767 )) # nothing listening
+	result: Result[Connection[Socket], HTTPError] = HTTPConnection.connect( '127.0.0.1', u16( 18767 )) # nothing listening
 	if result.is_ok():
 		return 1
 	return 0
@@ -831,7 +831,7 @@ class HTTPSClientTests( test_support.RealCompileMixin, unittest.TestCase ):
 	network-dependent departure ssl_test.py's own handshake tests already
 	are (there's no loopback TLS server here either, for the same reason:
 	lib/ssl.py is client-only - see PLAN_SSL.md). Exercises the actual
-	wiring in lib/http/client.py (the generic _Connection[T], _connect_tls_
+	wiring in lib/http/client.py (the generic Connection[T], _connect_tls_
 	or_http_err, _parse_url's https:// support, HTTPSConnection) against a
 	real server, not just that it compiles. '''
 

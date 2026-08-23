@@ -2063,7 +2063,7 @@ class Tests( unittest.TestCase ):
 
 	def test_compare_is_none_on_tagged_union_emits_a_tag_check( self ) -> None:
 		# `x is None` where x: Foo|None (a real TaggedUnion, e.g.
-		# sys.alloc_raw()'s Ptr[u8]|None) means "the active member is
+		# sys._alloc()'s Ptr[u8]|None) means "the active member is
 		# NoneType" - a tag check via the same _tagged_union_storage
 		# machinery match/conditional-dispatch already use, NOT a flat Cmp
 		# against a synthesized None operand of union type (which wouldn't

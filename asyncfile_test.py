@@ -218,7 +218,7 @@ class Task:
 		handle: reactor.CompletionHandle = reactor.CompletionHandle()
 		tracker: Tracker = self.tracker
 		work: Closure[[], Result[usize, OSError]] = lambda: _slow_job( tracker )
-		job = asyncfile._Job( handle = handle, work = work, waiter = w )
+		job = asyncfile.Job( handle = handle, work = work, waiter = w )
 		asyncfile.pool.submit( job )
 		reactor.wait_for_signal( reactor.Signal.Completion( handle )).unwrap( 'wait_for_signal' )
 

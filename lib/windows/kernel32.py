@@ -343,25 +343,25 @@ def GetSystemTimePreciseAsFileTime(
 # ---------------------------------------------------------------------------
 
 @cstruct
-class _SRWLOCK:
+class SRWLOCK:
 	_opaque: Ptr[None]  # SRWLOCK is a single pointer-sized opaque struct
 
 
 @extern('kernel32', 'AcquireSRWLockExclusive')
 def AcquireSRWLockExclusive(
-	SRWLock: Ptr[_SRWLOCK],
+	SRWLock: Ptr[SRWLOCK],
 ) -> None:
 	...
 
 @extern('kernel32', 'TryAcquireSRWLockExclusive')
 def TryAcquireSRWLockExclusive(
-	SRWLock: Ptr[_SRWLOCK],
+	SRWLock: Ptr[SRWLOCK],
 ) -> bool:
 	...
 
 @extern('kernel32', 'ReleaseSRWLockExclusive')
 def ReleaseSRWLockExclusive(
-	SRWLock: Ptr[_SRWLOCK],
+	SRWLock: Ptr[SRWLOCK],
 ) -> None:
 	...
 

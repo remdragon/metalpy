@@ -2836,7 +2836,7 @@ def main() -> None:
 	def test_ptr_or_none_return_and_is_none_check_compiles( self ) -> None:
 		# Phase 5 milestone (b): mirrors the real, load-bearing shape every
 		# allocation in the language ultimately runs through - lib/sys.py's
-		# own alloc_raw/HeapAlloc/malloc are plain @extern bindings returning a
+		# own _alloc/HeapAlloc/malloc are plain @extern bindings returning a
 		# bare (possibly-null) Ptr[u8] - a union can't cross the @extern
 		# boundary at all (only a plain C value type can), so the synthetic
 		# extern here mirrors that exact shape too, not Ptr[u8]|None

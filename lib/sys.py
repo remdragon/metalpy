@@ -12,7 +12,7 @@ class OwnershipError[T]:
 def alloc[T]( count: usize ) -> Ptr[T]:
 	with compiler.panic_arithmetic( 'allocation size overflow' ):
 		byte_count: usize = count * compiler.sizeof( T )
-	ptr = alloc_raw( byte_count )
+	ptr = _alloc( byte_count )
 	if ptr is None:
 		panic( 'out of memory' )
 	if compiler.target.debug:
@@ -212,22 +212,24 @@ def _assert( cond: bool, msg: str ) -> None:
 		panic( msg )
 
 # raw, untyped allocation - the byte-counted primitive sys.alloc[T] itself
-# builds on (below). Public (not sys._alloc) despite being a thin OS-level
-# wrapper other callers shouldn't normally need directly - lib/threading.py's
-# FastLock genuinely needs it: a raw Ptr[u8] of an exact byte size, with none
-# of sys.alloc[T]'s own generic-sizing/panic-on-OOM/debug-poisoning behavior
-# (the memory becomes a real OS mutex, which pthread_mutex_init/SRWLOCK's own
-# all-zero-is-unlocked contract must initialize on its own terms). Module-
-# level (module/package) privacy enforcement (SYNTAX.md) would otherwise
-# reject exactly this cross-package reach if this stayed `_alloc`.
+# builds on (below). Package-private (not module-private): lib/threading.py's
+# FastLock genuinely needs it directly - a raw Ptr[u8] of an exact byte size,
+# with none of sys.alloc[T]'s own generic-sizing/panic-on-OOM/debug-poisoning
+# behavior (the memory becomes a real OS mutex, which pthread_mutex_init/
+# SRWLOCK's own all-zero-is-unlocked contract must initialize on its own
+# terms). sys.py and threading.py are both bare top-level lib/ modules (no
+# enclosing package of their own) - module/package privacy enforcement
+# (SYNTAX.md) treats every such module as one implicit shared package, so a
+# single leading underscore already covers this cross-file reach correctly;
+# no need to go fully public.
 @compiler.target( os = 'windows' )
-def alloc_raw( size: usize ) -> Ptr[u8]:
+def _alloc( size: usize ) -> Ptr[u8]:
 	from windows.kernel32 import HeapAlloc, GetProcessHeap
 	ptr = HeapAlloc( GetProcessHeap(), 0, size )
 	return ptr
 
 @compiler.target( os = not 'windows' )
-def alloc_raw( size: usize ) -> Ptr[u8]:
+def _alloc( size: usize ) -> Ptr[u8]:
 	from crt import malloc
 	ptr = malloc( size )
 	return ptr

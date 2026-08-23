@@ -3159,7 +3159,7 @@ class FunctionLowering:
 		# function bodies are deliberately never walked by discovery.py's
 		# own visitor (see this class's docstring: "function bodies were
 		# deliberately left unvisited in stage 1"), so an import written
-		# inside a function body (lib/sys.py's memzero()/alloc_raw()/etc. -
+		# inside a function body (lib/sys.py's memzero()/_alloc()/etc. -
 		# one FFI declaration per @compiler.target(os=...) branch) only
 		# ever reaches here, never discovery.py's version. Registered
 		# directly into the current function's own scope (add_name, same
@@ -11661,7 +11661,7 @@ class FunctionLowering:
 		# this language has today (scalars, pointers, RC handles) identity
 		# coincides with value equality, so this is plain Cmp EQ/NE...
 		# UNLESS one side is a bare `None` literal being compared against a
-		# TaggedUnion-typed value (T|None, e.g. sys.alloc_raw()'s
+		# TaggedUnion-typed value (T|None, e.g. sys._alloc()'s
 		# Ptr[u8]|None) - there, "is None" means "the active member is
 		# NoneType", which needs a tag check (the same UnionStorage.get
 		# machinery match statements/conditional dispatch already use), not
@@ -12408,6 +12408,26 @@ class FunctionLowering:
 		# non-generic class
 		if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			target_cls = self.lowering._ensure_resolved( target_cls )
+
+		# module-level `_x`/`__x` privacy (SYNTAX.md, extended to cover
+		# classes too) - checked HERE, not inside the shared _try_resolve_
+		# namespace utility itself (self.lowering._try_resolve_namespace is
+		# a thin delegate to TypeResolver._try_resolve_namespace, which is
+		# ALSO reached by _stmt_diverges's own unrelated NoReturn re-probe -
+		# see check_module_visibility's own comment on why enforcing
+		# inside that shared utility produced a real false positive for
+		# functions). Gated on target_cls actually being a ClassLike -
+		# confirmed necessary via a SECOND real false positive, the same
+		# shape as _stmt_diverges's: this recognizer is tried against
+		# EVERY call node (construction_recognizers, _lower_call's own
+		# tuple), including calls to ordinary FUNCTIONS that _try_resolve_
+		# namespace happily resolves before this recognizer declines and
+		# falls through - checking unconditionally there flagged lib/
+		# builtins's own use of sys._assert (a Function, not a class)
+		# purely because THIS probe touched it, not because anything
+		# actually constructed it.
+		if isinstance( target_cls, ClassLike ):
+			self.lowering.discovery.check_module_visibility( target_cls, node.func, self._owning_module )
 
 		# T(...) where T defines a static __call__ dispatches to
 		# T.__call__(...) instead of construction - rewrite node.func to

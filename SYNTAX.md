@@ -583,7 +583,7 @@ At module scope, `import`/`from...import`, `class`/`def` definitions (including 
 
 A global variable's initializer is **not** restricted to a compile-time constant — it can call ordinary functions at real program-startup time; the compiler synthesizes a `__metalpy_init_<name>()` function per initializer, called before `main()` runs.
 
-**Module/Package Visibility**: a module-level function or global whose name starts with `__` (and does **not** also end with `__` — a real dunder like `__init__`/`__str__` is unaffected) is **module-private**: accessible only from the same defining file, never from another module even within the same package. One starting with a single `_` (and not `__`) is **package-private**: accessible from its own defining module, any sibling module in the same package, and any subpackage at any depth — but not from outside that package (a module with no enclosing package of its own has no wider namespace to grant access to, so package-privacy there degenerates to module-privacy). This is enforced at both `from module import _name` (the import itself fails) and `module._name`/`module._name()` (a qualified attribute access or call). This is a **new**, compiler-enforced semantic distinct from the class-level Field Visibility convention above (which remains its own, separately-scoped rule) — Python's own underscore convention carries no such enforcement.
+**Module/Package Visibility**: a module-level function, global, or **class** whose name starts with `__` (and does **not** also end with `__` — a real dunder like `__init__`/`__str__` is unaffected) is **module-private**: accessible only from the same defining file, never from another module even within the same package. One starting with a single `_` (and not `__`) is **package-private**: accessible from its own defining module, any sibling module in the same package, and any subpackage at any depth — but not from outside that package. A module with no enclosing package of its own (a bare top-level `lib/foo.py`) is still grouped with every *other* such bare top-level module for this purpose — they're all siblings in the implicit top-level "package" — **except** the program's own entry point (`__main__`), which is deliberately excluded from that grouping on both sides: it's the caller's own application code, not part of whichever library package it happens to import. This is enforced at `from module import _name`, at `module._name`/`module._name()` (a qualified attribute access or call), at `module._ClassName(...)` (construction), and in a type annotation referencing `module._ClassName`. This is a **new**, compiler-enforced semantic distinct from the class-level Field Visibility convention above (which remains its own, separately-scoped rule, covering members *within* a class rather than the class/function/global itself) — Python's own underscore convention carries no such enforcement.
 
 ```metalpy
 # lib/pkg/a.py
@@ -591,13 +591,18 @@ def __helper() -> i32:      # module-private - only lib/pkg/a.py itself can call
 	return 1
 def _shared() -> i32:       # package-private - lib/pkg/* and any lib/pkg/**/* subpackage can call this
 	return 2
+class _Internal:            # package-private classes work the same way
+	pass
 
 # lib/pkg/b.py (sibling module, same package)
-from pkg.a import _shared   # fine - same package
-from pkg.a import __helper  # compile error - module-private to pkg/a.py
+from pkg.a import _shared, _Internal   # fine - same package
+from pkg.a import __helper             # compile error - module-private to pkg/a.py
 
-# some unrelated top-level module
-from pkg.a import _shared   # compile error - outside pkg's own package
+# lib/sibling.py (a DIFFERENT bare top-level module, no package of its own)
+from pkg.a import _shared   # compile error - pkg.a's package is 'pkg', sibling.py isn't in it
+
+# the program's own entry point
+from pkg.a import _shared   # compile error - __main__ is never part of any library's own package
 ```
 
 ```metalpy

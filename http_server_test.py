@@ -45,7 +45,7 @@ import atomic
 import tcp
 import socket
 from socket import Socket
-from http.client import HTTPConnection, _Connection, Response as ClientResponse
+from http.client import HTTPConnection, Connection, Response as ClientResponse
 from http.server import Request, Response, handle_connection
 
 class App:
@@ -81,7 +81,7 @@ class BareClient:
 		self.__flag = flag
 
 	def __try_run( self ) -> Result[None, i32]:
-		conn: _Connection[Socket] = HTTPConnection.connect( '127.0.0.1', self.__port ).unwrap( 'client connect' )
+		conn: Connection[Socket] = HTTPConnection.connect( '127.0.0.1', self.__port ).unwrap( 'client connect' )
 
 		conn.request( 'GET', '/echo', None, None ).unwrap( 'req1' )
 		resp1: ClientResponse = conn.getresponse().unwrap( 'resp1' )
@@ -144,7 +144,7 @@ import reactor
 import tcp
 import socket
 from socket import Socket
-from http.client import HTTPConnection, _Connection, Response as ClientResponse, HTTPHeaders
+from http.client import HTTPConnection, Connection, Response as ClientResponse, HTTPHeaders
 from http.server import Request, Response, serve
 
 class App:
@@ -167,7 +167,7 @@ class ClientDriver:
 		self.__flag = flag
 
 	def __try_run( self ) -> Result[None, i32]:
-		conn: _Connection[Socket] = HTTPConnection.connect( '127.0.0.1', self.__port ).unwrap( 'client connect' )
+		conn: Connection[Socket] = HTTPConnection.connect( '127.0.0.1', self.__port ).unwrap( 'client connect' )
 
 		conn.request( 'GET', '/echo', None, None ).unwrap( 'req1' )
 		resp1: ClientResponse = conn.getresponse().unwrap( 'resp1' )

@@ -6,10 +6,10 @@ from discovery import Discovery
 
 
 class CsvLineReaderTests( test_support.RealCompileMixin, unittest.TestCase ):
-	''' PLAN csv.py, Step 3 - _LineReader is the first chunked-buffered
+	''' PLAN csv.py, Step 3 - LineReader is the first chunked-buffered
 	text-line-splitting layer in lib/ (only raw binary I/O existed before).
 	Writes a real temp file via File.binary_writer, reads it back through
-	_LineReader. Each case's compiled exe runs with the worktree root as its
+	LineReader. Each case's compiled exe runs with the worktree root as its
 	cwd (inherited from the test-runner process), so relative filenames land
 	there - each case uses its own filename to avoid collisions when the
 	merged executable runs all cases in one process. '''
@@ -36,7 +36,7 @@ def main() -> i32:
 	path: str = 'csv_lr_case1.tmp'
 	write_file( path, 'a\\nbb\\nccc\\n' )
 	r = File.binary_reader( path ).unwrap( 'open' )
-	lr = csv._LineReader( r )
+	lr = csv.LineReader( r )
 
 	m1 = lr.next_line().unwrap( 'l1' )
 	if not m1.has_line:
@@ -76,7 +76,7 @@ def main() -> i32:
 	path: str = 'csv_lr_case2.tmp'
 	write_file( path, 'x\\r\\nyy\\r\\n' )
 	r = File.binary_reader( path ).unwrap( 'open' )
-	lr = csv._LineReader( r )
+	lr = csv.LineReader( r )
 
 	m1 = lr.next_line().unwrap( 'l1' )
 	if not m1.has_line:
@@ -110,7 +110,7 @@ def main() -> i32:
 	path: str = 'csv_lr_case3.tmp'
 	write_file( path, 'onlyline' )
 	r = File.binary_reader( path ).unwrap( 'open' )
-	lr = csv._LineReader( r )
+	lr = csv.LineReader( r )
 
 	m1 = lr.next_line().unwrap( 'l1' )
 	if not m1.has_line:
@@ -138,7 +138,7 @@ def main() -> i32:
 	path: str = 'csv_lr_case4.tmp'
 	write_file( path, '' )
 	r = File.binary_reader( path ).unwrap( 'open' )
-	lr = csv._LineReader( r )
+	lr = csv.LineReader( r )
 
 	m1 = lr.next_line().unwrap( 'l1' )
 	if m1.has_line:
@@ -166,7 +166,7 @@ def main() -> i32:
 	path: str = 'csv_lr_case5.tmp'
 	write_file( path, long_line + '\\ntail\\n' )
 	r = File.binary_reader( path ).unwrap( 'open' )
-	lr = csv._LineReader( r )
+	lr = csv.LineReader( r )
 
 	m1 = lr.next_line().unwrap( 'l1' )
 	if not m1.has_line:

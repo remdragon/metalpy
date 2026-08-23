@@ -174,7 +174,7 @@ def inet_pton(
 # file): a `T|None` union as an @extern function's RETURN type corrupts the
 # actual pointer value (it no longer equals the buffer that was passed in),
 # while a bare Ptr/ConstPtr return still supports `is None`/`== None`
-# directly (same as lib/sys.py's `alloc_raw(...) -> Ptr[u8]`, checked with a
+# directly (same as lib/sys.py's `_alloc(...) -> Ptr[u8]`, checked with a
 # plain `if ptr is None:`) since raw pointers are inherently nullable - no
 # union wrapper needed or safe to use here.
 @extern( 'ws2_32', 'inet_ntop' )
