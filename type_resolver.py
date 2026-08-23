@@ -11,7 +11,7 @@ from discovery import Discovery
 from errors import CompileError
 from monomorphize import Monomorphizer
 from mpy_types import (
-	CallableType, CEnum, ClassLike, CStruct, CUnion, Function, GeneratorType, Module, Name, Overload,
+	CallableType, CEnum, ClassLike, ClosureType, CStruct, CUnion, Function, GeneratorType, Module, Name, Overload,
 	Parameter, RCClass, Scalar, Specialization, TaggedUnion, Type,
 	TupleType, TypeVar, Variable,
 )
@@ -3487,6 +3487,12 @@ class TypeResolver:
 			return None
 		inner = t.args[0]
 		return inner if isinstance( inner, CallableType ) else None
+
+	def _closure_type_of( self, t: Type|None ) -> ClosureType|None:
+		''' t's own ClosureType if t IS one - unlike _callable_type_of, no
+		Ptr[...] unwrap: a Closure is always a bare RC value, never
+		Ptr[Closure[...]]. '''
+		return t if isinstance( t, ClosureType ) else None
 
 	def _is_RC( self, t: Type|None ) -> bool:
 		''' true if `t`'s own runtime representation IS a single bare RC
