@@ -1887,6 +1887,30 @@ class CFGState:
 		if isinstance( operand, ir.Temp ):
 			self._temp_states.pop( operand.id, None )
 
+	def snapshot_temp_states( self ) -> dict[int,Type]:
+		''' lowering.py's _expr_BoolOp needs this: a non-last operand's
+		fate (kept by the decisive branch vs. discarded by the sibling
+		"continue" branch) forks into two mutually exclusive RUNTIME paths
+		that both get COMPILE-TIME code generated, sharing the SAME
+		operand/temp - but fresh_temp()/untrack_temp() mutate this dict
+		in place, not scoped per branch. Once the decisive branch (always
+		emitted FIRST in compile-time instruction order) calls
+		untrack_temp() on the operand it's keeping, that removal is
+		permanent from this dict's own perspective - the continue branch's
+		later delete_temp() call on the SAME operand would then find
+		nothing tracked and silently skip its Decref, even though THAT
+		branch is the one that's actually discarding it. Snapshot right
+		before the branch split, restore_temp_states() right before the
+		continue branch's own cleanup, so it sees its own independent,
+		unclaimed view - exactly mirroring _expr_IfExp's true/false
+		branches, each of which gets a fresh view for free by construction
+		(each lowers its own independent sub-expression from scratch,
+		rather than forking off one shared, already-lowered operand). '''
+		return dict( self._temp_states )
+
+	def restore_temp_states( self, snap: dict[int,Type] ) -> None:
+		self._temp_states = dict( snap )
+
 	# --- struct/union field construction (Allocate) -----------------------------
 
 	def field_value( self, t: Type, operand: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:

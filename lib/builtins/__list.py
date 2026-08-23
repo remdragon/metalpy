@@ -377,6 +377,13 @@ class list[T]( Sequence[T], Iterable[T] ):
 		with self.__lock:
 			return self.__inner.__len__()
 
+	def __bool__( self ) -> bool:
+		# Python-style truthiness: an empty list is falsy - see
+		# builtins.str.__bool__'s own docstring for why lowering.py's bare
+		# (non-union) truthiness testing needs this dunder explicitly
+		# rather than defaulting to always-true.
+		return self.__len__() != 0
+
 	def capacity( self ) -> usize:
 		with self.__lock:
 			return self.__inner.capacity()

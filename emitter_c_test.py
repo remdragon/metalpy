@@ -15592,6 +15592,381 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+class BoolOpValuePreservingTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' lowering.py's _expr_BoolOp used to force every `and`/`or` operand
+	into a bool-typed temp before returning it (`5 and 10` compiled to
+	True, not 10 like real Python) - a pre-existing design limitation, not
+	a regression. Fixed to keep the exact same short-circuit CONTROL FLOW
+	(jump on the decisive operand's own truthiness, via the new
+	_truthiness_of_operand - split out of _lower_truth_test so a caller
+	that also needs the operand's own value doesn't have to lower it
+	twice) while returning the decisive operand's real VALUE. A literal
+	operand's statically-known truthiness (`True`/`False`/`0`/...) is
+	folded rather than given a runtime check - see _expr_BoolOp's own
+	comment for why that's load-bearing, not just an optimization:
+	`0 or 'x'` needs 'x' alone to establish the result's type (0's own
+	unrelated int type must never be forced onto it), and `True or
+	foo()` needs foo() to never even be LOWERED (its return type need
+	not agree with True's own type either, the same way Python itself
+	never requires it). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_value_preserving_and_or( self ) -> None:
+		# core semantics from the plan: `5 and 10` -> 10 (not True), `0
+		# and 10` -> 0 (not False), `0 or 10` -> 10, and `0 or 'x'` -> 'x'
+		# - the last one only works if the non-decisive literal `0` is
+		# excluded from fixing the result's type (int and str share no
+		# common type otherwise).
+		self._run( '''
+def main() -> i32:
+	if ( 5 and 10 ) != 10:
+		return 1
+	if ( 0 and 10 ) != 0:
+		return 2
+	if ( 0 or 10 ) != 10:
+		return 3
+	if ( 0 or 'x' ) != 'x':
+		return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_literal_short_circuit_never_calls_skipped_operand( self ) -> None:
+		# `True or foo()` / `False and foo()`: foo() must never be called -
+		# proven here by foo() itself calling sys.exit() with a distinctive
+		# code (105/106) that would blow past main()'s own 0/1/2 exit codes
+		# if it ever ran, rather than by counting calls from inside the
+		# compiled program.
+		self._run( '''
+import sys
+
+def foo( n: i32 ) -> None:
+	sys.exit( n )
+
+def main() -> i32:
+	if ( True or foo( 105 ) ) != True:
+		return 1
+	if ( False and foo( 106 ) ) != False:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_runtime_short_circuit_never_calls_skipped_operand( self ) -> None:
+		# same as above but with a NON-literal decisive operand (a plain
+		# i32 local, not a constant) - exercises the actual JumpIfTrue/
+		# JumpIfFalse runtime path instead of the compile-time literal
+		# fold, still proving the skipped call never executes.
+		self._run( '''
+import sys
+
+def bang( n: i32 ) -> i32:
+	sys.exit( n )
+
+def main() -> i32:
+	big: i32 = 999
+	if ( big or bang( 107 ) ) != 999:
+		return 1
+	zero: i32 = 0
+	if ( zero and bang( 108 ) ) != 0:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rc_operand_bookkeeping( self ) -> None:
+		# dest can now hold an RC value (previously always bool, never RC)
+		# - mirrors IfExpTempLifetimeTests' own aliasing-vs-fresh split:
+		# an ALIASING decisive operand (an existing binding) needs its own
+		# Incref, a FRESH one (a Call result) just moves ownership. Also
+		# covers the genuinely NEW case IfExp never had: a fresh RC value
+		# computed for a NON-decisive operand must still be released
+		# (not leaked) since it's discarded rather than merged into dest.
+		self._run( '''
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		existing: str = 'lower'.lstrip()
+		z: str = existing or 'fallback'
+		if z != 'lower':
+			return 1
+		if compiler.refcount( existing ) != 2:
+			return 2
+		if compiler.refcount( z ) != 2:
+			return 3
+		z2: str = existing.upper() or 'fallback'
+		if z2 != 'LOWER':
+			return 4
+		if compiler.refcount( z2 ) != 1:
+			return 5
+		i: i32 = 0
+		tail: str = 'kept'
+		while i < 1000:
+			base: str = 'discarded'
+			# tail + '' (not the bare literal 'kept' + '' directly): a
+			# BinOp of two literal CONSTANTS gets compile-time constant-
+			# folded (compile_time_transformer.py) straight into the
+			# single immortal literal Const, before this even reaches
+			# _expr_BoolOp - defeating the point of this test (checking
+			# a genuinely FRESH, refcount=1 allocation, not the
+			# immortal METALPY_IMMORTAL_REFCOUNT literal). `tail` is a
+			# runtime variable, never folded, so __add__ genuinely
+			# allocates every iteration, same as IfExpTempLifetimeTests'
+			# own identical `dash + ''` workaround above.
+			kept: str = base.upper() and ( tail + '' )
+			if kept != 'kept':
+				return 6
+			if compiler.refcount( kept ) != 1:
+				return 7
+			i += 1
+		return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_union_operand_excludes_statically_falsy_leaf( self ) -> None:
+		# `z: i32|str = x or y`, x: i32|None - a None x is PROVABLY always
+		# falsy, so `or` can never actually keep it; x's contribution to
+		# z's own required type is therefore just i32 (not i32|None) - the
+		# None leaf must never be forced to also agree with y's own type.
+		# Checked both when x is None (falls through to y) and when x
+		# holds a real i32 (x's own i32 leaf survives, unwrapped).
+		self._run( '''
+def main() -> i32:
+	x1: i32|None = None
+	y1: str = 'y1'
+	z1: i32|str = x1 or y1
+	match z1:
+		case str( s1 ):
+			if s1 != 'y1':
+				return 1
+		case i32( v1 ):
+			return 2
+
+	x2: i32|None = 5
+	y2: str = 'y2'
+	z2: i32|str = x2 or y2
+	match z2:
+		case str( s2 ):
+			return 3
+		case i32( v2 ):
+			if v2 != 5:
+				return 4
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_and_excludes_statically_falsy_leaf_only_for_or( self ) -> None:
+		# `and` never excludes None the way `or` does (see
+		# _boolop_leaf_excluded's own docstring: None is a valid FALSY
+		# survivor for `and`, not excludable) - `x and y`, x: i32|None,
+		# must keep x's FULL type (i32|None), not just i32, since a None x
+		# is exactly the kind of falsy value `and` is supposed to return.
+		self._run( '''
+def main() -> i32:
+	x: i32|None = None
+	y: str = 'y'
+	z: i32|str|None = x and y
+	match z:
+		case str( s ):
+			return 1
+		case i32( v ):
+			return 2
+		case None:
+			return 0
+	return 3
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_last_operand_union_widens_without_exclusion( self ) -> None:
+		# the LAST operand is always emitted even if falsy (real Python
+		# `or`/`and` semantics - see _boolop_union_remap_shape's own
+		# docstring), so unlike a non-last operand, NOTHING gets excluded
+		# from it: `z: str|i32|None = y or x`, x: i32|None LAST - x's own
+		# None leaf must still be a valid member of z's type, since x
+		# survives as-is whenever y is falsy, None included.
+		self._run( '''
+def main() -> i32:
+	x: i32|None = None
+	empty: str = ''
+	z: str|i32|None = empty or x
+	match z:
+		case str( s ):
+			return 1
+		case i32( v ):
+			return 2
+		case None:
+			return 0
+	return 3
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_multi_leaf_exclusion_synthesizes_narrowed_union_with_no_declared_target( self ) -> None:
+		# `z = x or y` (no annotation), x: i32|str|None - TWO leaves (i32,
+		# str) survive excluding x's None, and there's no declared target
+		# union to remap into. _boolop_union_remap_shape used to bail out
+		# of remapping entirely whenever dest wasn't already established
+		# AND more than one leaf survived, falling back to seeding dest
+		# from x's own FULL (unexcluded) type - which either hard-failed
+		# outright (y's type not a member of the wider, unexcluded union)
+		# or silently produced an imprecise type carrying a provably-dead
+		# None member. Fixed by synthesizing/interning a real union of
+		# just the kept leaves (discovery._get_or_create_union, the same
+		# interning every other anonymous union already goes through) and
+		# seeding dest from THAT. Checked two ways: y's type (str) already
+		# a member of x's own full union used to make this silently
+		# compile with an imprecise str|i32|None type (confirmed via a
+		# strict i32|str-only function parameter, which a real
+		# str|i32|None value would be rejected by); a genuinely different
+		# y type (bool) used to hard-fail outright even though real
+		# Python's own `x or y` here unambiguously excludes x's None.
+		self._run( '''
+def take( v: i32|str ) -> i32:
+	match v:
+		case str( s ):
+			if s != 'y':
+				return 1
+			return 0
+		case i32( n ):
+			return 2
+
+def main() -> i32:
+	x: i32|str|None = None
+	y: str = 'y'
+	z = x or y
+	if take( z ) != 0:
+		return 1
+
+	x2: i32|str|None = 5
+	y2: str = 'y2'
+	z2 = x2 or y2
+	if take( z2 ) != 2:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	def test_multi_leaf_exclusion_mismatched_operand_is_still_a_compile_error( self ) -> None:
+		# the synthesized narrowed union (see the test above) is still
+		# just an ordinary union target once built - a later operand whose
+		# own type genuinely doesn't belong to it (bool, vs. the
+		# synthesized i32|str) must stay a real compile error, not
+		# silently widen further to include it too (that would be the
+		# separate, out-of-scope "auto-infer a union across ALL operands"
+		# feature, not this narrowing fix).
+		self._run( '''
+def main() -> i32:
+	x: i32|str|None = None
+	y: bool = True
+	z = x or y
+	return 0
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+
+
+class DefaultTruthinessTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' lowering.py's _truthiness_of_operand used to hard-fail on any
+	operand that wasn't already bool or a Scalar - a bare (non-union) str/
+	list/dict/set, or a plain RCClass instance, could never be used as an
+	if/while/BoolOp/`not` condition at all (see builtins.print()'s own
+	end-parameter comment, which had to work around the str case with an
+	explicit len()!=0 check rather than writing `if end:`). Fixed by
+	dispatching to the type's own __bool__ when it has one (added here for
+	list/dict/set, matching str's pre-existing one - "not empty"), and
+	defaulting any other bare, no-__bool__, non-Scalar type (a real,
+	always-non-null RCClass/CStruct instance) to unconditionally truthy -
+	matching real Python's own bool(obj) default of "true unless __bool__/
+	__len__ says otherwise" (this language has no __len__-based fallback,
+	only explicit __bool__). Also fixed _expr_UnaryOp's `not` operator,
+	which used to apply a raw C `!` to whatever operand it got - correct
+	for a Scalar (both are "!= 0"), but WRONG for any RC/union operand
+	(`!ptr` is a null-pointer check, always false for a live, non-null
+	object - silently wrong for `not ''`, an empty-but-non-null str,
+	correctly falsy per __bool__ but `!ptr` said truthy). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_container_bool_dunders( self ) -> None:
+		self._run( '''
+def main() -> i32:
+	empty_list: list[i32] = list[i32]()
+	if empty_list:
+		return 1
+	empty_list.append( 1 ).unwrap( 'append failed' )
+	if not empty_list:
+		return 2
+
+	empty_dict: dict[str, i32] = dict[str, i32]()
+	if empty_dict:
+		return 3
+	empty_dict[ 'k' ] = 1
+	if not empty_dict:
+		return 4
+
+	empty_set: set[i32] = set[i32]()
+	if empty_set:
+		return 5
+	empty_set.add( 1 )
+	if not empty_set:
+		return 6
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_bare_rcclass_defaults_truthy( self ) -> None:
+		self._run( '''
+class Foo:
+	x: i32
+
+def main() -> i32:
+	f: Foo = Foo( x = 0 )
+	if not f:
+		return 1
+	if f and 1:
+		return 0
+	return 2
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_not_on_bare_str_checks_content_not_pointer( self ) -> None:
+		# regression: `not ''` on an empty-but-non-null str used to
+		# silently test the pointer (always non-null, always "truthy")
+		# instead of str.__bool__'s real "byte_len() != 0" content check
+		self._run( '''
+def main() -> i32:
+	empty: str = ''
+	if not empty:
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+
 class CallableTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Callable[[Args],Ret]/Ptr[Callable[...]] end-to-end - see
 	PLAN_CALLABLE.md: a bare function reference used as a value (never

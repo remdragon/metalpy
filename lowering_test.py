@@ -2216,6 +2216,11 @@ class Tests( unittest.TestCase ):
 	# --- boolean operators (and/or) -------------------------------------------
 
 	def test_boolop_and_shape( self ) -> None:
+		# value-preserving `and`: `a` is only DECISIVE (its own value
+		# reaches dest) when falsy - JumpIfTrue skips that decisive block
+		# (assign+jump-to-end) whenever `a` is truthy, falling into the
+		# continue label where `b` (the last operand) is unconditionally
+		# decisive by exhaustion, no truthiness check needed for it at all.
 		code = '\n'.join([
 			'def main( a: bool, b: bool ) -> None:',
 			'	c: bool = a and b',
@@ -2233,8 +2238,10 @@ class Tests( unittest.TestCase ):
 		self._assert_ir( fn, [
 			ir.FuncStart( name = 'main', params = [ a, b ], return_type = none_type ),
 			ir.DeclareTemp( temp = t0 ),
+			ir.JumpIfTrue( cond = a, target = '__booland_continue_1__' ),
 			ir.Assign( dest = t0, src = a ),
-			ir.JumpIfFalse( cond = t0, target = '__booland_0__' ),
+			ir.Jump( target = '__booland_0__' ),
+			ir.Label( name = '__booland_continue_1__' ),
 			ir.Assign( dest = t0, src = b ),
 			ir.Label( name = '__booland_0__' ),
 			ir.Assign( dest = c, src = t0 ),
@@ -2244,6 +2251,10 @@ class Tests( unittest.TestCase ):
 		])
 
 	def test_boolop_or_shape( self ) -> None:
+		# mirror of test_boolop_and_shape above: `a` is decisive (survives
+		# into dest) when TRUTHY for `or` - JumpIfFalse skips that block
+		# whenever `a` is falsy, falling into `b`'s unconditional (last-
+		# operand) decisive assignment instead.
 		code = '\n'.join([
 			'def main( a: bool, b: bool ) -> None:',
 			'	c: bool = a or b',
@@ -2261,8 +2272,10 @@ class Tests( unittest.TestCase ):
 		self._assert_ir( fn, [
 			ir.FuncStart( name = 'main', params = [ a, b ], return_type = none_type ),
 			ir.DeclareTemp( temp = t0 ),
+			ir.JumpIfFalse( cond = a, target = '__boolor_continue_1__' ),
 			ir.Assign( dest = t0, src = a ),
-			ir.JumpIfTrue( cond = t0, target = '__boolor_0__' ),
+			ir.Jump( target = '__boolor_0__' ),
+			ir.Label( name = '__boolor_continue_1__' ),
 			ir.Assign( dest = t0, src = b ),
 			ir.Label( name = '__boolor_0__' ),
 			ir.Assign( dest = c, src = t0 ),
@@ -2275,7 +2288,10 @@ class Tests( unittest.TestCase ):
 		# three operands: only the first two should ever be lowered/jumped
 		# on if the first is falsy at runtime - but since this is static
 		# lowering (not interpretation), what we can actually verify is the
-		# STATIC shape: two JumpIfFalse checks (one per non-last operand)
+		# STATIC shape: two truthiness checks (one per non-last operand,
+		# `and`'s own skip check is JumpIfTrue - see test_boolop_and_shape),
+		# and three labels (one continue label per non-last operand, plus
+		# the shared end label).
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: bool = True',
@@ -2288,8 +2304,54 @@ class Tests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertEqual( kinds.count( 'JumpIfFalse' ), 2 )
-		self.assertEqual( kinds.count( 'Label' ), 1 )
+		self.assertEqual( kinds.count( 'JumpIfTrue' ), 2 )
+		self.assertEqual( kinds.count( 'Label' ), 3 )
+
+	def test_boolop_discarded_non_decisive_fresh_rc_operand_is_decreffed( self ) -> None:
+		# regression: a non-last operand that turns out non-decisive at
+		# runtime (skipped by the short-circuit jump) is fully discarded -
+		# never merged into dest - but _pending_temps/cfg._temp_states are
+		# flat, in-place-mutated bookkeeping shared between the decisive
+		# and continue branches, not scoped per branch the way _expr_
+		# IfExp's true/false branches are. The decisive branch's own flush
+		# (generated FIRST, compile-time-sequentially, right after the
+		# skip-jump) used to permanently remove the operand from both
+		# structures - by the time the continue branch's own flush ran, it
+		# found nothing left to release, so a FRESH RC operand discarded
+		# this way (e.g. `base.upper() and (tail + '')` when base.upper()
+		# is truthy) never got its Decref emitted in EITHER branch's
+		# actual code - a real, silent LEAK, confirmed via direct
+		# inspection (not caught by refcount()-based compile+run testing,
+		# which only ever inspected the SURVIVING value). Fixed via a
+		# _pending_temps/cfg._temp_states snapshot+restore around the
+		# branch split (see _expr_BoolOp's own comment). Checked via IR
+		# shape (not refcount()) since a pure leak doesn't crash or
+		# corrupt anything a compile+run test could otherwise observe.
+		self.discovery.import_name( 'builtins' )
+		code = '\n'.join([
+			'def main() -> None:',
+			'	base: str = "x"',
+			'	tail: str = "y"',
+			'	kept: str = base.upper() and ( tail + "" )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# base.upper()'s own Decref must be emitted exactly once - in the
+		# continue branch's own code, the only path that actually
+		# discards it (the decisive branch, generated first, keeps it
+		# instead - see _expr_BoolOp's own emit_decisive). isinstance(...,
+		# ir.Temp) specifically (not Variable) - only a TEMP's own Decref
+		# is what's in question here; base/tail/kept's own epilogue
+		# Decrefs (all also str) are a separate, already-correct concern.
+		temp_str_decrefs = [
+			instr.value for instr in fn.instructions
+			if type( instr ).__name__ == 'Decref'
+			and isinstance( instr.value, ir.Temp )
+			and getattr( instr.value.type, 'stem', None ) == 'str'
+		]
+		self.assertEqual( len( temp_str_decrefs ), 1 )
 
 	# --- if statements ---------------------------------------------------------
 
@@ -2427,10 +2489,16 @@ class Tests( unittest.TestCase ):
 		# haven.md) and splices the LAST case's own body in unconditionally
 		# instead of chaining it behind a redundant tag check: only ONE
 		# real Cmp (case 0's own tag == 0), one booland short-circuit +
-		# one if-test JumpIfFalse for case 0 - case 1 (Baz) has no test at
-		# all anymore, reached unconditionally once case 0's own check fails
+		# one if-test check for case 0 - case 1 (Baz) has no test at all
+		# anymore, reached unconditionally once case 0's own check fails.
+		# The booland's own short-circuit is now a JumpIfTrue (`and` skips
+		# its decisive/value-preserving block - see _expr_BoolOp - whenever
+		# the first operand is truthy, continuing to the second instead of
+		# forcing a bool coercion the way this used to); the if-test itself
+		# is still a separate, ordinary JumpIfFalse.
 		self.assertEqual( kinds.count( 'Cmp' ), 1 )
-		self.assertEqual( kinds.count( 'JumpIfFalse' ), 2 ) # case 0's own booland short-circuit + if-test
+		self.assertEqual( kinds.count( 'JumpIfTrue' ), 1 ) # case 0's own booland short-circuit
+		self.assertEqual( kinds.count( 'JumpIfFalse' ), 1 ) # case 0's own if-test
 
 	def test_match_union_construction_and_extraction_round_trip( self ) -> None:
 		# construct with one member, match should take that member's arm
