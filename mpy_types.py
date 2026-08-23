@@ -465,6 +465,15 @@ class Variable( Name ):
 	# local variables, neither of which is a standalone compile unit; this is
 	# what lets Compiler._enqueue tell them apart without a separate lookup
 	is_global: bool = False
+	# set by cfg.py's assign() the moment this global is genuinely
+	# reassigned from inside a function body (`global X; X = ...`) - never
+	# set for a global's own module-level initializer, since lower_global()
+	# (lowering.py) emits that ir.Assign directly, bypassing cfg.assign()
+	# entirely (see cfg.py's own is_global branch for why). A global that's
+	# only ever written by its own initializer never sees this flip to
+	# True - PLAN_THREAD_SAFE_SHARED_STATE.md's A.1: provably single-write,
+	# no lock needed. Only meaningful for is_global=True RC-typed globals.
+	reassigned_outside_init: bool = False
 	# set only for a local declared `Volatile[T]` (_stmt_AnnAssign) - means
 	# its C storage must be qualified `volatile` (see emitter_c._declarator)
 	is_volatile: bool = False

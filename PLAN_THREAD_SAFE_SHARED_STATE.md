@@ -2,10 +2,115 @@
 
 ## Status
 
-Proposed. Not implemented. No code changes accompany this document. Do not
-attempt without a dedicated worktree/session — this touches `cfg.py`,
-`emitter_c.py`, and `ObjectHeader`'s own layout, three of the most
-central, heavily-shared pieces of the compiler.
+**Part A (module globals) implemented and confirmed correct for both
+direct and narrowed reads/writes, Windows only.** Part B (instance fields,
+`ObjectHeader` growth) is still fully unimplemented - do not attempt
+without its own dedicated worktree/session, for the reasons this
+document's Part B section already gives.
+
+What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
+`ir.py`/`mpy_types.py`):
+- Detection: `Variable.reassigned_outside_init`, flipped by `cfg.py`'s
+  `assign()` the moment a `global X; X = ...` reassignment is lowered
+  (never for a global's own module-level initializer - `lower_global()`
+  bypasses `cfg.assign()` entirely, confirmed directly).
+- A per-global `SRWLOCK`-shaped lock (`static void*`, zero-init, no
+  separate init function - A.2/A.3's own design), synthesized only for
+  globals that end up needing one.
+- Real `ir.AcquireGlobalLock`/`ir.ReleaseGlobalLock` marker instructions
+  (not emission-time pattern-matching - an earlier version tried
+  reconstructing critical-section boundaries by looking for adjacent
+  `Decref`+`Assign` instructions at emission time and was confirmed
+  unsound: a union-typed global's decref/incref is a multi-instruction
+  tag-check+extract sequence, not a bare `Decref`/`Incref`, so the pattern
+  never matched the exact shape that caused the original bug).
+- **A direct read/write of a plain, non-Optional RC-typed global**:
+  confirmed correct under real concurrent stress (40 OS threads, 8 of them
+  reassigning while 32 concurrently read, 2000 iterations each - see
+  `thread_safe_globals_test.py`'s `test_concurrent_read_write_stress`).
+- **A narrowed read of a union-typed global** (`X: SomeClass|None`, `if X
+  is None: X = compute(); ...; return X` - **the exact shape
+  `lib/datetime.py`'s `localtz()` and `lib/termcolor.py`'s `_codes()`
+  themselves use**): also confirmed correct under real concurrent stress
+  (64 threads, 3000 iterations each, no manual lock at all - see
+  `test_narrowed_read_concurrent_stress`). Narrowing extracts a union's
+  payload via a *separate* lowering.py code path (`_expr_Name`'s own
+  narrowed-read rewrite, `lowering.py` around the `member is not None`
+  branch) that used to return a bare, unprotected view with no lock at
+  all - fixed by having that extraction perform its own protected
+  extract-and-retain (Acquire, both `GetAttr`s, `Incref`, Release, all in
+  one critical section) and register the result via `cfg.py`'s existing
+  `fresh_temp()`/`is_fresh_temp()` tracking (the same mechanism an
+  ordinary `Call`/`Allocate` result already uses) so that whichever of
+  `cfg.assign()`'s `is_alias` branch or `_incref_aliasing_return` (the
+  `return X` path specifically - a *different* mechanism from
+  `cfg.assign()`, confirmed by reading it directly) consumes the result
+  next recognizes it's already owned and doesn't increment it a second
+  time. **This fix is scoped to `_expr_Name` only** (module globals and
+  locals) - `_expr_Attribute`'s own, separately-duplicated narrowed-read
+  rewrite (for a narrowed *field*, e.g. `self._g.field`) is untouched,
+  since field-level locking is squarely Part B, not attempted this pass.
+- Both stress tests verified on clang and MSVC (Windows targets); the
+  mechanism is gated off entirely on POSIX for now (`emitter_c.py`'s
+  `_global_lock_supported()`), confirmed via a real crash under WSL/gcc
+  while building the first stress test - that target is genuinely
+  unprotected still, not silently broken by this change.
+- **Deterministic, non-timing-dependent regression coverage** alongside
+  the (necessarily non-deterministic) stress tests:
+  `lowering_test.py`'s exact-IR assertions confirm the lock markers land
+  in precisely the right positions with zero threading involved - a
+  regression here fails 100% of the time instead of "probably, if the
+  race happens to fire." Covers: a protected global's write (Decref+Assign
+  share one lock), a protected global's direct read (Incref+Assign share
+  one lock), a scalar (non-RC) global getting no markers at all on either
+  side, and the narrowed-read case (checked structurally - the presence
+  and adjacency of Acquire→[2×GetAttr]→Incref→Release as one block, not a
+  full exact-IR match, since the surrounding narrowing control flow is
+  incidental to what's being tested and would make the assertion brittle
+  to unrelated future changes). Each was confirmed to actually fail
+  without its corresponding fix, not just pass trivially.
+- **Two real bugs found and fixed along the way, worth knowing about if
+  you touch this code:**
+  1. Protecting only the `Incref`/`Decref` is NOT enough.
+     `ir.Assign(dest=b, src=X)` is its own, independent textual read of
+     `X` in the generated C (`b = X;`) - it does not reuse whatever value
+     an adjacent `Incref`/`Decref` already touched. An earlier version of
+     this implementation closed the read-side lock *before* emitting that
+     Assign; under real concurrent load this let a writer swap the global
+     in the gap between them, retaining one object while binding to a
+     different one - confirmed via an actual crash, not reasoned about in
+     the abstract. The fix: the Assign has to be inside the *same*
+     critical section as the Incref/Decref, on both the read and write
+     sides (see `lowering.py`'s `_cfg_assign`).
+  2. `cfg.assign()`'s `is_alias` branch previously increfed
+     unconditionally whenever `is_alias` was `True`, trusting the
+     *source AST shape* (a bare Name/Attribute "looks aliasing") rather
+     than what the expression actually *lowered to*. Once `_expr_Name`'s
+     narrowed-read fix started handing back an already-owned, freshly-
+     retained temp for exactly this shape, that unconditional incref
+     would have silently double-owned it (a leak). Fixed by checking
+     `cfg.py`'s own `is_fresh_temp(src)` first and taking the ownership-
+     transfer path instead when true - which is also a general
+     correctness improvement independent of this document's own
+     mechanism, not just a narrow enabler for it.
+
+**What's confirmed NOT yet covered - do not assume otherwise:**
+- POSIX (`pthread_mutex_t`) - A.3's own documented asymmetry, not
+  attempted this pass; the whole mechanism is a no-op there today.
+- A.2's lock-free CAS publish path - not attempted; A.3's lock is used
+  unconditionally for every protected global this pass covers.
+- Narrowed reads of a narrowed *field* (`_expr_Attribute`'s own copy of
+  the same rewrite) - deliberately out of scope, see above; that's Part B
+  territory (a field belongs to an object, not a module).
+- The write-once-at-init cost mitigations, `_protected`/`__private` field
+  enforcement, and everything else in Part B - unimplemented, as
+  originally scoped.
+- `lib/datetime.py`'s `localtz()`/`lib/termcolor.py`'s `_codes()` still
+  keep their own explicit `threading.FastLock` - this mechanism being
+  solid now doesn't obligate removing a working, already-verified guard
+  from shipped library code for its own sake; the mechanism's correctness
+  for their exact shape is verified independently, via
+  `thread_safe_globals_test.py`'s own narrowed-read stress test.
 
 ## Context
 
