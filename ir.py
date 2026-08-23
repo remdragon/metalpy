@@ -684,6 +684,13 @@ class AtomicRMW( Instruction ): # compiler.atomic_add/atomic_sub/atomic_exchange
 		return f'AtomicRMW( dest={self.dest!r}, op={self.op!r}, ptr={self.ptr!r}, value={self.value!r} )'
 
 @dataclass( kw_only = True )
+class MarkUnused( Instruction ): # `(void)value;` - explicitly discards an intentionally-unread value (e.g. compiler.atomic_sub()'s fetch-before-op result, called as a bare statement for its side effect only) so -Wunused-but-set-variable/C4189 doesn't fire on the temp that holds it
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'MarkUnused( value={self.value!r} )'
+
+@dataclass( kw_only = True )
 class AtomicCompareExchange( Instruction ): # compiler.atomic_compare_exchange(ptr, expected, desired) -> bool - C11 strong CAS; *expected is updated to the current value on failure
 	dest: Temp
 	ptr: Operand

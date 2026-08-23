@@ -166,7 +166,7 @@ class CcTool:
 		debug: bool = True,
 		asan: bool = False,
 		cflags: str = '',
-		warnings: bool = False,
+		warnings: bool = True,
 	) -> subprocess.CompletedProcess[str]:
 		''' compile a single .c file to a .o object file '''
 		# asan forces debug INFO on regardless of debug/release, so a crash

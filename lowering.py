@@ -5346,10 +5346,16 @@ class FunctionLowering:
 		value = self._lower_expr( node.args[1], pointee )
 		self._emit( ir.AtomicStore( ptr = ptr, value = value ))
 
-	def _lower_compiler_atomic_rmw( self, node: ast.Call, expected_type: Type|None, op: ir.AtomicRMWOp ) -> ir.Operand:
+	def _lower_compiler_atomic_rmw( self, node: ast.Call, expected_type: Type|None, op: ir.AtomicRMWOp, *, want_result: bool = True ) -> ir.Operand:
 		# shared by atomic_add/atomic_sub/atomic_exchange - same shape
 		# (ptr, val), dest gets the value from BEFORE the op (C11
-		# atomic_fetch_add/sub/exchange's own convention)
+		# atomic_fetch_add/sub/exchange's own convention). C11's atomic_fetch_*
+		# always returns a value even when called as a bare statement (the
+		# common case - most callers only want the side effect), so a
+		# want_result=False caller (_stmt_Expr's own bare-statement path)
+		# still needs the same dest temp for the IR shape, but marks it
+		# unused right after so -Wunused-but-set-variable/C4189 doesn't fire
+		# on a temp the source never asked to read
 		if len( node.args ) != 2 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.atomic_{op.value}(...) takes exactly two arguments: {ast.unparse(node)}', node )
 		ptr = self._lower_expr( node.args[0], None )
@@ -5357,6 +5363,8 @@ class FunctionLowering:
 		value = self._lower_expr( node.args[1], pointee )
 		dest = self._new_temp( expected_type or pointee )
 		self._emit( ir.AtomicRMW( dest = dest, op = op, ptr = ptr, value = value ))
+		if not want_result:
+			self._emit( ir.MarkUnused( value = dest ))
 		return dest
 
 	def _lower_compiler_atomic_compare_exchange( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
@@ -13764,15 +13772,15 @@ class FunctionLowering:
 				return result if want_result else None
 
 			case 'atomic_add':
-				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.ADD )
+				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.ADD, want_result = want_result )
 				return result if want_result else None
 
 			case 'atomic_sub':
-				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.SUB )
+				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.SUB, want_result = want_result )
 				return result if want_result else None
 
 			case 'atomic_exchange':
-				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.EXCHANGE )
+				result = self._lower_compiler_atomic_rmw( node, expected_type, ir.AtomicRMWOp.EXCHANGE, want_result = want_result )
 				return result if want_result else None
 
 			case 'atomic_compare_exchange':

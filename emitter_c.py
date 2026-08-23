@@ -1276,6 +1276,17 @@ def _self_qualname( function: Function ) -> str:
 def _has_self( function: Function ) -> bool:
 	return function.cls is not None and not function.is_static and not function.is_classmethod
 
+def _name_used_as_value( name: str, body_text: str ) -> bool:
+	''' emit_function's own unused-parameter (void)-marking check: is `name`
+	genuinely referenced as a value somewhere in the body, as opposed to
+	merely appearing as a struct FIELD of the same name (e.g. `self` is
+	also the Closure struct's own captured-receiver field, so `($t8)->self
+	= ...` mentions the literal token `self` without reading the
+	parameter) - a bare `\bname\b` search alone can't tell those apart and
+	wrongly treats the parameter as used, leaving the real unused
+	parameter's own -Wunused-parameter unsilenced '''
+	return re.search( rf'(?<!\.)(?<!->)\b{re.escape(name)}\b(?!\$)', body_text ) is not None
+
 def _returns_void_in_c( return_type: Type|None ) -> bool:
 	''' NoneType/NoReturn are value-less in C - a real void, not a
 	MetalpyNone struct with nothing in it. Shared by _function_prototype
@@ -2541,11 +2552,11 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 		# (self is a real local, cast from __obj, just above)
 		body_text = '\n'.join( lines[1:] )
 		void_marks: list[str] = []
-		if _has_self( function ) and not re.search( r'\bself\b(?!\$)', body_text ):
+		if _has_self( function ) and not _name_used_as_value( 'self', body_text ):
 			void_marks.append( 'self' )
 		for p in ( function.parameters or [] ):
 			name = _c_local_name( p )
-			if not re.search( rf'\b{re.escape(name)}\b(?!\$)', body_text ):
+			if not _name_used_as_value( name, body_text ):
 				void_marks.append( name )
 		for name in reversed( void_marks ):
 			lines.insert( 1, f'\t(void){name};' )
@@ -2917,6 +2928,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		pointee_c_type = c_type( instr.ptr.type.args[0] )
 		fn_name = { ir.AtomicRMWOp.ADD: 'atomic_fetch_add', ir.AtomicRMWOp.SUB: 'atomic_fetch_sub', ir.AtomicRMWOp.EXCHANGE: 'atomic_exchange' }[instr.op]
 		return [ f'\t{_emit_operand(instr.dest)} = {fn_name}((_Atomic({pointee_c_type})*){_emit_operand(instr.ptr)}, {_emit_operand(instr.value)});' ]
+	if isinstance( instr, ir.MarkUnused ):
+		return [ f'\t(void){_emit_operand(instr.value)};' ]
 	if isinstance( instr, ir.AtomicCompareExchange ):
 		# expected stays a plain T* (not _Atomic-cast) - that's what C11's
 		# own atomic_compare_exchange_strong signature expects for its
