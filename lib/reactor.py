@@ -392,22 +392,23 @@ def _blocking_wait_no_reactor( signal: Signal ) -> Result[None, WaitError]:
 # ---------------------------------------------------------------------------
 # sleep(delta: timedelta) -> Result[None, WaitError]
 #
-# Deliberately NOT lib/time.py (Python's own time.sleep(), just with a
-# timedelta argument instead of a float) - a top-level `import reactor`
-# there triggers a real, confirmed discovery bug: reactor.py's own
-# pre-existing `from datetime import timedelta` (needed for `timeout`
-# above, nothing to do with sleep()) started failing with "module datetime
-# does not export 'timedelta'" and cascaded into unrelated failures
-# elsewhere (lib/datetime.py's own `from zoneinfo import ZoneInfo`, no
-# relation to time.py or reactor.py at all) - some ordering issue in how a
-# deeper module cycle gets discovered once time.py also points at
-# reactor.py (reactor.py already imports time.py; datetime.py already does
-# a function-local `import time` of its own). Confirmed the failure is
-# real and caused by that one new edge specifically: reverted, reran the
-# exact same previously-passing test, it passed again. Not chased down
-# further - worth its own investigation. Living here instead avoids the
-# new edge entirely (reactor.py already imports time and datetime.timedelta,
-# so `sleep` needs no import this module doesn't already have).
+# The real implementation lives HERE, not lib/time.py, even though it's
+# conceptually "time.sleep(), but a timedelta argument instead of a float" -
+# a top-level `import reactor` in lib/time.py would close a real module
+# cycle (time -> reactor -> datetime -> zoneinfo -> time; zoneinfo.py's own
+# `import time` is the closing edge) and made reactor.py's own pre-existing
+# `from datetime import timedelta` (needed for `timeout` above, nothing to
+# do with sleep()) fail with "module datetime does not export 'timedelta'":
+# discovery.py resolves a top-level `from X import Y` eagerly, and a cycle
+# can reach back into a module still mid-scan, before it's gotten to
+# defining Y yet - the same "partially initialized module" limitation
+# CPython's own circular imports have, not a compiler bug. Root-caused and
+# confirmed via discovery_import_cycle_bug (memory) - fixed by staying here
+# rather than by discovery.py somehow tolerating that ordering. lib/time.py
+# does now have its own `sleep()` matching Python's API shape (the natural
+# caller-facing name) - it just gets there with a LOCAL `import reactor`,
+# not a top-level one, which sidesteps the cycle the same way Python
+# programmers already do.
 # ---------------------------------------------------------------------------
 
 def sleep( delta: timedelta ) -> Result[None, WaitError]:

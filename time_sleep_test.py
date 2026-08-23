@@ -1,10 +1,10 @@
 # time_sleep_test.py — real compile+link+run coverage for reactor.sleep(),
 # the reactor-aware sleep primitive built on top of reactor.py's own
-# timeout()/Signal.Completion machinery. Named time_sleep_test.py (not
-# reactor_sleep_test.py) because the feature is conceptually "time.sleep()
-# but timedelta-based and reactor-aware" - see reactor.py's own sleep()
-# docstring for why it lives in reactor.py rather than lib/time.py (a real,
-# confirmed discovery bug when time.py imports reactor.py at module scope).
+# timeout()/Signal.Completion machinery, and for time.sleep(), lib/time.py's
+# own thin forwarding wrapper around it (local, not top-level, imports -
+# see time.py's own sleep() docstring for why: a top-level import there
+# closes a real module cycle, time -> reactor -> datetime -> zoneinfo ->
+# time - discovery_import_cycle_bug in memory).
 
 import unittest
 from pathlib import Path
@@ -146,6 +146,37 @@ def run() -> i32:
 
 def main() -> i32:
 	return run()
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
+	def test_time_sleep_forwards_to_reactor_sleep( self ) -> None:
+		''' time.sleep() itself (not reactor.sleep() directly) - proves the
+		local-import fix end to end: lib/time.py's own sleep() has local
+		`import reactor`/`from datetime import timedelta` satisfying its OWN
+		parameter/return-type annotation, which needed a real discovery.py
+		fix (local_import_own_signature_annotation) to work at all. '''
+		self._run( '''
+import compiler
+import time
+import reactor
+from datetime import timedelta
+
+def run() -> Result[i32, reactor.WaitError]:
+	start: f64 = time.monotonic()
+	time.sleep( timedelta( milliseconds = 150 )).or_return()
+	with compiler.wrap_arithmetic:
+		elapsed: f64 = time.monotonic() - start
+	if elapsed < 0.12:
+		return Result.Ok( 1 )
+	return Result.Ok( 0 )
+
+def main() -> i32:
+	match run():
+		case Result.Ok( code ):
+			return code
+		case Result.Err( _ ):
+			return 90
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
