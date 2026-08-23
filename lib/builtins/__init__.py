@@ -2394,32 +2394,11 @@ def reduce[T, S: Iterable[T]]( fn: Ptr[Callable[[T,T],T]], seq: S ) -> T:
 		value1 = fn( value1, value2 )
 	return value1
 
-@overload
-def sum[T, S: Iterable[T]]( seq: S, start: T ) -> T:
+def sum[T, S: Iterable[T]]( seq: S, start: T = 0 ) -> T:
 	with compiler.wrap_arithmetic:
 		for item in iter( seq ):
 			start += item
 	return start
-
-@overload
-def sum[T, S: Iterable[T]]( seq: S ) -> T:
-	# NOT a default `start: T = 0` on the single-overload form above - a
-	# default parameter's own value gets lowered/filled in by
-	# _finish_generic_call's own default-filling loop (lowering.py), which
-	# hit a real, narrow bug specifically when S binds to tuple[...]'s
-	# synthesized backing class (a plain, non-generic RCClass, unlike list[T]
-	# /slice[T]'s own Specialization-of-a-generic-base shape): the filled-in
-	# default silently never made it into the emitted call's own argument
-	# list, crashing emitter_c.py with a KeyError on 'start' - confirmed via
-	# a real repro. Splitting into two ordinary @overloads (matching min/
-	# max's existing two-overload shape already established above) sidesteps
-	# the whole default-parameter-filling path.
-	it = iter( seq )
-	value: T = it.__next__().unwrap( 'sum(): empty sequence' )
-	with compiler.wrap_arithmetic:
-		for item in it:
-			value += item
-	return value
 
 def ord( s: str ) -> u32:
 	''' the inverse of chr() above - decodes s's own first (and only) code

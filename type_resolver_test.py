@@ -764,6 +764,37 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIsNotNone( first )
 		self.assertIs( first, second )
 
+	def test_implicit_generic_call_tags_resolved_callee_for_an_unannotated_tuple_local( self ) -> None:
+		# _type_of_expr had no ast.Tuple branch at all - an unannotated
+		# local assigned straight from a tuple LITERAL (no annotation
+		# needed, unlike list/slice, which always need one to even compile -
+		# see PLAN_TUPLE.md) fell through visit_Assign's own _type_of_expr(
+		# node.value) call as None, so this whole pass silently declined to
+		# resolve any bare generic call using that local as an argument -
+		# the ONLY realistic way to reach lowering.py's own separate,
+		# once-buggy generic-call default-parameter-filling gap (see
+		# lowering_test.py's GenericCallDefaultParameterTests), confirmed via
+		# a real repro before this branch was added. Each element's inferred
+		# type must match what Lowering._expr_Tuple will ACTUALLY tag it as
+		# (intrinsics.i32, this pass's own _natural_literal_type mapping),
+		# not this class's own annotation-style bare-Constant mapping
+		# (builtins.int) just above - using the wrong one would tag this
+		# call with a DIFFERENT tuple[...] specialization than the one real
+		# lowering builds
+		mod = self._import( '\n'.join([
+			'def take[S]( seq: S ) -> i32:',
+			'	return 0',
+			'',
+			'def main() -> None:',
+			'	t = ( 1, 2, 3 )',
+			'	take( t )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNotNone( callee )
+		self.assertEqual( callee.qualname, '__test__.take[tuple[intrinsics.i32,intrinsics.i32,intrinsics.i32]]' )
+
 	def test_generic_call_on_receiver_local_is_left_untagged( self ) -> None:
 		# x.method() where x is a plain local - fn.names only gains local
 		# entries incrementally as LOWERING itself walks the body, which

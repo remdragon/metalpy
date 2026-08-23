@@ -4504,6 +4504,34 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			else:
 				return None
 			return self.discovery.find_name_or_none( name )
+		if isinstance( node, ast.Tuple ):
+			# mirrors Lowering._expr_Tuple's own per-element natural-type
+			# inference (no outer expected_type there either, for a bare
+			# unannotated tuple local - same posture as this pass's own
+			# Constant handling just above) - each element's REAL lowered
+			# type via _natural_literal_type, NOT this pass's own Constant
+			# branch's annotation-style mapping (bare `1` -> builtins.int
+			# there vs intrinsics.i32 here) - using the wrong one would tag
+			# this tuple with a DIFFERENT TupleType than the one _expr_Tuple
+			# actually builds at real lowering time, two distinct backing
+			# RCClasses for what's supposed to be one tuple type. Without
+			# this branch at all, an unannotated tuple local's type was
+			# invisible to this whole pass (locals.get( name ) stored None
+			# from visit_Assign's own _type_of_expr( node.value ) call),
+			# which is what let a bare generic call whose only argument was
+			# such a local (`take(t)`, t = (1, 2, 3)) slip past this pass's
+			# own eager generic-call resolution and reach lowering.py's
+			# separate, once-buggy default-parameter-filling path instead
+			# (see lowering_test.py's own GenericCallDefaultParameterTests)
+			if len( node.elts ) < 2 or any( isinstance( e, ast.Starred ) for e in node.elts ):
+				return None # same arity/starred restrictions _expr_Tuple itself enforces - not this pass's job to error, just decline
+			elem_types: list[Type] = []
+			for elt in node.elts:
+				t = self._natural_literal_type( elt ) if isinstance( elt, ast.Constant ) else self._type_of_expr( elt )
+				if t is None or isinstance( t, TypeVar ):
+					return None
+				elem_types.append( t )
+			return self.discovery._get_or_create_tuple_type( elem_types )
 		if isinstance( node, ast.Name ):
 			narrowed = self._narrowed.get( node.id )
 			if narrowed is not None and len( narrowed ) == 1:
