@@ -18,6 +18,24 @@
 import compiler
 
 
+def sleep( delta: timedelta ) -> Result[None, reactor.WaitError]:
+	''' Python's time.sleep(seconds: float), but the argument is a timedelta
+	(this compiler's own idiom) and reactor-aware - see reactor.sleep()'s own
+	docstring for the real implementation and semantics, which this just
+	forwards to. Local (not top-level) imports here are load-bearing, not
+	stylistic: reactor.py itself already imports both time and datetime.
+	timedelta, so a top-level `import reactor`/`from datetime import
+	timedelta` here would close a real module cycle (time -> reactor ->
+	datetime -> zoneinfo -> time) - see discovery_import_cycle_bug in
+	memory. A local import breaks the cycle the same way Python programmers
+	always have: by the time this function's own body/signature actually
+	gets resolved, every module involved has already finished its top-level
+	scan. '''
+	import reactor
+	from datetime import timedelta
+	return reactor.sleep( delta )
+
+
 # ---------------------------------------------------------------------------
 # monotonic() -> f64 seconds
 # ---------------------------------------------------------------------------

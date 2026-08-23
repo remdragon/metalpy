@@ -389,6 +389,100 @@ def _blocking_wait_no_reactor( signal: Signal ) -> Result[None, WaitError]:
 			sys.panic( '_blocking_wait_no_reactor: Completion signals require a Worker to hand the result back to - callers must check current_worker() before constructing one' )
 
 
+# ---------------------------------------------------------------------------
+# sleep(delta: timedelta) -> Result[None, WaitError]
+#
+# The real implementation lives HERE, not lib/time.py, even though it's
+# conceptually "time.sleep(), but a timedelta argument instead of a float" -
+# a top-level `import reactor` in lib/time.py would close a real module
+# cycle (time -> reactor -> datetime -> zoneinfo -> time; zoneinfo.py's own
+# `import time` is the closing edge) and made reactor.py's own pre-existing
+# `from datetime import timedelta` (needed for `timeout` above, nothing to
+# do with sleep()) fail with "module datetime does not export 'timedelta'":
+# discovery.py resolves a top-level `from X import Y` eagerly, and a cycle
+# can reach back into a module still mid-scan, before it's gotten to
+# defining Y yet - the same "partially initialized module" limitation
+# CPython's own circular imports have, not a compiler bug. Root-caused and
+# confirmed via discovery_import_cycle_bug (memory) - fixed by staying here
+# rather than by discovery.py somehow tolerating that ordering. lib/time.py
+# does now have its own `sleep()` matching Python's API shape (the natural
+# caller-facing name) - it just gets there with a LOCAL `import reactor`,
+# not a top-level one, which sidesteps the cycle the same way Python
+# programmers already do.
+# ---------------------------------------------------------------------------
+
+def sleep( delta: timedelta ) -> Result[None, WaitError]:
+	''' Python's time.sleep(seconds: float), but the argument is a
+	timedelta (this compiler's own idiom - see lib/datetime.py) and the
+	implementation is reactor-aware: with a Worker driving the calling
+	fiber (current_worker() is not None), yields to the reactor for
+	`delta` instead of blocking its OS thread, so other work already
+	queued on that Worker keeps making progress in the meantime - the same
+	reactor-optional shape every other wait_for_signal()-based primitive
+	in this module already follows. With no Worker driving this thread,
+	sleeps the OS thread for real instead (_blocking_sleep below).
+
+	The reactor-driven path reuses timeout()'s own deadline machinery
+	rather than needing a new Signal kind: it waits on a Signal.Completion
+	whose CompletionHandle is deliberately never completed by anyone,
+	wrapped in `with timeout(delta):` - the ONLY way that wait can ever
+	resolve is the timeout elapsing (a normal sleep) or the reactor
+	shutting down (WaitError.Shutdown, propagated to the caller instead of
+	silently swallowed - callers with real cleanup to do on shutdown
+	should treat it the same as a signal-driven wait being interrupted,
+	not a successful sleep). '''
+	w: Worker|None = current_worker()
+	if w is None:
+		_blocking_sleep( delta )
+		return Result.Ok( None )
+	with timeout( delta ):
+		handle: CompletionHandle = CompletionHandle()
+		match wait_for_signal( Signal.Completion( handle )):
+			case Result.Ok( _ ):
+				sys.panic( 'reactor.sleep: unreachable - a Completion signal fired without ever being completed' )
+			case Result.Err( werr ):
+				match werr:
+					case WaitError.TimedOut( _ ):
+						return Result.Ok( None )
+					case WaitError.Shutdown( _ ):
+						return Result.Err( werr )
+
+
+@compiler.target( os = 'windows' )
+def _blocking_sleep( delta: timedelta ) -> None:
+	from windows.kernel32 import Sleep
+	Sleep( _ms_from_delta( delta ))
+
+@compiler.target( os = not 'windows' )
+def _blocking_sleep( delta: timedelta ) -> None:
+	from posix.time import nanosleep, timespec
+	secs_f: f64 = delta.total_seconds()
+	if secs_f <= 0.0:
+		return
+	with compiler.wrap_arithmetic:
+		sec: i64 = i64( secs_f )
+		frac_s: f64 = secs_f - f64( sec )
+		nsec: i64 = i64( frac_s * 1.0e9 )
+	req = timespec( tv_sec = sec, tv_nsec = nsec )
+	rem = timespec()
+	nanosleep( compiler.addrof( req ), compiler.addrof( rem ))   # best-effort - EINTR is not retried, see lib/posix/time.py's own comment
+
+def _ms_from_delta( delta: timedelta ) -> u32:
+	''' delta.total_seconds() as whole milliseconds, clamped to
+	[0, 4_000_000_000] - 0 for a non-positive duration (Sleep(0) just
+	yields the rest of this thread's timeslice, close enough to "no wait"
+	for a duration that shouldn't have blocked at all), the upper clamp so
+	a multi-year duration can't overflow u32. '''
+	with compiler.wrap_arithmetic:
+		ms_f: f64 = delta.total_seconds() * 1000.0
+	if ms_f <= 0.0:
+		return u32( 0 )
+	if ms_f > 4000000000.0:
+		return u32( 4000000000 )
+	with compiler.wrap_arithmetic:
+		return u32( ms_f )
+
+
 class _ReactorState:
 	''' shared once per Reactor across every one of its Workers (see
 	Reactor.__init__) - the ONLY extra state Worker.drain_fully() needs to

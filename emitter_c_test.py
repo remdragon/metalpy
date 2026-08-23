@@ -17952,6 +17952,61 @@ def main() -> i32:
 		] )
 
 
+class LocalImportOwnSignatureAnnotationTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' A function-body-local `from X import Y` could satisfy a LATER
+	body-local annotation in the same function (LocalImportAnnotationResolution
+	Tests above), but never its own function's PARAMETER or RETURN-TYPE
+	annotation - unconditionally, even with zero import cycle involved.
+	Root cause: those two resolvers run in different passes at different
+	times. discovery.py's _make_function_resolver resolves fn.parameters/
+	fn.return_type FIRST (arg.annotation/fn.node.returns only), strictly
+	before the body is ever walked; type_resolver.py's _ReferenceResolver
+	(which registers local imports into fn.names) only runs LATER, over the
+	body, in resolve_function_body. So a local import could never have run
+	yet by the time its own signature needed it, no matter its position in
+	the body. Found investigating a real discovery/module-cycle bug (see
+	reactor_sleep's own history) where this was the natural workaround
+	(move the import inside the function, matching Python's own idiom for
+	breaking a circular import) - and it failed outright. Fixed by having
+	_make_function_resolver pre-register fn's own body-local Import/
+	ImportFrom statements into fn.names before touching arg.annotation/
+	fn.node.returns at all. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		''' every real compile-and-run program in this class, merged into a
+		single executable (one build for the whole class); a nonzero exit is
+		decoded back to the failing sub-program and its own return code. '''
+		self.assert_programs_run([
+			( 'local_import_satisfies_own_parameter_annotation', '''
+def helper( h: HANDLE ) -> i32:
+	from windows.kernel32 import HANDLE, INVALID_HANDLE_VALUE
+	if h != INVALID_HANDLE_VALUE:
+		return 1
+	return 0
+
+def main() -> i32:
+	from windows.kernel32 import INVALID_HANDLE_VALUE
+	return helper( INVALID_HANDLE_VALUE )
+''' ),
+			( 'local_import_satisfies_own_return_type_annotation', '''
+def make() -> HANDLE:
+	from windows.kernel32 import HANDLE, INVALID_HANDLE_VALUE
+	return INVALID_HANDLE_VALUE
+
+def main() -> i32:
+	from windows.kernel32 import INVALID_HANDLE_VALUE
+	if make() != INVALID_HANDLE_VALUE:
+		return 1
+	return 0
+''' ),
+		] )
+
+
 class FStringTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' f-string (PEP 498) real end-to-end compile-and-run tests
 	(PLAN_FSTRINGS.md). Mirrors StrUpperLowerTests/ListGenericTests' own

@@ -40,6 +40,18 @@ def clock_gettime(
 ) -> i32:
 	...
 
+# lib/time.py's sleep() no-reactor fallback - a real blocking sleep, no
+# libc header pulled in (same reasoning as clock_gettime above). rem is
+# populated with the remaining time if interrupted by a signal (EINTR);
+# lib/time.py doesn't currently retry on that, so callers get a possibly-
+# short sleep in that rare case rather than never returning.
+@extern( 'c', 'nanosleep' )
+def nanosleep(
+	req: Ptr[timespec],
+	rem: Ptr[timespec],
+) -> i32:
+	...
+
 
 def get_local_timezone_name() -> str:
 	# sys_readlink syscall or libc wrapper

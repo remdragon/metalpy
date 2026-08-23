@@ -2987,6 +2987,67 @@ class Discovery( ast.NodeVisitor ):
 			if _overlaps( fn, other ):
 				self.fail_loc( f'{fn.qualname} and {other.qualname} are ambiguous - their parameter types overlap', fn.file, fn.line )
 
+	def _register_leading_function_imports( self, fn: Function ) -> None:
+		''' pre-registers fn's own body-local Import/ImportFrom statements into
+		fn.names before its parameter/return-type annotations (below, in the
+		same body() closure) get resolved. Without this, a local import can
+		never satisfy its OWN function's signature - unlike a body-local
+		annotation LATER in the same function, which type_resolver.py's
+		_ReferenceResolver can already see (local_import_annotation_resolution_
+		fixed), the signature is resolved here, in discovery.py, strictly
+		before _ReferenceResolver ever walks the body at all. Mirrors visit_
+		Import/visit_ImportFrom above, just targeting fn instead of scope_
+		stack[-1] (self.module_stack[-1] is already correct for a relative
+		import's own package lookup, since this only ever runs with module_
+		context(module) active - see body() below).
+
+		Deliberately best-effort, unlike visit_Import/visit_ImportFrom: a
+		BROKEN import (missing module/name) here just skips registering that
+		name rather than failing the whole function via self.fail() - the
+		real statement is still in fn.node.body and gets its own, single,
+		properly-scoped error later at lowering time (lowering.py's own
+		_stmt_ImportFrom, inside lower_function's per-statement recovery
+		boundary - see LocalImportOwnSignatureAnnotationTests/lowering_test.
+		py's test_from_import_missing_*). Failing eagerly here instead
+		double-reported the same broken import AND marked fn.broken before
+		the body was ever lowered, which surfaced a second, unrelated
+		"not every code path returns a value" error instead of the expected
+		one - a real regression caught by lowering_test.py's existing
+		coverage for that exact case. '''
+		for stmt in fn.node.body:
+			if isinstance( stmt, ast.Import ):
+				for alias in stmt.names:
+					try:
+						mod = self.import_name( alias.name )
+					except FileNotFoundError:
+						continue
+					fn.add_name( alias.asname or alias.name, mod )
+			elif isinstance( stmt, ast.ImportFrom ):
+				parts: list[str] = []
+				if stmt.level:
+					package = self.module_stack[-1].package
+					strip = stmt.level - 1
+					parts.extend(( package.split( '.' )[:-strip] if strip else package.split( '.' )) if package else [] )
+					if not parts:
+						continue
+				if stmt.module:
+					parts.append( stmt.module )
+				package = '.'.join( parts )
+				try:
+					mod = self.import_name( package )
+				except FileNotFoundError:
+					continue
+				if not mod:
+					continue
+				for alias in stmt.names:
+					try:
+						item = mod.get_local_or_raise( alias.name )
+					except CompileError:
+						continue
+					if not item:
+						continue
+					fn.add_name( alias.asname or alias.name, item )
+
 	def _make_function_resolver( self, fn: Function, module: Module, class_obj: ClassLike|None, group: Overload|None = None ) -> Callable[[],None]:
 		def body() -> None:
 			# Phase 2 of @compiler.target support (COMPILER-TARGET.md): fold
@@ -2995,6 +3056,7 @@ class Discovery( ast.NodeVisitor ):
 			# lowering attempt
 			fn.node.body = compile_time_transformer.transform_function_body( fn.node.body, self.active_target, self._detect_cc )
 			with self.module_context( module ):
+				self._register_leading_function_imports( fn )
 				with ( self.scope_context( class_obj ) if class_obj is not None else nullcontext() ):
 					with self.scope_context( fn ):
 						args = fn.node.args
