@@ -2387,6 +2387,32 @@ def map[T, U, S: Iterable[T]]( fn: Ptr[Callable[[T],U]], seq: S ) -> Generator[U
 	for item in seq.__iter__(): # not iter(seq) - see enumerate's own comment above
 		yield fn( item )
 
+# IMPORTANT NOTE: because `for i in range( ... )` is such a common idiom, the
+# compiler doesn't use the range functions below in those cases for performance
+# reasons. the implementations below exist when you want to use range() in other
+# ways like `it = iter( range( 10 ))`
+
+def range( stop: isize ) -> Iterator[isize,StopIteration]:
+	# FYI, see IMPORTANT NOTE above re range()
+	i: isize = 0
+	while i < stop:
+		yield i
+		i += 1
+
+def range( start: isize, stop: isize ) -> Iterator[isize,StopIteration]:
+	# FYI, see IMPORTANT NOTE above re range()
+	i: isize = start
+	while i < stop:
+		yield i
+		i += 1
+
+def range( start: isize, stop: isize, step: isize ) -> Iterator[isize,StopIteration]:
+	# FYI, see IMPORTANT NOTE above re range()
+	i: isize = start
+	while i < stop:
+		yield i
+		i += step
+
 def reduce[T, S: Iterable[T]]( fn: Ptr[Callable[[T,T],T]], seq: S ) -> T:
 	it = iter( seq )
 	value1: T = it.__next__().unwrap( 'reduce(): empty sequence' )
