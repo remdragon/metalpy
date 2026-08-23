@@ -34,6 +34,9 @@
 #     ThreadPoolDispatcher closes an overflowing connection outright
 #     rather than propagating the rejection - the peer sees an orderly
 #     close.
+#   - default_pool_size_matches_the_python_heuristic: threading.
+#     default_pool_size() == min(32, cpu_count() + 4), computed dynamically
+#     so it doesn't flake across machines with different core counts.
 
 import unittest
 
@@ -368,6 +371,24 @@ def main() -> i32:
 
 	gate.release.store( True )
 	pool.shutdown( True )
+	return 0
+''' ),
+			( 'default_pool_size_matches_the_python_heuristic', '''
+import compiler
+import sys
+import threading
+
+def main() -> i32:
+	n: u32 = sys.cpu_count()
+	with compiler.wrap_arithmetic:
+		expected: usize = usize( n ) + usize( 4 )
+	if expected > usize( 32 ):
+		expected = usize( 32 )
+	got: usize = threading.default_pool_size()
+	if got != expected:
+		return 1
+	if got < usize( 1 ) or got > usize( 32 ):
+		return 2
 	return 0
 ''' ),
 		], timeout = 30 )   # busy-wait loops on gate release - an infinite-spin regression fails instead of hanging the whole suite, matching reactor_test.py's own convention

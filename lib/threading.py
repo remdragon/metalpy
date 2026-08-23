@@ -473,6 +473,21 @@ class _PoolWorker:
 				return
 
 
+def default_pool_size() -> usize:
+	''' Python's own concurrent.futures.ThreadPoolExecutor default heuristic:
+	min(32, cpu_count() + 4) - a floor for low-core machines, a hard cap
+	against runaway thread counts on many-core ones. NOT used as ThreadPool.
+	__init__'s own default - that stays required, matching reactor.Reactor.
+	__init__(num_workers)'s own convention. A caller that wants a
+	reasonable size without picking one itself can call this explicitly:
+	threading.ThreadPool( threading.default_pool_size() ). '''
+	with compiler.wrap_arithmetic:
+		n: usize = usize( sys.cpu_count() ) + usize( 4 )
+	if n > usize( 32 ):
+		return usize( 32 )
+	return n
+
+
 class ThreadPool:
 	__workers: list[_PoolWorker]
 	__threads: list[Thread]
