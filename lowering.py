@@ -13873,6 +13873,7 @@ class FunctionLowering:
 			# doesn't need filling in here (unlike the non-inline variant) -
 			# this call RETURNS the final operand straight to _lower_call's
 			# own caller, nothing downstream reads `bindings` again
+			self._fill_generic_call_defaults( pending_spec.monomorphized, args, kwargs )
 			return self._lower_inline_call( node, pending_spec.monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 		if id( target ) in self.lowering._eager_return_inference_stack:
@@ -13892,6 +13893,11 @@ class FunctionLowering:
 			# nested generic call inside the body resolves against the
 			# concrete, already-substituted T
 			self.lowering._type_resolver.resolve_function_body( provisional )
+			# see _fill_generic_call_defaults's own docstring - provisional's
+			# own parameters are already substituted (built via
+			# _build_monomorphized_function above), same as any other
+			# generic call's monomorphized target
+			self._fill_generic_call_defaults( provisional, args, kwargs )
 			# forced True regardless of the real want_result - the real
 			# operand (and its .type) is needed to discover the return-only
 			# bindings even when the CALLER's own want_result is False; the

@@ -11328,14 +11328,17 @@ class GenericCallDefaultParameterTests( unittest.TestCase ):
 	way for type_resolver.py's own eager _try_resolve_generic_call pre-pass
 	to miss the call entirely - see _type_of_expr's own lack of an ast.Tuple
 	branch - and fall through to lowering.py's late, unfixed path). The same
-	gap existed at two sibling call sites that also monomorphize a generic
+	gap existed at three sibling call sites that also monomorphize a generic
 	target's parameters without ever filling in an omitted default:
 	_lower_class_generic_method_call (a generic method whose genericity is
-	inherited from its class, e.g. Result.Ok/.Err) and generic class
-	construction (Box(...) where Box[T] is generic). Fixed by adding one
-	shared _fill_generic_call_defaults, mirroring _lower_call_args' own
-	tail, called from all three sites once each has its own monomorphized
-	target in hand. '''
+	inherited from its class, e.g. Result.Ok/.Err), generic class
+	construction (Box(...) where Box[T] is generic), and
+	_infer_return_only_type_params_inline's own two _lower_inline_call call
+	sites (an @inline generic function whose type param is only inferable
+	from its own return type). Fixed by adding one shared
+	_fill_generic_call_defaults, mirroring _lower_call_args' own tail,
+	called from every site once each has its own monomorphized target in
+	hand. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -11388,6 +11391,36 @@ class GenericCallDefaultParameterTests( unittest.TestCase ):
 		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == '$$__new__' ]
 		self.assertEqual( len( calls ), 1 )
 		self.assertIn( 'pad', calls[0].kwargs )
+
+	def test_inline_return_only_inference_fills_in_omitted_default( self ) -> None:
+		# _infer_return_only_type_params_inline (an @inline generic function
+		# whose only type param is inferable from its own RETURN type, never
+		# any parameter - PLAN_RETURN_INFERENCE.md) splices the body directly
+		# rather than emitting an ir.Call at all, via its own two
+		# _lower_inline_call call sites - both had the identical gap, one
+		# call site further down the same crash chain: no ir.Call/emitter_c.py
+		# KeyError here, but the exact same shape one level earlier
+		# (_lower_inline_call's own `kwargs[param.stem]` bindings lookup,
+		# lowering.py) crashed with a bare KeyError on the omitted parameter
+		# - confirmed via a real repro before this fix
+		code = '\n'.join([
+			'@inline',
+			'def make[T]( pad: i32 = 5 ) -> T:',
+			'	return pad',
+			'',
+			'def main() -> i32:',
+			'	x: i32 = make()', # pad omitted - forces the default to be spliced in
+			'	return x',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# the splice's own local for `pad` must be assigned the real default
+		# (5), not left unbound - inspects the spliced Assign directly since
+		# @inline never emits an ir.Call to check kwargs on
+		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem.endswith( '$pad' ) ]
+		self.assertEqual( len( assigns ), 1 )
+		self.assertEqual( assigns[0].src, ir.Const( type = self.discovery.get_intrinsics()['i32'], value = 5 ))
 
 
 class OverloadMoveResolutionTests( unittest.TestCase ):
