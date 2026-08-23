@@ -11109,6 +11109,83 @@ class DefaultValueConstructionTests( unittest.TestCase ):
 			self.assertEqual( disco.errors.errors, [] )
 
 
+class GenericCallDefaultParameterTests( unittest.TestCase ):
+	''' _lower_call_args' own default-value-filling tail (fills in a
+	parameter the CALLER omitted - see DefaultValue*Tests above) only ever
+	ran on the PLAIN, non-generic call path - a bare call to a generic
+	function (`take(x)`, T inferred from the argument) goes through
+	_lower_inferred_generic_call/_finish_generic_call instead, which built
+	args/kwargs straight from what the call site actually wrote and never
+	filled in an omitted default at all. Confirmed via a real repro:
+	emitter_c.py's _emit_call_args crashed with a bare KeyError on the
+	omitted parameter's own stem, reachable in practice specifically via an
+	unannotated tuple local (tuple literals are one of the few shapes whose
+	type doesn't need an annotation to compile, so they're also the easiest
+	way for type_resolver.py's own eager _try_resolve_generic_call pre-pass
+	to miss the call entirely - see _type_of_expr's own lack of an ast.Tuple
+	branch - and fall through to lowering.py's late, unfixed path). The same
+	gap existed at two sibling call sites that also monomorphize a generic
+	target's parameters without ever filling in an omitted default:
+	_lower_class_generic_method_call (a generic method whose genericity is
+	inherited from its class, e.g. Result.Ok/.Err) and generic class
+	construction (Box(...) where Box[T] is generic). Fixed by adding one
+	shared _fill_generic_call_defaults, mirroring _lower_call_args' own
+	tail, called from all three sites once each has its own monomorphized
+	target in hand. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ):
+		return self.compiler._lower( self.discovery.main )
+
+	def test_bare_generic_call_fills_in_omitted_default_bound_to_a_tuple( self ) -> None:
+		code = '\n'.join([
+			'def take[S]( seq: S, pad: i32 = 99 ) -> i32:',
+			'	return pad',
+			'',
+			'def main() -> i32:',
+			'	t = ( 1, 2, 3 )', # unannotated - infers straight from the tuple
+			# literal, unlike list/slice, which need an explicit annotation to
+			# even compile - see this class's own docstring for why this is
+			# the shape that actually reaches the buggy path in practice
+			'	return take( t )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'take' ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertIn( 'pad', calls[0].kwargs )
+
+	def test_generic_class_construction_fills_in_omitted_default( self ) -> None:
+		code = '\n'.join([
+			'class Box[T]:',
+			'	val: T',
+			'	pad: i32',
+			'',
+			'	def __init__( self, val: T, pad: i32 = 77 ) -> None:',
+			'		self.val = val',
+			'		self.pad = pad',
+			'',
+			'def main() -> i32:',
+			'	b = Box( 5 )',
+			'	return b.pad',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# construction lowers to a call against the synthesized $$__new__
+		# (not a bare __init__ call - see _try_lower_construct_call)
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == '$$__new__' ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertIn( 'pad', calls[0].kwargs )
+
+
 class OverloadMoveResolutionTests( unittest.TestCase ):
 	''' move(...) sugar used to only be recognized once a single concrete
 	Function target was already chosen (_check_move_argument, reachable
