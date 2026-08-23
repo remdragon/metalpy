@@ -94,6 +94,28 @@ _REFLECTED_BINOP_DUNDER: dict[str,str] = {
 	'__xor__': '__rxor__',
 }
 
+# ast.operator -> the IN-PLACE dunder name (__iadd__, ...) _stmt_AugAssign
+# tries before falling back to the ordinary out-of-place _BINOP_DUNDER path.
+# No reflected counterpart - Python's own data model has no such concept for
+# in-place operators either (there's no "b.__riadd__(a)"). Gated (see
+# _find_iplace_dunder) on the receiver being an RC-class pointer: only then
+# does mutating self in place have any effect the caller can observe (a
+# CStruct/Scalar receiver's self is passed BY VALUE), so this table is only
+# ever consulted for RC-class receivers.
+_IPLACE_BINOP_DUNDER: dict[type,str] = {
+	ast.Add: '__iadd__',
+	ast.Sub: '__isub__',
+	ast.Mult: '__imul__',
+	ast.FloorDiv: '__ifloordiv__',
+	ast.Mod: '__imod__',
+	ast.Div: '__itruediv__',
+	ast.BitOr: '__ior__',
+	ast.BitAnd: '__iand__',
+	ast.BitXor: '__ixor__',
+	ast.LShift: '__ilshift__',
+	ast.RShift: '__irshift__',
+}
+
 # ArithmeticMode subclass -> the mode-qualified dunder name prefix binop
 # dispatch tries FIRST, before falling back to the base name (__add__ ->
 # __wrapped_add__ under ArithmeticWrap, __saturated_add__ under
@@ -1039,8 +1061,6 @@ class Lowering:
 		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ) and node.func.id == 'range':
 			return 'range'
 		return None
-
-	_FOR_LOOP_ALTERNATIVES = 'call .__len__()/.__getitem__() directly and consume their Result yourself instead'
 
 	def _function_ref_operand( self, fn: Function ) -> ir.FunctionRef:
 		# fn.parameters/fn.return_type must already be resolved (not None) -
@@ -3783,6 +3803,54 @@ class FunctionLowering:
 		# _lower_attr_target_obj's own reasoning and _stmt_Assign's own
 		# Attribute/Subscript branches, just fused with a read first.
 		if isinstance( node.target, ast.Name ):
+			existing = self._existing_local_or_none( node.target.id, node.target, 'cannot use it as an AugAssign target' )
+			# try an __iadd__-family in-place operator FIRST, same reasoning
+			# as the Attribute/Subscript branches below - but only ever
+			# worth even looking for an RC-class target (is_rc_pointer());
+			# lower the target's identity/type before the rvalue (mirroring
+			# how Attribute/Subscript already resolve their own `old` before
+			# lowering `right`) so `right`'s own type inference has the
+			# target's type to hint against. _ensure_resolved(existing), NOT
+			# existing.type - a genuine module-level global's own Variable
+			# may not have had its OWN .resolve run yet at this point (its
+			# .type is None until then, see Variable's own doc), unlike a
+			# GetAttr-produced field/an already-lowered local, which are
+			# always already resolved
+			self.lowering._ensure_resolved( existing )
+			if existing is not None and existing.type is not None and self.lowering._ensure_resolved( existing.type ).is_rc_pointer():
+				# no hint at all (not existing.type, not even usize) - an
+				# RCClass target is never itself a Ptr specialization, and
+				# __iadd__'s own parameter type is independent of the
+				# receiver's type (e.g. Counter.__iadd__(self, v: i32)), so
+				# hinting a bare literal toward existing.type (an RCClass)
+				# would wrongly REJECT it outright (_expr_Constant's own
+				# literal-vs-expected_type check fires regardless of strict)
+				# instead of just widening or skipping a coercion - infer
+				# right's own natural type instead, exactly like an ordinary
+				# `existing + right` BinOp already would (_lower_binary_
+				# operands never hints a non-constant/differently-typed
+				# operand toward the OTHER side's type either)
+				right = self._lower_expr( node.value, None )
+				iplace_method = self._find_iplace_dunder( existing.type, type( node.op ), right.type )
+				if iplace_method is not None:
+					self._emit_iplace_dunder_call( node, iplace_method, existing, right )
+					return
+				# no matching __iadd__ - reproduce `x = x + y` manually;
+				# `right` is already lowered, so this must NOT delegate back
+				# through a synthesized BinOp+_stmt_Assign (that would
+				# re-lower node.value - a real double-evaluation risk this
+				# file already guards against elsewhere, see the comment
+				# above on Attribute/Subscript targets). is_alias=False
+				# matches what the delegated path below would compute
+				# anyway (_is_aliasing_expr never treats a bare BinOp as
+				# aliasing, regardless of its operands)
+				result = self._lower_binop_values( node, existing, right, existing.type )
+				self._cfg.unnarrow( node.target.id )
+				for instr in self._cfg_assign( existing, result, is_alias = False, node = node ):
+					self._emit( instr )
+				self._emit( ir.Assign( dest = existing, src = result ))
+				return
+			# not RC (or not yet declared) - unchanged: synthesized x = x + y
 			read = ast.Name( id = node.target.id, ctx = ast.Load() )
 			ast.copy_location( read, node.target )
 			binop = ast.BinOp( left = read, op = node.op, right = node.value )
@@ -3795,9 +3863,29 @@ class FunctionLowering:
 			attr_var = self.lowering._attr_lookup( obj.type, node.target.attr, node.target )
 			old = self._new_temp( attr_var.type )
 			self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
-			usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-			right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( old.type ) else old.type
-			right = self._lower_expr( node.value, right_hint )
+			field_is_rc = self.lowering._ensure_resolved( attr_var.type ).is_rc_pointer()
+			if field_is_rc:
+				# no hint - see the Name branch's identical comment: a field's
+				# own RCClass type is never a sensible hint for __iadd__'s
+				# independently-typed argument, and hinting a bare literal
+				# toward it would wrongly REJECT it outright (_expr_Constant's
+				# literal-vs-expected_type check isn't strict-gated)
+				right = self._lower_expr( node.value, None )
+			else:
+				usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+				right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( old.type ) else old.type
+				right = self._lower_expr( node.value, right_hint )
+			iplace_method = self._find_iplace_dunder( attr_var.type, type( node.op ), right.type ) if field_is_rc else None
+			if iplace_method is not None:
+				# old aliases the SAME heap object attr_var's own field
+				# already points to (a plain GetAttr read, no incref of its
+				# own) - mutating it in place via __iadd__ already mutates
+				# the field's pointee; the field's own pointer value never
+				# changes, so SetAttr/writeback would be redundant (and, for
+				# writeback in particular, actively pointless - only the
+				# field's pointee changed, not the struct holding the field)
+				self._emit_iplace_dunder_call( node, iplace_method, old, right )
+				return
 			result = self._lower_binop_values( node, old, right, attr_var.type )
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> += value, inside __init__ construction itself -
@@ -3836,30 +3924,72 @@ class FunctionLowering:
 				result = self._lower_binop_values( node, old, right, old.type )
 				self._emit( ir.SetItem( obj = obj, index = index, value = result ))
 			else:
-				# a real __getitem__ - read via it like any other method
-				# call, auto-consuming a Result exactly like an ordinary
-				# `obj[i]` read already does, then write back via
-				# __setitem__ the same way an ordinary `obj[i] = v` already
-				# does - index is lowered exactly once, shared by both
+				# a real __getitem__/__setitem__ pair. Tries an __iadd__-
+				# family in-place operator on the element type FIRST (RC-
+				# class elements only - see _find_iplace_dunder): that path
+				# only ever needs __getitem__'s own single Result consumed
+				# and skips __setitem__ entirely. Falls back to the ordinary
+				# get->combine->set sequence otherwise, with both Results'
+				# coverage checked TOGETHER (_require_chained_result_return)
+				# instead of two independent checks that could each fail at
+				# a different time. index is lowered exactly once, shared by
+				# both the get and (fallback) set calls.
 				setitem_fn = self.lowering._find_method( obj.type, '__setitem__' )
 				if setitem_fn is None:
 					self.lowering.discovery.fail( f'{ast.unparse(node.target.value)} defines __getitem__ but not __setitem__ - cannot assign to {ast.unparse(node.target)}', node.target )
 				self.lowering._ensure_resolved( getitem_fn )
 				self.lowering.schedule( getitem_fn.return_type )
-				index = self._lower_expr( node.target.slice, getitem_fn.parameters[0].type )
-				get_dest = self._new_temp( getitem_fn.return_type )
-				self._emit( ir.Call( dest = get_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
-				old = self._maybe_consume_result( node.target, get_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
-				right = self._lower_expr( node.value, old.type )
-				result = self._lower_binop_values( node, old, right, old.type )
 				self.lowering._ensure_resolved( setitem_fn )
 				self.lowering.schedule( setitem_fn.return_type )
+				index = self._lower_expr( node.target.slice, getitem_fn.parameters[0].type )
+				# the element type - unwrapped from __getitem__'s own
+				# Result[T,E] return type if fallible - is knowable purely
+				# from getitem_fn's declared signature, before the get Call
+				# is even emitted, which lets `right` (and the __iadd__
+				# lookup, which needs right's type) be resolved BEFORE
+				# deciding which path to take, exactly the same "lower the
+				# target/its type first so the rvalue infers against it"
+				# ordering the Attribute/Name branches already use
+				get_shape = self.lowering._type_resolver._result_shape( getitem_fn.return_type )
+				elem_type = get_shape[0] if get_shape is not None else getitem_fn.return_type
+				elem_is_rc = self.lowering._ensure_resolved( elem_type ).is_rc_pointer()
+				# no hint when the element is RC - see the Attribute/Name
+				# branches' identical comment on why elem_type is never a
+				# sensible hint for __iadd__'s own independently-typed
+				# argument (and would wrongly reject a bare literal outright)
+				right = self._lower_expr( node.value, None if elem_is_rc else elem_type, strict = False )
+				iplace_method = self._find_iplace_dunder( elem_type, type( node.op ), right.type ) if elem_is_rc else None
+				get_dest = self._new_temp( getitem_fn.return_type )
+				self._emit( ir.Call( dest = get_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
+				if iplace_method is not None:
+					old = self._maybe_consume_result( node.target, get_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+					# old already went through __getitem__'s own incref (see
+					# lib/builtins/__list.py's __getitem__), so it's a
+					# genuine extra owned reference to the SAME heap object
+					# the container's slot stores - mutating it in place via
+					# __iadd__ already mutates what the container holds.
+					# __setitem__ is skipped entirely: this is the concrete
+					# fix for needing two separately-covered Results (one
+					# from __getitem__, one from __setitem__) for what's
+					# conceptually one fallible operation
+					self._emit_iplace_dunder_call( node, iplace_method, old, right )
+					return
+				set_shape = self.lowering._type_resolver._result_shape( setitem_fn.return_type )
+				error_classes = [ shape[1] for shape in ( get_shape, set_shape ) if shape is not None ]
+				if error_classes:
+					result_cls = self.lowering.discovery.find_name( 'Result', node.target )
+					self.lowering._type_resolver._require_chained_result_return(
+						node.target, result_cls, error_classes, self.lowering._SUBSCRIPT_ALTERNATIVES, fn = self._current_fn,
+					)
+				old = self._consume_checked_result( node.target, get_dest, get_shape[0], extra = None ) if get_shape is not None else get_dest
+				result = self._lower_binop_values( node, old, right, old.type )
 				if setitem_fn.return_type is self.lowering.discovery.get_none_type():
 					self._emit( ir.Call( dest = None, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
 				else:
 					set_dest = self._new_temp( setitem_fn.return_type )
 					self._emit( ir.Call( dest = set_dest, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
-					self._maybe_consume_result( node.target, set_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+					if set_shape is not None:
+						self._consume_checked_result( node.target, set_dest, set_shape[0], extra = None )
 		else:
 			self.lowering.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
 
@@ -5866,6 +5996,22 @@ class FunctionLowering:
 		self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
 		return self._consume_checked_result( node, value, result_type, extra = None )
 
+	def _reject_unconsumed_result_operand( self, node: ast.AST, operand: ir.Operand ) -> None:
+		# an unconsumed Result[T,E] used directly as a binop/comparison
+		# operand is (unlike __len__/__getitem__ above) never legitimate -
+		# Result is itself a @union, so left unchecked it would silently
+		# fall into the ordinary union leaf-pair dispatch and get decomposed
+		# into per-leaf (T, E) arithmetic/comparison instead of erroring
+		shape = self.lowering._type_resolver._result_shape( operand.type )
+		if shape is None:
+			return
+		result_type, error_cls = shape
+		self.lowering.discovery.fail(
+			f'operand is a Result[{result_type.qualname},{error_cls.qualname}] - consume it first '
+			f'via .unwrap()/.or_return()/match: {ast.unparse(node)}',
+			node,
+		)
+
 	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
 		# mirrors _stmt_Assign's Name-target "reuse existing, else infer/
 		# declare" rule (`for i in range(count):` reuses `i` if a variable
@@ -5993,12 +6139,20 @@ class FunctionLowering:
 		self._emit( ir.Assign( dest = obj_var, src = obj ))
 
 		self.lowering._ensure_resolved( len_fn )
+		if self.lowering._type_resolver._result_shape( len_fn.return_type ) is not None:
+			self.lowering.discovery.fail(
+				f'for loop iteration requires an infallible __len__() - '
+				f'{obj.type.qualname if obj.type else "?"}.__len__() returns '
+				f'{len_fn.return_type.qualname}, which can fail - this __len__() call is '
+				f'compiler-synthesized (no source position exists to attach .unwrap()/'
+				f'.or_return() to); iterate manually via while+__getitem__ instead: {ast.unparse(node)}',
+				node,
+			)
 		self.lowering.schedule( len_fn.return_type )
 		len_dest = self._new_temp( len_fn.return_type )
 		self._emit( ir.Call( dest = len_dest, target = len_fn, receiver = obj_var, args = [], kwargs = {} ))
-		len_operand = self._maybe_consume_result( node, len_dest, self.lowering._FOR_LOOP_ALTERNATIVES )
-		len_var = self._declare_hidden_local( f'__for_len_{unique}', len_operand.type, node )
-		self._emit( ir.Assign( dest = len_var, src = len_operand ))
+		len_var = self._declare_hidden_local( f'__for_len_{unique}', len_dest.type, node )
+		self._emit( ir.Assign( dest = len_var, src = len_dest ))
 
 		index_var = self._declare_hidden_local( f'__for_index_{unique}', usize_cls, node )
 		self._emit( ir.Assign( dest = index_var, src = ir.Const( type = usize_cls, value = 0 ) ))
@@ -6025,6 +6179,13 @@ class FunctionLowering:
 			ctx = ast.Load(),
 		)
 		ast.copy_location( subscript, node )
+		# __getitem__ is expected to always be fallible in practice (it must
+		# be able to report IndexError/KeyError) - this read is compiler-
+		# synthesized (no source position for the user to attach .unwrap()/
+		# .or_return() to), so it keeps auto-consuming a Result exactly like
+		# _expr_Subscript used to unconditionally do, unlike ordinary
+		# user-written `x[i]` (see _expr_Subscript's own comment)
+		subscript.is_for_loop_element_read = True
 		bind = ast.Assign( targets = [ node.target ], value = subscript )
 		ast.copy_location( bind, node )
 		self._stmt_Assign( bind )
@@ -8919,7 +9080,9 @@ class FunctionLowering:
 		self._emit( ir.Allocate( dest = pyslice_dest, cls = pyslice_cls, fields = { 'start': start, 'stop': stop } ))
 		dest = self._new_temp( getitem_fn.return_type )
 		self._emit( ir.Call( dest = dest, target = getitem_fn, receiver = obj, args = [ pyslice_dest ], kwargs = {} ))
-		return self._maybe_consume_result( node, dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+		# plain sugar for obj.__getitem__(slice) - see _expr_Subscript's own
+		# comment for why this doesn't auto-consume a fallible result
+		return dest
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
 		if isinstance( node.value, ast.Attribute ) and not isinstance( node.slice, ast.Slice ):
@@ -9004,17 +9167,25 @@ class FunctionLowering:
 			self._emit( ir.GetItem( dest = dest, obj = obj, index = index ))
 			return dest
 
-		# a real __getitem__ - call it like any other method, then if it
-		# returns Result[T,E] (slice.__getitem__'s own real signature, e.g.),
-		# auto-consume it exactly like or_return()/checked arithmetic do:
-		# `obj[i]` reads as sugar for `obj.__getitem__(i).or_return()`
-		# whenever __getitem__ can fail
+		# a real __getitem__ - call it like any other method. `obj[i]` is
+		# plain sugar for `obj.__getitem__(i)`, nothing more: if __getitem__
+		# is fallible, the caller gets the raw Result[T,E] back and consumes
+		# it explicitly (.unwrap()/.or_return()/match), exactly like a
+		# fallible `==`/`!=` already does (see _lower_eq_or_ne) - no
+		# auto-.or_return() sugar here (that's reserved for checked
+		# arithmetic, where formulas get too deep to hand-unwrap every step)
 		self.lowering._ensure_resolved( getitem_fn )
 		self.lowering.schedule( getitem_fn.return_type )
 		index = self._lower_expr( node.slice, getitem_fn.parameters[0].type )
 		call_dest = self._new_temp( getitem_fn.return_type )
 		self._emit( ir.Call( dest = call_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
-		return self._maybe_consume_result( node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+		if getattr( node, 'is_for_loop_element_read', False ):
+			# a for-loop's own per-iteration bind (_lower_for_over_indexable) -
+			# compiler-synthesized, no source position to attach .unwrap()/
+			# .or_return() to, and __getitem__ is expected to always be
+			# fallible in practice - keep auto-consuming here specifically
+			return self._maybe_consume_result( node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+		return call_dest
 
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		return self._lower_call( node, expected_type, want_result = True )
@@ -9155,6 +9326,14 @@ class FunctionLowering:
 		# untouched below when neither operand is a union - existing,
 		# already-verified dunder/reflected-dunder/scalar-arithmetic
 		# tail keeps handling that case exactly as it does today.
+		# Result[T,E] is itself a @union, so it would otherwise fall straight
+		# into the union-leaf-pair dispatch below and get silently
+		# decomposed into per-leaf (T, E) arithmetic instead of erroring -
+		# an unconsumed Result operand here almost always means the user
+		# forgot to .unwrap()/.or_return() a fallible x[i]/x.method() first
+		self._reject_unconsumed_result_operand( node, left )
+		self._reject_unconsumed_result_operand( node, right )
+
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
 		if left_shape is not None or right_shape is not None:
@@ -9962,6 +10141,57 @@ class FunctionLowering:
 		self._emit( ir.Cmp( dest = dest, op = cmp_op, left = left, right = right ))
 		return dest
 
+	def _find_iplace_dunder( self, receiver_type: Type|None, op: type, arg_type: Type ) -> Function|None:
+		''' __iadd__-family lookup for _stmt_AugAssign's Name/Attribute/
+		Subscript target branches. Gated on is_rc_pointer(): only an
+		RC-class receiver's `self` is a single shared pointer whose in-place
+		mutation is externally visible after the call returns - a plain
+		CStruct/Scalar receiver's `self` is passed BY VALUE (see
+		_maybe_deref_arrow_receiver's own comment on receiver-passing
+		conventions), so an __iadd__ found on one would silently mutate a
+		throwaway copy the caller never sees. Never even worth looking there.
+		No reflected variant - Python's own data model has none either. '''
+		if receiver_type is None:
+			return None
+		receiver_type = self.lowering._ensure_resolved( receiver_type )
+		if not receiver_type.is_rc_pointer():
+			return None
+		name = _IPLACE_BINOP_DUNDER.get( op )
+		if name is None:
+			return None
+		return self._find_dunder_for_arg( receiver_type, name, arg_type )
+
+	def _emit_iplace_dunder_call( self, node: ast.AugAssign, method: Function, receiver: ir.Operand, arg: ir.Operand ) -> None:
+		''' Calls an __iadd__-family method purely for its mutating side
+		effect - unlike Python's own convention (an in-place dunder returns
+		a value the caller reassigns, typically `self`), this protocol
+		requires a plain None return: every caller here only ever found this
+		method because the receiver is RC (_find_iplace_dunder's own gate),
+		so mutation is already visible through the shared pointer and there
+		is nothing meaningful to reassign. A method found here that declares
+		a non-None return is almost certainly a signature mistake (someone
+		followed Python's own __iadd__ convention by habit) - fail loudly
+		right here rather than silently discard the return value, which
+		would otherwise mask a real mistake behind a confusing, unrelated
+		error somewhere downstream. '''
+		none_type = self.lowering.discovery.get_none_type()
+		if method.return_type is not none_type:
+			self.lowering.discovery.fail(
+				f'{method.qualname} must return None to be usable as an in-place operator '
+				f'(expected to mutate its receiver directly, not return a value to reassign): {ast.unparse(node)}',
+				node,
+			)
+		self.lowering._resolve_call_target( method )
+		self.lowering.schedule( method.return_type )
+		for p in ( method.parameters or [] ):
+			self.lowering.schedule( p.type )
+		call_receiver = None if method.cls is None else receiver
+		call_args = ( [ receiver, arg ] ) if method.cls is None else [ arg ]
+		if method.is_inline:
+			self._lower_inline_call( node, method, call_receiver, call_args, {}, None, False )
+		else:
+			self._emit( ir.Call( dest = None, target = method, receiver = call_receiver, args = call_args, kwargs = {} ))
+
 	def _find_dunder_for_arg( self, owner_type: Type|None, name: str, arg_type: Type ) -> Function|None:
 		''' like self.lowering._find_method, but Overload-aware: if `name`
 		resolves to a real Overload group on owner_type (multiple defs
@@ -10157,6 +10387,12 @@ class FunctionLowering:
 		# Scalar) has none registered, so `None == x` below still misses
 		# and falls through to the union-recognition/flat-Cmp tail exactly
 		# as before.
+		# Result[T,E] is itself a @union - reject an unconsumed one up front,
+		# on both operands, before either can reach the union-leaf dispatch
+		# below and get silently decomposed into a per-leaf (T, E) compare
+		# (see _lower_binop_values' own identical guard/comment)
+		self._reject_unconsumed_result_operand( node, left )
+
 		method = self._find_dunder_for_arg( left.type, method_name, left.type )
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		# the hint handed to the comparator's own lowering below: left.type,
@@ -10181,6 +10417,7 @@ class FunctionLowering:
 		# silently widening) blind - both are reinstated manually below in
 		# the same order _coerce_or_check_operand itself would try them.
 		right = self._lower_expr( node.comparators[0], right_hint, strict = False )
+		self._reject_unconsumed_result_operand( node, right )
 		if right.type is not left.type:
 			if self._is_safe_scalar_widening( right.type, left.type ):
 				widened = self._new_temp( left.type )
