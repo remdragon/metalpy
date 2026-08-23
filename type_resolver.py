@@ -928,6 +928,94 @@ class TypeResolver:
 			extra_locals[ stem ] = subject_type
 		return extra_locals
 
+	def _reserve_generator_match_binding_fields( self, fn: Function ) -> dict[str,Type]:
+		''' sibling of _reserve_generator_match_subject_fields above, for
+		the OTHER half of a match statement _match_pattern builds directly
+		(bypassing self.visit()/visit_Assign) whenever a pattern actually
+		BINDS a name (`case T(v):`, a bare `case v:`, ...) - the SAME
+		timing gap (the binding doesn't exist as a real AST node until
+		match-desugaring runs, well after this generator's own backing
+		class was already built) gives it the IDENTICAL uninitialized-
+		read-across-a-generator-resume shape confirmed for the subject,
+		just for the extracted PAYLOAD instead. Confirmed via a real repro
+		+ generated-C trace that the binding's own trailing decref really
+		is necessary (not spurious): a leaf class's own Ok(...)-style wrap
+		constructor genuinely retains its argument, so the binding's own
+		separately-owned reference still needs releasing exactly once -
+		cfg.py's ordinary scope-exit tracking places that release at the
+		enclosing if/elif chain's shared exit block, reachable via a
+		resume goto (lowering.py's _lower_generator_yield) that skips
+		straight over the binding's own declaration whenever the arm
+		containing it crosses a yield. Over-promotion posture matches the
+		subject: ANY case whose body contains a yield ANYWHERE gets every
+		one of its own pattern's binding(s) promoted (_walk_generator_
+		match_bindings, below, on a throwaway _ReferenceResolver - same
+		"safe to run this early" posture _resolve_expr_type_for_desugar
+		already established), regardless of whether the bound name is
+		itself referenced again after the yield - the trailing decref
+		exists unconditionally once the binding's own type needs one,
+		independent of whether user code re-reads the name.
+
+		Unlike the subject (a synthetic, compiler-only name never spelled
+		by user code), a binding's own name IS a real, user-visible
+		identifier that ordinary source statements elsewhere in the SAME
+		arm (`case Result.Ok(v): yield v`) already reference as a plain
+		ast.Name - and this compiler already requires every use of one
+		identifier within a single function to share ONE C-level slot
+		regardless of which arm/match bound it (confirmed via a real
+		repro: reusing the same name across two DIFFERENT match
+		statements in one function with an incompatible type is already a
+		real compile error, "already declared earlier in this function...
+		with an incompatible type" - the same invariant an ordinary local
+		already has). So a promoted binding's own field is simply named
+		after the binding itself, unchanged - reusing it as an extra_
+		locals key means it automatically joins _build_generator_next_
+		function's own rename_targets (locals_decl.keys()), so
+		_GeneratorNameRenamer's existing whole-body rename pass (which
+		runs BEFORE match-desugaring - see visit_Match's own comment on
+		why _apply_live_flag_guards has to be called inline there too)
+		already rewrites every ordinary ast.Name reference to it (`yield
+		v`, or any later re-read, anywhere in the function) into `self.v`
+		for free, zero new rewriting machinery needed. Because that rename
+		is a single, WHOLE-FUNCTION-wide pass with no notion of "which
+		arm", a name promoted anywhere must be treated as promoted
+		EVERYWHERE it's bound in this same function too, or a case that
+		does NOT itself cross a yield would end up with its own binding
+		still writing an unpromoted local while every read of that same
+		name elsewhere got rewritten to the field - so every qualifying
+		match node collected here is tagged with the SAME shared name set
+		(generator_promoted_binding_names), not just the ones whose own
+		case triggered a promotion; _match_pattern reads that tag off
+		`node` (the enclosing match statement, already threaded through
+		every recursive call for exactly this kind of bookkeeping). '''
+		extra_locals: dict[str,Type] = {}
+		match_nodes: list[ast.Match] = []
+		promoted_names: set[str] = set()
+		for node in self._walk_generator_body( fn.node.body ):
+			if not isinstance( node, ast.Match ):
+				continue
+			match_nodes.append( node )
+			subject_type = self._resolve_expr_type_for_desugar( fn, node.subject )
+			if subject_type is None:
+				continue
+			original_subject_name = node.subject.id if isinstance( node.subject, ast.Name ) else None
+			for case in node.cases:
+				has_yield = any(
+					isinstance( n, ( ast.Yield, ast.YieldFrom ))
+					for n in self._walk_generator_body( case.body )
+				)
+				if not has_yield:
+					continue
+				ref_resolver = _ReferenceResolver( self, fn )
+				bindings = ref_resolver._walk_generator_match_bindings( case.pattern, subject_type, original_subject_name )
+				for binding_node, binding_type in bindings:
+					extra_locals[ binding_node.name ] = binding_type
+					promoted_names.add( binding_node.name )
+		if promoted_names:
+			for node in match_nodes:
+				node.generator_promoted_binding_names = promoted_names
+		return extra_locals
+
 	def _desugar_range_for( self, fn: Function, node: ast.For ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 4 - `for x in range(...): BODY`
 		(containing yield) becomes the EXACT equivalent while-loop shape
@@ -2909,6 +2997,10 @@ class TypeResolver:
 			# _build_generator_backing_class below, so a qualifying match's
 			# reserved field exists in the backing class in time.
 			extra_locals.update( self._reserve_generator_match_subject_fields( fn ))
+			# same pass-ordering requirement as the subject reservation just
+			# above (must run before _collect_generator_locals/_build_
+			# generator_backing_class) - see this method's own docstring
+			extra_locals.update( self._reserve_generator_match_binding_fields( fn ))
 			self._validate_generator_defer_sites( fn )
 			defer_sites = self._desugar_generator_defer_sites( fn )
 			self._validate_and_tag_generator_value_returns( fn, elem_type, error_type )
@@ -7411,7 +7503,19 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			ast.copy_location( test, node )
 			if pattern.name is None:
 				return test, []
-			bind = ast.Assign( targets = [ ast.Name( id = pattern.name, ctx = ast.Store() ) ], value = subj_expr )
+			# generator_promoted_binding_names (TypeResolver._reserve_
+			# generator_match_binding_fields, run early - see its own
+			# docstring): this binding's own trailing scope-exit decref
+			# would otherwise be reachable via a generator resume goto
+			# that skips right over an ordinary local's own declaration,
+			# the SAME uninitialized-read shape visit_Match's own
+			# promoted-subject handling above already closes for the
+			# match SUBJECT - build a field write instead of a fresh
+			# local when this exact name was reserved a field for it.
+			promoted_binding_names = getattr( node, 'generator_promoted_binding_names', None )
+			promoted = promoted_binding_names is not None and pattern.name in promoted_binding_names
+			target = self.resolver._self_attr( pattern.name, node ) if promoted else ast.Name( id = pattern.name, ctx = ast.Store() )
+			bind = ast.Assign( targets = [ target ], value = subj_expr )
 			ast.copy_location( bind, node )
 			# is_match_binding: lowering.py's _stmt_Assign reads this to mark
 			# the payload as read (ir.MarkUsed) right after its own real
@@ -7448,8 +7552,23 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# i32|None) failed to narrow, rejecting `x = v` as
 			# i32|None-into-i32, even though the identical pattern against a
 			# plain `v: i32|None = ...` local already narrowed correctly.
-			self.locals[ pattern.name ] = self._type_of_expr( subj_expr )
-			return test, [ bind ]
+			binding_type = self._type_of_expr( subj_expr )
+			self.locals[ pattern.name ] = binding_type
+			if not promoted:
+				return test, [ bind ]
+			# same reasoning as visit_Match's own subj_assign live-flag-guard
+			# call above: an RC-typed promoted field's construction-time
+			# placeholder is a bare zero, not a real prior object, so this
+			# write needs the SAME first-assignment-vs-reassignment guard
+			# every other RC-typed promoted local's own reassignment already
+			# needs (PLAN_GENERATORS.md Phase 5) - applied inline here since
+			# _apply_live_flag_guards' own usual caller (_rename_and_track_
+			# liveness) already ran, well before this match was desugared.
+			guarded = (
+				self.resolver._apply_live_flag_guards( [ bind ], { pattern.name } )
+				if binding_type is not None and binding_type.is_rc() else [ bind ]
+			)
+			return test, guarded
 
 		if isinstance( pattern, ast.MatchValue ):
 			# the value expression comes straight from user source (case
@@ -7772,3 +7891,89 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		combined = ast.BoolOp( op = ast.And(), values = [ test, inner_test ] )
 		ast.copy_location( combined, node )
 		return combined, inner_binds
+
+	def _walk_generator_match_bindings(
+		self, pattern: ast.pattern, subj_type: 'Type|None', original_subject_name: str|None = None,
+	) -> list[tuple[ast.MatchAs,'Type']]:
+		''' pure, type-only mirror of _match_pattern's/_match_union_member's
+		own structural dispatch above - used ONLY by TypeResolver._reserve_
+		generator_match_binding_fields, at the SAME early stage (before
+		_collect_generator_locals) _reserve_generator_match_subject_fields's
+		own subject resolution already runs at, for the identical pass-
+		ordering reason (see that method's own docstring). Finds every
+		ast.MatchAs node that WILL receive a real binding Assign once
+		_match_pattern actually runs for real (the exact same is_match_
+		binding branch there), together with each one's own resolved
+		(member-substituted) type - MUST NEVER call self.visit()/
+		generic_visit_expr or discovery.fail (unlike the real dispatch,
+		which sometimes does - see _match_pattern's own MatchValue branch),
+		only the read-only lookups (_resolved_union_members/_try_resolve_
+		callable_namespace) _reserve_generator_match_subject_fields's own
+		docstring already established as safe to run this early. Declines
+		(omits) any pattern shape/resolution gap it doesn't confidently
+		handle - that ONE binding then falls back to today's plain-local
+		(potentially still-unsound for that one shape) behavior rather
+		than risking a wrong promotion, same posture the subject
+		reservation already takes for an unresolvable subject type.
+		MatchValue/MatchSingleton never bind anything, so they
+		contribute nothing, same as the real dispatch. The same-name-
+		reuse narrowing shape (`match x: case T(x):`) is excluded
+		too - it never reaches _match_pattern's is_match_binding branch
+		at all (see _match_union_member's own narrow_marker comment), so
+		reserving a field for it would tag a binding that's never
+		actually written. original_subject_name is only ever meaningful
+		at the outermost call (mirrors _match_pattern's own restriction -
+		see its own comment on why), so a nested-opaque-member hop below
+		deliberately does not thread it through, matching the real
+		dispatch's own identical behavior. '''
+		if subj_type is None:
+			return []
+		if isinstance( pattern, ast.MatchAs ) and pattern.pattern is None:
+			return [ ( pattern, subj_type ) ] if pattern.name is not None else []
+		if isinstance( pattern, ( ast.MatchValue, ast.MatchSingleton )):
+			return []
+		if isinstance( pattern, ast.MatchSequence ):
+			if any( isinstance( p, ast.MatchStar ) for p in pattern.patterns ):
+				return []
+			resolved_subj_type = self.resolver.ensure_resolved( subj_type )
+			tuple_type = self.resolver.tuple_storage.tuple_type_for( resolved_subj_type )
+			if tuple_type is None or len( tuple_type.elem_types ) != len( pattern.patterns ):
+				return []
+			out: list[tuple[ast.MatchAs,'Type']] = []
+			for elem_type, subpattern in zip( tuple_type.elem_types, pattern.patterns ):
+				out.extend( self._walk_generator_match_bindings( subpattern, elem_type ))
+			return out
+		if not isinstance( pattern, ast.MatchClass ) or pattern.kwd_patterns or len( pattern.patterns ) != 1:
+			return []
+		spec = self.resolver._as_specialization( subj_type )
+		subj_base = spec.base if spec is not None else subj_type
+		if not isinstance( subj_base, TaggedUnion ):
+			return []
+		members = self._resolved_union_members( subj_type, subj_base )
+		if isinstance( pattern.cls, ast.Attribute ):
+			owner = self._try_resolve_callable_namespace( pattern.cls.value )
+			if not isinstance( owner, TaggedUnion ):
+				return []
+			owner = self.resolver.ensure_resolved( owner )
+			if owner is not subj_base:
+				outer_member = next( ( attr for attr in members if attr.type is owner ), None )
+				if outer_member is None:
+					return []
+				return self._walk_generator_match_bindings( pattern, outer_member.type )
+			member = next( ( attr for attr in members if attr.stem == pattern.cls.attr ), None )
+		elif isinstance( pattern.cls, ast.Name ):
+			leaf_type = self._try_resolve_callable_namespace( pattern.cls )
+			if leaf_type is None:
+				return []
+			member = next( ( attr for attr in members if attr.type is leaf_type ), None )
+		else:
+			return []
+		if member is None:
+			return []
+		inner_pattern = pattern.patterns[0]
+		if (
+			isinstance( inner_pattern, ast.MatchAs ) and inner_pattern.pattern is None
+			and inner_pattern.name is not None and inner_pattern.name == original_subject_name
+		):
+			return []
+		return self._walk_generator_match_bindings( inner_pattern, member.type )

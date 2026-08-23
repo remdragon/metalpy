@@ -20920,6 +20920,124 @@ def main() -> i32:
 ''' ),
 		])
 
+	def test_match_arm_binding_crossing_a_yield( self ) -> None:
+		''' Regression for a real, confirmed uninitialized-memory bug,
+		SIBLING of test_match_on_fallible_call_subject_crossing_a_yield
+		above but for a match ARM'S OWN extracted binding (`case
+		Result.Ok(v): yield v`, v RC-typed), not the match SUBJECT: the
+		binding is built directly by _match_pattern (bypassing self.
+		visit()/visit_Assign), the SAME timing gap the subject had -
+		by the time _match_pattern actually runs (during the generator's
+		own synthesized $$__next__ method's normal resolution), the
+		backing class's field list is already final, so the binding
+		stayed an ordinary, non-promoted local even when its own arm
+		crosses a yield. Confirmed via a real generated-C trace that the
+		binding's own trailing release_object() is a REAL, necessary
+		release (Ok(v)'s own wrap-constructor genuinely retains its
+		argument, so v's own separately-owned reference still needs
+		releasing exactly once) placed at the enclosing if/elif's shared
+		exit block - reachable via a resume goto that skips straight over
+		v's own declaration, reading and releasing garbage on every
+		resumed call. Fixed by promoting a qualifying binding into a real
+		field on the generator's own backing class (type_resolver.py's
+		_reserve_generator_match_binding_fields/_walk_generator_match_
+		bindings/_match_pattern), mirroring the subject's own fix. '''
+		self.assert_programs_run([
+			( 'match_arm_binding_extracting_an_rc_class_element_then_yielding_it', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen( lst: list[Box] ) -> Generator[Box, IndexError | StopIteration]:
+	i: usize = 0
+	while True:
+		match lst.__getitem__( i ):
+			case Result.Ok( v ):
+				yield v
+				with compiler.wrap_arithmetic:
+					i += 1
+			case Result.Err( _ ):
+				return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		lst: list[Box] = [ Box( 1 ), Box( 2 ), Box( 3 ) ]
+		g = gen( lst )
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v.v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 3:
+			return 1
+		if total != 6:
+			return 2
+		return 0
+''' ),
+			# a harder shape: BOTH arms bind a name AND cross their own
+			# yield (over-promotion posture - any case whose body contains
+			# a yield ANYWHERE gets its own binding(s) promoted, regardless
+			# of whether the bound name is itself referenced again after
+			# the yield), alternating Ok/Err across several resumed calls,
+			# exercising the live-flag-guarded reassignment/release for
+			# BOTH promoted bindings (v and e) many times each, not just
+			# once right before a terminating return
+			( 'match_arm_bindings_in_both_arms_alternating_ok_err_across_resumes', '''
+class Boom:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( i: usize ) -> Result[Box, Boom]:
+	with compiler.wrap_arithmetic:
+		if i == 1 or i == 3:
+			return Result.Err( Boom( v = i32( i )))
+		return Result.Ok( Box( v = i32( i )))
+
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			match maybe( i ):
+				case Result.Ok( v ):
+					yield v.v
+				case Result.Err( e ):
+					yield -e.v
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 5:
+			return 1
+		# 0 + (-1) + 2 + (-3) + 4
+		if total != 2:
+			return 2
+		return 0
+''' ),
+		])
+
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
 		# level statement (preamble/tail) is supported for now, same start-
