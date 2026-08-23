@@ -106,11 +106,30 @@ class Result[T,E]:
 	# lowering.py's _consume_checked_result, which every or_return() call
 	# actually goes through.
 
+	@overload
 	def unwrap( self, errmsg: str ) -> T:
+		...
+
+	@overload
+	def unwrap( self, errmsg: Ptr[Callable[[E], str]] ) -> T:
+		...
+
+	# a single real body for BOTH stubs above (not two independent plain
+	# implementations) - two Functions sharing the 'unwrap' qualname would
+	# otherwise collide in _get_or_create_specialization's own qualname-
+	# keyed cache once this generic class is monomorphized (confirmed via a
+	# real compile: the second implementation silently got back the FIRST
+	# one's already-cached specialization instead of its own), the same
+	# collision unwrap_or's own stub+impl split already sidesteps
+	def unwrap( self, errmsg: str | Ptr[Callable[[E], str]] ) -> T:
 		if self.is_ok():
 			ok: T = self.data.v_Ok
 			return ok
-		sys.panic( errmsg )
+		if type( errmsg ) is str:
+			sys.panic( errmsg )
+		else:
+			err: E = self.data.v_Err
+			sys.panic( errmsg( err ))
 
 	@overload
 	def unwrap_or( self, default: T ) -> T:
