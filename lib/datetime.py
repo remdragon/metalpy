@@ -38,6 +38,7 @@
 # still not implemented - a documented scope cut, not an oversight.
 
 import compiler
+import threading
 from _civil_calendar import days_from_civil, civil_from_days, weekday_from_days, days_in_month
 from math import floordiv_i64, floormod_i64
 from zoneinfo import ZoneInfo
@@ -48,12 +49,23 @@ _US_PER_DAY: i64 = 86_400_000_000
 _SECONDS_PER_DAY: i64 = 86400
 
 __localtz: ZoneInfo|None = None
+__localtz_lock: threading.FastLock = threading.FastLock()
 
 def localtz() -> ZoneInfo:
+	''' cached local ZoneInfo, computed once. Lock-guarded, not a bare
+	is-None check: ZoneInfo() does real OS work (syscalls, possibly a file
+	parse), and this runs on every OS thread that ever calls datetime.
+	now()/date.today() with no explicit tz - an unguarded check-then-set
+	here is a real data race under concurrent first-touch (confirmed via a
+	real SIGILL/heap-corruption repro: a thread-per-connection HTTP demo
+	crashing under load, only on routes calling datetime.now(), only on a
+	fresh process - many request-handling threads racing to construct and
+	store their own ZoneInfo into this same global at once). '''
 	global __localtz
-	if __localtz is None:
-		__localtz = ZoneInfo()
-	return __localtz
+	with __localtz_lock:
+		if __localtz is None:
+			__localtz = ZoneInfo()
+		return __localtz
 
 @union
 class DateError:

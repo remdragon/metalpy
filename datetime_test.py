@@ -391,6 +391,93 @@ def main() -> i32:
 	return 0
 '''
 
+# regression for a real crash: lib/datetime.py's localtz() used to cache the
+# system zone via a bare `if __localtz is None: __localtz = ZoneInfo()`, no
+# lock - safe for a single-threaded caller, but a genuine unsynchronized
+# read-check-then-write data race once called concurrently from more than
+# one OS thread on a fresh process (every thread sees None at once, each
+# constructs its own ZoneInfo, all race to store into the same global).
+# Found via a real thread-per-connection HTTP demo (lib/tcpserver.py's
+# ThreadPerConnectionDispatcher) crashing under concurrent load - SIGILL,
+# zero output - specifically on routes calling datetime.now(), only on a
+# fresh process, only with enough concurrent first-touch callers; confirmed
+# by a from-scratch trivial-handler variant of the same server never
+# crashing across the same repro. Many threads racing into localtz()'s
+# first call, all before it's cached, is exactly that window - fixed by
+# guarding the check-then-set with threading.FastLock (see localtz()'s own
+# docstring). Every worker must observe the SAME cached zone name - a
+# corrupted/premature-free race would show up as a crash or a mismatched/
+# garbage name long before this check.
+_LOCALTZ_CONCURRENT_INIT_STRESS = '''
+import compiler
+import threading
+import zoneinfo
+import atomic
+from datetime import localtz
+
+_N: i32 = 150
+_arrived: atomic.Atomic[i32] = atomic.Atomic[i32]( 0 )
+
+class Worker:
+	name: str
+	def __init__( self ) -> None:
+		self.name = ''
+	def run( self ) -> None:
+		# a real start barrier, not just "spawned close together" - every
+		# thread spins here until all _N have arrived, so they all hit
+		# localtz()'s first-touch check as close to simultaneously as
+		# possible (a tight back-to-back spawn loop alone wasn't enough to
+		# reliably hit the race window in practice)
+		_arrived.fetch_add( 1 )
+		while _arrived.load() < _N:
+			pass
+		tz: zoneinfo.ZoneInfo = localtz()
+		self.name = tz.name
+
+def main() -> i32:
+	n: i32 = _N
+	workers: list[Worker] = list[Worker]()
+	i: i32 = 0
+	while i < n:
+		w: Worker = Worker()
+		workers.append( w ).unwrap( 'worker append failed' )
+		with compiler.wrap_arithmetic:
+			i += 1
+
+	# spawned only after every Worker already exists, so CreateThread/
+	# pthread_create calls run back-to-back with no other work between them -
+	# maximizes how many threads race into localtz()'s first-touch window
+	# together
+	threads: list[threading.Thread] = list[threading.Thread]()
+	j: usize = 0
+	nw: usize = workers.__len__()
+	while j < nw:
+		w2: Worker = workers.__getitem__( j ).unwrap( 'index in bounds by construction' )
+		threads.append( threading.Thread( w2.run ) ).unwrap( 'thread append failed' )
+		with compiler.wrap_arithmetic:
+			j += 1
+
+	k: usize = 0
+	nt: usize = threads.__len__()
+	while k < nt:
+		th: threading.Thread = threads.__getitem__( k ).unwrap( 'index in bounds by construction' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			k += 1
+
+	expected: str = localtz().name
+	if expected.byte_len() == 0:
+		return 1
+	m: usize = 0
+	while m < nw:
+		w3: Worker = workers.__getitem__( m ).unwrap( 'index in bounds by construction' )
+		if w3.name != expected:
+			return 2
+		with compiler.wrap_arithmetic:
+			m += 1
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile datetime tests' )
 class TimedeltaTests( RealCompileMixin, unittest.TestCase ):
@@ -423,6 +510,12 @@ class DatetimeTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_rc_lifetime_stress( self ) -> None:
 		self.assert_programs_run([ ( 'datetime_rc_stress', _DATETIME_RC_STRESS ) ], timeout = 30.0 )
+
+	def test_localtz_concurrent_init_stress( self ) -> None:
+		# own executable: relies on __localtz being freshly-unset at process
+		# start (see this case's own docstring above) - must not be merged
+		# with other cases via assert_programs_run
+		self.assert_programs_run([ ( 'localtz_concurrent_init_stress', _LOCALTZ_CONCURRENT_INIT_STRESS ) ], timeout = 30.0 )
 
 
 if __name__ == '__main__':

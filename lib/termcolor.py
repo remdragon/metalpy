@@ -9,27 +9,34 @@ closely enough to run existing code written against it unmodified:
 
 import compiler
 import sys
+import threading
 
 _color_codes: dict[str,str]|None = None
+_color_codes_lock: threading.FastLock = threading.FastLock()
 
 def _codes() -> dict[str,str]:
+	''' lock-guarded lazy init, not a bare is-None check - see lib/
+	datetime.py's localtz() for why an unguarded check-then-set on a
+	module-global cache is a real data race once called from more than
+	one OS thread. '''
 	global _color_codes
-	if _color_codes is None:
-		codes: dict[str,str] = dict[str,str]()
-		codes['black']   = '30'
-		codes['red']     = '31'
-		codes['green']   = '32'
-		codes['yellow']  = '33'
-		codes['blue']    = '34'
-		codes['magenta'] = '35'
-		codes['cyan']    = '36'
-		codes['white']   = '37'
-		# 'grey' maps to bright-black (90), not plain black (30) - plain
-		# black is invisible on the common dark-terminal-background case
-		# this is meant for (dim status/debug output).
-		codes['grey']    = '90'
-		_color_codes = codes
-	return _color_codes
+	with _color_codes_lock:
+		if _color_codes is None:
+			codes: dict[str,str] = dict[str,str]()
+			codes['black']   = '30'
+			codes['red']     = '31'
+			codes['green']   = '32'
+			codes['yellow']  = '33'
+			codes['blue']    = '34'
+			codes['magenta'] = '35'
+			codes['cyan']    = '36'
+			codes['white']   = '37'
+			# 'grey' maps to bright-black (90), not plain black (30) - plain
+			# black is invisible on the common dark-terminal-background case
+			# this is meant for (dim status/debug output).
+			codes['grey']    = '90'
+			_color_codes = codes
+		return _color_codes
 
 def colored( text: str, color: str|None = None, attrs: list[str]|None = None ) -> str:
 	parts: list[str] = []
