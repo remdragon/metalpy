@@ -38,6 +38,13 @@ class set[T]:
 	def __len__( self ) -> usize:
 		return self.__inner.__len__()
 
+	def __bool__( self ) -> bool:
+		# Python-style truthiness: an empty set is falsy - see
+		# builtins.str.__bool__'s own docstring for why lowering.py's bare
+		# (non-union) truthiness testing needs this dunder explicitly
+		# rather than defaulting to always-true.
+		return self.__len__() != 0
+
 	# Add value to the set. Idempotent: dict[K,V].__setitem__'s own
 	# overwrite-existing-key path makes inserting a value that's already
 	# present a harmless dummy-value overwrite (True -> True), matching

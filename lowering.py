@@ -465,8 +465,16 @@ class Lowering:
 		# itself, since a well-behaved callee already accounts for that on
 		# its own side)? Name/Attribute reads are the only currently-
 		# supported expression forms that alias existing state -
-		# BinOp/BoolOp/Compare/Constant/UnaryOp never produce RC values at
-		# all, and Call is always fresh from the caller's perspective.
+		# BinOp/Compare/Constant/UnaryOp never produce RC values at all,
+		# and Call is always fresh from the caller's perspective. BoolOp
+		# CAN now hold an RC value (it returns the decisive operand's own
+		# value, not always bool - see _expr_BoolOp), but still correctly
+		# falls through to False below like IfExp already does: both
+		# already resolve ownership internally (their own Incref-if-
+		# aliasing-else-untrack bookkeeping on whichever operand/branch
+		# actually wins) before returning dest, so from THIS function's
+		# caller's perspective dest is already a fresh, independently-
+		# owned handoff, exactly like an ordinary Call result.
 		# ast.Subscript is NOT aliasing in general: _expr_Subscript's
 		# dominant path (a real __getitem__) is a Call underneath (fresh).
 		# Its other path (tuple[...]'s own constant-index element access,
@@ -6031,13 +6039,139 @@ class FunctionLowering:
 		safe for a bool target (see its own comment) so this never needs an
 		enclosing wrap_arithmetic/panic_arithmetic the way a genuine
 		narrowing scalar cast would. '''
+		# None, not bool_cls: a BoolOp/IfExp dispatch method treats a given
+		# expected_type as authoritative for ITS OWN dest (seeding the
+		# merge target's type up front, needed for real by the genuine
+		# "declared union target" case, e.g. `z: T|U = x or y`) - it has
+		# no way to tell "the caller only wants this as loose HINT"
+		# (strict=False below) apart from "the caller genuinely requires
+		# it" (an ordinary strict assignment/argument/return), since
+		# strict itself is never threaded down into the dispatch methods.
+		# Forcing bool_cls here would make THAT operand's own natural
+		# value (e.g. a bare RCClass with no __bool__, always truthy
+		# per _truthiness_of_operand's own default) fail to coerce for a
+		# condition like `if f and g:` even though real Python evaluates
+		# it fine - the whole point of computing the REAL value first and
+		# reducing it to bool via _truthiness_of_operand afterward, same
+		# as any other expression kind here. A bare literal (True/False/5/
+		# 1.0/...) still self-types correctly without this hint - its own
+		# Python value's type (bool vs int vs float) is what _expr_
+		# Constant keys off, not expected_type.
+		operand = self._lower_expr( node, None, strict = False )
+		return self._truthiness_of_operand( operand, node )
+
+	def _truthiness_of_operand( self, operand: ir.Operand, node: ast.AST ) -> ir.Operand:
+		''' the tail half of _lower_truth_test above, factored out so a
+		caller that already has a LOWERED operand - and, unlike if/while/
+		ternary's test position, also needs the operand's own original
+		value (_expr_BoolOp, which must return the decisive operand's real
+		value, not a forced bool) - can get its truthiness without lowering
+		`node` a second time (which would double any side effects, e.g. a
+		Call operand). Same rules and same reused conversion machinery
+		(_lower_scalar_cast/_coerce_or_check_operand) as _lower_truth_test
+		itself - see its docstring for the semantics. '''
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		operand = self._lower_expr( node, bool_cls, strict = False )
 		if operand.type is bool_cls or self.lowering._type_resolver._same_type( operand.type, bool_cls ):
 			return operand
 		if isinstance( operand.type, Scalar ):
 			return self._lower_scalar_cast( bool_cls, operand, node )
-		return self._coerce_or_check_operand( operand, bool_cls, node )
+		# a non-Scalar type with its own __bool__ (e.g. builtins.str - empty
+		# string is falsy, see its own docstring) dispatches to it directly -
+		# the bare (non-union) counterpart of _rewrite_tagged_union_
+		# truthiness's identical call on a NULLABLE union's non-None leaf.
+		# Previously missing entirely: a bare str used as a condition
+		# silently tested its own always-true POINTER instead of its
+		# content (see builtins.print()'s own end-parameter comment, which
+		# worked around it with an explicit len()!=0 check rather than
+		# fixing the root cause) - now needed for real by _expr_BoolOp,
+		# which requires a genuine truthiness answer for ANY operand type,
+		# not just bool/Scalar, to decide a non-last operand's short-circuit
+		# jump without forcing its VALUE through bool too.
+		bool_method = self.lowering._find_method( operand.type, '__bool__' )
+		if bool_method is not None:
+			self.lowering._ensure_resolved( bool_method )
+			self.lowering.schedule( bool_method.return_type )
+			for p in ( bool_method.parameters or [] ):
+				self.lowering.schedule( p.type )
+			dest = self._new_temp( bool_cls )
+			self._emit( ir.Call( dest = dest, target = bool_method, receiver = operand, args = [], kwargs = {} ))
+			return dest
+		# no __bool__ of its own - a TaggedUnion dispatches per-leaf via its
+		# own tag instead: this is the GENERAL counterpart of type_resolver.
+		# py's _rewrite_tagged_union_truthiness, which only ever rewrites an
+		# if/while/ternary's own TOP-LEVEL test and only for the narrow
+		# "exactly one non-None leaf" shape. An operand reached from here
+		# (e.g. a BoolOp operand union-coerced into i32|str, which has no
+		# None leaf at all) was never visited by that AST-level rewrite in
+		# the first place, so it still needs a real answer.
+		# EXCEPT a Result[T,E] (or any is_result_type() union): that one
+		# must stay a hard error here, not get a silent tag-based truthy/
+		# falsy answer - cfg.py's own _unchecked_results tracking already
+		# requires a Result be explicitly consumed (.unwrap()/.is_ok()/
+		# match) before use, specifically so a fallible call's error case
+		# can never be silently ignored; falling into the generic per-leaf
+		# dispatch here would treat `if fallible_call():` as implicitly
+		# "truthy unless Err", quietly bypassing that whole mechanism.
+		shape = self.lowering._type_resolver._tagged_union_shape( operand.type )
+		if shape is not None:
+			if shape[0].is_result_type():
+				# fall all the way through to the ordinary hard-fail below,
+				# NOT the bare-type default-true fallback further down -
+				# an unchecked Result must stay a real compile error either
+				# way, never a silent answer of any kind
+				return self._coerce_or_check_operand( operand, bool_cls, node )
+			return self._truthiness_of_union_operand( operand, shape, node )
+		# default truthiness for any other bare, non-Scalar, non-union,
+		# no-__bool__ type (a plain RCClass/CStruct/... instance): only
+		# None itself is falsy by default, everything else is truthy -
+		# matches real Python's own bool(obj) default. NoneType is itself
+		# a Scalar in this compiler (see discovery.get_none_type()), so a
+		# bare `None`-typed operand is already handled by the Scalar
+		# branch above and never reaches here; this default is reachable
+		# only for a real, always-non-null object reference, for which
+		# "truthy" is the only sound answer.
+		return ir.Const( type = bool_cls, value = True )
+
+	def _truthiness_of_union_operand( self, operand: ir.Operand, shape: 'tuple[TaggedUnion,list[Variable]]', node: ast.AST ) -> ir.Operand:
+		''' tag-dispatch truthiness for a bare TaggedUnion operand (already
+		resolved to (base, members) by the caller's _tagged_union_shape
+		call) - each leaf's OWN truthiness decides the union's, recursively
+		(another _truthiness_of_operand call, so a nested union leaf, or a
+		leaf with its own __bool__, or a plain Scalar leaf all work exactly
+		as they would standalone). A None leaf is hard-coded falsy - the
+		only type this compiler treats as unconditionally falsy (see this
+		method's caller). Mirrors cfg.py's _tag_gated_refcount_instructions'
+		identical per-leaf tag-Cmp-JumpIfFalse-then-Jump-to-a-shared-end
+		shape, just computing a bool RESULT per leaf (via ir.Assign into a
+		shared dest) instead of an incref/decref side effect. '''
+		base, members = shape
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		none_type = self.lowering.discovery.get_none_type()
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( base )
+		dest = self._new_temp( bool_cls )
+		end_label = self._new_label( 'union_truth_end' )
+		for member in members:
+			next_label = self._new_label( 'union_truth_next' )
+			tag_dest = self._new_temp( tag_attr.type )
+			self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
+			cmp_dest = self._new_temp( bool_cls )
+			self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
+			self._emit( ir.JumpIfFalse( cond = cmp_dest, target = next_label ))
+			if member.type is none_type:
+				leaf_truth: ir.Operand = ir.Const( type = bool_cls, value = False )
+			else:
+				# owning=False (default): a transient borrow for the
+				# duration of this check only, same as _maybe_unwrap_union_
+				# arg's own ordinary call-argument use - `operand` itself
+				# still owns the reference and gets its own normal decref
+				# wherever it's otherwise flushed/released
+				payload = self._maybe_unwrap_union_arg( operand, member.type )
+				leaf_truth = self._truthiness_of_operand( payload, node )
+			self._emit( ir.Assign( dest = dest, src = leaf_truth ))
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = next_label ))
+		self._emit( ir.Label( name = end_label ))
+		return dest
 
 	def _stmt_While( self, node: ast.While ) -> None:
 		if node.orelse:
@@ -10214,13 +10348,23 @@ class FunctionLowering:
 		# method in the first place.
 		operand_hint = expected_type if self.lowering._type_resolver._tagged_union_shape( expected_type ) is None else None
 		if isinstance( node.op, ast.Not ):
-			# strict=False: `not x` applies C-style truthiness to WHATEVER
-			# scalar x already is (ir.Not/emitter_c.py's own `!operand` C
-			# emission handles any scalar type, not just bool) - expected_type
-			# here is only ever a hint for the RARE case node.operand itself
-			# still needs inference (an untyped literal/generic call), never a
-			# real requirement that x must already BE expected_type's own type
+			# strict=False: expected_type here is only ever a hint for the
+			# RARE case node.operand itself still needs inference (an
+			# untyped literal/generic call), never a real requirement that
+			# x must already BE expected_type's own type
 			operand = self._lower_expr( node.operand, operand_hint, strict = False )
+			# `not x` needs x's real TRUTHINESS, not a raw `!operand` C
+			# negation - those coincide for a Scalar (both are "!= 0"), but
+			# NOT for an arbitrary RC/union operand: `!ptr` in C is a null-
+			# pointer check, which is always false for any live, non-null
+			# object - silently wrong for e.g. `not ''` (an empty-but-non-
+			# null str, correctly falsy per _truthiness_of_operand's own
+			# str.__bool__ dispatch, but `!ptr` would say truthy since the
+			# pointer itself isn't null). _truthiness_of_operand is the
+			# single source of truth for what "truthy" means for any type
+			# (Scalar/__bool__/union-tag-dispatch/default) - reused here so
+			# `not x` can never disagree with `if x:`/BoolOp's own answer.
+			truthiness = self._truthiness_of_operand( operand, node )
 			# `not x`'s own result is ALWAYS bool, never expected_type itself
 			# (which, same reasoning as operand_hint above, might be a union
 			# wrapping bool - `return not flag` from a function declared ->
@@ -10236,7 +10380,7 @@ class FunctionLowering:
 			# bare `!(flag)` assigned straight into a union struct in C
 			bool_cls = self.lowering.discovery.find_name( 'bool', node )
 			dest = self._new_temp( bool_cls )
-			self._emit( ir.Not( dest = dest, operand = operand ))
+			self._emit( ir.Not( dest = dest, operand = truthiness ))
 			return dest
 		operand = self._lower_expr( node.operand, operand_hint )
 
@@ -10305,12 +10449,17 @@ class FunctionLowering:
 		# already scopes it correctly). `keep` (the construct's own
 		# dest/final-value temps) is excluded - their ownership is already
 		# fully resolved by the incref/untrack_temp() decision made just
-		# above each call site (IfExp) or is simply never RC to begin with
-		# (BoolOp's `operand` is always bool), and dest in particular is
-		# still actively in use afterward (assigned into, then read again
-		# once every operand/branch merges) so it must not be DeleteTemp'd
-		# here even though the actual decref side would already be a safe
-		# no-op for it.
+		# above each call site (both IfExp's branches and BoolOp's own
+		# DECISIVE operand get this same treatment now - see _expr_BoolOp),
+		# and dest in particular is still actively in use afterward
+		# (assigned into, then read again once every operand/branch
+		# merges) so it must not be DeleteTemp'd here even though the
+		# actual decref side would already be a safe no-op for it.
+		# _expr_BoolOp's own NON-decisive operands (evaluated only for
+		# their truthiness, never surviving into dest - see its own
+		# comment) are the one case that calls this with `keep` holding
+		# ONLY dest: the operand itself is meant to be released here too,
+		# same as any other purely-intermediate temp.
 		branch_temps = self._pending_temps[ start_idx: ]
 		self._pending_temps = self._pending_temps[ : start_idx ]
 		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
@@ -10321,35 +10470,369 @@ class FunctionLowering:
 				self._emit( instr )
 			self._emit( ir.DeleteTemp( temp = t ))
 
+	def _boolop_leaf_excluded( self, leaf_type: Type, is_and: bool ) -> bool:
+		''' True if leaf_type can PROVABLY never be the value that survives
+		into a BoolOp's dest at a NON-LAST operand position, given is_and -
+		see _boolop_union_remap_shape's own comment for why this matters (`x:
+		i32|None or y: str` must not force y to also agree with x's own
+		None leaf, since a None x is always falsy and `or` never keeps a
+		falsy non-last operand). Deliberately narrow: only NoneType counts,
+		exactly the same "single, statically-fixed truthiness" class a
+		literal constant belongs to (see _expr_BoolOp's own whole-operand
+		skip) - a type with its own __bool__ (str, list, dict, set, ...) is
+		genuinely runtime-dependent (an empty string is exactly as real a
+		value as a non-empty one), so it's NEVER excluded either direction,
+		matching _truthiness_of_operand's own identical distinction. `and`
+		never excludes anything via this: None is a valid FALSY survivor
+		for `and` (not excludable), and no OTHER type has a single fixed
+		truthiness at the bare TYPE level - only a literal CONSTANT does,
+		already handled separately. '''
+		if not is_and:
+			return leaf_type is self.lowering.discovery.get_none_type()
+		return False
+
+	def _boolop_union_remap_shape( self, operand_type: Type|None, dest_type: Type|None, is_last: bool, is_and: bool ) -> 'tuple[TaggedUnion,list[Variable],list[Variable]]|None':
+		''' does a DECISIVE BoolOp operand need per-LEAF re-mapping into
+		dest's own (possibly wider/differently-shaped) union type, rather
+		than a single plain coercion of its WHOLE type? Two shapes need
+		this:
+		- a NON-LAST operand with at least one of its own leaves PROVABLY
+		  excluded from ever surviving here (_boolop_leaf_excluded) - e.g.
+		  `x: i32|None or y: str`: a None x is always falsy, so `or` never
+		  keeps it - only the REMAINING (kept) leaves need to agree with
+		  dest's type, not operand_type as a whole.
+		- the LAST operand, whenever its own type is a union that doesn't
+		  already exactly equal dest's (e.g. `z: str|i32|None = y or x`,
+		  x: i32|None, y: str - x is unconditionally decisive here
+		  regardless of its own truthiness, per real Python's `or`/`and`
+		  keeping the last operand "as-is" even when falsy, so EVERY leaf
+		  of x, not just some, needs its own chance to become a member of
+		  dest's own wider union). Confirmed as a real, necessary case, not
+		  just the non-last one: without this, `x` (i32|None) failed
+		  _coerce_or_check_operand's plain, whole-type coercion outright -
+		  that path only ever handles a bare LEAF value becoming a member
+		  of a union, never one union's own leaves flowing into a
+		  DIFFERENT, wider union.
+		Returns None when there's nothing to remap: operand_type isn't a
+		union at all, the two types already match exactly, dest_type isn't
+		established yet AND this is the last operand (operand's own
+		natural, WHOLE type just becomes dest's directly - no remapping
+		needed, nothing to exclude for is_last anyway), or (non-last case
+		only, degenerately) every leaf would be excluded - each of these
+		is safest left to the ordinary, single coercion path instead of
+		asserted against. A Result[T,E] is never remapped, same reasoning
+		as _truthiness_of_operand's own identical exclusion: it must stay
+		fully, explicitly checked (.unwrap()/.is_ok()/match), never
+		implicitly unwrapped by a truthiness/last-operand position.
+		dest_type is NOT established yet for a NON-last operand with a
+		real exclusion (e.g. `tz or localtz()`, tz: ZoneInfo|None, no
+		annotation) is still remapped: with exactly one surviving leaf,
+		_emit_decisive_remapped's own per-leaf loop seeds dest's type
+		directly from that ONE leaf (no union wrapping needed at all,
+		since there's only one possible outcome); with two or more,
+		_emit_decisive_remapped synthesizes/interns a real union of
+		exactly the kept leaves first (discovery._get_or_create_union -
+		the same interning every other anonymous union in this compiler
+		already goes through), so a later operand still gets a real,
+		properly excluded target to widen into instead of x's own full,
+		unexcluded type. Confirmed as a real, necessary case, not just the
+		"dest already established" one: skipping it here left dest seeded
+		from tz's own UNEXCLUDED ZoneInfo|None (`(tz or localtz()).
+		utcoffset(...)` then failed with "'utcoffset' is not callable on
+		intrinsics.NoneType" - lib/datetime.py's own real usage of this
+		exact idiom); the two-or-more-leaf case was ALSO confirmed broken
+		on its own (`x: i32|str|None; y: bool; z = x or y` - a hard
+		compile error, "expected str|None|i32, got bool", even though
+		real Python's own `x or y` here unambiguously excludes x's None). '''
+		shape = self.lowering._type_resolver._tagged_union_shape( operand_type )
+		if shape is None:
+			return None
+		base, members = shape
+		if base.is_result_type():
+			return None
+		if dest_type is not None and self.lowering._type_resolver._same_type( operand_type, dest_type ):
+			return None
+		if is_last:
+			if dest_type is None:
+				return None
+			return base, members, members
+		kept = [ m for m in members if not self._boolop_leaf_excluded( m.type, is_and ) ]
+		if not kept:
+			return None
+		return base, members, kept
+
+	def _emit_decisive_remapped( self, operand_start: int, operand: ir.Operand, remap: 'tuple[TaggedUnion,list[Variable],list[Variable]]', dest_ref: list, node: ast.AST ) -> None:
+		''' _expr_BoolOp's emit_decisive, for a union-typed decisive
+		operand that needs per-leaf re-mapping into dest's own type
+		(_boolop_union_remap_shape) - since which of the KEPT leaves is
+		actually active can't be known at compile time when more than one
+		remains, this dispatches on the RUNTIME tag (mirrors
+		_truthiness_of_union_operand's identical per-leaf tag-Cmp-
+		JumpIfFalse-then-Jump-to-a-shared-end shape), doing the ordinary
+		strict-coercion + aliasing-vs-fresh merge once PER SURVIVING LEAF
+		instead of once for the whole operand - merging through one
+		intermediate temp first (extract, THEN decide fresh-vs-borrowed
+		once for the merged result) would blur whether that merged value
+		is a fresh wrap (_coerce_into_union already increfs what it wraps)
+		or a borrowed passthrough (still needs its own Incref here),
+		corrupting refcounts either way; committing to a live
+		is_union_coerce_result check per leaf (exactly what _is_aliasing_
+		expr already relies on elsewhere for the identical reason) is what
+		keeps this safe. `dest_ref` is a one-element list holding the
+		enclosing _expr_BoolOp's own `dest` (a plain nonlocal isn't
+		reachable from this method) - mutated in place the same way
+		emit_decisive's own `nonlocal dest` would. `operand` itself (the
+		ORIGINAL, wider union) is fully consumed by the end of this call -
+		its own remaining temps (plus every tag/cmp/payload-extraction temp
+		from every branch, taken or not) are flushed via the ordinary
+		_flush_branch_temps, keeping only dest. '''
+		base, _all_members, kept = remap
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( base )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		end_label = self._new_label( 'boolop_narrow_end' )
+		# dest not established yet and more than one leaf survives the
+		# exclusion: its own type can't be seeded from whichever leaf
+		# happens to be processed FIRST in the loop below (that would
+		# arbitrarily drop the others) - synthesize/intern a real union of
+		# exactly the kept leaves up front instead, mirroring
+		# _emit_binop_fallible_dispatch's own identical success/error-
+		# union collapsing (single leaf -> that leaf itself, 2+ ->
+		# discovery._get_or_create_union, then schedule() + union_storage.
+		# get() so it's actually usable in emitted IR, not just interned).
+		if dest_ref[0] is None and len( kept ) > 1:
+			narrowed = self.lowering.discovery._get_or_create_union( [ m.type for m in kept ] )
+			self.lowering.schedule( narrowed )
+			self.lowering._union_storage.get( narrowed )
+			dest_ref[0] = self._new_temp( narrowed )
+		for member in kept:
+			next_label = self._new_label( 'boolop_narrow_next' )
+			tag_dest = self._new_temp( tag_attr.type )
+			self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = tag_attr.stem ))
+			cmp_dest = self._new_temp( bool_cls )
+			self._emit( ir.Cmp( dest = cmp_dest, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = tag_attr.type, value = tags[member.stem] )))
+			self._emit( ir.JumpIfFalse( cond = cmp_dest, target = next_label ))
+			# owning=False (default): a transient borrow out of `operand` -
+			# same as _truthiness_of_union_operand's identical extraction.
+			# The subsequent _coerce_or_check_operand call either wraps it
+			# fresh (is_union_coerce_result=True, already Increfed by that
+			# wrap's own constructor) or leaves it exactly as this borrowed
+			# read (no wrap needed - payload.type already equals dest's own
+			# type), in which case it still shares operand's own reference
+			# and needs its own Incref below before becoming dest's
+			# independent copy.
+			payload = self._maybe_unwrap_union_arg( operand, member.type )
+			dest = dest_ref[0]
+			coerced = self._coerce_or_check_operand( payload, dest.type if dest is not None else None, node )
+			if dest is None:
+				dest = self._new_temp( coerced.type )
+				dest_ref[0] = dest
+			if getattr( coerced, 'is_union_coerce_result', False ):
+				self._cfg.untrack_temp( coerced )
+			else:
+				for instr in self._cfg.incref( dest.type, coerced ):
+					self._emit( instr )
+			self._emit( ir.Assign( dest = dest, src = coerced ))
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = next_label ))
+		self._emit( ir.Label( name = end_label ))
+		self._flush_branch_temps( operand_start, dest_ref[0] )
+
 	def _expr_BoolOp( self, node: ast.BoolOp, expected_type: Type|None ) -> ir.Operand:
-		# short-circuit and/or: evaluate operands left to right, each into
-		# the same dest temp, stopping early (jump to end) as soon as the
-		# result is already decided - `and` stops on the first falsy
-		# operand, `or` stops on the first truthy one. Needed by match's
-		# nested pattern tests (an outer tag check AND, only if that
-		# passes, an inner tag check on the payload - reading the payload
-		# before confirming the outer tag would be reading the wrong
-		# union member's storage)
+		# short-circuit and/or: evaluate operands left to right, stopping
+		# early (jump to end) as soon as the result is already decided -
+		# `and` stops on the first FALSY operand, `or` on the first
+		# TRUTHY one - same short-circuit control flow as before. `dest`
+		# now ends up holding the DECISIVE operand's own VALUE, not a
+		# forced bool coercion (Python semantics: `5 and 10` -> 10, `0 or
+		# 10` -> 10) - the decisive operand's truthiness (computed via
+		# _truthiness_of_operand, without re-lowering it) only decides
+		# WHETHER to jump, never what gets merged into dest. Needed by
+		# match's nested pattern tests (an outer tag check AND, only if
+		# that passes, an inner tag check on the payload - reading the
+		# payload before confirming the outer tag would be reading the
+		# wrong union member's storage).
+		#
+		# The first operand actually lowered as a real candidate fixes
+		# dest's own type; every later such operand is checked/coerced
+		# against that same type via the ordinary strict _lower_expr path
+		# - same "operands share one common type" assumption _lower_
+		# binary_operands already makes for +/-/* etc. A genuine mismatch
+		# across the chain is a real compile error via the usual
+		# _check_assignable message.
+		#
+		# A literal operand (ast.Constant) whose Python truthiness is
+		# known at compile time is folded instead of given a runtime
+		# check:
+		# - non-decisive for this op (`0` in `0 or x`, `True` in `True
+		#   and x`) can never end up in dest, so it's skipped outright -
+		#   its own, possibly unrelated literal type never has to agree
+		#   with the rest of the chain either. Needed for `0 or 'x'` ->
+		#   'x': without this, 0's own int type would wrongly become
+		#   dest's type before 'x' is ever reached, rejecting it as a
+		#   mismatch.
+		# - decisive for this op (`True or foo()`, `False and foo()`)
+		#   makes dest = that literal and stops lowering the chain right
+		#   there - every remaining operand is provably unreachable,
+		#   exactly like Python's own bytecode never touching them. Not
+		#   just an optimization: without it, foo()'s own return type
+		#   would have to agree with the decisive literal's type too
+		#   (None vs bool here), which real Python never requires since
+		#   it never evaluates foo() at all.
 		#
 		# Each operand's own intermediate temps (e.g. `field.find(x)`'s
 		# Result temp, consumed as `.is_ok()`'s receiver) are flushed via
-		# _flush_branch_temps right after that operand's own code runs,
-		# before any later operand's short-circuit jump could skip past a
-		# temp this operand already finished with - see that method's own
-		# comment for the confirmed crash this fixes.
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		# _flush_branch_temps right after that operand's own code runs -
+		# see that method's own comment for the confirmed crash this
+		# fixes. A non-decisive operand's OWN value is flushed right
+		# along with them (nothing kept but dest) since it never survives
+		# into dest either.
 		is_and = isinstance( node.op, ast.And )
 		end_label = self._new_label( 'booland' if is_and else 'boolor' )
-		dest = self._new_temp( bool_cls )
-		for i, value_node in enumerate( node.values ):
+		dest = self._new_temp( expected_type ) if expected_type is not None else None
+
+		def lower_operand( value_node: ast.expr ) -> tuple[int, ir.Operand]:
+			# strict=False: the real, strict "must agree with dest's type"
+			# check is deferred to emit_decisive below, not applied here -
+			# a decisive operand whose type is a union needing per-leaf
+			# RE-MAPPING into dest's own type (see
+			# _boolop_union_remap_shape) needs its own REAL, natural type
+			# intact to even detect that shape; forcing it through dest.type
+			# here first would reject it outright (a whole union coercing
+			# into a DIFFERENT union isn't a coercion this compiler supports
+			# in general - only per-LEAF, which is exactly what remapping
+			# does instead).
 			operand_start = len( self._pending_temps )
-			operand = self._lower_truth_test( value_node )
-			self._emit( ir.Assign( dest = dest, src = operand ))
+			operand = self._lower_expr( value_node, dest.type if dest is not None else expected_type, strict = False )
+			return operand_start, operand
+
+		def emit_decisive( operand_start: int, value_node: ast.expr, operand: ir.Operand, is_last: bool ) -> None:
+			# the deferred strict coercion/check lower_operand skipped -
+			# same "operands share one common type" requirement as always,
+			# just applied here, at the one choke point every decisive
+			# operand (is_last, a decisive literal constant, or a non-last
+			# operand that turned out decisive at runtime) passes through.
+			# A union-typed operand that needs per-leaf re-mapping into
+			# dest's own type (_boolop_union_remap_shape - covers BOTH a
+			# non-last operand with some of its own leaves excluded, e.g.
+			# `x: i32|None or y: str`, AND the last operand whenever its
+			# own union differs from dest's, e.g. `z: str|i32|None = y or
+			# x`) is delegated to _emit_decisive_remapped instead - plain
+			# _coerce_or_check_operand below only ever handles a bare LEAF
+			# value becoming a union member, never one union's own leaves
+			# flowing into a DIFFERENT, wider union.
+			nonlocal dest
+			remap = self._boolop_union_remap_shape( operand.type, dest.type if dest is not None else None, is_last, is_and )
+			if remap is not None:
+				dest_ref = [ dest ]
+				self._emit_decisive_remapped( operand_start, operand, remap, dest_ref, node )
+				dest = dest_ref[0]
+				return
+			operand = self._coerce_or_check_operand( operand, dest.type if dest is not None else None, value_node )
+			# mirrors _expr_IfExp's own per-branch RC bookkeeping: an
+			# aliasing operand (existing Name/Attribute read) needs its
+			# own Incref before merging into dest, a fresh one (Call/
+			# Allocate result, INCLUDING a union-wrap _coerce_or_check_
+			# operand just built above) just has its ownership moved via
+			# untrack_temp - see _expr_IfExp's own comment for the
+			# confirmed UAF/double-free this avoids. _is_aliasing_expr's
+			# own is_union_coerce_result check (see its docstring) is what
+			# makes this correct even though `operand` may no longer be
+			# what `value_node` originally looked like.
+			if dest is None:
+				dest = self._new_temp( operand.type )
+			if self.lowering._is_aliasing_expr( value_node, operand ):
+				for instr in self._cfg.incref( dest.type, operand ):
+					self._emit( instr )
+			else:
+				self._cfg.untrack_temp( operand )
 			self._flush_branch_temps( operand_start, dest, operand )
-			if i < len( node.values ) - 1:
-				jump_opcode = ir.JumpIfFalse if is_and else ir.JumpIfTrue
-				self._emit( jump_opcode( cond = dest, target = end_label ))
+			self._emit( ir.Assign( dest = dest, src = operand ))
+
+		n = len( node.values )
+		for i, value_node in enumerate( node.values ):
+			is_last = i == n - 1
+			static_truth = bool( value_node.value ) if isinstance( value_node, ast.Constant ) else None
+			if static_truth is not None and not is_last:
+				decisive = ( is_and and not static_truth ) or ( not is_and and static_truth )
+				if not decisive:
+					continue # provably never reaches dest - skip regardless of its own type
+				operand_start, operand = lower_operand( value_node )
+				emit_decisive( operand_start, value_node, operand, True )
+				break # every remaining operand is provably unreachable
+			operand_start, operand = lower_operand( value_node )
+			if is_last:
+				emit_decisive( operand_start, value_node, operand, True )
+				break
+			cond = self._truthiness_of_operand( operand, value_node )
+			# _truthiness_of_operand's own default-truthy fallback (a bare,
+			# no-__bool__, non-Scalar, non-union type - e.g. a plain
+			# RCClass instance) returns a compile-time Const, not a real
+			# runtime check - same "single, statically-fixed truthiness"
+			# class a literal AST Constant belongs to (see the static_truth
+			# handling above), just discovered from the operand's TYPE
+			# instead of its own source syntax. Route it through the exact
+			# same compile-time decisive-or-skip logic: without this, a
+			# NON-decisive such operand (`f and 1`, f: a bare RCClass -
+			# always truthy, so `and` never keeps it) would still generate
+			# a real (if dead/unreachable) runtime jump PLUS a "decisive"
+			# branch that tries to coerce f's own type into dest - which
+			# can fail outright in a condition context (dest.type forced
+			# to bool) even though real Python could never actually reach
+			# that branch at all.
+			const_truth = cond.value if isinstance( cond, ir.Const ) and cond.type is self.lowering.discovery.find_name( 'bool', node ) else None
+			if const_truth is not None:
+				decisive = ( is_and and not const_truth ) or ( not is_and and const_truth )
+				if not decisive:
+					self._flush_branch_temps( operand_start, dest )
+					continue
+				emit_decisive( operand_start, value_node, operand, False )
+				break
+			continue_label = self._new_label( 'booland_continue' if is_and else 'boolor_continue' )
+			skip_opcode = ir.JumpIfTrue if is_and else ir.JumpIfFalse
+			# snapshot _pending_temps HERE, before the branch split: operand
+			# (and cond's own temp, and any of operand's own intermediate
+			# temps) are shared, ALREADY-COMPUTED values whose FATE forks
+			# into two mutually exclusive runtime paths below (kept by the
+			# decisive branch, discarded by the continue branch) - but
+			# _pending_temps is one flat, IN-PLACE-MUTATED list, not scoped
+			# per branch the way _expr_IfExp's true/false branches are
+			# (each of THOSE captures its own FRESH start point, AFTER the
+			# other branch's own flush already trimmed the list, since each
+			# branch lowers its own independent sub-expression from
+			# scratch). Here, both branches share the SAME already-lowered
+			# operand: emit_decisive's own flush call (for the decisive
+			# branch, generated first in COMPILE-TIME instruction order)
+			# permanently trims operand out of _pending_temps - by the time
+			# the continue branch's OWN flush call below runs, it would
+			# find nothing left to release, NEVER emitting operand's
+			# DeleteTemp/Decref in EITHER branch's actual code. Confirmed
+			# as a real, reproducible LEAK (not a crash -
+			# `base.upper() and (tail + '')`'s discarded str never got
+			# decref'd in the continue branch's own generated code), missed
+			# by refcount()-based testing that only ever inspected the
+			# SURVIVING value, never the discarded one. Restoring the
+			# snapshot right before the continue branch gives it back its
+			# own, independent view of what's pending, exactly mirroring
+			# IfExp's own effect (a fresh, unclaimed view per branch).
+			pending_snapshot = list( self._pending_temps )
+			# same problem, one layer down: fresh_temp()/untrack_temp()
+			# mutate cfg._temp_states in place too - the decisive branch's
+			# own untrack_temp(operand) call (run first, compile-time-
+			# sequentially) permanently un-registers operand's ownership,
+			# so the continue branch's later delete_temp() on the SAME
+			# operand would silently skip its Decref. See
+			# snapshot_temp_states' own docstring for the confirmed leak
+			# this fixes.
+			temp_states_snapshot = self._cfg.snapshot_temp_states()
+			self._emit( skip_opcode( cond = cond, target = continue_label ))
+			emit_decisive( operand_start, value_node, operand, False )
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = continue_label ))
+			self._pending_temps = pending_snapshot
+			self._cfg.restore_temp_states( temp_states_snapshot )
+			self._flush_branch_temps( operand_start, dest )
 		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, dest.type )
 		return dest
 
 	def _expr_IfExp( self, node: ast.IfExp, expected_type: Type|None ) -> ir.Operand:

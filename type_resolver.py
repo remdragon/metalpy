@@ -6181,46 +6181,6 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		ast.copy_location( result, ctx_node )
 		return result
 
-	def _tagged_union_payload_expr( self, expr_node: ast.expr, ctx_node: ast.AST ) -> ast.expr|None:
-		''' the raw `expr.data.v_<T>` extraction alone (no truthiness test,
-		no __bool__() call) - used by visit_BoolOp's value-coalescing
-		rewrite for `x or y`'s TRUTHY branch, where `x` is proven non-None
-		by the very fact that branch is being taken, so the branch's own
-		VALUE should be the unwrapped T, not the still-Optional x (matching
-		Python: `x or y` narrows the "x" case exactly the same way an `if
-		x:` block would). Same type/shape restrictions as
-		_rewrite_tagged_union_truthiness (single non-None member) -
-		deliberately not factored to share code with it, since that method
-		has its own additional `not x` recursion this one never needs. '''
-		expr_type = self._type_of_expr( expr_node )
-		if expr_type is None:
-			return None
-		spec = self.resolver._as_specialization( expr_type )
-		base = spec.base if spec is not None else expr_type
-		if not isinstance( base, TaggedUnion ):
-			return None
-		if spec is not None:
-			members = self.resolver.monomorphizer.monomorphize_class( spec ).attributes
-		else:
-			self.resolver.ensure_resolved( base )
-			for attr in base.attributes:
-				self.resolver.ensure_resolved( attr )
-			members = base.attributes
-		none_type = self.discovery.get_none_type()
-		none_member = next( ( attr for attr in members if attr.type is none_type ), None )
-		if none_member is None:
-			return None
-		non_none = [ m for m in members if m.type is not none_type ]
-		if len( non_none ) != 1:
-			return None
-		member = non_none[0]
-		_tag_attr, data_attr, _payload_cls, _tags = self.resolver.union_storage.get( base )
-		data_expr = ast.Attribute( value = expr_node, attr = data_attr.stem, ctx = ast.Load() )
-		ast.copy_location( data_expr, ctx_node )
-		payload_expr = ast.Attribute( value = data_expr, attr = f'v_{member.stem}', ctx = ast.Load() )
-		ast.copy_location( payload_expr, ctx_node )
-		return payload_expr
-
 	def _try_fold_is_rc_if( self, node: ast.If ) -> list[ast.stmt]|None:
 		''' rewrite 4: `if compiler.is_rc(T): A else: B` (T a generic class's
 		own type param) folds to just A's or B's statements, the OTHER
@@ -6681,67 +6641,67 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# into it (generic_visit or self.visit both eventually reach
 		# THIS method for a top-level BoolOp test) - those callers need a
 		# guaranteed bool result (Python's `if x or y:` only cares about
-		# truthiness, never which operand "won"), so they opt out of the
-		# value-coalescing rewrite below entirely, always getting the
-		# plain bool-forcing behavior instead - confirmed as a real
-		# regression via a pre-existing test (`if x or y:` against two
-		# TaggedUnion operands) that this rewrite silently broke before
+		# truthiness, never which operand "won"), so they opt out of
+		# value-coalescing entirely, always getting the plain bool-forcing
+		# behavior below instead - confirmed as a real regression via a
+		# pre-existing test (`if x or y:` against two TaggedUnion
+		# operands) that a value-coalescing rewrite silently broke before
 		# this flag existed: it turned the condition into a ternary
 		# PRODUCING one of the two operands, instead of combining both
 		# operands' own truthiness into a single bool.
 		#
-		# value-coalescing: real Python and/or semantics (the actual
-		# OPERAND survives, not a bool) - restricted to exactly 2
-		# operands, left operand a bare Name (safe to reference twice -
-		# once for its own truthiness, once as the resulting value -
-		# without re-evaluating a call/side-effecting expression a second
-		# time), whose type is a TaggedUnion with a None member (the
-		# "fill in a default when None/falsy" idiom, e.g. `tz or
-		# localtz()`). Desugars into an ordinary ternary, reusing
-		# visit_IfExp/_expr_IfExp's own already-correct rewrite/RC
-		# handling entirely rather than reimplementing it here: `x or y`
-		# is exactly `x if <truthy(x)> else y`; `x and y` is exactly `y
-		# if <truthy(x)> else x`. Anything outside this shape (more than
-		# 2 operands, a non-Name left operand, or a left operand that's
-		# plain bool/not a TaggedUnion at all) falls through unchanged to
-		# the existing bool-only path below (e.g. match's own nested-
-		# pattern tests, already bool on both sides).
-		if not getattr( node, 'is_condition_context', False ) and len( node.values ) == 2 and isinstance( node.values[0], ast.Name ):
-			left, right = node.values
-			truthy = self._rewrite_tagged_union_truthiness( left, node )
-			if truthy is not None:
-				is_and = isinstance( node.op, ast.And )
-				if is_and:
-					# x and y: truthy -> y (as-is); falsy -> x, UNCHANGED
-					# (matches real Python - a falsy-but-non-None x is still
-					# possible, so the falsy branch can't be unwrapped here;
-					# the ternary's own two branches naturally end up typed
-					# y's-type | x's-declared-type, same as Python's real
-					# `and` would produce)
-					body, orelse = right, left
-				else:
-					# x or y: truthy -> x, but UNWRAPPED to its non-None
-					# payload (this branch proves x isn't None, exactly like
-					# an `if x:` block would - matches _rewrite_tagged_
-					# union_truthiness's own narrowing for that shape);
-					# falsy -> y, as-is
-					unwrapped = self._tagged_union_payload_expr( left, node )
-					body, orelse = ( unwrapped if unwrapped is not None else left ), right
-				if_exp = ast.IfExp( test = truthy, body = body, orelse = orelse )
-				ast.copy_location( if_exp, node )
-				return self.visit_IfExp( if_exp )
-		# each operand of `and`/`or` is a boolean context — rewrite
-		# T|None operands BEFORE generic_visit recurses into the old nodes
-		for i, value in enumerate( node.values ):
-			rewritten = self._rewrite_tagged_union_truthiness( value, node )
-			if rewritten is not None:
-				node.values[i] = rewritten
-			elif isinstance( value, ast.BoolOp ):
-				# a nested boolop operand (`(a or b) or c`) is ALSO
-				# purely a boolean context here, once this outer BoolOp
-				# has reached this plain bool-forcing path itself - see
-				# visit_BoolOp's own is_condition_context comment
-				value.is_condition_context = True
+		# Real Python and/or value-coalescing itself (the actual OPERAND
+		# survives, not a bool) is handled directly by lowering.py's own
+		# _expr_BoolOp now (PLAN_BOOLOP_VALUE_PRESERVING), for ANY number
+		# of operands and any operand type/position - including a union
+		# operand with some of its own leaves provably excluded (e.g.
+		# `x: T|None or y: U` never keeps x's None leaf) and per-leaf
+		# re-mapping into a wider declared union. This method USED to
+		# desugar the narrow "exactly 2 operands, left is a bare Name
+		# with a nullable-union type" shape into an ast.IfExp here first,
+		# reusing _expr_IfExp's own coercion - but _expr_IfExp has no
+		# equivalent union-re-mapping of its own, so that rewrite firing
+		# ahead of lowering.py's newer, more general handling actively
+		# broke it (confirmed: `z: i32|str|None = x and y`, x: i32|None,
+		# desugared into an IfExp whose `orelse` branch tried to coerce
+		# x's WHOLE i32|None type into z's wider union directly, which
+		# _expr_IfExp's plain _lower_expr call - strict, leaf-only -
+		# correctly rejects, even though lowering.py's own _expr_BoolOp
+		# would have handled the identical shape correctly on its own).
+		# Removed rather than taught the same re-mapping _expr_BoolOp
+		# already has, to avoid two independent implementations of the
+		# same semantics drifting apart again.
+		#
+		# each operand of `and`/`or` is a boolean context ONLY when this
+		# WHOLE BoolOp itself already is one (is_condition_context - an
+		# if/while/assert's own top-level test, or a nested boolop operand
+		# of one already marked as such, same flag this method's own top
+		# comment describes). Outside a condition context (an ordinary
+		# value-producing expression, e.g. `z: T|str = x or y`),
+		# lowering.py's own _expr_BoolOp already produces the real,
+		# value-preserving result directly for ANY shape (not just this
+		# rewrite's own narrow "2 operands, left is a bare Name" case
+		# above) - unconditionally rewriting every operand into its own
+		# bool-only truthiness here would destroy the very value that
+		# needs to survive into the caller's own declared type. Confirmed
+		# as a real bug: `z: i32|str = x or y` (x: i32|None, y: str)
+		# silently rewrote x into `x.tag != 0` (a bool), which
+		# _check_assignable then correctly rejected as not matching z's
+		# own declared union - lowering.py never even got a chance to
+		# apply ITS OWN narrowing (excluding x's None leaf, per real
+		# Python's `or` semantics) because the value was already gone by
+		# the time it got there.
+		if getattr( node, 'is_condition_context', False ):
+			for i, value in enumerate( node.values ):
+				rewritten = self._rewrite_tagged_union_truthiness( value, node )
+				if rewritten is not None:
+					node.values[i] = rewritten
+				elif isinstance( value, ast.BoolOp ):
+					# a nested boolop operand (`(a or b) or c`) is ALSO
+					# purely a boolean context here, once this outer BoolOp
+					# has reached this plain bool-forcing path itself - see
+					# visit_BoolOp's own is_condition_context comment
+					value.is_condition_context = True
 		self.generic_visit( node )
 		return node
 
