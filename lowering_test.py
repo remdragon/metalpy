@@ -801,6 +801,7 @@ class Tests( unittest.TestCase ):
 			'	b: i32 = a + 1',
 			'	c: i32 = a - 1',
 			'	d: i32 = a * 2',
+			'	return Result.Ok( None )',
 		])
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
@@ -814,6 +815,23 @@ class Tests( unittest.TestCase ):
 		if result_cls.resolve is not None:
 			result_cls.resolve()
 		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
+		none_type = self.discovery.get_none_type()
+		# union_storage.get(), not a bare get_local('Ok') - Result.Ok/Err
+		# start out registered as plain field-annotation Variables (the
+		# @union sugar's own source shape, `Ok: T = 1`); the REAL
+		# constructor Function only exists once UnionStorage synthesizes
+		# it, which overwrites names['Ok'] as a side effect - the same
+		# thing _coerce_into_union (lowering.py) always does before its
+		# own get_local_or_raise('Ok') call. Skipping this and reading
+		# get_local('Ok') directly returns the stale Variable instead,
+		# confirmed via a real repro (AttributeError: 'Variable' object
+		# has no attribute 'type_params', deep in monomorphize.py).
+		self.compiler.type_resolver.union_storage.get( result_cls )
+		ok_fn = result_cls.get_local( 'Ok' )
+		if ok_fn.resolve is not None:
+			ok_fn.resolve()
+		monomorphized_ok = self.discovery._get_or_create_specialization( ok_fn, [ none_type, overflow_cls ] )
+		result_none_overflow = self.discovery._get_or_create_specialization( result_cls, [ none_type, overflow_cls ] )
 
 		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 4, type = i32 )
 		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 5, type = i32 )
@@ -837,6 +855,7 @@ class Tests( unittest.TestCase ):
 		t3 = ir.Temp( type = i32, id = 3 )
 		t4 = ir.Temp( type = result_i32_overflow, id = 4 ) # MulCheck's Result
 		t5 = ir.Temp( type = i32, id = 5 )
+		t6 = ir.Temp( type = result_none_overflow, id = 6 ) # trailing return Result.Ok( None )'s Call
 
 		fn = self.compiler._lower( checked_fn )
 		self._assert_ir( fn, [
@@ -866,6 +885,10 @@ class Tests( unittest.TestCase ):
 			ir.Assign( dest = d, src = t5 ),
 			ir.DeleteTemp( temp = t5 ),
 			ir.DeleteTemp( temp = t4 ),
+			ir.DeclareTemp( temp = t6 ),
+			ir.Call( dest = t6, target = self.compiler.lowering._monomorphized_function( monomorphized_ok ), receiver = None, args = [ ir.Const( type = none_type, value = None ) ], kwargs = {} ),
+			ir.DeleteTemp( temp = t6 ),
+			ir.Return( value = t6 ),
 			ir.FuncEnd( name = '__test__.checked' ),
 		])
 
@@ -884,10 +907,11 @@ class Tests( unittest.TestCase ):
 			'	x: T',
 			'',
 			'def get_result() -> Result[i32,MyError]:',
-			'	pass',
+			'	return Result( x = 0 )',
 			'',
 			'def foo() -> Result[i32,MyError]:',
 			'	v: i32 = get_result().or_return()',
+			'	return Result( x = v )',
 		])
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
@@ -911,6 +935,7 @@ class Tests( unittest.TestCase ):
 		# distinct (if structurally equal) object, not what the real temp
 		# in the lowered IR now carries
 		t0 = ir.Temp( type = get_result_fn.return_type, id = 0 ) # get_result()'s Result
+		t2 = ir.Temp( type = foo_fn.return_type, id = 2 ) # trailing return Result( x = v )'s Allocate
 		self._assert_ir( fn, [
 			ir.FuncStart( name = '__test__.foo', params = [], return_type = foo_fn.return_type ),
 			ir.DeclareTemp( temp = t0 ),
@@ -920,6 +945,10 @@ class Tests( unittest.TestCase ):
 			ir.Assign( dest = v, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.DeclareTemp( temp = t2 ),
+			ir.Allocate( dest = t2, cls = result_cls, fields = { 'x': v } ),
+			ir.DeleteTemp( temp = t2 ),
+			ir.Return( value = t2 ),
 			ir.FuncEnd( name = '__test__.foo' ),
 		])
 		self.assertFalse( any( isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'or_return' for i in fn.instructions ))
@@ -1321,6 +1350,7 @@ class Tests( unittest.TestCase ):
 			'	a: i32 = 10',
 			'	b: i32 = a // 3',
 			'	c: i32 = a % 3',
+			'	return Result.Ok( None )',
 		])
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
@@ -1336,6 +1366,13 @@ class Tests( unittest.TestCase ):
 			result_cls.resolve()
 		error_union = self.discovery._get_or_create_union( [ zerodiv_cls, overflow_cls ] )
 		result_i32_err = self.discovery._get_or_create_specialization( result_cls, [ i32, error_union ] )
+		none_type = self.discovery.get_none_type()
+		self.compiler.type_resolver.union_storage.get( result_cls ) # see test_binop_check_mode_emits_or_return's own comment on why this must run before get_local('Ok')
+		ok_fn = result_cls.get_local( 'Ok' )
+		if ok_fn.resolve is not None:
+			ok_fn.resolve()
+		monomorphized_ok = self.discovery._get_or_create_specialization( ok_fn, [ none_type, error_union ] )
+		result_none_err = self.discovery._get_or_create_specialization( result_cls, [ none_type, error_union ] )
 
 		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 4, type = i32 )
 		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 5, type = i32 )
@@ -1353,6 +1390,7 @@ class Tests( unittest.TestCase ):
 		t1 = ir.Temp( type = i32, id = 1 )            # unwrapped via OrReturn
 		t2 = ir.Temp( type = result_i32_err, id = 2 ) # Mod's Result
 		t3 = ir.Temp( type = i32, id = 3 )
+		t4 = ir.Temp( type = result_none_err, id = 4 ) # trailing return Result.Ok( None )'s Call
 
 		fn = self.compiler._lower( checked_fn )
 		self._assert_ir( fn, [
@@ -1374,6 +1412,10 @@ class Tests( unittest.TestCase ):
 			ir.Assign( dest = c, src = t3 ),
 			ir.DeleteTemp( temp = t3 ),
 			ir.DeleteTemp( temp = t2 ),
+			ir.DeclareTemp( temp = t4 ),
+			ir.Call( dest = t4, target = self.compiler.lowering._monomorphized_function( monomorphized_ok ), receiver = None, args = [ ir.Const( type = none_type, value = None ) ], kwargs = {} ),
+			ir.DeleteTemp( temp = t4 ),
+			ir.Return( value = t4 ),
 			ir.FuncEnd( name = '__test__.checked' ),
 		])
 
@@ -1418,6 +1460,7 @@ class Tests( unittest.TestCase ):
 			'	a: i32 = 10',
 			'	with compiler.wrap_arithmetic:',
 			'		b: i32 = a // 3',
+			'	return Result.Ok( None )',
 		])
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
@@ -1540,6 +1583,7 @@ class Tests( unittest.TestCase ):
 			'def checked() -> Result[None,OverflowError]:',
 			'	a: i32 = 1',
 			'	b: i32 = -a',
+			'	return Result()',
 		])
 		mod = self._import( code )
 		i32 = self.discovery.get_intrinsics()['i32']
@@ -1552,12 +1596,15 @@ class Tests( unittest.TestCase ):
 		if result_cls.resolve is not None:
 			result_cls.resolve()
 		result_i32_overflow = self.discovery._get_or_create_specialization( result_cls, [ i32, overflow_cls ] )
+		none_type = self.discovery.get_none_type()
+		result_none_overflow = self.discovery._get_or_create_specialization( result_cls, [ none_type, overflow_cls ] )
 
 		a = Variable( stem = 'a', qualname = '__test__.checked.a', file = Path( '__test__.py' ), line = 8, type = i32 )
 		b = Variable( stem = 'b', qualname = '__test__.checked.b', file = Path( '__test__.py' ), line = 9, type = i32 )
 
 		t0 = ir.Temp( type = result_i32_overflow, id = 0 ) # NegCheck's Result
 		t1 = ir.Temp( type = i32, id = 1 )                 # unwrapped via OrReturn
+		t2 = ir.Temp( type = result_none_overflow, id = 2 ) # trailing return Result()'s Allocate
 
 		fn = self.compiler._lower( checked_fn )
 		self._assert_ir( fn, [
@@ -1570,6 +1617,10 @@ class Tests( unittest.TestCase ):
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
+			ir.DeclareTemp( temp = t2 ),
+			ir.Allocate( dest = t2, cls = result_cls, fields = {} ),
+			ir.DeleteTemp( temp = t2 ),
+			ir.Return( value = t2 ),
 			ir.FuncEnd( name = '__test__.checked' ),
 		])
 
@@ -6595,6 +6646,7 @@ class Tests( unittest.TestCase ):
 			'def checked() -> Result[None,OverflowError]:',
 			'	with errdefer:',
 			'		pass',
+			'	return Result()',
 		])
 		mod = self._import( code )
 		bool_cls = mod.get_local( 'bool' )
@@ -6610,7 +6662,15 @@ class Tests( unittest.TestCase ):
 
 		flag0 = Variable( stem = '__defer_flag_0', qualname = '__test__.checked.__defer_flag_0', file = Path( '__test__.py' ), line = 10, type = bool_cls )
 		return_value_var = Variable( stem = '__return_value', qualname = '__test__.checked.__return_value', file = Path( '__test__.py' ), line = 9, type = checked_fn.return_type )
-		is_err_temp = ir.Temp( type = bool_cls, id = 0 )
+		# t0: Result()'s own Allocate (the explicit trailing return's own
+		# value - MUST be real: a Result-returning function relying purely
+		# on implicit fallthrough with no real return value is exactly the
+		# uninitialized-__return_value bug class this compiler now rejects
+		# outright - see lib/builtins/__list.py's own list.insert() fix and
+		# msvc_toolset_c11atomics memory). is_err_temp is id=1, not 0 - it's
+		# allocated AFTER t0 has already been declared/assigned/deleted
+		t0 = ir.Temp( type = checked_fn.return_type, id = 0 )
+		is_err_temp = ir.Temp( type = bool_cls, id = 1 )
 		# is_err's genericity is inherited from Result's own class type
 		# params (like Result.Ok/.Err) - the receiver's type (Result[None,
 		# OverflowError]) already pins down the concrete args by the time
@@ -6625,10 +6685,19 @@ class Tests( unittest.TestCase ):
 			ir.FuncStart( name = '__test__.checked', params = [], return_type = checked_fn.return_type ),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = False )),
 			ir.Assign( dest = flag0, src = ir.Const( type = bool_cls, value = True )),
-			# no Label here - see test_noreturn_function_epilogue_has_no_
-			# return_value_var's identical comment; nothing else in this
-			# function needs to goto this depth, only the fall-off-the-end
-			# path reaches it, via pure fallthrough
+			ir.DeclareTemp( temp = t0 ),
+			ir.Allocate( dest = t0, cls = result_cls, fields = {} ),
+			ir.Assign( dest = return_value_var, src = t0 ),
+			ir.DeleteTemp( temp = t0 ),
+			# an EXPLICIT `return Result()` (needed - see t0's own comment
+			# above) reaches the SAME shared epilogue a pure fall-off-the-end
+			# would have - unlike that pure-fallthrough case (see
+			# test_noreturn_function_epilogue_has_no_return_value_var's
+			# identical comment on when no Label/Jump is needed), an
+			# explicit return mid-body genuinely needs a real goto to reach
+			# it, so both the Jump and its Label are real here
+			ir.Jump( target = '__epilogue_0__' ),
+			ir.Label( name = '__epilogue_0__' ),
 			ir.JumpIfFalse( cond = flag0, target = '__defer_skip_1__' ),
 			# the is_err() check is computed fresh, INSIDE the flag guard -
 			# with per-Epilogue labels a check computed once up front
@@ -6710,6 +6779,7 @@ class Tests( unittest.TestCase ):
 			'		pass',
 			'	a: i32 = 1',
 			'	b: i32 = a + 1',
+			'	return Result.Ok( None )',
 		])
 		mod = self._import( code )
 		checked_fn = mod.get_local( 'checked' )
@@ -6807,9 +6877,11 @@ class Tests( unittest.TestCase ):
 			'def checked_with() -> Result[None,OverflowError]:',
 			'	with errdefer:',
 			'		cleanup()',
+			'	return Result()',
 			'',
 			'def checked_call() -> Result[None,OverflowError]:',
 			'	errdefer( cleanup() )',
+			'	return Result()',
 		])
 		mod = self._import( code )
 		fn_with = mod.get_local( 'checked_with' )
@@ -6834,6 +6906,7 @@ class Tests( unittest.TestCase ):
 			'def checked() -> Result[None,OverflowError]:',
 			'	a: i32 = 1',
 			'	b: i32 = a + 1',
+			'	return Result.Ok( None )',
 		])
 		mod = self._import( code )
 		checked_fn = mod.get_local( 'checked' )

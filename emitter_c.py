@@ -2788,6 +2788,19 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# than inventing a new one.
 		if instr.dest is not None and not _returns_void_in_c( instr.target.return_type ):
 			return [ f'\t{_emit_operand(instr.dest)} = {call_expr};' ]
+		if instr.dest is not None:
+			# dest is a real declared MetalpyNone temp (see the comment above)
+			# but the callee's own C function is void, so it can't be assigned
+			# FROM the call expression - give it a defined placeholder value
+			# separately instead of leaving it genuinely uninitialized. A
+			# NoneType temp's bit value never carries information, but it can
+			# still be READ later (e.g. _coerce_into_union wrapping it into a
+			# Result[None,E].Ok(...) payload) - an uninitialized read there is
+			# real UB, not just a harmless value-doesn't-matter case: confirmed
+			# via MSVC's /RTC1 uninitialized-variable runtime check aborting
+			# (STATUS_BREAKPOINT) on exactly this shape (list.append() wrapped
+			# to return Result[None,BorrowError]).
+			return [ f'\t{call_expr};', f'\t{_emit_operand(instr.dest)} = 0;' ]
 		return [ f'\t{call_expr};' ]
 
 	if isinstance( instr, ir.CallIndirect ):
