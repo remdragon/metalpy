@@ -491,22 +491,24 @@ def default_pool_size() -> usize:
 class ThreadPool:
 	__workers: list[_PoolWorker]
 	__threads: list[Thread]
-	__next:    usize
+	__next:    atomic.Atomic[usize]
 
 	def __init__( self, size: usize, max_queue_depth: usize|None = None ) -> None:
 		''' spawns `size` daemon worker threads immediately (Thread.
 		__init__ starts them - there is no separate .run() to call, unlike
 		reactor.Reactor). Required, no default - matches reactor.Reactor.
-		__init__(num_workers)'s own convention exactly. max_queue_depth is
-		enforced PER WORKER (each of the `size` workers independently caps
-		its own queue at this depth), not pool-wide - fits the existing
-		round-robin architecture with no new cross-worker synchronization;
-		a real tradeoff is that submit() can reject under skewed load even
-		while a different worker sits idle. None (default) preserves the
-		original unbounded behavior exactly. '''
+		__init__(num_workers)'s own convention exactly (see threading.
+		default_pool_size() for a caller that wants a reasonable size
+		without picking one itself). max_queue_depth is enforced PER WORKER
+		(each of the `size` workers independently caps its own queue at
+		this depth), not pool-wide - fits the existing round-robin
+		architecture with no new cross-worker synchronization; a real
+		tradeoff is that submit() can reject under skewed load even while a
+		different worker sits idle. None (default) preserves the original
+		unbounded behavior exactly. '''
 		self.__workers = list[_PoolWorker]()
 		self.__threads = list[Thread]()
-		self.__next = 0
+		self.__next = atomic.Atomic[usize]( 0 )
 		i: usize = 0
 		while i < size:
 			w: _PoolWorker = _PoolWorker( max_queue_depth )
@@ -517,15 +519,19 @@ class ThreadPool:
 				i = i + 1
 
 	def submit( self, work: Closure[[], None] ) -> Result[None, QueueFullError]:
-		''' round-robin across workers - same (idx+1) % len idiom as
-		reactor.Reactor.spawn(). Err(QueueFullError()) only when this pool
-		was constructed with a max_queue_depth AND the worker this job
-		would land on is already at that depth - the caller decides what
-		"full" means for it (drop the work, close a connection, block and
-		retry, ...). '''
-		idx: usize = self.__next
+		''' round-robin across workers, via an atomic fetch_add rather than
+		a plain load-then-store on a bare usize field: two threads calling
+		submit() concurrently used to be able to both read the SAME index
+		before either wrote back, silently skipping a worker (a lost
+		round-robin step - not memory-unsafe, but a real fairness bug, and
+		the one genuine data race left over in this class). fetch_add is a
+		single atomic RMW, so every caller gets a distinct, monotonically
+		increasing ticket with no lost updates - same effective (idx+1) %
+		len idiom as reactor.Reactor.spawn(), just computed from an
+		ever-growing ticket instead of a stored-and-wrapped index. '''
+		ticket: usize = self.__next.fetch_add( usize( 1 ))
 		with compiler.panic_arithmetic( 'ThreadPool.submit: pool size is zero' ):
-			self.__next = ( idx + 1 ) % self.__workers.__len__()
+			idx: usize = ticket % self.__workers.__len__()
 		w: _PoolWorker = self.__workers.__getitem__( idx ).unwrap( 'ThreadPool.submit: index in bounds by construction' )
 		return w.submit( _PoolJob( work ))
 
