@@ -6758,6 +6758,147 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_writes_rc_module_global_wraps_decref_and_assign_in_one_lock( self ) -> None:
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: `global G; G = Box()`
+		# must bracket BOTH the Decref of G's current value AND the Assign
+		# that overwrites it inside one AcquireGlobalLock/ReleaseGlobalLock
+		# pair, never two separate ones - releasing between them would let
+		# a concurrent reader's own Incref interleave in the gap (see that
+		# plan's own worked reader-vs-writer interleaving). Also confirms
+		# reassigned_outside_init flips True as a side effect - never for a
+		# global's own module-level initializer (Box() at `G: Box = Box()`
+		# above is lowered by lower_global(), which never touches
+		# cfg.assign() at all - see that flag's own comment).
+		code = '\n'.join([
+			'class Box:',
+			'	def __init__( self ) -> None:',
+			'		pass',
+			'',
+			'G: Box = Box()',
+			'',
+			'def main() -> None:',
+			'	global G',
+			'	G = Box()',
+			'	return',
+		])
+		mod = self._import( code )
+		none_type = self.discovery.get_none_type()
+		box_cls = mod.get_local( 'Box' )
+		g = mod.get_local( 'G' )
+		if g.resolve is not None:
+			g.resolve()
+		self.assertFalse( g.reassigned_outside_init ) # not yet, before main() itself is lowered
+
+		fn = self._lower_main()
+		self.assertTrue( g.reassigned_outside_init )
+		# $$__new__ is only synthesized/registered once something actually
+		# constructs a Box - can't look it up until after _lower_main()
+		new_fn = box_cls.get_local( '$$__new__' )
+		t0 = ir.Temp( type = box_cls, id = 0 )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.DeclareTemp( temp = t0 ),
+			ir.Call( dest = t0, target = new_fn, receiver = None, args = [], kwargs = {} ),
+			ir.AcquireGlobalLock( var = g ),
+			ir.Decref( value = g ),
+			ir.Assign( dest = g, src = t0 ),
+			ir.ReleaseGlobalLock( var = g ),
+			ir.DeleteTemp( temp = t0 ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_reads_rc_module_global_wraps_incref_and_assign_in_one_lock( self ) -> None:
+		# the read-side counterpart - `x: Box = G` must bracket BOTH the
+		# Incref of G's current value AND the Assign that binds it into x
+		# inside one lock pair. Confirmed necessary the hard way: an
+		# earlier version closed the lock right after the Incref, before
+		# emitting the Assign - under real concurrent stress this let a
+		# writer swap G in the gap, so the Assign's own SEPARATE read of G
+		# (its own `x = G;` in the generated C) could bind a DIFFERENT
+		# object than the one the Incref just retained.
+		code = '\n'.join([
+			'class Box:',
+			'	def __init__( self ) -> None:',
+			'		pass',
+			'',
+			'G: Box = Box()',
+			'',
+			'def touch() -> None:',
+			'	global G',
+			'	G = Box()',
+			'',
+			'def main() -> None:',
+			'	x: Box = G',
+			'	return',
+		])
+		mod = self._import( code )
+		box_cls = mod.get_local( 'Box' )
+		none_type = self.discovery.get_none_type()
+		g = mod.get_local( 'G' )
+		if g.resolve is not None:
+			g.resolve()
+		touch = mod.get_local( 'touch' )
+		if touch.resolve is not None:
+			touch.resolve()
+		# force g.reassigned_outside_init True BEFORE lowering main(), the
+		# same way it would be if `touch` happened to be lowered first in a
+		# real compile (functions are lowered off a work queue, in
+		# whatever order they're scheduled - not necessarily the order a
+		# human reads the source in; the read side has to emit these
+		# markers unconditionally for exactly this reason, see cfg.py's
+		# own `is_alias` branch comment)
+		self.compiler._lower( touch )
+		self.assertTrue( g.reassigned_outside_init )
+		x = Variable( stem = 'x', qualname = 'main.x', file = Path( '__test__.py' ), line = 12, type = box_cls )
+
+		fn = self._lower_main()
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.AcquireGlobalLock( var = g ),
+			ir.Incref( value = g ),
+			ir.Assign( dest = x, src = g ),
+			ir.ReleaseGlobalLock( var = g ),
+			ir.Jump( target = '__epilogue_0__' ),
+			ir.Label( name = '__epilogue_0__' ),
+			ir.Decref( value = x ),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
+	def test_writes_scalar_module_global_gets_no_lock( self ) -> None:
+		# regression guard for a real bug found while building this
+		# mechanism: cfg.py's assign() early-returns before ever reaching
+		# its own is_global/is_alias branches when the destination type
+		# has no RC leaves, so no AcquireGlobalLock is ever emitted for a
+		# scalar global - an earlier version of the read-side release
+		# didn't mirror that early-return and emitted an orphaned
+		# ReleaseGlobalLock with no matching Acquire (caught by
+		# test_reads_module_global above failing unexpectedly).
+		code = '\n'.join([
+			'G: i32 = 5',
+			'',
+			'def main() -> None:',
+			'	global G',
+			'	G = 6',
+			'	return',
+		])
+		mod = self._import( code )
+		i32 = self.discovery.get_intrinsics()['i32']
+		none_type = self.discovery.get_none_type()
+		g = mod.get_local( 'G' )
+		if g.resolve is not None:
+			g.resolve()
+
+		fn = self._lower_main()
+		self.assertFalse( g.reassigned_outside_init )
+		self._assert_ir( fn, [
+			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
+			ir.Assign( dest = g, src = ir.Const( type = i32, value = 6 )),
+			ir.Return( value = None ),
+			ir.FuncEnd( name = 'main' ),
+		])
+
 	# --- overload call sites ---------------------------------------------------
 
 	def test_overload_call_resolves_to_unconditional_target( self ) -> None:
