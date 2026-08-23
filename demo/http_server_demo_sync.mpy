@@ -1,16 +1,17 @@
 '''
-Synchronous demo server - blocking I/O, NO reactor anywhere, dispatched
-onto a bounded threading.ThreadPool (lib/tcpserver.py's own default
-ConnectionDispatcher) rather than one OS thread per connection. Built on
-the same generic tcpserver.TcpServer + http.server.serve_sync() every
-sync TCP-based server in this codebase can now share, mirroring how
-http_server_demo_async.mpy already builds on reactor.Reactor +
-http.server.serve().
+Synchronous demo server - blocking I/O, NO reactor anywhere, one real OS
+thread per accepted connection (lib/tcpserver.py's own default
+ConnectionDispatcher, ThreadPerConnectionDispatcher). Built on the generic
+tcpserver.TcpServer + http.server.serve_sync() every sync TCP-based server
+in this codebase can now share, mirroring how http_server_demo_async.mpy
+already builds on reactor.Reactor + http.server.serve().
 
-See demo/http_server_demo_sync_unbounded.mpy for the older unbounded
-thread-per-connection baseline (still available as an explicit opt-in via
-tcpserver.ThreadPerConnectionDispatcher, for stress-test comparison
-against this bounded-pool default).
+Thread-per-connection, not a bounded thread pool, is the default here on
+purpose: HTTP/1.1 keep-alive means a single accepted connection's handler
+(_handle_connection) runs for as long as that connection stays open, not
+just for one request - see demo/http_server_demo_sync_pooled.mpy for what
+goes wrong (confirmed via a real load test, not just reasoning) when a
+FIXED-size pool is used for that instead.
 '''
 
 import tcp
@@ -22,7 +23,7 @@ from demo.http_server_demo_app import App
 def main() -> i32:
 	listener: tcp.TcpListener = tcp.TcpListener.bind( '0.0.0.0', u16( 8080 )).unwrap( 'error binding 0.0.0.0:8080' )
 	addr: socket.SocketAddr = listener.getsockname().unwrap( 'error getting address from socket' )
-	print( f'listening on http://0.0.0.0:{addr.port} (sync, bounded thread pool)' )
+	print( f'listening on http://0.0.0.0:{addr.port} (sync, thread-per-connection)' )
 	app: App = App()
 	serve_sync( listener, app.handle ).run()
 	return 0

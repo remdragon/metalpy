@@ -503,11 +503,16 @@ def serve( listener: tcp.TcpListener, handler: Closure[[Request], Response], r: 
 def serve_sync( listener: tcp.TcpListener, handler: Closure[[Request], Response], dispatcher: tcpserver.ConnectionDispatcher|None = None ) -> tcpserver.TcpServer:
 	''' the sync counterpart to serve() - same _handle_connection loop,
 	just dispatched per tcpserver.ConnectionDispatcher's own strategy
-	(default: a bounded threading.ThreadPool - see tcpserver.TcpServer's
-	own default) instead of one fiber per connection. Doesn't block: call
-	.run() on the TcpServer this returns, mirroring serve()/r.run()'s own
-	build-then-drive split - there's just no separate reactor to hand off
-	to here, the caller drives the TcpServer directly. '''
+	(default: one OS thread per connection - see tcpserver.TcpServer's
+	own default and tcpserver.ThreadPoolDispatcher's own docstring for
+	why a bounded pool is NOT safe to default to here: _handle_connection
+	loops for a keep-alive connection's whole lifetime, so a fixed pool
+	would only ever serve as many CONCURRENT connections as it has
+	workers, starving the rest) instead of one fiber per connection.
+	Doesn't block: call .run() on the TcpServer this returns, mirroring
+	serve()/r.run()'s own build-then-drive split - there's just no
+	separate reactor to hand off to here, the caller drives the
+	TcpServer directly. '''
 	h: Closure[[Request], Response] = handler
 	on_connection: Closure[[tcp.TcpConnection], None] = lambda conn: _handle_connection( conn, h )
 	return tcpserver.TcpServer( listener, on_connection, dispatcher )
