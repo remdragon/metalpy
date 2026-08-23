@@ -2629,6 +2629,19 @@ class FunctionLowering:
 		for those. '''
 		if value is None or not self.lowering._is_aliasing_expr( node_expr, value ):
 			return
+		if self._cfg.is_fresh_temp( value ):
+			# value LOOKS aliasing from node_expr's own AST shape (a bare
+			# Name/Attribute node), but it's already a freshly-owned value -
+			# a narrowed read of a protected global performs its own
+			# protected retain up front and registers the result via
+			# fresh_temp() (see _expr_Name's own comment - this is
+			# `return localtz_style_global` after narrowing, the exact
+			# shape that motivated this whole mechanism). Increffing again
+			# here would double-own it; nothing else to do - it's already
+			# tracked the same way an ordinary Call/Allocate result being
+			# returned is, and existing ownership-transfer handling covers
+			# that case already.
+			return
 		if force or not self._cfg.has_live_entry( value ):
 			for instr in self._cfg.incref( value.type, value ):
 				self._emit( instr )
@@ -7392,6 +7405,34 @@ class FunctionLowering:
 			# shape instead of the real monomorphized one.
 			base = self.lowering.monomorphize_class( name.type ) if isinstance( name.type, Specialization ) else name.type
 			_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
+			if name.is_global:
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: the "name itself
+				# still owns the whole union unconditionally the entire time"
+				# reasoning above does NOT hold for a protected global - a
+				# concurrent thread can reassign its slot at any point after
+				# this extraction, unlike a local/parameter no other thread
+				# can touch. Extract AND retain atomically under one lock
+				# instead of returning a bare (unowned) view, and hand back
+				# an already-fresh, OWNED temp via fresh_temp() - cfg.py's
+				# assign() (its own is_alias branch) and
+				# _incref_aliasing_return both recognize an already-fresh
+				# temp via is_fresh_temp() and skip incref'ing it again,
+				# exactly like an ordinary Call/Allocate result. Confirmed
+				# necessary via a real crash under concurrent stress: the
+				# original "bare view, incref happens later, wherever this
+				# operand is next consumed" design left an unprotected
+				# window between this extraction and that later incref, in
+				# which a concurrent writer could free the very object being
+				# extracted.
+				self._emit( ir.AcquireGlobalLock( var = name ))
+				payload_dest = self._new_temp( payload_cls )
+				self._emit( ir.GetAttr( dest = payload_dest, obj = name, attr = data_attr.stem ))
+				leaf_dest = self._new_temp( member.type )
+				self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+				self._emit( ir.Incref( value = leaf_dest ))
+				self._emit( ir.ReleaseGlobalLock( var = name ))
+				self._cfg.fresh_temp( leaf_dest, member.type )
+				return leaf_dest
 			payload_dest = self._new_temp( payload_cls )
 			self._emit( ir.GetAttr( dest = payload_dest, obj = name, attr = data_attr.stem ))
 			leaf_dest = self._new_temp( member.type )

@@ -6899,6 +6899,69 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_narrowed_read_of_protected_union_global_wraps_extraction_and_incref_in_one_lock( self ) -> None:
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part A's hardest case: once
+		# narrowing has proven `G` (a Box|None global) is non-None, reading
+		# it (`b: Box = G`) used to extract the payload via a bare GetAttr
+		# sequence with NO lock at all - _expr_Name's narrowed-read rewrite
+		# is a separate code path from cfg.assign()'s own is_alias branch,
+		# which the direct-read tests above exercise instead. Confirmed via
+		# a real crash under concurrent stress that protecting only the
+		# eventual Incref wasn't enough either - the extraction itself
+		# (reading the union's .data/.v_Box fields) has to be inside the
+		# SAME critical section as the retain, or a concurrent writer can
+		# free the object between the two. This test doesn't hand-construct
+		# the exact IR (the narrowed if/else control flow around it is
+		# incidental, not what's being tested, and brittle to match
+		# exactly) - it checks the one property that actually matters:
+		# exactly one Acquire/Release pair for G's write (inside
+		# `if G is None:`) and one more for the narrowed read, and that
+		# second pair genuinely brackets both GetAttrs AND the Incref, not
+		# just the Incref alone.
+		self.discovery.import_name( 'builtins' )
+		code = '\n'.join([
+			'class Box:',
+			'	def __init__( self ) -> None:',
+			'		pass',
+			'',
+			'G: Box|None = None',
+			'',
+			'def touch() -> None:',
+			'	global G',
+			'	G = Box()',
+			'',
+			'def main() -> Box:',
+			'	global G',
+			'	if G is None:',
+			'		G = Box()',
+			'	b: Box = G',
+			'	return b',
+		])
+		mod = self._import( code )
+		g = mod.get_local( 'G' )
+		if g.resolve is not None:
+			g.resolve()
+		touch = mod.get_local( 'touch' )
+		if touch.resolve is not None:
+			touch.resolve()
+		self.compiler._lower( touch ) # force g.reassigned_outside_init True before main - see the direct-read test's own comment for why this matters
+		self.assertTrue( g.reassigned_outside_init )
+
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		acquire_idxs = [ i for i, k in enumerate( kinds ) if k == 'AcquireGlobalLock' ]
+		release_idxs = [ i for i, k in enumerate( kinds ) if k == 'ReleaseGlobalLock' ]
+		self.assertEqual( len( acquire_idxs ), 2, kinds ) # one for the write inside `if G is None:`, one for the narrowed read
+		self.assertEqual( len( release_idxs ), 2, kinds )
+		self.assertTrue( all( fn.instructions[i].var is g for i in acquire_idxs ))
+		self.assertTrue( all( fn.instructions[i].var is g for i in release_idxs ))
+		last_acquire, last_release = acquire_idxs[-1], release_idxs[-1]
+		self.assertLess( last_acquire, last_release, kinds )
+		bracketed = kinds[ last_acquire : last_release + 1 ]
+		self.assertIn( 'Incref', bracketed, kinds ) # the retain, not just the extraction
+		self.assertEqual( bracketed.count( 'GetAttr' ), 2, kinds ) # .data, then .v_Box
+
 	# --- overload call sites ---------------------------------------------------
 
 	def test_overload_call_resolves_to_unconditional_target( self ) -> None:

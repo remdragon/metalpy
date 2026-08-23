@@ -1783,9 +1783,59 @@ class CFGState:
 			# complete) - these markers become pure no-ops there for a
 			# global that turns out to never actually be reassigned
 			# anywhere.
-			if isinstance( src, Variable ) and src.is_global:
-				instructions.append( ir.AcquireGlobalLock( var = src ))
-			instructions += self._incref_instructions( dest.type, src ) # bump the new value first - safe even if src and dest already alias the same object
+			if self.is_fresh_temp( src ):
+				# src LOOKS aliasing from the source AST's own shape (is_alias
+				# reflects that a Name/Attribute node was read, not what it
+				# actually lowered to), but it's already a freshly-owned value
+				# here - a narrowed read of a protected global performs its
+				# own protected retain up front and registers the result via
+				# fresh_temp() (see lowering.py's _expr_Name), specifically so
+				# this branch doesn't double-own it. Untrack instead of
+				# increffing again, same as the plain-Temp ownership-transfer
+				# branch below - this is sound for every OTHER existing caller
+				# too, not just this new one: is_fresh_temp can only be True
+				# for a Call/Allocate-produced (or now, protected-narrowed-
+				# read-produced) temp, and nothing already relies on
+				# increffing one of those a second time here.
+				self._temp_states.pop( src.id, None )
+			else:
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: reading a global's
+				# CURRENT value (src here) needs the same protection writing one
+				# does - _incref_instructions shares _refcount_instructions with
+				# _decref_instructions (see that method's own comment), so for a
+				# union-typed global (e.g. ZoneInfo|None) this ALSO isn't a bare
+				# ir.Incref, it's the same tag-check+extract+retain sequence,
+				# which only whoever is CONSTRUCTING it (here) can bound.
+				#
+				# Opens the critical section here (Acquire only - the matching
+				# Release is emitted by lowering.py's _cfg_assign, AFTER the
+				# trailing ir.Assign it emits, not here) for the SAME reason the
+				# write side's Decref+Assign have to share one critical section:
+				# `ir.Assign(dest=b, src=X)` is ITS OWN, SEPARATE textual read of
+				# X in the generated C (`b = X;`), not a reuse of whatever value
+				# the Incref above just retained - confirmed the hard way, via a
+				# real crash under concurrent stress: retain_object(X) protected
+				# the INCREF, but the Assign's own independent read of X, right
+				# after the lock was released, could observe a DIFFERENT object
+				# than the one just retained if a writer swapped X in between -
+				# leaking the retained object and under-retaining the one
+				# actually bound to `b`. Emitted UNCONDITIONALLY whenever src is
+				# simply a global (not gated on src.reassigned_outside_init,
+				# unlike the write side's own check in the `dest.is_global`
+				# branch below) - a READ can be lowered before the ONE write
+				# that will eventually mark this global as needing protection is
+				# (functions are lowered off a work queue in whatever order
+				# they're scheduled, not necessarily the order a human reads the
+				# source in), so reassigned_outside_init's FINAL value isn't
+				# reliably known yet at this point. emitter_c.py defers the real
+				# "does this end up mattering" decision to emission time instead
+				# (after every function has been lowered, so the fact is
+				# complete) - these markers become pure no-ops there for a
+				# global that turns out to never actually be reassigned
+				# anywhere.
+				if isinstance( src, Variable ) and src.is_global:
+					instructions.append( ir.AcquireGlobalLock( var = src ))
+				instructions += self._incref_instructions( dest.type, src ) # bump the new value first - safe even if src and dest already alias the same object
 		elif isinstance( src, ir.Temp ):
 			# ownership transfers from the temp's own (momentary) tracking
 			# into dest, not a second independent owner - untrack it so its
