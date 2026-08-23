@@ -7438,6 +7438,111 @@ class FunctionLowering:
 		dest.is_union_coerce_result = True
 		return dest
 
+	def _build_generator_zero_value( self, t: Type, node: ast.AST ) -> ir.Operand:
+		''' PLAN_GENERATORS.md Phase 5's own "generator_zero_rc_field"
+		placeholder mechanism (type_resolver.py's _rewrite_generator_
+		constructor) works for a plain scalar or a plain RCClass-typed
+		promoted field (a bare `0` reinterpreted as NULL, gated on the
+		compiler-internal tag _expr_Constant checks), but a TaggedUnion
+		WITHOUT a None member (e.g. Result[Box,IndexError] - no leaf a bare
+		int literal can coerce into when NEITHER leaf is itself a plain
+		int) has no such placeholder at all - confirmed unreachable before
+		anything actually promoted a match statement's own subject (see
+		_reserve_generator_match_subject_fields), which routinely needs
+		exactly this shape (Result[T,IndexError] for an arbitrary element
+		type T, including an RCClass). Building a REAL leaf instance via
+		the union's own synthesized Ok/Err-style wrap constructor is unsafe
+		here: that constructor's own body unconditionally increfs the leaf
+		it wraps (see _coerce_into_union's own comment) - retaining a NULL
+		placeholder would deref a null ObjectHeader* and crash immediately
+		at CONSTRUCTION time, before the generator is ever iterated once.
+
+		Instead this builds the union's raw tag+data storage directly via
+		two nested ir.Allocate ops (mirroring UnionStorage.build_member_
+		constructor's own `$union_cls.__allocate__(tag=.., data=$payload_
+		cls(v_<member>=value))` shape, just built at the IR level instead
+		of via synthesized AST needing a scope to resolve $union_cls/
+		$payload_cls names in) - NOT the member's own wrap constructor, so
+		no incref ever fires: _lower_allocate_fields's own generic field-
+		building loop only increfs an ALIASING value (a bare Name/Attribute
+		read of something that already exists), and every value built here
+		is a fresh ast.Constant, never aliasing (_is_aliasing_expr's own
+		documented rule - "Constant... never produce RC values at all"),
+		so it's treated as already-owned, no incref emitted - correct here
+		specifically because there is nothing real to own yet.
+
+		Recurses into the union's own FIRST member (arbitrarily - live-
+		flag gating means the actual tag/value picked here is never
+		observed by anything but this same field's own state/flag-gated
+		destructor deciding NOT to decref it), so a leaf that's itself a
+		nested union (uncommon, unexercised by anything built so far) gets
+		the same treatment. Declines (a clean, actionable compile error,
+		not a silent miscompile or a raw crash) for any OTHER leaf shape
+		(CStruct, CEnum, ...) - genuinely unneeded for this bug's own
+		scope (every case built so far is a scalar or an RCClass leaf),
+		and a real "how do you zero THIS" design question if it ever is,
+		better raised explicitly than guessed. '''
+		base = t.base if isinstance( t, Specialization ) else t
+		if isinstance( base, Scalar ):
+			const_node = ast.Constant( value = False if base.stem == 'bool' else 0 )
+			ast.copy_location( const_node, node )
+			return self._lower_expr( const_node, t )
+		if isinstance( base, RCClass ):
+			const_node = ast.Constant( value = 0 )
+			const_node.generator_zero_rc_field = True
+			ast.copy_location( const_node, node )
+			return self._lower_expr( const_node, t )
+		if isinstance( base, TaggedUnion ):
+			_abstract_tag_attr, _abstract_data_attr, _abstract_payload_cls, tags = self.lowering._union_storage.get( base )
+			# union_storage.get(base)'s own tag/data/payload_cls are for the
+			# ABSTRACT union - deliberately never schedule()d by get() itself
+			# when the union is generic (see its own comment: "only a
+			# CONCRETE specialization's own substituted payload_cls... is
+			# ever a real compile unit"), so emitting THAT bare payload_cls
+			# directly would bake in still-unbound TypeVars (confirmed by a
+			# real repro: NotImplementedError: c_type: unsupported type
+			# <TypeVar 'builtins.Result.T'>, from a generic generator's own
+			# for-loop-over-iterator desugaring, which synthesizes exactly
+			# this shape - _desugar_iterator_for's own internal match,
+			# checking .__next__()'s Result). Mirrors _lower_allocate_
+			# fields's own identical "concrete_union = ...monomorphize_
+			# class(fn_cls)" branch for a TaggedUnion target_cls, just keyed
+			# on `t` itself being a Specialization rather than on the
+			# current lowering context's own class happening to match -
+			# this can be reached from ANY generator, not just from inside
+			# one of the union's own synthesized methods. `tags` (tag
+			# VALUES, not types) doesn't change under substitution, so it's
+			# still read from the abstract union above.
+			if isinstance( t, Specialization ):
+				concrete_union = self.lowering.monomorphize_class( t )
+				tag_attr = concrete_union.get_local_or_raise( 'tag' )
+				data_attr = concrete_union.get_local_or_raise( 'data' )
+				assert isinstance( tag_attr, Variable ) and isinstance( data_attr, Variable )
+				payload_cls = data_attr.type
+				assert isinstance( payload_cls, CUnion )
+			else:
+				tag_attr, data_attr, payload_cls = _abstract_tag_attr, _abstract_data_attr, _abstract_payload_cls
+			leaf = self.lowering._substituted_field( base.attributes[0], t )
+			leaf_value = self._build_generator_zero_value( leaf.type, node )
+			for instr in self._cfg.field_value( leaf_value.type, leaf_value, is_alias = False ):
+				self._emit( instr )
+			self.lowering.schedule( payload_cls )
+			payload_dest = self._new_temp( payload_cls )
+			self._emit( ir.Allocate( dest = payload_dest, cls = payload_cls, fields = { f'v_{leaf.stem}': leaf_value } ))
+			tag_const_node = ast.Constant( value = tags[ leaf.stem ] )
+			ast.copy_location( tag_const_node, node )
+			tag_value = self._lower_expr( tag_const_node, tag_attr.type )
+			for instr in self._cfg.field_value( tag_value.type, tag_value, is_alias = False ):
+				self._emit( instr )
+			self.lowering.schedule( t )
+			union_dest = self._new_temp( t )
+			self._emit( ir.Allocate( dest = union_dest, cls = base, fields = { tag_attr.stem: tag_value, data_attr.stem: payload_dest } ))
+			return union_dest
+		self.lowering.discovery.fail(
+			f'cannot build a generator zero-placeholder value for {t.qualname if t else "?"} yet - see PLAN_GENERATORS.md',
+			node,
+		)
+
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
 		name = self.lowering.discovery.find_name( node.id, node )
 		if isinstance( name, Function ):
@@ -11942,7 +12047,23 @@ class FunctionLowering:
 		for name, field in fields_to_build.items():
 			if name in given_by_name:
 				expr = given_by_name[name]
-				value = self._lower_expr( expr, field.type )
+				field_base = field.type.base if isinstance( field.type, Specialization ) else field.type
+				if getattr( expr, 'generator_zero_rc_field', False ) and isinstance( field_base, TaggedUnion ):
+					# _expr_Constant's own generator_zero_rc_field
+					# exemption only ever helps a plain scalar/RCClass
+					# target - a TaggedUnion is unconditionally exempted
+					# from THAT check regardless of the tag (see its own
+					# comment), so a bare `0` literal here would instead
+					# fall through to ordinary union-coercion, which
+					# genuinely fails whenever NEITHER leaf happens to be
+					# a plain int (e.g. Result[Box,IndexError] - no leaf
+					# a bare int literal can ever match). See
+					# _build_generator_zero_value's own docstring for why
+					# a real leaf-wrap constructor call isn't safe here
+					# either (would incref a NULL placeholder).
+					value = self._build_generator_zero_value( field.type, expr )
+				else:
+					value = self._lower_expr( expr, field.type )
 			else:
 				# omitted at the call site, but declared with a default
 				# (`field.init`, already confirmed not None by truly_missing

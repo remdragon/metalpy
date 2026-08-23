@@ -20816,6 +20816,110 @@ def main() -> i32:
 ''' ),
 		])
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_match_on_fallible_call_subject_crossing_a_yield( self ) -> None:
+		''' Regression for a real, confirmed uninitialized-memory bug (found
+		via MSVC's own C4700 and independently corroborated by gcc's
+		-Wmaybe-uninitialized on the exact same variable): a `match`
+		statement's own synthesized subject temp (__match_subj_N) used to
+		stay an ordinary, non-promoted local even when one of its arms
+		contains a yield - the arm's own post-yield resume goto jumps
+		directly into a fresh call frame, skipping the subject's own
+		declaration entirely, so the match's generic trailing "release
+		whichever variant's payload wasn't consumed" cleanup read it
+		uninitialized on every resumed call (confirmed capable of a real
+		release_object() on a garbage pointer, not just a benign skipped
+		check). Fixed by promoting a qualifying match's subject into a real
+		field on the generator's own backing class (type_resolver.py's
+		_reserve_generator_match_subject_fields/visit_Match) - a field's
+		own cleanup is reassignment/destructor-driven, not lexical-scope-
+		driven, so it's naturally immune to a yield/resume boundary
+		splitting one logical execution across two call frames. '''
+		self.assert_programs_run([
+			( 'match_on_getitem_result_directly_inside_generator_while_loop', '''
+def gen( lst: list[i32] ) -> Generator[i32, IndexError | StopIteration]:
+	i: usize = 0
+	while True:
+		match lst.__getitem__( i ):
+			case Result.Ok( v ):
+				yield v
+				with compiler.wrap_arithmetic:
+					i += 1
+			case Result.Err( _ ):
+				return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		lst: list[i32] = [ 1, 2, 3 ]
+		g = gen( lst )
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 3:
+			return 1
+		if total != 6:
+			return 2
+		return 0
+''' ),
+			# a SECOND, harder shape than the report's own 2-arm case: BOTH
+			# arms are non-terminating (fall through, one via yield, one via
+			# a plain `pass`) and the Err arm's own payload is a real
+			# RCClass, exercised across several resumed calls that alternate
+			# Ok/Err - the match's own subject field gets reassigned (and,
+			# for the Err iterations, the previous live value read back and
+			# released) many times across many separate __next__() call
+			# frames, not just once right before a terminating return
+			( 'match_with_two_nonterminating_arms_alternating_ok_err_across_resumes', '''
+class Boom:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( i: usize ) -> Result[i32, Boom]:
+	with compiler.wrap_arithmetic:
+		if i == 1 or i == 3:
+			return Result.Err( Boom( v = i32( i ) ) )
+		return Result.Ok( i32( i ) )
+
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 5:
+			match maybe( i ):
+				case Result.Ok( v ):
+					yield v
+				case Result.Err( _ ):
+					pass
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		g = gen()
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 3:
+			return 1
+		if total != 0 + 2 + 4:
+			return 2
+		return 0
+''' ),
+		])
+
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
 		# level statement (preamble/tail) is supported for now, same start-
