@@ -37,7 +37,7 @@ class ConnectionDispatcher:
 	thread per connection, or handed to a bounded ThreadPool.
 
 	IMPORTANT for on_connection callbacks that loop for the life of the
-	connection (e.g. lib/http/server.py's own _handle_connection, which
+	connection (e.g. lib/http/server.py's own handle_connection, which
 	keeps handling requests on the SAME connection until it closes -
 	HTTP/1.1 keep-alive): the dispatcher's own concurrency unit is one
 	CONNECTION, for its ENTIRE lifetime, not one discrete unit of work.

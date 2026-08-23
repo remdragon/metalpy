@@ -1898,6 +1898,33 @@ class FunctionLowering:
 		# own Parameter exists (not yet constructed this early).
 		self._ever_declared_stems: set[str] = { p.stem for p in ( fn.parameters or [] )} if fn is not None else set()
 		self._current_fn = fn
+		# set for real in run()/run_global(), right before either enters its
+		# own module_context - see check_module_visibility's own comment on
+		# why this (not discovery.module_stack[-1]) is what every privacy
+		# check reached from this instance uses. None here only covers the
+		# brief window before run()/run_global() itself runs (never actually
+		# observed - nothing calls check_module_visibility that early).
+		self._owning_module: 'Module|None' = None
+		# id()s of Variable objects CURRENTLY bound as an @inline splice's
+		# own self/parameter aliases (both _lower_inline_call's single-
+		# expression path and _splice_multi_statement_inline_body's own
+		# copy add/remove their own bound ids here) - a name resolving to
+		# one of these is a pure ALIAS for whatever the ORIGINAL call site
+		# already passed in (e.g. `other` inside an inlined scalar_eq[T]
+		# resolving straight through to the caller's own operand, zero-
+		# copy - see _lower_inline_call's own "when the operand is ALREADY
+		# a Variable" comment), not a fresh access in its own right -
+		# check_module_visibility's 3 lowering.py call sites skip re-
+		# checking these: the ORIGINAL operand expression already got its
+		# own, correct check when IT was first lowered at the real call
+		# site, before ever being threaded through the splice. Confirmed
+		# necessary via a real false positive: lib/csv.py's own `self.
+		# __state == _ST_START_FIELD` got flagged as builtins illegally
+		# reaching csv's own package-private constant, purely because the
+		# generic scalar_eq[i32] dunder this dispatches through re-resolves
+		# its own `other` parameter (bound directly to _ST_START_FIELD)
+		# while lowering ITS OWN body, under builtins' own module context.
+		self._inline_param_alias_ids: set[int] = set()
 		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
 		self._loop_depth = 0
 		self._loop_labels: list[_LoopContext] = []
@@ -1965,6 +1992,14 @@ class FunctionLowering:
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
 		module = self.lowering._find_module_for( fn )
+		# fixed for this WHOLE lowering pass, unlike discovery.module_stack
+		# (which type-resolution can transiently re-push mid-lowering, e.g.
+		# monomorphizing an @inline generic dunder call - see check_module_
+		# visibility's own comment on why that's a real, confirmed false-
+		# positive source for module-privacy checks specifically) - every
+		# check_module_visibility call site reached from within this
+		# FunctionLowering instance uses THIS, not the ambient stack top.
+		self._owning_module = module
 		if fn.extern_lib is not None:
 			# @extern(lib, symbol) - a foreign call signature declaration,
 			# not a real body to lower (discovery.py already required a
@@ -2292,6 +2327,7 @@ class FunctionLowering:
 
 	def run_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self.lowering._find_module_for( var )
+		self._owning_module = module # see run()'s own identical comment
 
 		with self.lowering.discovery.module_context( module ):
 			if var.init is not None:
@@ -7734,6 +7770,20 @@ class FunctionLowering:
 
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
 		name = self.lowering.discovery.find_name( node.id, node )
+		# module-level `_x`/`__x` privacy (SYNTAX.md) - covers a bare-name
+		# VALUE read (not a call - _resolve_callee's own hook covers that)
+		# whose binding reached local scope WITHOUT ever going through
+		# visit_ImportFrom's own check (discovery.py): a LOCAL, function-
+		# body `from X import _y` (as opposed to a module-level one) is
+		# bound directly into fn.names during LOWERING itself, never
+		# visiting discovery.py's visit_ImportFrom at all - confirmed via a
+		# real repro, lib/sys.py's own exit()'s `from crt import _exit;
+		# _exit(code)`. Harmless (not double-erroring) for the ordinary
+		# module-level-import case too - same pass/fail result either way,
+		# since both checks compare the identical (defining, accessing)
+		# module pair.
+		if id( name ) not in self._inline_param_alias_ids:
+			self.lowering.discovery.check_module_visibility( name, node, self._owning_module )
 		if isinstance( name, Function ):
 			return self._lower_function_ref( name, node )
 		if not isinstance( name, Variable ):
@@ -9095,6 +9145,13 @@ class FunctionLowering:
 			if isinstance( names, dict ):
 				name_obj = names.get( attr )
 				if isinstance( name_obj, Variable ):
+					# module-level `_x`/`__x` privacy (SYNTAX.md) - a safe
+					# no-op unless name_obj is a genuine module-level global
+					# (is_global) - see check_module_visibility's own
+					# docstring. A class attribute reached this same way
+					# (obj a ClassLike, not a Module) is unaffected.
+					if id( name_obj ) not in self._inline_param_alias_ids:
+						self.lowering.discovery.check_module_visibility( name_obj, node, self._owning_module )
 					self.lowering._ensure_resolved( name_obj )
 					return name_obj
 		obj = self._lower_expr( node.value, None )
@@ -12165,6 +12222,18 @@ class FunctionLowering:
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization|_ReceiverDispatch,ir.Operand|None]:
 		target = self.lowering._type_resolver._resolve_callee_target( func_node )
 		if target is not None:
+			# module-level `_x`/`__x` privacy (SYNTAX.md) - THIS is the one
+			# real "about to actually call this" resolution site (unlike
+			# _stmt_diverges's own unrelated re-probe of the identical
+			# _resolve_callee_target/_try_resolve_namespace chain, purely to
+			# ask "is this NoReturn-shaped" - see _try_resolve_namespace's
+			# own comment on why enforcing THERE was a real false positive).
+			# Unwrap a Specialization the same way _stmt_diverges does - a
+			# private GENERIC function reached this way is still a Function
+			# underneath, just monomorphization-wrapped.
+			fn_target = target.base if isinstance( target, Specialization ) else target
+			if id( fn_target ) not in self._inline_param_alias_ids:
+				self.lowering.discovery.check_module_visibility( fn_target, func_node, self._owning_module )
 			return target, None
 
 		if not isinstance( func_node, ast.Attribute ):
@@ -12822,6 +12891,26 @@ class FunctionLowering:
 		# non-generic class
 		if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			target_cls = self.lowering._ensure_resolved( target_cls )
+
+		# module-level `_x`/`__x` privacy (SYNTAX.md, extended to cover
+		# classes too) - checked HERE, not inside the shared _try_resolve_
+		# namespace utility itself (self.lowering._try_resolve_namespace is
+		# a thin delegate to TypeResolver._try_resolve_namespace, which is
+		# ALSO reached by _stmt_diverges's own unrelated NoReturn re-probe -
+		# see check_module_visibility's own comment on why enforcing
+		# inside that shared utility produced a real false positive for
+		# functions). Gated on target_cls actually being a ClassLike -
+		# confirmed necessary via a SECOND real false positive, the same
+		# shape as _stmt_diverges's: this recognizer is tried against
+		# EVERY call node (construction_recognizers, _lower_call's own
+		# tuple), including calls to ordinary FUNCTIONS that _try_resolve_
+		# namespace happily resolves before this recognizer declines and
+		# falls through - checking unconditionally there flagged lib/
+		# builtins's own use of sys._assert (a Function, not a class)
+		# purely because THIS probe touched it, not because anything
+		# actually constructed it.
+		if isinstance( target_cls, ClassLike ):
+			self.lowering.discovery.check_module_visibility( target_cls, node.func, self._owning_module )
 
 		# T(...) where T defines a static __call__ dispatches to
 		# T.__call__(...) instead of construction - rewrite node.func to
@@ -13553,6 +13642,22 @@ class FunctionLowering:
 		# so a recursive @inline call reached from a pre-return statement
 		# in the multi-statement path is caught identically
 		self._inlining_stack.append( id( target ))
+		# splicing target's own body statements directly into THIS
+		# FunctionLowering instance's own pass (no separate FunctionLowering
+		# instance/module_context push for target itself - that's the whole
+		# point of @inline) means self._owning_module would otherwise still
+		# read as the CALLER's own module for code lexically written in
+		# target's module - wrong for check_module_visibility specifically:
+		# inlining is a pure optimization and must stay transparent to
+		# access control, exactly like a private method inlined into a
+		# caller in any other language doesn't retroactively become public.
+		# Confirmed as a real false positive, not just theory: Ptr.__str__
+		# (an @inline dunder living in builtins) reaches builtins' own
+		# _ptr_hex_digits from its spliced body - without this save/
+		# restore, that got attributed to whatever unrelated module
+		# happened to be calling str(ptr), e.g. __main__.
+		saved_owning_module = self._owning_module
+		self._owning_module = target.module
 		try:
 			if len( stmts ) > 1:
 				# the splice's own pre-return statements bind self/params
@@ -13649,6 +13754,7 @@ class FunctionLowering:
 				saved_live[stem] = self._cfg.is_live( stem )
 				self._cfg.mark_live( stem )
 
+			self._inline_param_alias_ids.update( bound_ids )
 			return_expr = stmts[-1].value
 			module = self.lowering._find_module_for( target )
 			try:
@@ -13657,6 +13763,7 @@ class FunctionLowering:
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
 						self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids )
 			finally:
+				self._inline_param_alias_ids.difference_update( bound_ids )
 				for stem, was_live in saved_live.items():
 					if not was_live:
 						self._cfg.unmark_live( stem )
@@ -13668,6 +13775,7 @@ class FunctionLowering:
 			return result if want_result else None
 		finally:
 			self._inlining_stack.pop()
+			self._owning_module = saved_owning_module
 
 	def _splice_multi_statement_inline_body( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, stmts: list[ast.stmt] ) -> ir.Operand|None:
 		# PLAN_INLINE.md multi-statement generalization - target's own
@@ -13787,6 +13895,7 @@ class FunctionLowering:
 			# this whole splice returns, so no per-stem save/restore is
 			# needed here, unlike provisional.names/that other path
 			self._cfg.mark_live( stem )
+		self._inline_param_alias_ids.update( bound_ids ) # see _lower_inline_call's own identical comment - removed again once this whole splice returns, in the try/finally around its own module_context below
 
 		# early/nested-return + defer/errdefer/.or_return() generalization -
 		# a splice-local "epilogue" scope for the pre-return statements: an
@@ -13843,146 +13952,149 @@ class FunctionLowering:
 			merge_label = self._new_label( 'inline_merge' )
 
 		module = self.lowering._find_module_for( target )
-		with self.lowering.discovery.module_context( module ):
-			with self.lowering.discovery.scope_context( provisional ):
-				# the ONE place self._current_fn is ever reassigned in this
-				# file - narrowly scoped to this window, restored in a
-				# finally. Needed because _stmt_AnnAssign/_stmt_Assign's
-				# fresh-declaration branch registers a new local into
-				# self._current_fn (see their own code) while their
-				# "already exists?" check instead goes through discovery.
-				# find_name_or_none (walking discovery.scope_stack, which
-				# module_context/scope_context above already point at
-				# `provisional`) - without this reassignment those two
-				# would disagree: a pre-return local would silently
-				# register into the CALLER's own namespace (self._current_
-				# fn, unless reassigned, stays whatever the caller's own
-				# top-level function is - confirmed by grep, it's assigned
-				# exactly once, in __init__, and never touched anywhere
-				# else in this file), corrupting any later caller-side
-				# reference to a same-named local; and reassigning that
-				# same pre-return local a second time within the SAME
-				# spliced body would fail to find its own first
-				# registration, creating a second, independent binding
-				# instead of a replace (a silent decref/leak, not just a
-				# cosmetic issue - cfg.py's own fresh-vs-replace machinery
-				# depends on finding the SAME Variable object both times).
-				# Making self._current_fn and the active scope_context
-				# point at the same `provisional` object for this whole
-				# window fixes both at once.
-				#
-				# result_var/exited_flag are both given a real, flat,
-				# unconditional declaration/init RIGHT HERE - before the
-				# pre-return statements (and therefore before any .or_
-				# return()/checked-arithmetic early exit nested inside
-				# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
-				# DeclareLocal's own docstring) could otherwise become
-				# result_var's first, block-scoped-and-therefore-unsafe
-				# write. exited_flag has a trivial default (False) an
-				# ordinary ir.Assign already declares safely; result_var's
-				# type has no generic default, hence DeclareLocal
-				scope_label: str|None = None
-				if supports_early_exit:
-					assert exited_flag is not None and bool_cls is not None and merge_label is not None
+		try:
+			with self.lowering.discovery.module_context( module ):
+				with self.lowering.discovery.scope_context( provisional ):
+					# the ONE place self._current_fn is ever reassigned in this
+					# file - narrowly scoped to this window, restored in a
+					# finally. Needed because _stmt_AnnAssign/_stmt_Assign's
+					# fresh-declaration branch registers a new local into
+					# self._current_fn (see their own code) while their
+					# "already exists?" check instead goes through discovery.
+					# find_name_or_none (walking discovery.scope_stack, which
+					# module_context/scope_context above already point at
+					# `provisional`) - without this reassignment those two
+					# would disagree: a pre-return local would silently
+					# register into the CALLER's own namespace (self._current_
+					# fn, unless reassigned, stays whatever the caller's own
+					# top-level function is - confirmed by grep, it's assigned
+					# exactly once, in __init__, and never touched anywhere
+					# else in this file), corrupting any later caller-side
+					# reference to a same-named local; and reassigning that
+					# same pre-return local a second time within the SAME
+					# spliced body would fail to find its own first
+					# registration, creating a second, independent binding
+					# instead of a replace (a silent decref/leak, not just a
+					# cosmetic issue - cfg.py's own fresh-vs-replace machinery
+					# depends on finding the SAME Variable object both times).
+					# Making self._current_fn and the active scope_context
+					# point at the same `provisional` object for this whole
+					# window fixes both at once.
+					#
+					# result_var/exited_flag are both given a real, flat,
+					# unconditional declaration/init RIGHT HERE - before the
+					# pre-return statements (and therefore before any .or_
+					# return()/checked-arithmetic early exit nested inside
+					# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
+					# DeclareLocal's own docstring) could otherwise become
+					# result_var's first, block-scoped-and-therefore-unsafe
+					# write. exited_flag has a trivial default (False) an
+					# ordinary ir.Assign already declares safely; result_var's
+					# type has no generic default, hence DeclareLocal
+					scope_label: str|None = None
+					if supports_early_exit:
+						assert exited_flag is not None and bool_cls is not None and merge_label is not None
+						if result_var is not None:
+							self._emit( ir.DeclareLocal( variable = result_var ))
+						self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
+						scope_label = self._cfg.push_inline_scope()
+						self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
+					outer_fn = self._current_fn
+					outer_prelude = self._in_inline_splice_prelude
+					self._current_fn = provisional
+					self._in_inline_splice_prelude = True
+					try:
+						for stmt in pre_return_stmts:
+							# mirrors FunctionLowering.run()'s own identical
+							# per-statement recovery boundary - one bad
+							# statement doesn't stop the rest of this splice
+							# from being lowered (and error-collected)
+							try:
+								self._lower_stmt( stmt )
+							except CompileError:
+								continue
+					finally:
+						self._current_fn = outer_fn
+						self._in_inline_splice_prelude = outer_prelude
+
+					if not supports_early_exit:
+						# PLAN_RETURN_INFERENCE.md's own @inline variant - see
+						# this method's own top-of-function comment. No scope
+						# was pushed, nothing to merge - the trailing return-
+						# expression's own natural type IS the answer being
+						# discovered here, exactly as the pre-existing
+						# single-statement/original multi-statement code always
+						# computed it
+						result = self._lower_expr( return_stmt.value, expected_type )
+						self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
+						return result if want_result else None
+
+					assert scope_label is not None and exited_flag is not None and merge_label is not None
+					# current_epilogue_label()'s own fallback target once
+					# nothing shallower within THIS splice qualified (push_
+					# inline_scope()'s own label) - an inline-unwind return_()
+					# call reached during the splice already replayed
+					# everything itself and jumps straight past this, to
+					# merge_label below (see _stmt_Return/_consume_checked_
+					# result's own splice branches). Neither label is a real
+					# jump target unless the splice body actually contained an
+					# early exit reaching one of those two branches (a plain
+					# multi-statement @inline body with none, e.g. Ptr.__str__,
+					# never goes near either) - gated on InlineScope.captured,
+					# same "don't declare a label nothing goto's" reasoning
+					# build_epilogue_ladder() already uses for a real function's
+					# own shared epilogue (a real, confirmed -Wunused-label
+					# otherwise, suite-wide)
+					if self._cfg.inline_scope_captured():
+						self._emit( ir.Label( name = scope_label ))
+					for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
+						self._emit( instr )
+					was_captured = self._cfg.pop_inline_scope()
+					self._inline_scope_vars.pop()
+
+					# early exit vs normal fallthrough - both converge into ONE
+					# result operand from here, same "shared dest temp, two
+					# Assign sites, converge at one label" shape _expr_IfExp
+					# already uses for Python's own ternary. self._current_fn/
+					# _in_inline_splice_prelude are already restored to the
+					# REAL caller above, before this point - the trailing
+					# return-expression's own .or_return()/checked-arithmetic
+					# behavior is therefore unchanged from the single-statement
+					# case (validates and jumps against the CALLER's own
+					# epilogue/return type, exactly as already tested), while
+					# scope_context(provisional) stays active so it can still
+					# resolve pre-return-declared locals it references
+					if was_captured:
+						self._emit( ir.Label( name = merge_label ))
+					result = self._new_temp( target.return_type )
+					normal_label = self._new_label( 'inline_normal' )
+					converge_label = self._new_label( 'inline_converge' )
+					self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
 					if result_var is not None:
-						self._emit( ir.DeclareLocal( variable = result_var ))
-					self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
-					scope_label = self._cfg.push_inline_scope()
-					self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
-				outer_fn = self._current_fn
-				outer_prelude = self._in_inline_splice_prelude
-				self._current_fn = provisional
-				self._in_inline_splice_prelude = True
-				try:
-					for stmt in pre_return_stmts:
-						# mirrors FunctionLowering.run()'s own identical
-						# per-statement recovery boundary - one bad
-						# statement doesn't stop the rest of this splice
-						# from being lowered (and error-collected)
-						try:
-							self._lower_stmt( stmt )
-						except CompileError:
-							continue
-				finally:
-					self._current_fn = outer_fn
-					self._in_inline_splice_prelude = outer_prelude
-
-				if not supports_early_exit:
-					# PLAN_RETURN_INFERENCE.md's own @inline variant - see
-					# this method's own top-of-function comment. No scope
-					# was pushed, nothing to merge - the trailing return-
-					# expression's own natural type IS the answer being
-					# discovered here, exactly as the pre-existing
-					# single-statement/original multi-statement code always
-					# computed it
-					result = self._lower_expr( return_stmt.value, expected_type )
-					self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
-					return result if want_result else None
-
-				assert scope_label is not None and exited_flag is not None and merge_label is not None
-				# current_epilogue_label()'s own fallback target once
-				# nothing shallower within THIS splice qualified (push_
-				# inline_scope()'s own label) - an inline-unwind return_()
-				# call reached during the splice already replayed
-				# everything itself and jumps straight past this, to
-				# merge_label below (see _stmt_Return/_consume_checked_
-				# result's own splice branches). Neither label is a real
-				# jump target unless the splice body actually contained an
-				# early exit reaching one of those two branches (a plain
-				# multi-statement @inline body with none, e.g. Ptr.__str__,
-				# never goes near either) - gated on InlineScope.captured,
-				# same "don't declare a label nothing goto's" reasoning
-				# build_epilogue_ladder() already uses for a real function's
-				# own shared epilogue (a real, confirmed -Wunused-label
-				# otherwise, suite-wide)
-				if self._cfg.inline_scope_captured():
-					self._emit( ir.Label( name = scope_label ))
-				for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
-					self._emit( instr )
-				was_captured = self._cfg.pop_inline_scope()
-				self._inline_scope_vars.pop()
-
-				# early exit vs normal fallthrough - both converge into ONE
-				# result operand from here, same "shared dest temp, two
-				# Assign sites, converge at one label" shape _expr_IfExp
-				# already uses for Python's own ternary. self._current_fn/
-				# _in_inline_splice_prelude are already restored to the
-				# REAL caller above, before this point - the trailing
-				# return-expression's own .or_return()/checked-arithmetic
-				# behavior is therefore unchanged from the single-statement
-				# case (validates and jumps against the CALLER's own
-				# epilogue/return type, exactly as already tested), while
-				# scope_context(provisional) stays active so it can still
-				# resolve pre-return-declared locals it references
-				if was_captured:
-					self._emit( ir.Label( name = merge_label ))
-				result = self._new_temp( target.return_type )
-				normal_label = self._new_label( 'inline_normal' )
-				converge_label = self._new_label( 'inline_converge' )
-				self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
-				if result_var is not None:
-					self._emit( ir.Assign( dest = result, src = result_var ))
-				self._emit( ir.Jump( target = converge_label ))
-				self._emit( ir.Label( name = normal_label ))
-				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
-				self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
-				self._emit( ir.Assign( dest = result, src = trailing_value ))
-				# trailing_value's own ownership (if it's a bare temp - e.g.
-				# the Result.Ok(x) construction temp a trailing `return
-				# Result.Ok(x)` produces) just transferred into `result`
-				# above via the plain ir.Assign - untrack it, or whatever
-				# later cleans up STILL-pending temps (_flush_pending_temps,
-				# called by _lower_stmt's own post-statement wrapper once
-				# this whole splice call returns) would emit a SECOND,
-				# unconditional RC-check for it outside the "normal" arm's
-				# own guard - reading trailing_value's memory even on the
-				# early-exit path, where it was never assigned at all (a
-				# real uninitialized-read bug, not just a redundant decref -
-				# confirmed by a real repro under MSVC's /RTC1). Exactly the
-				# same concern _stmt_Return's own identical transfer already
-				# guards against via this same call
-				self._cfg.untrack_temp( trailing_value )
-				self._emit( ir.Label( name = converge_label ))
+						self._emit( ir.Assign( dest = result, src = result_var ))
+					self._emit( ir.Jump( target = converge_label ))
+					self._emit( ir.Label( name = normal_label ))
+					trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+					self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
+					self._emit( ir.Assign( dest = result, src = trailing_value ))
+					# trailing_value's own ownership (if it's a bare temp - e.g.
+					# the Result.Ok(x) construction temp a trailing `return
+					# Result.Ok(x)` produces) just transferred into `result`
+					# above via the plain ir.Assign - untrack it, or whatever
+					# later cleans up STILL-pending temps (_flush_pending_temps,
+					# called by _lower_stmt's own post-statement wrapper once
+					# this whole splice call returns) would emit a SECOND,
+					# unconditional RC-check for it outside the "normal" arm's
+					# own guard - reading trailing_value's memory even on the
+					# early-exit path, where it was never assigned at all (a
+					# real uninitialized-read bug, not just a redundant decref -
+					# confirmed by a real repro under MSVC's /RTC1). Exactly the
+					# same concern _stmt_Return's own identical transfer already
+					# guards against via this same call
+					self._cfg.untrack_temp( trailing_value )
+					self._emit( ir.Label( name = converge_label ))
+		finally:
+			self._inline_param_alias_ids.difference_update( bound_ids )
 		return result if want_result else None
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:

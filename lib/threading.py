@@ -17,8 +17,8 @@ import socket
 import atomic
 
 if compiler.target.os == 'windows':
-	from windows.kernel32 import _SRWLOCK
-	LockOpaque: TypeAlias = _SRWLOCK
+	from windows.kernel32 import SRWLOCK
+	LockOpaque: TypeAlias = SRWLOCK
 	# a Win32 thread HANDLE is a void* (Ptr[None])
 	ThreadHandle: TypeAlias = Ptr[None]
 else:
@@ -33,7 +33,7 @@ else:
 
 
 class FastLock:
-	__lock: Ptr[LockOpaque]  # Ptr[_SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
+	__lock: Ptr[LockOpaque]  # Ptr[SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
 	__locked: bool
 
 	# ------------------------------------------------------------------

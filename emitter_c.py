@@ -695,7 +695,7 @@ def mangle_qualname( qualname: str ) -> str:
 # AcquireSRWLockExclusive/ReleaseSRWLockExclusive take a
 # `void**` here (not the real PSRWLOCK type) since SRWLOCK's own real
 # layout is just one pointer-sized slot (see windows/kernel32.py's own
-# _SRWLOCK comment) - void** is ABI-identical and avoids also declaring a
+# SRWLOCK comment) - void** is ABI-identical and avoids also declaring a
 # matching struct type for calls the emitter synthesizes directly, never
 # referenced by name from metalpy source (so never routed through the
 # ordinary @extern forward-declaration machinery on their own).
@@ -705,11 +705,11 @@ def _needs_global_lock( var: Variable ) -> bool:
 def _global_lock_name( var: Variable ) -> str:
 	return mangle_qualname( var.qualname ) + '$lock'
 
-# windows.kernel32._SRWLOCK's own mangled struct name - reused verbatim
+# windows.kernel32.SRWLOCK's own mangled struct name - reused verbatim
 # (not an independent void**/opaque type of our own) so that a program
 # that ALSO happens to use lib/threading.py's FastLock somewhere (which
 # independently triggers a REAL `AcquireSRWLockExclusive(struct windows$
-# kernel32$_SRWLOCK*)` extern declaration, via the ordinary @extern
+# kernel32$SRWLOCK*)` extern declaration, via the ordinary @extern
 # forward-declaration machinery) ends up with two IDENTICAL declarations
 # of the same two functions, not two CONFLICTING ones - confirmed as a
 # real compile error otherwise (clang: "conflicting types for
@@ -719,8 +719,14 @@ def _global_lock_name( var: Variable ) -> str:
 # this type - the lock global's own storage stays a plain `void*` (see
 # _global_lock_name's own declaration site), cast to this type only at
 # the two call sites that need it, so the real struct's full body is
-# never required to exist in this translation unit at all.
-_SRWLOCK_STRUCT_NAME = mangle_qualname( 'windows.kernel32._SRWLOCK' )
+# never required to exist in this translation unit at all. The class was
+# renamed windows.kernel32._SRWLOCK -> SRWLOCK (module/package-visibility
+# enforcement, SYNTAX.md - the leading underscore was a package-private
+# naming choice, not the real Win32 API's own spelling, and lib/
+# threading.py genuinely needs cross-package access to it) - this string
+# MUST stay in lockstep with that real qualname, or the mangled name
+# emitted here silently stops matching the struct's own real declaration.
+_SRWLOCK_STRUCT_NAME = mangle_qualname( 'windows.kernel32.SRWLOCK' )
 
 def _global_lock_acquire( lock_name: str ) -> str:
 	if _target_uses_pthread_lock():

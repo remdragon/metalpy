@@ -32,7 +32,7 @@ thread-hop for a first cut (a future revision could pool these too if a
 real workload shows otherwise).
 
 The pool itself is a fixed-size set of daemon threads, started at
-module/import time (see _pool's own comment).
+module/import time (see pool's own comment).
 '''
 
 import compiler
@@ -57,9 +57,12 @@ def _wait_error_to_os_error( werr: reactor.WaitError ) -> OSError:
 # and its own loopback wake pair (used directly, genuinely blocking - no
 # Poller involved, unlike reactor.Worker's own non-blocking/polled use of
 # the identical socket.make_loopback_pair() primitive).
+#
+# Job is public (not module-private) for the same reason `pool` (below) is -
+# this module's own white-box concurrency tests construct one directly.
 # ---------------------------------------------------------------------------
 
-class _Job:
+class Job:
 	handle: reactor.CompletionHandle
 	work:   Closure[[], Result[usize, OSError]]
 	waiter: reactor.Worker
@@ -75,17 +78,17 @@ class _Job:
 
 
 class _PoolWorker:
-	__jobs:       list[_Job]
+	__jobs:       list[Job]
 	__wake_read:  socket.Socket
 	__wake_write: socket.Socket
 
 	def __init__( self ) -> None:
-		self.__jobs = list[_Job]()
+		self.__jobs = list[Job]()
 		( read_side, write_side ) = socket.make_loopback_pair()
 		self.__wake_read = read_side
 		self.__wake_write = write_side
 
-	def submit( self, job: _Job ) -> None:
+	def submit( self, job: Job ) -> None:
 		self.__jobs.append( job ).unwrap( '_PoolWorker.submit: queue overflow' )
 		poke: bytes = b'x'
 		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.submit: wake failed' )
@@ -131,7 +134,7 @@ class _Pool:
 			with compiler.wrap_arithmetic:
 				i = i + 1
 
-	def submit( self, job: _Job ) -> None:
+	def submit( self, job: Job ) -> None:
 		idx: usize = self.__next
 		with compiler.panic_arithmetic( '_Pool.submit: pool size is zero' ):
 			self.__next = ( idx + 1 ) % self.__workers.__len__()
@@ -146,13 +149,19 @@ class _Pool:
 # ordering gap in _topologically_sort_globals, fixed by a concurrent
 # session's own unrelated work, commit 0e82361/81d91d1) - reverified via
 # the original repro before removing the workaround here.
-_pool: _Pool = _Pool( _POOL_SIZE )
+#
+# Public (not module-private) despite being an implementation detail
+# ordinary AsyncFile callers never touch directly - this module's own
+# white-box concurrency tests (asyncfile_test.py) submit jobs to it
+# directly, bypassing the higher-level read()/write() API, specifically to
+# exercise the pool's own dispatch/concurrency behavior in isolation.
+pool: _Pool = _Pool( _POOL_SIZE )
 
 
 # ---------------------------------------------------------------------------
 # _ReactorAsyncFileOps — the FileOpsInterface implementation this whole module
 # exists to provide. Stateless (a single shared instance, _ops below) -
-# every real per-operation state lives in the CompletionHandle/_Job each
+# every real per-operation state lives in the CompletionHandle/Job each
 # call constructs fresh.
 # ---------------------------------------------------------------------------
 
@@ -164,7 +173,7 @@ class _ReactorAsyncFileOps( FileOpsInterface ):
 			return fs.read_raw( fd, buf, count )
 		handle: reactor.CompletionHandle = reactor.CompletionHandle()
 		work: Closure[[], Result[usize, OSError]] = lambda: fs.read_raw( fd, buf, count )
-		_pool.submit( _Job( handle = handle, work = work, waiter = w ))
+		pool.submit( Job( handle = handle, work = work, waiter = w ))
 		match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
 			case Result.Ok( _ ):
 				pass
@@ -179,7 +188,7 @@ class _ReactorAsyncFileOps( FileOpsInterface ):
 			return fs.write_raw( fd, buf, count )
 		handle: reactor.CompletionHandle = reactor.CompletionHandle()
 		work: Closure[[], Result[usize, OSError]] = lambda: fs.write_raw( fd, buf, count )
-		_pool.submit( _Job( handle = handle, work = work, waiter = w ))
+		pool.submit( Job( handle = handle, work = work, waiter = w ))
 		match reactor.wait_for_signal( reactor.Signal.Completion( handle )):
 			case Result.Ok( _ ):
 				pass

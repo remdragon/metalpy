@@ -37,6 +37,24 @@ class Name:
 class Type( Name ):
 	''' maybe only use this to distinguish types from values '''
 
+	# the module this type was DEFINED in - set only for a genuine
+	# module-level, user-defined class (RCClass/CStruct/CUnion/CEnum/
+	# TaggedUnion parsed from real source, via discovery.py's own
+	# _parse_ClassDef_* family) - mirrors Function.module/Variable.module
+	# (see either's own comment for the motivating cross-module-
+	# resolution use case). Left None for every other Type kind (Scalar,
+	# Specialization, CallableType, a synthesized anonymous union, ...) -
+	# none of those have a real "defining module" of their own. Used by
+	# name/import-visibility enforcement (SYNTAX.md's `_x`/`__x` module/
+	# package-privacy rules, extended to cover classes too) to compare the
+	# DEFINING module against whichever module is doing the accessing.
+	# repr=False/compare=False for the identical reason Variable.module's
+	# own field is: two independently-constructed Discovery passes'
+	# Module objects for "the same" module differ in identity/content, so
+	# including this in dataclass equality/repr would make every Type-
+	# comparing pass in this codebase (there are many) spuriously fragile.
+	module: 'Module|None' = field( default = None, repr = False, compare = False )
+
 	def __repr__( self ) -> str:
 		# every Type subclass below opts out of the dataclass-generated repr
 		# (repr=False) and inherits this one instead, deliberately never
@@ -465,6 +483,21 @@ class Variable( Name ):
 	# local variables, neither of which is a standalone compile unit; this is
 	# what lets Compiler._enqueue tell them apart without a separate lookup
 	is_global: bool = False
+	# the module this Variable was DEFINED in - set from Discovery.module_
+	# stack at parse time, mirroring Function.module (see that field's own
+	# comment for the motivating cross-module-resolution use case). Only
+	# meaningful (and only ever set) for a genuine module-level global
+	# (is_global=True); a class attribute or lowering-built local has no
+	# owning Module of its own. Used by name/import-visibility enforcement
+	# (SYNTAX.md's `_x`/`__x` module/package-privacy rules) to compare the
+	# DEFINING module against whichever module is doing the accessing.
+	# repr=False/compare=False for the identical reason `uid` below is:
+	# Module.names accumulates differently across separately-constructed
+	# Discovery passes even for "the same" module, so including it in
+	# dataclass equality would make lowering_test.py's exact-IR structural
+	# comparisons spuriously fragile - this field is read directly by
+	# enforcement logic, never compared/printed.
+	module: 'Module|None' = field( default = None, repr = False, compare = False )
 	# set by cfg.py's assign() the moment this global is genuinely
 	# reassigned from inside a function body (`global X; X = ...`) - never
 	# set for a global's own module-level initializer, since lower_global()

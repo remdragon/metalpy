@@ -4001,6 +4001,24 @@ class TypeResolver:
 			if not isinstance( names, dict ):
 				return None
 			result = names.get( node.attr )
+			# NOT the place for module-level `_x`/`__x` privacy enforcement,
+			# despite looking like the obvious shared chokepoint - this
+			# method is ALSO reached by _stmt_diverges (both this file's own
+			# copy and lowering.py's, via _resolve_callee_target) purely to
+			# ask "is this call's target NoReturn-shaped", completely
+			# independent of whether the call itself was already resolved
+			# through a resolved_callee pre-tag (compile_time_transformer's
+			# assert-statement rewrite, e.g., synthesizes a bare `sys.
+			# _assert(...)` node with resolved_callee already set - the
+			# REAL call never re-resolves this namespace path, but _stmt_
+			# diverges's own re-probe does, unconditionally). Enforcing here
+			# produced a real false positive: lib/builtins/__init__.py's own
+			# `assert` statements got flagged for "illegally" reaching sys.
+			# _assert cross-package, purely because of this unrelated
+			# re-probe - confirmed via the full lib/ compile (159 test
+			# failures) before this comment/fix existed. See _resolve_callee
+			# (lowering.py) instead - the one caller of this chain that
+			# actually represents a real, final call-target resolution.
 			if getattr( result, 'resolve', None ) is not None:
 				result.resolve()
 			return result

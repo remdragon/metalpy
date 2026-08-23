@@ -2239,6 +2239,282 @@ class QualnameCollisionTests( unittest.TestCase ):
 		self.assertEqual( disco.errors.errors, [] )
 
 
+class ModuleVisibilityEnforcementTests( unittest.TestCase ):
+	''' a module-level name starting with `__` (not a real dunder) is
+	private to its own defining module/file; one starting with a single
+	`_` is accessible only within its defining module's own package (and
+	subpackages, at any depth) - see Discovery.check_module_visibility's
+	own docstring for the exact rule. This is a NEW compiler-enforced
+	semantic (Python's own underscore convention is purely stylistic) -
+	class-level `_`/`__` field/method visibility is a SEPARATE, still-
+	unenforced convention (SYNTAX.md's own protected/private field spec),
+	deliberately untouched by any of these tests. '''
+
+	def _compile( self, files: dict[str,str], entry_source: str ) -> tuple['compiler.Compiler', discovery.Discovery]:
+		import compiler as compiler_module
+		root = Path( self._tmp )
+		for name, text in files.items():
+			path = root / name
+			path.parent.mkdir( parents = True, exist_ok = True )
+			path.write_text( text )
+		# the real lib/ dir has to stay reachable, and import_builtins=True
+		# is needed too - RCClass construction unconditionally pulls in
+		# sys.alloc (Lowering._schedule_rcclass_construction ->
+		# _resolve_sys_function), and lib/sys.py itself references str,
+		# which only resolves with builtins loaded
+		disco = discovery.Discovery( paths = [ root, Path( discovery.__file__ ).parent / 'lib' ], import_builtins = True )
+		comp = compiler_module.Compiler( disco )
+		comp.import_code( entry_source, root / '__main__.py', scope = None )
+		comp.run()
+		return comp, disco
+
+	def setUp( self ) -> None:
+		self._tmpdir = tempfile.TemporaryDirectory()
+		self._tmp = self._tmpdir.name
+		self.addCleanup( self._tmpdir.cleanup )
+
+	def test_module_private_function_rejected_via_from_import( self ) -> None:
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': 'def __helper() -> i32:\n\treturn 1\n' },
+			'from pkg.a import __helper\n'
+			'def main() -> i32:\n\treturn __helper()\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'private to its own module' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a.__helper', errors[0] )
+
+	def test_module_private_function_allowed_within_its_own_module( self ) -> None:
+		# same-module access never reaches the new checks at all (it's a
+		# plain local name lookup, not a Module.names dotted walk) - this is
+		# a regression guard confirming that stays true, not a positive
+		# test of the check firing
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': (
+				'def __helper() -> i32:\n\treturn 1\n'
+				'def call_helper() -> i32:\n\treturn __helper()\n'
+			)},
+			'from pkg.a import call_helper\n'
+			'def main() -> i32:\n\treturn call_helper()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_package_private_function_allowed_from_sibling_module( self ) -> None:
+		_comp, disco = self._compile(
+			{
+				'pkg/__init__.py': '',
+				'pkg/a.py': 'def _shared() -> i32:\n\treturn 1\n',
+				'pkg/b.py': 'from pkg.a import _shared\ndef use() -> i32:\n\treturn _shared()\n',
+			},
+			'from pkg.b import use\n'
+			'def main() -> i32:\n\treturn use()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_package_private_function_allowed_from_subpackage( self ) -> None:
+		_comp, disco = self._compile(
+			{
+				'pkg/__init__.py': '',
+				'pkg/a.py': 'def _shared() -> i32:\n\treturn 1\n',
+				'pkg/sub/__init__.py': '',
+				'pkg/sub/c.py': 'from pkg.a import _shared\ndef use() -> i32:\n\treturn _shared()\n',
+			},
+			'from pkg.sub.c import use\n'
+			'def main() -> i32:\n\treturn use()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_package_private_function_rejected_from_unrelated_module( self ) -> None:
+		_comp, disco = self._compile(
+			{
+				'pkg/__init__.py': '',
+				'pkg/a.py': 'def _shared() -> i32:\n\treturn 1\n',
+			},
+			'from pkg.a import _shared\n'
+			'def main() -> i32:\n\treturn _shared()\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'only accessible within its own package' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a._shared', errors[0] )
+
+	def test_package_private_function_allowed_from_sibling_top_level_module( self ) -> None:
+		# two BARE top-level modules (no enclosing directory/package at
+		# all, e.g. lib/sys.py and lib/threading.py) are still "the same
+		# package" for this purpose - confirmed as a real false positive:
+		# lib/threading.py's FastLock genuinely needs lib/sys.py's own
+		# package-private `_alloc`, and the two are no less siblings than
+		# two files sharing one subdirectory would be. Routed through a
+		# THIRD top-level module (b.py), not __main__ itself, to keep this
+		# test distinct from the entry-point-is-excluded test just below -
+		# _compile's own entry source always becomes __main__.py, which is
+		# deliberately NOT part of this same grouping (see that test).
+		_comp, disco = self._compile(
+			{
+				'a.py': 'def _shared() -> i32:\n\treturn 1\n',
+				'b.py': 'from a import _shared\ndef use() -> i32:\n\treturn _shared()\n',
+			},
+			'from b import use\n'
+			'def main() -> i32:\n\treturn use()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_package_private_function_rejected_from_entry_point_module( self ) -> None:
+		# the entry point (__main__, also package == '') is deliberately
+		# NOT part of the "every bare top-level module is one implicit
+		# package" grouping the test above confirms - it's the user's own
+		# application code, not part of whichever library package it
+		# happens to import, and _compile's own entry source is always
+		# compiled as __main__.py
+		_comp, disco = self._compile(
+			{ 'a.py': 'def _shared() -> i32:\n\treturn 1\n' },
+			'from a import _shared\n'
+			'def main() -> i32:\n\treturn _shared()\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'only accessible within its own package' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'a._shared', errors[0] )
+
+	def test_dunder_global_is_never_private( self ) -> None:
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': '__version__: i32 = 3\n' },
+			'from pkg.a import __version__\n'
+			'def main() -> i32:\n\treturn __version__\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_module_private_global_rejected_via_dotted_attribute_access( self ) -> None:
+		# the from-import path (visit_ImportFrom) is checked separately
+		# above - this exercises the OTHER real access path: `module.name`
+		# reached via an already-imported Module object (from pkg import a;
+		# a.__secret), which goes through lowering.py's _expr_Attribute /
+		# type_resolver.py's _try_resolve_namespace instead
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': 'import pkg.a as a\n', 'pkg/a.py': '__secret: i32 = 7\n' },
+			'from pkg import a\n'
+			'def main() -> i32:\n\treturn a.__secret\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'private to its own module' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a.__secret', errors[0] )
+
+	def test_package_private_function_call_rejected_via_dotted_attribute_access( self ) -> None:
+		# same as above but for a CALLED function (module.func(), not a bare
+		# value) - a genuinely different lowering path (_resolve_callee /
+		# TypeResolver._try_resolve_namespace, not _expr_Attribute's own
+		# Variable-only branch)
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': 'import pkg.a as a\n', 'pkg/a.py': 'def _internal() -> i32:\n\treturn 1\n' },
+			'from pkg import a\n'
+			'def main() -> i32:\n\treturn a._internal()\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'only accessible within its own package' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a._internal', errors[0] )
+
+	def test_class_method_underscore_names_are_unaffected( self ) -> None:
+		# scope check: a class METHOD (fn.cls is not None) is a separate,
+		# still-unenforced convention (SYNTAX.md's own protected/private
+		# field spec) - this new mechanism must not accidentally start
+		# blocking it. Single-underscore only, deliberately - a real `__x`
+		# method name inside a class body is subject to Python's own
+		# separate name-mangling convention, an unrelated concern this
+		# test has no business getting tangled up in.
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': (
+				'class Widget:\n'
+				'\tdef __init__( self ) -> None:\n\t\tpass\n'
+				'\tdef _protected( self ) -> i32:\n\t\treturn 1\n'
+			)},
+			'from pkg.a import Widget\n'
+			'def main() -> i32:\n'
+			'\tw: Widget = Widget()\n'
+			'\treturn w._protected()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_module_private_class_rejected_via_from_import( self ) -> None:
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': (
+				'class __Helper:\n\tx: i32\n\tdef __init__( self ) -> None:\n\t\tself.x = 1\n'
+			)},
+			'from pkg.a import __Helper\n'
+			'def main() -> i32:\n\th: __Helper = __Helper()\n\treturn h.x\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'private to its own module' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a.__Helper', errors[0] )
+
+	def test_package_private_class_allowed_from_sibling_module( self ) -> None:
+		_comp, disco = self._compile(
+			{
+				'pkg/__init__.py': '',
+				'pkg/a.py': 'class _Shared:\n\tx: i32\n\tdef __init__( self ) -> None:\n\t\tself.x = 1\n',
+				'pkg/b.py': 'from pkg.a import _Shared\ndef use() -> i32:\n\ts: _Shared = _Shared()\n\treturn s.x\n',
+			},
+			'from pkg.b import use\n'
+			'def main() -> i32:\n\treturn use()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_package_private_class_rejected_from_unrelated_module( self ) -> None:
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': 'class _Shared:\n\tx: i32\n\tdef __init__( self ) -> None:\n\t\tself.x = 1\n' },
+			'from pkg.a import _Shared\n'
+			'def main() -> i32:\n\ts: _Shared = _Shared()\n\treturn s.x\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'only accessible within its own package' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a._Shared', errors[0] )
+
+	def test_package_private_class_construction_rejected_via_dotted_attribute_access( self ) -> None:
+		# module.ClassName(...) - a genuinely different lowering path
+		# (_try_lower_construct_call) from from-import. No explicit type
+		# annotation on the assignment target - that would ALSO reach
+		# a._Shared through the SEPARATE type-annotation path
+		# (visit_Attribute), correctly flagging a SECOND violation of its
+		# own; this test wants only the construction-call path in
+		# isolation, so the target's type is inferred from the call instead.
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': 'import pkg.a as a\n', 'pkg/a.py': 'class _Shared:\n\tx: i32\n\tdef __init__( self ) -> None:\n\t\tself.x = 1\n' },
+			'from pkg import a\n'
+			'def main() -> i32:\n\ts = a._Shared()\n\treturn s.x\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'only accessible within its own package' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( 'pkg.a._Shared', errors[0] )
+
+	def test_package_private_class_rejected_in_type_annotation_from_unrelated_module( self ) -> None:
+		# x: module._ClassName - discovery.py's own visit_Attribute (used
+		# for TYPE-position dotted references), a genuinely different
+		# resolution path from both from-import and construction-call. A
+		# parameter annotation only actually gets resolved once the
+		# function itself is reachable - main() has to call use(), which
+		# means constructing an a._Shared to pass it, so this fixture
+		# legitimately trips BOTH the annotation check (on use's own
+		# parameter) AND the construction-call check (at the call site) -
+		# both real, both correctly reported; the annotation-specific
+		# assertion just checks for at least one being the annotation.
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': 'import pkg.a as a\n', 'pkg/a.py': 'class _Shared:\n\tx: i32\n\tdef __init__( self ) -> None:\n\t\tself.x = 1\n' },
+			'from pkg import a\n'
+			'def use( s: a._Shared ) -> i32:\n\treturn s.x\n'
+			'def main() -> i32:\n\treturn use( a._Shared() )\n',
+		)
+		errors = [ e for e in disco.errors.errors if 'only accessible within its own package' in e ]
+		self.assertGreaterEqual( len( errors ), 1, disco.errors.errors )
+		self.assertTrue( all( 'pkg.a._Shared' in e for e in errors ), disco.errors.errors )
+
+	def test_dunder_class_is_never_private( self ) -> None:
+		# a real dunder-NAMED class is unusual, but the stem check itself
+		# (starts with __, ends with __) must stay consistent regardless
+		# of what kind of Name it's applied to
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': 'class __Dunder__:\n\tx: i32\n\tdef __init__( self ) -> None:\n\t\tself.x = 1\n' },
+			'from pkg.a import __Dunder__\n'
+			'def main() -> i32:\n\td: __Dunder__ = __Dunder__()\n\treturn d.x\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
+
 class OverloadTests( unittest.TestCase ):
 	def setUp( self ) -> None:
 		self.discovery = discovery.Discovery( import_builtins = False )

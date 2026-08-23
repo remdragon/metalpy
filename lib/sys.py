@@ -211,8 +211,17 @@ def _assert( cond: bool, msg: str ) -> None:
 	if not cond:
 		panic( msg )
 
-# private helper functions:
-
+# raw, untyped allocation - the byte-counted primitive sys.alloc[T] itself
+# builds on (below). Package-private (not module-private): lib/threading.py's
+# FastLock genuinely needs it directly - a raw Ptr[u8] of an exact byte size,
+# with none of sys.alloc[T]'s own generic-sizing/panic-on-OOM/debug-poisoning
+# behavior (the memory becomes a real OS mutex, which pthread_mutex_init/
+# SRWLOCK's own all-zero-is-unlocked contract must initialize on its own
+# terms). sys.py and threading.py are both bare top-level lib/ modules (no
+# enclosing package of their own) - module/package privacy enforcement
+# (SYNTAX.md) treats every such module as one implicit shared package, so a
+# single leading underscore already covers this cross-file reach correctly;
+# no need to go fully public.
 @compiler.target( os = 'windows' )
 def _alloc( size: usize ) -> Ptr[u8]:
 	from windows.kernel32 import HeapAlloc, GetProcessHeap
