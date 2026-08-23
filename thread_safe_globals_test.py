@@ -17,14 +17,21 @@
 # (instance fields) remains completely unimplemented, so plenty of other
 # racy shapes still need it.
 #
-# The mechanism itself only guards a Windows target so far (emitter_c.py's
-# _global_lock_supported() - see PLAN_THREAD_SAFE_SHARED_STATE.md's own A.3
-# POSIX-asymmetry note) - confirmed via a real crash under WSL/gcc while
-# building this file: a plain global reassigned/read under real concurrent
-# stress corrupts the heap there exactly like it used to on Windows before
-# this session's fix, since nothing protects it on that target yet. Both
-# stress tests below are Windows-only for this reason, not because the
-# shape doesn't apply to POSIX too.
+# The mechanism now guards both a Windows target (SRWLOCK) and a Linux one
+# (pthread_mutex_t, emitter_c.py's _global_lock_supported() - see
+# PLAN_THREAD_SAFE_SHARED_STATE.md's own A.3 POSIX-asymmetry note for why
+# Linux's own storage/init shape genuinely differs from Windows's, not just
+# a platform #ifdef). macOS remains unguarded (and untested - this repo's
+# only verified targets are Windows-x64/Linux-x64) - _global_lock_supported()
+# deliberately excludes it rather than assuming pthread_mutex_t behaves
+# identically there. Both stress tests below now run on sys.platform in
+# ('win32', 'linux') - widened from the earlier Windows-only gating, still
+# excluding macOS/anything else for the same untested-target reason.
+# The Linux leg was confirmed to be a REAL fix, not a no-op that happens to
+# pass: temporarily sabotaging _global_lock_supported() to exclude 'linux'
+# and re-running under WSL/gcc reproduced real SIGILL crashes (3/30 runs)
+# with the exact same signature as the original bug this whole mechanism
+# exists to close - restored immediately after confirming that.
 
 import sys
 import unittest
@@ -209,7 +216,7 @@ def main() -> i32:
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile tests' )
 class ThreadSafeGlobalsTests( RealCompileMixin, unittest.TestCase ):
-	@unittest.skipUnless( sys.platform == 'win32', 'Part A only guards a Windows target so far - see this file\'s own header comment' )
+	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
 	def test_concurrent_read_write_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
@@ -218,7 +225,7 @@ class ThreadSafeGlobalsTests( RealCompileMixin, unittest.TestCase ):
 	def test_scalar_global_unaffected( self ) -> None:
 		self.assert_programs_run([ ( 'scalar_global_unaffected', _SCALAR_GLOBAL_UNAFFECTED ) ])
 
-	@unittest.skipUnless( sys.platform == 'win32', 'Part A only guards a Windows target so far - see this file\'s own header comment' )
+	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
 	def test_narrowed_read_concurrent_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run

@@ -688,7 +688,11 @@ def mangle_qualname( qualname: str ) -> str:
 # as a single opaque, pointer-sized value whose all-zero state IS already a
 # valid, unlocked lock (no InitializeSRWLock call exists anywhere in this
 # codebase) - a `void*` initialized to 0 is exactly that, no separate init
-# function needed. AcquireSRWLockExclusive/ReleaseSRWLockExclusive take a
+# # function needed on Windows - Linux's own pthread_mutex_t storage is NOT
+# zero-init-safe the same way and needs a real pthread_mutex_init() call;
+# see _global_lock_name's own declaration site (in the globals-emission
+# loop, emit_c()) for that platform's storage shape and init wiring.
+# AcquireSRWLockExclusive/ReleaseSRWLockExclusive take a
 # `void**` here (not the real PSRWLOCK type) since SRWLOCK's own real
 # layout is just one pointer-sized slot (see windows/kernel32.py's own
 # _SRWLOCK comment) - void** is ABI-identical and avoids also declaring a
@@ -719,9 +723,23 @@ def _global_lock_name( var: Variable ) -> str:
 _SRWLOCK_STRUCT_NAME = mangle_qualname( 'windows.kernel32._SRWLOCK' )
 
 def _global_lock_acquire( lock_name: str ) -> str:
+	if _target_os == 'linux':
+		# pthread_mutex_lock, not lib/threading.py's own FastLock (see
+		# _global_lock_name's storage declaration site for why this needs a
+		# REAL pthread_mutex_t, not a bare void* the way SRWLOCK's storage
+		# gets away with) - <pthread.h> is force-included whenever any
+		# locked global exists on this target (see emit_c()'s own
+		# required_headers.add('pthread.h')), so the real prototype is
+		# always in scope here, unlike Windows's own hand-declared forward
+		# prototypes (SRWLOCK has no portable equivalent to "just include
+		# the real header", since that would drag in the whole of
+		# windows.h - pthread.h carries no such cost).
+		return f'\tpthread_mutex_lock( &{lock_name} );'
 	return f'\tAcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
 def _global_lock_release( lock_name: str ) -> str:
+	if _target_os == 'linux':
+		return f'\tpthread_mutex_unlock( &{lock_name} );'
 	return f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
 # set once, at the very top of emit_c() (which has `compiler` in scope) -
@@ -740,17 +758,23 @@ def _global_lock_release( lock_name: str ) -> str:
 _target_os: str|None = None
 
 def _global_lock_supported() -> bool:
-	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A ships Windows (SRWLOCK)
-	first - POSIX (pthread_mutex_t, needing a real pthread_mutex_init()
-	call, not zero-init-safe the way SRWLOCK is - see that plan's own A.3
-	POSIX-asymmetry note) is deliberately not implemented yet. Checked here,
-	not inside _needs_global_lock itself (which stays a pure "is this
-	global genuinely reassigned" fact, independent of what THIS pass of the
-	emitter can currently do about it) - keeps detection and platform-
-	support-status separate. False here means every one of this global's
-	accesses falls through to today's plain, unwrapped emission - exactly
-	the pre-existing (unprotected, not a regression) POSIX behavior. '''
-	return _target_os == 'windows'
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: Windows (SRWLOCK) and Linux
+	(pthread_mutex_t, needing a real pthread_mutex_init() call, not
+	zero-init-safe the way SRWLOCK is - see that plan's own A.3
+	POSIX-asymmetry note, and _global_lock_name's storage-declaration site
+	below for how the init call is actually wired in). macOS is
+	deliberately excluded even though it's also POSIX/pthread - this
+	repo's own verified compiler matrix is Windows-x64 and Linux-x64 only
+	(see PLAN_THREAD_SAFE_SHARED_STATE.md's own A.3 note on that), so
+	claiming macOS support here would be untested, not just unimplemented.
+	Checked here, not inside _needs_global_lock itself (which stays a pure
+	"is this global genuinely reassigned" fact, independent of what THIS
+	pass of the emitter can currently do about it) - keeps detection and
+	platform-support-status separate. False here means every one of this
+	global's accesses falls through to today's plain, unwrapped emission -
+	exactly the pre-existing (unprotected, not a regression) behavior for
+	any target this returns False for. '''
+	return _target_os in ( 'windows', 'linux' )
 
 # the bare forward tag (no body) is always legal to repeat, even if the
 # real struct ALSO gets a full body defined elsewhere in this same
@@ -4228,7 +4252,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	global _target_os
 	_target_os = compiler.disco.active_target['os']
 	locked_globals = [ g for g in compiler.globals if _needs_global_lock( g.variable ) ]
-	if locked_globals and _global_lock_supported():
+	if locked_globals and _global_lock_supported() and _target_os == 'windows':
 		# real kernel32.dll exports (SRWLOCK is a genuine Win32 primitive,
 		# not something this codebase invents) - registered the same way
 		# __metalpy_format_f64's own GetProcAddress dependency is, just
@@ -4239,6 +4263,28 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		# windows.kernel32 for anything else.
 		compiler.extern_libs.setdefault( 'kernel32', set() ).update((
 			'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive',
+		))
+	if locked_globals and _global_lock_supported() and _target_os == 'linux':
+		# pthread_mutex_t's real definition (needed below, where this
+		# module's own storage declaration is a genuine `pthread_mutex_t`,
+		# not an opaque void* the way SRWLOCK gets away with - see
+		# _global_lock_name's own storage-declaration comment) only exists
+		# if <pthread.h> is actually included in this translation unit.
+		# Ordinarily that only happens when a compiled program itself
+		# imports lib/posix/pthread.py (its own @extern(header='pthread.h')
+		# bindings populate compiler.disco.required_headers - see
+		# discovery.py's own extern_header handling) - force it here
+		# instead, the same way this whole block force-registers kernel32
+		# on Windows even for a program that never itself touches
+		# windows.kernel32. Registering 'pthread' the same way (mirroring
+		# lib/threading.py's own @extern('pthread', ...) bindings, which
+		# already link -lpthread whenever threading.py is used) - harmless
+		# even on a modern glibc where pthread symbols live in libc itself
+		# (glibc >= 2.34) and -lpthread resolves to an effectively-empty
+		# compatibility stub.
+		compiler.disco.required_headers.add( 'pthread.h' )
+		compiler.extern_libs.setdefault( 'pthread', set() ).update((
+			'pthread_mutex_init', 'pthread_mutex_lock', 'pthread_mutex_unlock',
 		))
 	# __metalpy_format_f64 (PROLOGUE, always present) resolves ntdll's own
 	# exported _snprintf via GetProcAddress on Windows, to avoid linking
@@ -4292,8 +4338,15 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		parts.append( _PROLOGUE_FLOAT_FORMAT )
 	if uses_parse_conv:
 		parts.append( _PROLOGUE_FLOAT_PARSE )
-	if locked_globals and _global_lock_supported():
+	if locked_globals and _global_lock_supported() and _target_os == 'windows':
 		parts.append( _PROLOGUE_GLOBAL_LOCK_WINDOWS )
+		# Linux needs no analogous hand-declared prologue: pthread_mutex_t's
+		# real definition and pthread_mutex_lock/unlock/init's real
+		# prototypes come from <pthread.h> itself (force-included just
+		# above, in this function's own required_headers.add('pthread.h')),
+		# which carries none of SRWLOCK's "don't want to drag in all of
+		# windows.h just for one struct" cost - see _global_lock_acquire's
+		# own comment.
 
 	# collect #include requirements from all modules whose symbols are
 	# compiled into this translation unit
@@ -4469,7 +4522,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# not dependency order - see _emit_global_init_fn's own docstring)
 	for g in compiler.globals:
 		parts.append( _emit_global_declaration( g ))
-	if _global_lock_supported():
+	if _global_lock_supported() and _target_os == 'windows':
 		# one bare, all-zero-initialized `void*` per protected global -
 		# SRWLOCK's own all-zero state is already a valid, unlocked lock
 		# (see _PROLOGUE_GLOBAL_LOCK_WINDOWS's own comment), so this needs
@@ -4479,6 +4532,25 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		# Variable/LoweredGlobal of their own to hang that machinery off.
 		for g in locked_globals:
 			parts.append( f'static void* {_global_lock_name( g.variable )} = 0;' )
+	elif _global_lock_supported() and _target_os == 'linux':
+		# a REAL pthread_mutex_t here, not a bare void* - unlike SRWLOCK,
+		# zero-initializing a pthread_mutex_t isn't a portable guarantee
+		# (PLAN_THREAD_SAFE_SHARED_STATE.md's own A.3 POSIX-asymmetry note;
+		# glibc happens to tolerate it, lib/threading.py's own POSIX
+		# FastLock.__init__ deliberately does NOT rely on that and calls
+		# pthread_mutex_init() explicitly instead, and this mirrors that
+		# choice). No initializer here at all (plain tentative-definition
+		# zero BSS, same as any other uninitialized static) - the REAL
+		# initialization is a genuine pthread_mutex_init() call, emitted
+		# unconditionally at the very top of __metalpy_init() below, before
+		# any ordinary function body can possibly run (ir.AcquireGlobalLock/
+		# ir.ReleaseGlobalLock markers only ever appear inside ordinary
+		# function bodies, never inside a global's OWN init instructions -
+		# see Variable.reassigned_outside_init's own comment - so it's safe
+		# for this to run before, or in any order relative to, the
+		# topologically-sorted global-init calls just below it).
+		for g in locked_globals:
+			parts.append( f'static pthread_mutex_t {_global_lock_name( g.variable )};' )
 	for g in compiler.globals:
 		init_fn = _emit_global_init_fn( g )
 		if init_fn is not None:
@@ -4511,8 +4583,21 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		f'\t{_global_init_fn_name( g )}();'
 		for g in _topologically_sort_globals( compiler )
 	]
+	# pthread_mutex_init() calls for every protected global's real lock
+	# storage (see that storage declaration's own comment, just above, for
+	# why this can't just be a static zero-initializer the way SRWLOCK's
+	# storage is). Emitted first, ahead of init_calls - not because
+	# anything actually depends on that relative order (nothing in a
+	# global's own init instructions ever acquires one of these locks; see
+	# the storage declaration's own comment), just the simplest place to
+	# put an unconditional, order-independent one-time setup step.
+	lock_init_calls = (
+		[ f'\tpthread_mutex_init( &{_global_lock_name( g.variable )}, ((void*)0) );' for g in locked_globals ]
+		if _global_lock_supported() and _target_os == 'linux' else []
+	)
 	parts.append(
 		'static void __metalpy_init( void ) {\n'
+		+ ( '\n'.join( lock_init_calls ) + '\n' if lock_init_calls else '' )
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)

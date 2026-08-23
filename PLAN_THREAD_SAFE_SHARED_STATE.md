@@ -3,10 +3,10 @@
 ## Status
 
 **Part A (module globals) implemented and confirmed correct for both
-direct and narrowed reads/writes, Windows only.** Part B (instance fields,
-`ObjectHeader` growth) is still fully unimplemented - do not attempt
-without its own dedicated worktree/session, for the reasons this
-document's Part B section already gives.
+direct and narrowed reads/writes, on both Windows and Linux.** Part B
+(instance fields, `ObjectHeader` growth) is still fully unimplemented - do
+not attempt without its own dedicated worktree/session, for the reasons
+this document's Part B section already gives.
 
 What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
 `ir.py`/`mpy_types.py`):
@@ -14,9 +14,21 @@ What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
   `assign()` the moment a `global X; X = ...` reassignment is lowered
   (never for a global's own module-level initializer - `lower_global()`
   bypasses `cfg.assign()` entirely, confirmed directly).
-- A per-global `SRWLOCK`-shaped lock (`static void*`, zero-init, no
-  separate init function - A.2/A.3's own design), synthesized only for
-  globals that end up needing one.
+- A per-global lock, synthesized only for globals that end up needing
+  one - platform-shaped, not a single portable primitive (A.3's own
+  documented asymmetry): on Windows, a bare `static void*` holding an
+  `SRWLOCK`, zero-init, no separate init function needed (SRWLOCK's
+  all-zero state IS a valid unlocked lock, per Win32's own contract); on
+  Linux, a real `static pthread_mutex_t`, explicitly initialized via a
+  genuine `pthread_mutex_init()` call emitted at the very top of the
+  synthesized `__metalpy_init()` (zero-initializing a `pthread_mutex_t` is
+  not a portable guarantee, unlike SRWLOCK - see A.3's own note; this
+  deliberately does not rely on it even though glibc happens to tolerate
+  it). `<pthread.h>` is force-included whenever any global needs this on
+  Linux (`compiler.disco.required_headers.add('pthread.h')`,
+  `emit_c()`), the same way kernel32's SRWLOCK exports are force-linked on
+  Windows - a compiled program gets this regardless of whether it itself
+  imports `posix.pthread`/`lib/threading.py` for anything else.
 - Real `ir.AcquireGlobalLock`/`ir.ReleaseGlobalLock` marker instructions
   (not emission-time pattern-matching - an earlier version tried
   reconstructing critical-section boundaries by looking for adjacent
@@ -50,11 +62,19 @@ What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
   locals) - `_expr_Attribute`'s own, separately-duplicated narrowed-read
   rewrite (for a narrowed *field*, e.g. `self._g.field`) is untouched,
   since field-level locking is squarely Part B, not attempted this pass.
-- Both stress tests verified on clang and MSVC (Windows targets); the
-  mechanism is gated off entirely on POSIX for now (`emitter_c.py`'s
-  `_global_lock_supported()`), confirmed via a real crash under WSL/gcc
-  while building the first stress test - that target is genuinely
-  unprotected still, not silently broken by this change.
+- Both stress tests verified on clang, MSVC, AND WSL/gcc (Windows and
+  Linux targets alike - `emitter_c.py`'s `_global_lock_supported()`
+  returns `True` for `_target_os in ('windows', 'linux')`). The Linux leg
+  was confirmed to be a REAL fix, not a no-op that happens to pass:
+  temporarily sabotaging `_global_lock_supported()` to exclude `'linux'`
+  and re-running the narrowed-read stress binary under WSL/gcc reproduced
+  real SIGILL crashes (3/30 runs) with the exact same signature as the
+  original bug this mechanism exists to close, immediately restored after
+  confirming that. macOS is deliberately still excluded (returns `False`
+  there too) - this repo's own verified compiler/target matrix is
+  Windows-x64 and Linux-x64 only; claiming macOS support would be
+  untested, not just unimplemented, even though pthread_mutex_t exists
+  there too.
 - **Deterministic, non-timing-dependent regression coverage** alongside
   the (necessarily non-deterministic) stress tests:
   `lowering_test.py`'s exact-IR assertions confirm the lock markers land
@@ -93,10 +113,29 @@ What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
      transfer path instead when true - which is also a general
      correctness improvement independent of this document's own
      mechanism, not just a narrow enabler for it.
+- **Linux (`pthread_mutex_t`) support added in a follow-up pass, with NO
+  changes needed to `cfg.py`/`lowering.py`/`ir.py`/`mpy_types.py` at
+  all** - every `ir.AcquireGlobalLock`/`ir.ReleaseGlobalLock` marker is
+  already platform-agnostic IR emitted the same way regardless of target;
+  only `emitter_c.py` (which already decides, per-target, whether a
+  marker becomes a real op or a no-op) needed changes: `_global_lock_
+  supported()` widened to include `'linux'`, `_global_lock_acquire`/
+  `_global_lock_release` branch to `pthread_mutex_lock`/`_unlock` there,
+  the per-global lock's own storage/init differs (see above), and
+  `<pthread.h>`/`-lpthread` get force-registered the same way kernel32's
+  SRWLOCK exports are on Windows. This is the concrete payoff of this
+  mechanism's own original design choice - deciding real-op-vs-no-op at
+  EMISSION time, per target, off IR markers that never themselves know or
+  care what platform they're compiled for.
 
 **What's confirmed NOT yet covered - do not assume otherwise:**
-- POSIX (`pthread_mutex_t`) - A.3's own documented asymmetry, not
-  attempted this pass; the whole mechanism is a no-op there today.
+- macOS - `_global_lock_supported()` deliberately still returns `False`
+  there, even though pthread_mutex_t exists on macOS too; this repo's own
+  verified compiler/target matrix is Windows-x64 and Linux-x64 only, so
+  claiming macOS support would be untested, not just unimplemented. A
+  program's own `_g$lock`-style globals on that target fall through to
+  today's plain, unwrapped (unprotected) emission - not a regression, the
+  same pre-existing behavior every other not-yet-covered case gets.
 - A.2's lock-free CAS publish path - not attempted; A.3's lock is used
   unconditionally for every protected global this pass covers.
 - Narrowed reads of a narrowed *field* (`_expr_Attribute`'s own copy of
@@ -603,6 +642,21 @@ machinery:
   (a lighter, portably-zero-init-safe primitive, e.g. a raw futex-based
   spinlock, may be worth building instead of reusing `pthread_mutex_t`
   specifically for this purpose).
+
+  **Status update:** implemented, but simpler than this bullet's own
+  speculation - the `pthread_mutex_init()` call is NOT routed through the
+  general `_emit_global_init_fn`/`_topologically_sort_globals` machinery
+  (that machinery exists to order one metalpy-level global's initializer
+  against another's, keyed off a real `Variable`/`LoweredGlobal` - these
+  locks have neither, same as the Windows `SRWLOCK` case just above).
+  Instead, every protected global's `pthread_mutex_init()` call is emitted
+  directly into the synthesized `__metalpy_init()` function body's own
+  text, unconditionally ahead of the topologically-sorted global-init
+  calls - safe with no ordering analysis needed at all, since (as
+  `Variable.reassigned_outside_init`'s own comment establishes) a global's
+  OWN init instructions never contain an `ir.AcquireGlobalLock`/
+  `ReleaseGlobalLock` marker in the first place; only ordinary function
+  bodies do, and those only ever run after `__metalpy_init()` returns.
 
 ### A.4 Where to insert acquire/release (the A.3 lock case)
 
