@@ -175,6 +175,12 @@ class CcTool:
 		# fuzzing performance)
 		want_debug_info = debug or asan
 		if self.name == 'cl':
+			# /experimental:c11atomics - MSVC's own <stdatomic.h> (unconditionally
+			# included in every generated .c, for RC refcount atomics) hard-errors
+			# with C1189 "C atomic support is not enabled" under plain /std:c11
+			# without this flag on newer MSVC toolsets (confirmed on VS 18/
+			# BuildTools 14.51.36231) - full C11 atomics support is still gated
+			# behind this experimental switch there.
 			cmd = [ self.path, '/nologo', '/std:c11', '/experimental:c11atomics' ]
 			if warnings:
 				cmd += [ '/W4', '/wd4701' ]

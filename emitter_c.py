@@ -1460,10 +1460,16 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 		# broadening this fix beyond the signed case it was first written for.
 		magnitude = abs( value )
 		if value < 0:
+			# 0-x instead of -x: bitwise identical two's-complement negation
+			# (both operands already the same unsigned type), but MSVC's /W4
+			# flags a literal unary minus applied to an unsigned type (C4146)
+			# even though the result is well-defined - binary subtraction from
+			# an unsigned zero sidesteps the warning entirely, clang/gcc emit
+			# identical code either way
 			if stem in _SIGNED_TO_UNSIGNED:
 				uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
-				return f'(({ctype})(-({uctype}){magnitude}ULL))'
-			return f'(-(({ctype}){magnitude}ULL))'
+				return f'(({ctype})(({uctype})0 - ({uctype}){magnitude}ULL))'
+			return f'(({ctype})0 - ({ctype}){magnitude}ULL)'
 		return f'(({ctype}){magnitude}ULL)'
 	magnitude = abs( value )
 	hi, lo = magnitude >> 64, magnitude & 0xFFFFFFFFFFFFFFFF
@@ -1488,7 +1494,9 @@ def _emit_wide_int_const( value: int, stem: str ) -> str:
 	# whole function already uses), then negates THAT, overflowing signed
 	# __int128 - confirmed via the same real SIGILL crash as i64::MIN above.
 	if value < 0:
-		return f'(__metalpy_wideint)(-{unsigned_expr})'
+		# 0-x, not -x - same MSVC C4146 (unary minus on unsigned) dodge as the
+		# <=64-bit branch above, same bitwise result
+		return f'(__metalpy_wideint)((__metalpy_wideuint)0 - {unsigned_expr})'
 	return f'(__metalpy_wideint){unsigned_expr}'
 
 def _emit_const( c: ir.Const ) -> str:
