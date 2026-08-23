@@ -239,10 +239,10 @@ class OverflowError: pass
 @cstruct
 class Result[T,E]:
 	def is_err( self ) -> bool:
-		pass
+		return bool()
 	@staticmethod
 	def Err( e: E ) -> Result[T,E]:
-		pass
+		return Result()
 
 def checked( e: OverflowError ) -> Result[None,OverflowError]:
 	with errdefer:

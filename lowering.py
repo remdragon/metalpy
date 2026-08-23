@@ -1988,6 +1988,37 @@ class FunctionLowering:
 						except CompileError:
 							continue
 
+					if self._return_value_var is not None and not ( body_stmts and self._stmt_diverges( body_stmts[-1] )):
+						# self._return_value_var is only ever created for a REAL
+						# (non-None/NoReturn) declared return type (see its own
+						# construction above) - reaching here means fn's own body
+						# can fall off the closing brace without ever having set a
+						# return value on that path. Before this check existed,
+						# nothing caught this at all: emitter_c.py's own ir.Return
+						# handling only ever fires from an EXPLICIT return (or the
+						# fn.return_type is none_type fallthrough a few lines below,
+						# which deliberately does NOT apply here), so the compiled
+						# C function's own __return_value local was simply left
+						# uninitialized on this path - a real, confirmed bug (lib/
+						# builtins/__list.py's list[T].insert(), found via a genuine
+						# MSVC /RTC1 uninitialized-variable runtime trap, not a
+						# hypothetical - see msvc_toolset_c11atomics memory). Uses
+						# _stmt_diverges (not the deliberately conservative _body_
+						# may_fall_off_the_end below, which tolerates false positives
+						# as harmless dead code for the None-return case) so a
+						# genuinely-terminating body (trailing if/else that both
+						# return, an exhaustive-by-construction match, a NoReturn
+						# call, a `while True:` with no break) is correctly NOT
+						# flagged.
+						self.lowering.discovery.fail(
+							f'{fn.qualname}: not every code path returns a value '
+							f'(declared to return {fn.return_type.qualname if fn.return_type is not None else "?"}) - '
+							f'add an explicit `return` on every path (a non-exhaustive '
+							f'match/if with no matching case counts as a path that can '
+							f'still fall through)',
+							fn.node,
+						)
+
 					# reaching the closing brace with no explicit `return` on
 					# this path is __init__'s success path too - every
 					# required attribute must already be initialized here.
@@ -6434,6 +6465,33 @@ class FunctionLowering:
 
 		self._lower_binary_branch( is_err_cond, node, err_thunk, ok_thunk )
 
+	def _loop_has_reachable_break( self, body: list[ast.stmt] ) -> bool:
+		''' does `body` contain a `break` that would actually exit the loop
+		it belongs to - used by _stmt_diverges' own `while True:` case, to
+		decide whether the loop can really be exited normally at all. Does
+		NOT descend into a NESTED ast.While/ast.For's own body - a break
+		inside a nested loop exits THAT loop, not this one, so it doesn't
+		count here. Does descend into ast.If (both body/orelse - a match
+		statement's own desugared chain included, same shape _stmt_diverges
+		itself already recurses through) and ast.Try, since a break inside
+		either of those still belongs to the SAME enclosing loop. '''
+		for stmt in body:
+			if isinstance( stmt, ast.Break ):
+				return True
+			if isinstance( stmt, ( ast.While, ast.For, ast.FunctionDef ) ):
+				continue
+			for field in ( 'body', 'orelse', 'finalbody', 'handlers' ):
+				sub = getattr( stmt, field, None )
+				if not isinstance( sub, list ):
+					continue
+				# ast.Try.handlers is a list[ast.ExceptHandler], not a list[ast.stmt]
+				# directly - recurse into each handler's own .body instead
+				sub_stmts = [ h.body for h in sub ] if field == 'handlers' else [ sub ]
+				for stmts in sub_stmts:
+					if isinstance( stmts, list ) and self._loop_has_reachable_break( stmts ):
+						return True
+		return False
+
 	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
 		''' true if `stmt` never falls through to the statement after it -
 		either structurally (return/break/continue) or because it's a bare
@@ -6453,6 +6511,17 @@ class FunctionLowering:
 		today's existing (safe, if incomplete) behavior. '''
 		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
 			return True
+		if isinstance( stmt, ast.With ):
+			# a with-block's own exit (__exit__) doesn't change whether
+			# control falls through PAST the with statement itself - that's
+			# entirely decided by whether its OWN body's last statement
+			# diverges, exactly like an ast.If's body above. Extremely
+			# common shape in this codebase (`with self.__lock: return
+			# ...`, `with compiler.wrap_arithmetic: return ...`) - without
+			# this, EVERY lock-wrapped accessor/mutator in lib/builtins/
+			# __list.py, __init__.py (dict), etc. was wrongly flagged as
+			# non-terminating by the definite-return check built on this.
+			return bool( stmt.body ) and self._stmt_diverges( stmt.body[-1] )
 		if isinstance( stmt, ast.If ):
 			# an if/else BOTH of whose own branches diverge is itself
 			# terminating, even though it isn't literally a Return/Break/
@@ -6467,6 +6536,21 @@ class FunctionLowering:
 				bool( stmt.body ) and self._stmt_diverges( stmt.body[-1] )
 				and bool( stmt.orelse ) and self._stmt_diverges( stmt.orelse[-1] )
 			)
+		if (
+			isinstance( stmt, ast.While ) and isinstance( stmt.test, ast.Constant ) and stmt.test.value is True
+			and not self._loop_has_reachable_break( stmt.body )
+		):
+			# `while True:` with no break anywhere in its own body (not
+			# counting a break that belongs to a NESTED loop instead - see
+			# _loop_has_reachable_break) never falls through to whatever
+			# follows it, REGARDLESS of what its body itself ends with -
+			# the only way past this statement is a `return`/NoReturn call
+			# somewhere inside it, or it runs forever. Needed so a
+			# definite-return check built on this can't-fall-through
+			# analysis doesn't reject a real, common shape (an event-loop-
+			# style function whose only way out is an inner `return`) as
+			# "missing return".
+			return True
 		if not ( isinstance( stmt, ast.Expr ) and isinstance( stmt.value, ast.Call )):
 			return False
 		if self.lowering._defer_kind_of_call( stmt.value ) is not None:
@@ -6489,6 +6573,17 @@ class FunctionLowering:
 			# actually exercised it). defer/errdefer always falls through
 			# (arms a flag, never diverges) - never NoReturn-shaped
 			return False
+		if self.lowering._is_compiler_call( stmt.value ) == 'early_return':
+			# compiler.early_return(err) - a same-function early bailout,
+			# lowered as an unconditional jump straight to the epilogue with
+			# Result.Err(err) as the return value (_lower_compiler_early_
+			# return) - genuinely diverges exactly like an ordinary `return`,
+			# but is a compiler intrinsic (recognized textually, same as
+			# defer/errdefer above), not an ordinary resolvable Function, so
+			# _resolve_callee_target below would never find it - without this
+			# case a function whose only "return" is compiler.early_return(...)
+			# as a bare statement was wrongly flagged as never returning.
+			return True
 		target = self.lowering._type_resolver._resolve_callee_target( stmt.value.func )
 		fn = target.base if isinstance( target, Specialization ) else target
 		if not isinstance( fn, Function ):

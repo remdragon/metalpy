@@ -4445,6 +4445,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if owner_type is None:
 				return None
 			owner_type = self.resolver.ensure_resolved( owner_type )
+			if isinstance( node.slice, ast.Slice ):
+				# x[a:b]/x[:b]/x[a:] (str/bytearray only - PLAN_POSIX_FEATURE.md)
+				# desugars to a call to the receiver's own _byte_slice(start,
+				# stop) (lowering.py's _lower_slice_subscript), auto-unwrapped
+				# via _maybe_consume_result the same way .or_return() is - so
+				# the slice EXPRESSION's own type, as any caller sees it, is
+				# _byte_slice's success type, not the raw Result[T,E] it
+				# returns. Without this, `match buf[:n].decode(): case
+				# Result.Ok(s): ... case Result.Err(_): ...` (lib/posix/
+				# time.py's own _read_etc_timezone_file) came back
+				# subj_type=None (a slice subscript's own type was simply
+				# never resolved here at all), so the exhaustiveness pre-pass
+				# couldn't recognize a real, exhaustive Ok/Err match as
+				# terminating - the same "falls off the end" false positive
+				# class as the move()/.or_return()/fallible-construction
+				# fixes just above, just reached through a slice subscript
+				# instead. Only gcc (the POSIX/Linux target) ever compiles
+				# this file at all, which is why clang/MSVC's own full-suite
+				# runs never caught it.
+				slice_fn = getattr( owner_type, 'names', {} ).get( '_byte_slice' )
+				if not isinstance( slice_fn, Function ):
+					return None
+				if slice_fn.resolve is not None:
+					slice_fn.resolve()
+				shape = self.resolver._result_shape( slice_fn.return_type )
+				return shape[0] if shape is not None else slice_fn.return_type
 			tuple_type = self.resolver.tuple_storage.tuple_type_for( owner_type )
 			if tuple_type is None:
 				return None
@@ -4457,6 +4483,26 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return None
 			return tuple_type.elem_types[ node.slice.value ]
 		if isinstance( node, ast.Call ):
+			if isinstance( node.func, ast.Name ) and node.func.id == 'move' and len( node.args ) == 1 and not node.keywords:
+				# move(x) is a call-site ownership-transfer marker (SYNTAX.md),
+				# never a real registered callable - textually recognized the
+				# same way lowering.py's own _lower_call/_emit_call_args do
+				# (isinstance(expr.func, ast.Name) and expr.func.id == 'move').
+				# Its own "return type" for inference purposes is simply x's
+				# own type - move() doesn't change WHAT the value is, only who
+				# owns it. Without this, an argument shaped `f(move(x))` typed
+				# to None here (the generic Call-handling below has no real
+				# Function/Overload to resolve 'move' against), which starved
+				# _overload_call_return_type's own arg_types of a real type
+				# and made it give up entirely (any(t is None...) -> None) -
+				# confirmed via a real repro: `match str.from_cstr(move(out)):`
+				# (str.from_cstr is @overload'd) came back subj_type=None,
+				# so the exhaustiveness/flattening pre-pass below couldn't
+				# recognize an exhaustive Result.Ok/Result.Err match as
+				# terminating, baking a spurious "falls off the end" into the
+				# generated C (invisible before the definite-return check this
+				# was found alongside, since nothing used to verify that).
+				return self._type_of_expr( node.args[0] )
 			# PLAN_GENERATORS.md Phase 3 (roadmap Phase 3) - a call to a
 			# GENERIC function (explicit gen[i32](...) or inferred
 			# gen(...)) was already resolved by visit_Call, which tags
@@ -4500,14 +4546,35 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					if receiver_type is None:
 						return None
 					receiver_type = self.resolver.ensure_resolved( receiver_type )
-					receiver_cls_base = (
-						receiver_type.base if isinstance( receiver_type, Specialization ) else receiver_type
-					)
+					# _as_specialization, not a bare isinstance(receiver_type,
+					# Specialization) - receiver_type here can ALREADY be the
+					# concretely-monomorphized Result[X,E] union itself (not
+					# wrapped in a Specialization at all), e.g. whenever the
+					# receiver's own declared/inferred type was eagerly
+					# monomorphized earlier (Monomorphizer.origin_of's own
+					# docstring - same duality _same_type/_unify_type_param
+					# already guard against elsewhere in this file). The old
+					# bare isinstance check then compared the CONCRETE union
+					# object against the ABSTRACT Result class by identity,
+					# which can never match - `<expr>.or_return()` silently
+					# came back None whenever its receiver's type had already
+					# been monomorphized, breaking every downstream use of
+					# THIS call's own inferred type (confirmed via a real
+					# repro: `arr = self.as_array().or_return()` inside
+					# json.JSONValue.array_append, whose own receiver type
+					# resolves to an already-concrete Result[list[JSONValue],
+					# JSONError] - this left `arr`'s own tracked local type
+					# None, which cascaded into the match statement further
+					# down not being recognized as exhaustive, and ultimately
+					# into a spurious "falls off the end" the definite-return
+					# check this bug was found alongside would otherwise wrongly reject).
+					receiver_spec = self.resolver._as_specialization( receiver_type )
+					receiver_cls_base = receiver_spec.base if receiver_spec is not None else receiver_type
 					if (
 						receiver_cls_base is self.discovery.find_name_or_none( 'Result' )
-						and isinstance( receiver_type, Specialization ) and receiver_type.args
+						and receiver_spec is not None and receiver_spec.args
 					):
-						return receiver_type.args[0]
+						return receiver_spec.args[0]
 					return None
 				receiver_type = self._type_of_expr( node.func.value )
 				target = None
@@ -4601,11 +4668,40 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				return self._overload_call_return_type( target, node )
 			if isinstance( target, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 				# a plain (non-generic) construction call, Foo(...) - its own
-				# type is just the class itself. An IMPLICIT generic
-				# construction (Result(...), inferring its own type params
-				# from the call's arguments with no explicit subscript) is
-				# deliberately not handled here - that's the classes half of
-				# this work, not yet done
+				# type is just the class itself... UNLESS Foo has a FALLIBLE
+				# __init__ (-> Result[None,E]), in which case Foo(...) itself
+				# becomes Result[Foo,E] (SYNTAX.md - same rule lowering.py's
+				# own _try_lower_construct_call/_init_fallibility apply at the
+				# real construction call site). Scoped to RCClass/CStruct only,
+				# mirroring _try_lower_construct_call's own chain_lookup gate -
+				# CUnion/TaggedUnion/CEnum construction isn't user-__init__-
+				# driven the same way. A non-Function init (an @overload group,
+				# or none at all) falls back to the plain, infallible `target`
+				# below - the real construction call site (_try_lower_
+				# construct_call) is the authority on rejecting/handling that
+				# shape; this is a best-effort type PROBE, not construction
+				# itself. Without this, `match SomeFallibleClass(...): case
+				# Result.Ok(x): ... case Result.Err(_): ...` (str.from_cstr,
+				# huffman.HuffmanEncoder/Decoder, ...) had this call's own
+				# subject type come back as the bare class (not a TaggedUnion
+				# at all), so the exhaustiveness/flattening pre-pass below
+				# couldn't recognize a real, exhaustive Ok/Err match as
+				# terminating - the same "falls off the end" false positive
+				# _type_of_expr's move()-unwrapping fix just above exists for,
+				# just reached through a construction call instead of an
+				# ordinary one.
+				if isinstance( target, ( RCClass, CStruct )):
+					init = target.chain_lookup( '__init__' )
+					if isinstance( init, Function ):
+						if init.resolve is not None:
+							init.resolve()
+						none_type = self.discovery.get_none_type()
+						if init.return_type is not none_type:
+							shape = self.resolver._result_shape( init.return_type )
+							if shape is not None and shape[0] is none_type:
+								result_cls = self.discovery.find_name_or_none( 'Result' )
+								if result_cls is not None:
+									return self.discovery._get_or_create_specialization( result_cls, [ target, shape[1] ] )
 				return target
 			if isinstance( target, Specialization ):
 				# EXPLICIT generic construction, Holder[Box](...) -
@@ -6741,7 +6837,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			resolved = [ self._resolve_case_member( base, members, case.pattern ) for case in node.cases ]
 			if resolved[-1] is not None and all( m is not None for m in resolved ):
 				distinct_ids = { id( m ) for m in resolved }
-				if len( distinct_ids ) == len( resolved ) == len( members ):
+				# len(distinct_ids) == len(members) - NOT len(resolved) too -
+				# every member must be covered at least once, but an EARLIER
+				# case may legitimately re-cover a member a LATER, broader
+				# case also covers (a more specific nested-pattern refinement
+				# followed by its own catch-all, e.g. `case Result.Ok(_):
+				# ...`, `case Result.Err(SpecificError(_)): ...`, `case
+				# Result.Err(_): ...` - two cases both resolve to Err, one
+				# refining the other, still exhaustive together). Requiring
+				# a strict 1:1 case<->member mapping here rejected this
+				# common, legitimate style outright - confirmed via a real
+				# repro (http_client_test.py's own HTTPConnection.connect()
+				# match, Ok + Err(NameResolutionFailed) + Err(_)) that used
+				# to silently compile into a "falls off the end" fallthrough
+				# no diagnostic ever caught, exactly the class of bug this
+				# whole definite-return investigation started from.
+				if len( distinct_ids ) == len( members ):
 					last_guaranteed = True
 		elif last_is_wildcard and isinstance( base, TaggedUnion ) and len( members ) == 2 and len( node.cases ) >= 2:
 			# a bare, UNNAMED wildcard specifically (case _:, not a named
