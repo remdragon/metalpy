@@ -4597,6 +4597,86 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		self.assertIn( '__metalpy_init___main__$g1();', body )
 		self.assertIn( '__metalpy_init___main__$g2();', body )
 
+class MacosGlobalLockPoisonPillTests( unittest.TestCase ):
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: macOS structurally reuses
+	Linux's pthread_mutex_t codegen (emitter_c._target_uses_pthread_lock),
+	but that path has never been compiled/linked/run on real macOS hardware
+	(no macOS machine in this repo's own dev environment - see
+	_global_lock_supported's own docstring). Rather than silently claiming
+	untested support, _global_lock_supported() asserts False the moment
+	it's actually invoked for a real macOS compile that needs the lock.
+	These are pure Python-level checks against emit_c() itself - no C
+	compiler needed, since the poisoned case never gets far enough to
+	produce any C at all. Deliberately plain unittest.TestCase (not
+	RCClassTestCase), same reasoning as MetalpyInitSynthesisTests just
+	above (each test needs its own Discovery with an explicit
+	active_target override). '''
+
+	_MACOS_TARGET = ActiveTarget( os = 'macos', arch = 'x86_64', family = 'unix', bits = 64, debug = True, posix = True )
+
+	_NO_REASSIGNMENT_FIXTURE = '\n'.join([
+		'import compiler',
+		'class Foo:',
+		'	x: i32',
+		'	@staticmethod',
+		'	def make( v: i32 ) -> Foo:',
+		'		return Foo.__allocate__( x = v )',
+		'',
+		'g1: Foo = Foo.make( 1 )',
+		'',
+		'def main() -> i32:',
+		'	with compiler.wrap_arithmetic:',
+		'		return g1.x - 1',
+	])
+
+	# the exact "genuinely reassigned from inside a function body" shape
+	# that flips Variable.reassigned_outside_init True (cfg.py's own
+	# assign() `dest.is_global` branch) - the ONLY shape that ever makes
+	# _needs_global_lock(...) true, and therefore the only shape that can
+	# ever reach _global_lock_supported() at all (see this file's own
+	# emitter_c.py comment on every call site being gated on locked_globals)
+	_REASSIGNED_GLOBAL_FIXTURE = '\n'.join([
+		'import compiler',
+		'class Box:',
+		'	x: i32',
+		'	def __init__( self, x: i32 ) -> None:',
+		'		self.x = x',
+		'',
+		'_current: Box = Box( 0 )',
+		'',
+		'def swap( n: i32 ) -> None:',
+		'	global _current',
+		'	_current = Box( n )',
+		'',
+		'def main() -> i32:',
+		'	swap( 1 )',
+		'	with compiler.wrap_arithmetic:',
+		'		return _current.x - 1',
+	])
+
+	def _compile( self, source: str ) -> Compiler:
+		discovery = Discovery( import_builtins = True, active_target = self._MACOS_TARGET )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		return compiler
+
+	def test_no_protected_global_compiles_cleanly_on_macos( self ) -> None:
+		# the poison pill must NOT fire for a macOS compile that never
+		# actually needs this mechanism at all - confirms the gating (every
+		# _global_lock_supported() call site short-circuits on locked_globals
+		# first) actually works, not just that the assert text is correct
+		compiler = self._compile( self._NO_REASSIGNMENT_FIXTURE )
+		src = emitter_c.emit_c( compiler ) # must not raise
+		self.assertIn( 'int main(', src )
+
+	def test_protected_global_on_macos_raises_the_poison_pill( self ) -> None:
+		compiler = self._compile( self._REASSIGNED_GLOBAL_FIXTURE )
+		with self.assertRaises( AssertionError ) as ctx:
+			emitter_c.emit_c( compiler )
+		self.assertIn( 'completely untested', str( ctx.exception ))
+
 class WindowsTargetCTypeTests( unittest.TestCase ):
 	def test_invalid_handle_value_emits_with_pointer_cast( self ) -> None:
 		import ir
