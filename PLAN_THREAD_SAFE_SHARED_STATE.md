@@ -129,13 +129,30 @@ What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
   care what platform they're compiled for.
 
 **What's confirmed NOT yet covered - do not assume otherwise:**
-- macOS - `_global_lock_supported()` deliberately still returns `False`
-  there, even though pthread_mutex_t exists on macOS too; this repo's own
-  verified compiler/target matrix is Windows-x64 and Linux-x64 only, so
-  claiming macOS support would be untested, not just unimplemented. A
-  program's own `_g$lock`-style globals on that target fall through to
-  today's plain, unwrapped (unprotected) emission - not a regression, the
-  same pre-existing behavior every other not-yet-covered case gets.
+- macOS - deliberately **poisoned, not silently unimplemented.**
+  `_global_lock_supported()` now structurally supports macOS (it reuses
+  Linux's exact `pthread_mutex_t` codegen via `_target_uses_pthread_lock()`
+  - same storage, same `pthread_mutex_init`/`lock`/`unlock` calls, same
+  `<pthread.h>`/`-lpthread` force-registration) but `assert False`s the
+  instant it's actually invoked for a real macOS compile that needs the
+  lock (i.e. only when a genuinely reassigned/protected global exists on
+  that target - every call site is gated on `locked_globals` first, so an
+  unrelated macOS compile with no protected globals is entirely
+  unaffected - see `emitter_c_test.py`'s `MacosGlobalLockPoisonPillTests`,
+  which checks both halves of that directly). This is a deliberately
+  LOUDER failure mode than the earlier "silently return `False`, leave a
+  real race unprotected with no signal" behavior - a compile that would
+  have needed this mechanism on macOS now hard-fails instead of silently
+  shipping unsafe output. Why poisoned instead of just enabled: this
+  repo's own verified compiler/target matrix is Windows-x64 and Linux-x64
+  only (no macOS machine in this dev environment) - the code path is
+  believed correct by construction (it's the exact same pthread codegen
+  already verified on Linux) but has never actually been compiled,
+  linked, or run for real. Whoever next has real macOS hardware should
+  delete the assert in `_global_lock_supported()`, run
+  `thread_safe_globals_test.py`'s own stress tests for real against a
+  macOS target, and update this section - not just delete the assert and
+  assume.
 - A.2's lock-free CAS publish path - not attempted; A.3's lock is used
   unconditionally for every protected global this pass covers.
 - Narrowed reads of a narrowed *field* (`_expr_Attribute`'s own copy of
