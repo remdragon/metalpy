@@ -143,6 +143,12 @@ def main() -> i32:
 	d[20] = 200
 	d[30] = 300
 
+	keysum: i32 = 0
+	with compiler.wrap_arithmetic:
+		for k in d.keys(): # __iter__ delegates to keys(), which delegates to the actual generator - exercises that 3-deep pass-through chain
+			keysum += k
+	if keysum != 60:
+		return 8
 	if sum( d ) != 60: # walks KEYS, matching real python's dict.__iter__
 		return 1
 	if min( d ) != 10:

@@ -2793,8 +2793,11 @@ class dict[K, V]( Iterable[K] ):
 		with self.__lock:
 			self.__inner.__setitem__( key, value )
 
-	def __iter__( self ) -> Generator[K, StopIteration]:
+	def keys( self ) -> Generator[K, StopIteration]:
 		return _dict_key_iter( self )
+
+	def __iter__( self ) -> Generator[K, StopIteration]:
+		return self.keys()
 
 	def with_lock( self, body: Closure[[UnsafeDict[K, V]], None] ) -> None:
 		# unlike list[T]'s own no-arg with_lock, body here takes the raw

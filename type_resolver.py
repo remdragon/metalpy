@@ -4197,6 +4197,29 @@ class TypeResolver:
 				self.ensure_generator_synthesized( monomorphized, origin_stems )
 				return monomorphized
 			if isinstance( obj.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+				if id( obj ) in self.monomorphizer._building:
+					# reentrant: obj is the SAME spec currently mid-build one
+					# frame up (e.g. dict[i32,i32].__iter__'s own pass-through-
+					# generator resolution needs `self`'s type to look up
+					# `self.keys()`, but self IS dict[i32,i32], still being
+					# built) - monomorphize_class has no way to hand back a
+					# partial result, so calling it again here would just
+					# restart the SAME build from scratch, forever (confirmed
+					# by a real repro: unbounded recursion, not a slow
+					# reconvergence). Fall back to the ABSTRACT, unsubstituted
+					# base instead - callers here only ever want a `.names`
+					# lookup for a call target's DECLARED shape (e.g.
+					# _try_synthesize_generator_passthrough's own
+					# _type_of_expr probe), which still finds the abstract
+					# `keys` Function fine; its still-TypeVar'd GeneratorType
+					# return annotation then correctly fails that caller's own
+					# `not isinstance(resolved, GeneratorType)` gate instead of
+					# recursing - deferring to the later, correctly-timed retry
+					# once dict[i32,i32] is actually finished, exactly like the
+					# existing "reached from within its own enclosing generic
+					# class's monomorphize_class" gap this same function's
+					# neighboring GeneratorType branch above already documents.
+					return obj.base
 				return self.monomorphizer.monomorphize_class( obj )
 			# Scalar (Ptr[T]/ConstPtr[T], the intrinsic generic-pointer
 			# scalars - see mpy_types.py's Scalar) has no monomorphization
