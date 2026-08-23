@@ -276,6 +276,47 @@ def GetCurrentDirectoryA(
 ) -> u32:
 	...
 
+@extern( 'kernel32', 'CreateDirectoryA' )
+def CreateDirectoryA(
+	lpPathName: ConstPtr[u8],
+	lpSecurityAttributes: Ptr[None],
+) -> bool:
+	...
+
+@extern( 'kernel32', 'RemoveDirectoryA' )
+def RemoveDirectoryA(
+	lpPathName: ConstPtr[u8],
+) -> bool:
+	...
+
+@extern( 'kernel32', 'DeleteFileA' )
+def DeleteFileA(
+	lpFileName: ConstPtr[u8],
+) -> bool:
+	...
+
+# MoveFileExA, not the plainer MoveFileA - plain MoveFileA fails if the
+# destination already exists, unlike POSIX rename(2)/Python's os.rename
+# (which atomically replace an existing destination). MOVEFILE_REPLACE_
+# EXISTING restores that POSIX-equivalent replace semantics.
+MOVEFILE_REPLACE_EXISTING: u32 = 0x1
+
+@extern( 'kernel32', 'MoveFileExA' )
+def MoveFileExA(
+	lpExistingFileName: ConstPtr[u8],
+	lpNewFileName: ConstPtr[u8],
+	dwFlags: u32,
+) -> bool:
+	...
+
+@extern( 'kernel32', 'GetEnvironmentVariableA' )
+def GetEnvironmentVariableA(
+	lpName: ConstPtr[u8],
+	lpBuffer: Ptr[u8],
+	nSize: u32,
+) -> u32:
+	...
+
 @extern('kernel32', 'WaitForSingleObject')
 def WaitForSingleObject(
 	hHandle: HANDLE,

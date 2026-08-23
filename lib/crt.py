@@ -164,6 +164,47 @@ def getcwd(
 	# callers must check get_errno() to distinguish the failure reason.
 	...
 
+@extern( 'c', 'mkdir', header = 'sys/stat.h' )
+def mkdir(
+	# ConstPtr[None], not ConstPtr[u8] - lib/posix/stat.py's own stat()
+	# extern already pulls in sys/stat.h (real prototype: mkdir(const
+	# char*, mode_t)), and once a header makes the real prototype visible
+	# gcc hard-errors on a char*/unsigned-char* mismatch
+	# (-Wincompatible-pointer-types) - void* sidesteps the signedness
+	# distinction entirely, same posture as opendir/stat's own path params.
+	path: ConstPtr[None],
+	mode: i32,
+) -> i32:
+	...
+
+@extern( 'c', 'rmdir' )
+def rmdir(
+	path: ConstPtr[u8],
+) -> i32:
+	...
+
+@extern( 'c', 'unlink' )
+def unlink(
+	path: ConstPtr[u8],
+) -> i32:
+	...
+
+@extern( 'c', 'rename' )
+def rename(
+	old: ConstPtr[u8],
+	new: ConstPtr[u8],
+) -> i32:
+	...
+
+@extern( 'c', 'getenv' )
+def getenv(
+	name: ConstPtr[u8],
+) -> ConstPtr[u8]:
+	# the returned pointer is owned by the CRT (valid only until the next
+	# environment mutation) - callers must copy it into a str immediately,
+	# never hold onto it.
+	...
+
 # ---------------------------------------------------------------------------
 # Unicode-correct case mapping - str.upper()/str.lower() (see PLAN_STR_UPPER_
 # LOWER.md). towupper_l/towlower_l (the explicit-locale, thread-safe POSIX.1-
