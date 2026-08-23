@@ -2979,6 +2979,14 @@ class TypeResolver:
 				for attr in base_cls.attributes:
 					if attr.resolve is not None:
 						attr.resolve()
+					# a field whose own annotation failed to resolve (e.g. an
+					# invalid generic subscript) is already recorded as a
+					# compile error by _resolve_guarded, which leaves attr.type
+					# None and attr.broken True rather than raising back out
+					# here - skip its teardown instead of asserting; mpy.py
+					# aborts on the recorded error once the whole unit drains
+					if attr.broken or attr.type is None:
+						continue
 					body.extend( self._build_field_teardown_ast(
 						ast.Attribute(
 							value = ast.Name( id = 'self', ctx = ast.Load() ),
