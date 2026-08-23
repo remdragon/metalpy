@@ -105,7 +105,14 @@ class ThreadPoolDispatcher( ConnectionDispatcher ):
 
 	@virtual
 	def dispatch( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
-		self.__pool.submit( lambda: on_connection( conn ))
+		# ConnectionDispatcher.dispatch()'s own abstract signature stays ->
+		# None (unchanged) - a full queue closes the connection outright
+		# rather than propagating a Result up through every dispatcher
+		match self.__pool.submit( lambda: on_connection( conn )):
+			case Result.Ok( _ ):
+				pass
+			case Result.Err( _ ):
+				conn.close()
 
 
 class TcpServer:
