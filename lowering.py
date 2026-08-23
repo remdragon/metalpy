@@ -3693,7 +3693,7 @@ class FunctionLowering:
 				writeback( obj )
 		elif isinstance( node.target, ast.Subscript ):
 			obj = self._lower_expr( node.target.value, None )
-			getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
+			getitem_fn = self._find_indexlike_getitem( obj.type )
 			if getitem_fn is None:
 				# no real __getitem__ declared (raw pointers, or any other
 				# type that doesn't define subscript access as a method) -
@@ -5831,7 +5831,7 @@ class FunctionLowering:
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 
 		len_fn = self.lowering._find_method( obj.type, '__len__' )
-		getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
+		getitem_fn = self._find_indexlike_getitem( obj.type )
 		missing = [ name for name, fn in (( '__len__', len_fn ), ( '__getitem__', getitem_fn )) if fn is None ]
 		if missing:
 			self.lowering.discovery.fail(
@@ -8607,64 +8607,71 @@ class FunctionLowering:
 			self._emit( ir.Call( dest = None, target = add_fn, receiver = dest, args = [ operand ], kwargs = {} ))
 		return dest
 
-	# obj.type.stem -> its own length-accessor method name, for slice
-	# syntax's own default-stop resolution (_lower_slice_subscript below).
-	# str and bytearray genuinely expose differently-named length
-	# accessors (str.__len__() is a Unicode codepoint count - see its own
-	# docstring - not the byte length _byte_slice's own byte-offset
-	# contract needs; bytearray has no such split, __len__() IS its real
-	# byte length) - not a uniform dunder lookup, so a small fixed table
-	# for the currently-supported types is the honest shape here, same
-	# posture as the tuple-index/pointer-fallback cases elsewhere in
-	# _expr_Subscript already hardcoding per concrete type family rather
-	# than inventing a protocol for every caller. memoryview's own
-	# __len__() is its real byte length too (lib/builtins/__memoryview.py),
-	# same shape as bytearray.
-	_SLICE_LENGTH_METHOD = { 'str': 'byte_len', 'bytearray': '__len__', 'memoryview': '__len__' }
-
 	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
-		''' x[a:b] / x[:b] / x[a:] - str/bytearray only (PLAN_POSIX_FEATURE.md's
-		scope; list[T] slicing deferred - no real caller, and would need new
-		RC-aware bulk-copy machinery list[T] doesn't have yet). Byte-offset
-		semantics, not Python's real Unicode-codepoint offsets - deliberate:
-		the one real caller (lib/posix/time.py's target_path[idx+9:]) slices
-		from str.find()'s own byte offset, and str already has exactly the
-		right byte-offset primitive (_byte_slice, also used by split()) -
-		distinct from str.__len__()'s codepoint count. No special RC/
-		aliasing tagging needed (unlike the tuple-index case's node.
-		is_tuple_element_read) - this goes through an ordinary ir.Call,
-		which the general Call-result convention already treats as a fresh,
-		owned value by default. '''
+		''' x[a:b] / x[:b] / x[a:] - dispatches through an ordinary
+		__getitem__(PySlice) overload (PySlice: a start/stop range
+		descriptor, lib/builtins/__init__.py), resolved via
+		_find_dunder_for_arg - the caller here already knows the exact arg
+		type (PySlice), exactly that helper's designed use case, unlike the
+		plain-index path's _find_indexlike_getitem. Replaces the old
+		hardcoded 3-type (str/bytearray/memoryview) own _byte_slice/
+		_SLICE_LENGTH_METHOD dispatch - any type declaring a
+		__getitem__(PySlice) overload now supports slice syntax generically
+		(str/bytearray/memoryview keep byte-offset semantics via their own
+		overload bodies; list[T]/UnsafeList[T] return a borrowed slice[T]
+		view instead of a copy - see their own __getitem__(PySlice)).
+		stop's default (omitted upper bound) is left for the CALLEE's own
+		overload body to resolve (PySlice.stop is nullable) rather than
+		hardcoded here per type, since only the callee knows the right unit
+		(str's real __len__() is a codepoint count, wrong for its own
+		byte-offset slicing - see str.byte_len() vs str.__len__()). No
+		special RC/aliasing tagging needed (unlike the tuple-index case's
+		node.is_tuple_element_read) - this goes through an ordinary
+		ir.Call, which the general Call-result convention already treats as
+		a fresh, owned value by default. '''
 		node_slice = node.slice
 		assert isinstance( node_slice, ast.Slice )
 		if node_slice.step is not None:
 			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
-		slice_fn = self.lowering._find_method( obj.type, '_byte_slice' )
-		length_method_name = self._SLICE_LENGTH_METHOD.get( getattr( obj.type, 'stem', None ) )
-		if slice_fn is None or length_method_name is None:
+		pyslice_cls = self.lowering._ensure_resolved( self.lowering.discovery.find_name( 'PySlice', node ))
+		getitem_fn = self._find_dunder_for_arg( obj.type, '__getitem__', pyslice_cls )
+		if getitem_fn is None:
 			self.lowering.discovery.fail(
-				f'slicing is not supported for {obj.type.qualname} (only str, bytearray, and memoryview support slice syntax): {ast.unparse(node)}',
+				f'slicing is not supported for {obj.type.qualname if obj.type else "?"} '
+				f'(no __getitem__(PySlice) overload): {ast.unparse(node)}',
 				node,
 			)
-		self.lowering._ensure_resolved( slice_fn )
-		self.lowering.schedule( slice_fn.return_type )
-		start_type = slice_fn.parameters[0].type
-		stop_type = slice_fn.parameters[1].type
+		self.lowering._ensure_resolved( getitem_fn )
+		self.lowering.schedule( getitem_fn.return_type )
+		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		start_field = self.lowering._find_field( pyslice_cls, 'start' )
+		stop_field = self.lowering._find_field( pyslice_cls, 'stop' )
+		assert start_field is not None and stop_field is not None, 'internal compiler error: PySlice missing start/stop fields'
 		if node_slice.lower is not None:
-			start = self._lower_expr( node_slice.lower, start_type )
+			start = self._lower_expr( node_slice.lower, start_field.type )
 		else:
-			start = ir.Const( type = start_type, value = 0 )
+			start = ir.Const( type = usize_cls, value = 0 )
 		if node_slice.upper is not None:
-			stop = self._lower_expr( node_slice.upper, stop_type )
+			# lowered against the concrete leaf type (usize), not the union
+			# (stop_field.type) directly - a bare int literal defaults to
+			# i32 against a union expected_type (_expr_Constant's own
+			# literal-vs-union exemption), which then fails to coerce into
+			# usize|None (i32 isn't one of its leaves) - coerce the already
+			# usize-typed operand into the union explicitly instead
+			stop_value = self._lower_expr( node_slice.upper, usize_cls )
+			stop = self._coerce_or_check_operand( stop_value, stop_field.type, node_slice.upper )
 		else:
-			length_fn = self.lowering._find_method( obj.type, length_method_name )
-			self.lowering._ensure_resolved( length_fn )
-			self.lowering.schedule( length_fn.return_type )
-			len_dest = self._new_temp( length_fn.return_type )
-			self._emit( ir.Call( dest = len_dest, target = length_fn, receiver = obj, args = [], kwargs = {} ))
-			stop = len_dest
-		dest = self._new_temp( slice_fn.return_type )
-		self._emit( ir.Call( dest = dest, target = slice_fn, receiver = obj, args = [ start, stop ], kwargs = {} ))
+			# no upper bound given - PySlice.stop is nullable specifically
+			# so this "unbounded" state survives all the way into the
+			# callee's own overload body, rather than being resolved here
+			# against a hardcoded per-type length method
+			none_node = ast.Constant( value = None )
+			ast.copy_location( none_node, node )
+			stop = self._lower_expr( none_node, stop_field.type )
+		pyslice_dest = self._new_temp( pyslice_cls )
+		self._emit( ir.Allocate( dest = pyslice_dest, cls = pyslice_cls, fields = { 'start': start, 'stop': stop } ))
+		dest = self._new_temp( getitem_fn.return_type )
+		self._emit( ir.Call( dest = dest, target = getitem_fn, receiver = obj, args = [ pyslice_dest ], kwargs = {} ))
 		return self._maybe_consume_result( node, dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
@@ -8678,7 +8685,7 @@ class FunctionLowering:
 		obj = self._lower_expr( node.value, None )
 		if isinstance( node.slice, ast.Slice ):
 			return self._lower_slice_subscript( node, obj )
-		getitem_fn = self.lowering._find_method( obj.type, '__getitem__' )
+		getitem_fn = self._find_indexlike_getitem( obj.type )
 		if getitem_fn is None:
 			# tuple[...]'s own constant-index-only element access
 			# (PLAN_TUPLE.md) - checked ahead of the ordinary Ptr/ConstPtr
@@ -9800,6 +9807,51 @@ class FunctionLowering:
 				and any( isinstance( a, TypeVar ) and any( a is tv for tv in impl.type_params or [] ) for a in param_type.args )
 			)
 			if is_wildcard or self.lowering._type_resolver._same_type( param_type, arg_type ):
+				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
+		return None
+
+	def _find_indexlike_getitem( self, owner_type: Type|None ) -> Function|None:
+		''' like self.lowering._find_method(owner_type, '__getitem__'), but
+		Overload-aware for the ordinary x[i] (non-slice) subscript path -
+		once a type gains a second __getitem__ overload for slice syntax
+		(a compound range-descriptor argument, e.g. PySlice), this picks the
+		leaf whose single parameter is a plain Scalar rather than silently
+		treating the whole Overload group as "no such method" the way a bare
+		_find_method does (same real gap _find_dunder_for_arg's own docstring
+		describes, but __getitem__ is explicitly out of that helper's scope).
+
+		Unlike _find_dunder_for_arg, this can't match against a caller-known
+		concrete arg_type: an ordinary index's own type is normally INFERRED
+		FROM getitem_fn's declared parameter type (a bare literal `0` needs
+		that hint to pick i32/usize/whatever a given type's __getitem__
+		actually declares - confirmed via a real repro, a @cstruct with
+		def __getitem__(self, i: i32) that broke when this was first written
+		to require an exact usize match) - so there's no arg_type to match
+		against yet at the point this needs to run. Every subscript index is
+		numeric regardless of which concrete Scalar a type picks, and no
+		slice-descriptor argument is ever itself a bare Scalar, so "prefer
+		the Scalar-typed leaf" is a structurally sound, arg-type-agnostic
+		way to pick the index leaf over the slice leaf. '''
+		owner_type = self.lowering._ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass )):
+			found = owner_type.chain_lookup( '__getitem__' )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( '__getitem__' ) if isinstance( names, dict ) else None
+		found = self.lowering._resolve_scalar_name( found )
+		if isinstance( found, Function ):
+			return found
+		if not isinstance( found, Overload ):
+			return None
+		for impl in found.implementations:
+			if impl.resolve is not None:
+				impl.resolve()
+			params = impl.parameters or []
+			arg_index = 1 if impl.cls is None else 0
+			if len( params ) != arg_index + 1:
+				continue
+			param_type = self.lowering._ensure_resolved( params[arg_index].type )
+			if isinstance( param_type, Scalar ):
 				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
 		return None
 

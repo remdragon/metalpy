@@ -657,6 +657,41 @@ class TypeResolver:
 			found = names.get( name ) if isinstance( names, dict ) else None
 		return found if isinstance( found, Function ) else None
 
+	def _probe_indexlike_getitem( self, owner_type: Type|None ) -> Function|None:
+		''' like _probe_method(owner_type, '__getitem__') above, but
+		Overload-aware for the "indexable" for-loop desugaring shape
+		(__len__()+__getitem__(), e.g. list[T]) - mirrors lowering.py's own
+		_find_indexlike_getitem exactly (same real gap, same fix: prefer
+		the Scalar-typed leaf over a compound one, e.g. PySlice, since an
+        ordinary index's own concrete type is normally INFERRED FROM
+		__getitem__'s declared parameter, not known up front here either -
+		see that method's own docstring for the full reasoning), deliberately
+		duplicated rather than reached across the TypeResolver/Lowering
+		boundary, same posture _probe_method itself already documents. '''
+		if owner_type is None:
+			return None
+		owner_type = self.ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass )):
+			found = owner_type.chain_lookup( '__getitem__' )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( '__getitem__' ) if isinstance( names, dict ) else None
+		if isinstance( found, Function ):
+			return found
+		if not isinstance( found, Overload ):
+			return None
+		for impl in found.implementations:
+			if impl.resolve is not None:
+				impl.resolve()
+			params = impl.parameters or []
+			arg_index = 1 if impl.cls is None else 0
+			if len( params ) != arg_index + 1:
+				continue
+			param_type = self.ensure_resolved( params[arg_index].type )
+			if isinstance( param_type, Scalar ):
+				return impl
+		return None
+
 	def _resolve_expr_type_for_desugar( self, fn: Function, expr: ast.expr ) -> Type|None:
 		''' PLAN_GENERATORS.md Phase 1 - best-effort "what type does this
 		expression have", used to decide which for-loop desugaring shape
@@ -858,7 +893,7 @@ class TypeResolver:
 		if next_fn is not None:
 			return self._desugar_iterator_for( fn, node, obj_type, next_fn, extra_locals )
 		len_fn = self._probe_method( obj_type, '__len__' )
-		getitem_fn = self._probe_method( obj_type, '__getitem__' )
+		getitem_fn = self._probe_indexlike_getitem( obj_type )
 		if len_fn is not None and getitem_fn is not None:
 			return self._desugar_indexable_for( fn, node, obj_type, getitem_fn, extra_locals )
 		self.discovery.fail(

@@ -44,10 +44,22 @@ class memoryview:
 	def __len__( self ) -> usize:
 		return self.__len
 
+	@overload
 	def __getitem__( self, idx: usize ) -> Result[u8, IndexError]:
 		if idx >= self.__len:
 			return Result.Err( IndexError() )
 		return Result.Ok( self.__ptr[idx] )
+
+	@overload
+	def __getitem__( self, s: PySlice ) -> memoryview:
+		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
+		infallible, matching real Python's own slice semantics exactly -
+		out-of-range bounds silently clamp rather than raising (see
+		_resolve_pyslice_bounds), unlike single-element s[i] above, which
+		DOES error on an out-of-range index. Delegates to _byte_slice below
+		for the actual (non-copying) view construction. '''
+		( start, stop ) = _resolve_pyslice_bounds( s, self.__len )
+		return self._byte_slice( start, stop )
 
 	def get_ptr( self ) -> Ptr[u8]:
 		return self.__ptr
@@ -60,9 +72,10 @@ class memoryview:
 		''' a VIEW into the SAME underlying buffer (start,end) - unlike
 		str/bytearray's own _byte_slice (lib/builtins/__init__.py), this
 		does NOT copy, matching real Python's own memoryview slicing
-		semantics (a sub-view, not a fresh allocation). Looked up by name
-		from lowering.py's _lower_slice_subscript, same as str/bytearray's
-		own - see that function's own _SLICE_LENGTH_METHOD table. '''
+		semantics (a sub-view, not a fresh allocation). Called by
+		__getitem__(PySlice) above once bounds are validated - kept
+		separate so trusted internal callers with already-valid bounds
+		don't pay for a redundant check. '''
 		with compiler.panic_arithmetic( 'memoryview slice: end < start, cannot overflow' ):
 			piece_len: usize = end - start
 			ptr: Ptr[u8] = self.__ptr + start
