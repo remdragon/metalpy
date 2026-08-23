@@ -21118,6 +21118,72 @@ def main() -> i32:
 ''' ),
 		])
 
+	def test_match_arm_scalar_binding_reused_after_its_own_yield( self ) -> None:
+		''' A RELATED but distinct bug from test_match_arm_binding_crossing_
+		a_yield above: that one is about a promoted binding's own trailing
+		RC decref reading garbage post-resume; THIS one is about the
+		binding's own VALUE surviving the resume at all, for a plain
+		SCALAR (non-RC) type - `case Result.Ok(v): yield v; ... uses v
+		again ...`. Before the fix, a scalar binding never got a trailing
+		decref generated for it at all (nothing to release), so this
+		specific shape never showed up in the original RC-decref repro -
+		but it's still broken for the same underlying reason: `v`'s own
+		declaration is skipped entirely by the post-yield resume goto (a
+		fresh $$__next__ call frame), so a SECOND yield in the same arm
+		that re-reads `v` reads whatever garbage happens to be on the
+		stack. Confirmed via a real repro + MSVC C4700 on the UNFIXED
+		code (this compiler's own over-promotion posture - promote
+		whenever the arm crosses a yield ANYWHERE, regardless of RC-ness -
+		incidentally already closes this too, verified by temporarily
+		reverting type_resolver.py to the commit before this fix and
+		re-running this exact repro: same C4700 on `v`, same generated-C
+		shape, gone once the fix is back). Runtime alone doesn't reliably
+		catch this (the stale stack slot often happens to still hold the
+		right value, matching this project's own established "doesn't
+		always manifest" pattern for uninitialized-memory bugs), so the
+		real assertion is the WARNING trace above (verified by hand, not
+		re-checked by this test itself) - this test's job is just to keep
+		exercising the shape end-to-end (compile+link+run) as a
+		regression tripwire, and to fail loudly if a future change
+		makes the runtime VALUE checks below wrong too. '''
+		self.assert_programs_run([
+			( 'match_arm_scalar_binding_read_across_two_yields_in_one_arm', '''
+def gen( lst: list[i32] ) -> Generator[i32, IndexError | StopIteration]:
+	i: usize = 0
+	while True:
+		match lst.__getitem__( i ):
+			case Result.Ok( v ):
+				yield v
+				with compiler.wrap_arithmetic:
+					yield v * 2
+				with compiler.wrap_arithmetic:
+					i += 1
+			case Result.Err( _ ):
+				return
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		lst: list[i32] = [ 1, 2, 3 ]
+		g = gen( lst )
+		total: i32 = 0
+		count: usize = 0
+		while True:
+			r = g.__next__()
+			match r:
+				case Result.Ok( v ):
+					total += v
+					count += 1
+				case Result.Err( _ ):
+					break
+		if count != 6:
+			return 1
+		# (1+2)+(2+4)+(3+6) = 3+6+9 = 18
+		if total != 18:
+			return 2
+		return 0
+''' ),
+		])
+
 	def test_defer_inside_while_unit_loop_body_is_rejected( self ) -> None:
 		# PLAN_GENERATORS.md's defer/errdefer phase - only a direct top-
 		# level statement (preamble/tail) is supported for now, same start-
