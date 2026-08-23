@@ -17,7 +17,7 @@ from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
-	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range,
+	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range, GeneratorType, Protocol,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -1616,6 +1616,62 @@ class Lowering:
 					node,
 				)
 			bindings[ id( declared ) ] = actual
+			if isinstance( declared.bound, Specialization ) and isinstance( declared.bound.base, Protocol ):
+				# a PARAMETRIZED protocol bound (S: Iterable[T]) - T usually
+				# never appears in ANY parameter's own declared type
+				# directly (only inside S's bound, and in the return type -
+				# e.g. min[T,S:Iterable[T]](seq:S) -> T), so ordinary
+				# argument unification alone would never bind it, and
+				# return-only inference (the OTHER mechanism that could)
+				# breaks down the moment T flows through an intermediate
+				# local into a NESTED generic call inside the body (a real,
+				# separate gap, confirmed by a real repro: `value: T = ...;
+				# value = min(value, t)` inside min[T,S]'s own body hit a
+				# false "T inferred as both min.T and i32" conflict, since
+				# the eager return-only lowering leaves T as its own
+				# abstract placeholder throughout the body, not the value
+				# actually flowing through it). Reverse-unify instead, right
+				# here: now that `declared` (S) is bound to a concrete
+				# `actual`, find actual's OWN declared conformance
+				# Specialization for the SAME protocol S's bound names
+				# (already substituted/concrete - see Monomorphizer.
+				# monomorphize_class's own protocols handling) and unify
+				# ITS args against the bound's own args - the same
+				# structural walk TypeVar.bound_satisfied_by uses to CHECK
+				# this, just repurposed here to also BIND from it.
+				base = actual.base if isinstance( actual, Specialization ) else actual
+				if isinstance( base, TupleType ):
+					base = base.backing
+				skip_reentrant = isinstance( actual, Specialization ) and id( actual ) in self._type_resolver.monomorphizer._building
+				if isinstance( actual, Specialization ) and isinstance( base, RCClass ) and not skip_reentrant:
+					# _building guard (skip_reentrant) - see mpy_types.py's
+					# identical guard on TypeVar.bound_satisfied_by for the
+					# full "why" (a real repro: this SAME reentrant-
+					# monomorphize shape, reached through a different call
+					# chain, caused a RecursionError without it).
+					base = self._type_resolver.monomorphizer.monomorphize_class( actual )
+				if isinstance( base, RCClass ) and not skip_reentrant:
+					# skip_reentrant gates the WHOLE lookup, not just the
+					# monomorphize call above: base.protocols would still be
+					# base's own ABSTRACT, unsubstituted list in the reentrant
+					# case (base fell back to actual.base, never substituted) -
+					# unifying against THOSE args binds the outer type param to
+					# the WRONG (abstract, wrong-class) TypeVar instead of the
+					# real concrete type, which is worse than leaving it
+					# unbound (confirmed by a real repro: a generated `Result.
+					# Err(StopIteration())` construction inside _sequence_iter
+					# [T,slice[i32]] ended up with T bound to slice[T]'s OWN
+					# unrelated T instead of i32, surfacing far downstream as
+					# "Specialization not concrete" rather than a clean "T
+					# unbound" - silently wrong data flow, not just a locally
+					# imprecise check the way bound_satisfied_by's identical
+					# skip is safe to allow, since binding is the whole point
+					# here, not just a true/false verdict).
+					for entry in base.protocols:
+						if isinstance( entry, Specialization ) and entry.base is declared.bound.base:
+							for b_arg, e_arg in zip( declared.bound.args, entry.args ):
+								self._unify_type_param( type_params, b_arg, e_arg, bindings, node, context_qualname )
+							break
 			return
 		if isinstance( declared, Specialization ):
 			# _as_specialization, not a bare isinstance(actual, Specialization)
@@ -1640,6 +1696,24 @@ class Lowering:
 				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
 			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
 			return
+		if isinstance( declared, GeneratorType ):
+			# a declared Generator[T,E]/Iterator[Result[T,E]] return type
+			# (e.g. iter[T,S:Iterable[T]](seq:S) -> Generator[T,StopIteration])
+			# unified against `actual` - the REAL synthesized backing class a
+			# concrete generator call actually produces (never itself a
+			# GeneratorType - only the abstract annotation ever is). There's
+			# no direct backing-class -> GeneratorType reverse mapping, but
+			# the backing class's own __next__ always returns Result[elem_type,
+			# error_type] (see type_resolver.py's ensure_generator_synthesized),
+			# so read T/E back off THAT instead - same "derive the same fact
+			# a different way" approach _same_type's TupleType/Specialization
+			# duality already uses.
+			next_fn = self._find_iterator_next_method( actual )
+			result_args = next_fn.return_type.args if next_fn is not None and isinstance( next_fn.return_type, Specialization ) else None
+			if result_args is not None and len( result_args ) == 2:
+				self._unify_type_param( type_params, declared.elem_type, result_args[0], bindings, node, context_qualname )
+				self._unify_type_param( type_params, declared.error_type, result_args[1], bindings, node, context_qualname )
+			return
 
 	def _check_type_param_bounds( self, node: ast.AST, type_params: list[TypeVar], concrete_args: list[Type], context_qualname: str ) -> None:
 		# every call site that finishes substituting a concrete type for each
@@ -1648,7 +1722,7 @@ class Lowering:
 		# once concrete_args is fully known - see TypeVar.bound's own comment
 		# for why this can't live in _get_or_create_specialization instead
 		for tv, concrete in zip( type_params, concrete_args ):
-			if not tv.bound_satisfied_by( concrete ):
+			if not tv.bound_satisfied_by( concrete, type_params, concrete_args, self._type_resolver ):
 				self.discovery.fail(
 					f'{context_qualname}[...]: {concrete.qualname} does not implement protocol {tv.bound.qualname} '
 					f'required by type parameter {tv.stem!r}: {ast.unparse(node)}',
@@ -1675,6 +1749,20 @@ class Lowering:
 			return any( self._type_mentions_param( a, tv ) for a in t.args )
 		if isinstance( t, CallableType ):
 			return any( self._type_mentions_param( a, tv ) for a in t.arg_types ) or self._type_mentions_param( t.return_type, tv )
+		if isinstance( t, GeneratorType ):
+			# Generator[T,E]/Iterator[Result[T,E]]/Generator[T,SendType,E] -
+			# a return-only type param can live inside any of these slots
+			# (e.g. iter[T,S:Iterable[T]](seq:S) -> Generator[T,StopIteration],
+			# T never appears in any parameter's own declared type directly -
+			# confirmed by a real repro: without this, T was wrongly
+			# classified as genuinely-missing instead of return-only-
+			# inferable, since this method previously had no GeneratorType
+			# case at all)
+			return (
+				self._type_mentions_param( t.elem_type, tv )
+				or self._type_mentions_param( t.error_type, tv )
+				or ( t.send_type is not None and self._type_mentions_param( t.send_type, tv ))
+			)
 		return False
 
 	def _param_referenced_type_params_for( self, target: Function ) -> frozenset[int]:
@@ -5319,6 +5407,25 @@ class FunctionLowering:
 		if target_is_float or source_is_float:
 			opcode, extra = self._arithmetic_mode[-1].GetFloatCast( target_is_float = target_is_float, source_is_float = source_is_float )
 			return self._lower_arithmetic_op( node, opcode, extra, target_type, { 'operand': operand }, 'cast' )
+		if target_type.stem == 'bool':
+			# bool(x) for ANY integer x is unconditionally safe, regardless
+			# of width - unlike a genuine narrowing int<->int cast (u8(-1)
+			# can't represent -1, a real overflow), there is no source value
+			# a bool conversion can't represent: C itself defines converting
+			# any scalar to _Bool as "0 stays false, any nonzero becomes
+			# true" (not a raw truncating bit-cast - confirmed correct via a
+			# real repro, bool(4) under wrap_arithmetic mode DID already
+			# give True, not a wrongly-truncated False, since the emitted C
+			# cast itself carries the right semantics regardless of how
+			# THIS compiler's own width bookkeeping treated it). Emitting
+			# through the same unconditional CastWrap path a widening cast
+			# already uses (rather than the mode-gated GetCast() narrowing
+			# path below, previously reached because bool's sizeof is
+			# smaller than most sources) means bool(x)/an auto-truthiness
+			# conversion never needs an enclosing wrap_arithmetic/
+			# panic_arithmetic/Result[_,OverflowError] wrapper - matching
+			# Python's own bool(x), which never raises for a plain scalar.
+			return self._lower_arithmetic_op( node, ir.CastWrap, None, target_type, { 'operand': operand }, 'cast' )
 		if target_type.sizeof >= operand.type.sizeof:
 			# same-width or widening int<->int - always succeeds, in every
 			# mode, no Result involved: matches CastWrap's own bare-C-cast
@@ -5683,10 +5790,35 @@ class FunctionLowering:
 
 	# --- loops ---------------------------------------------------------------
 
+	def _lower_truth_test( self, node: ast.expr ) -> ir.Operand:
+		''' the value fed to a while/if's own truth test - Python semantics:
+		ANY value can be tested for truthiness, not just a real bool
+		(0/0.0 -> False, any other scalar -> True; a bool already -> itself
+		unchanged; anything else - an RC/union receiver, say - falls
+		through to the ordinary strict bool-typed coercion, which already
+		handles is-not-None-style union narrowing and correctly rejects a
+		genuine non-bool-non-scalar mismatch). strict=False here skips
+		_check_assignable's hard rejection so a non-bool SCALAR operand can
+		be intercepted and converted, rather than failing outright with
+		"expected bool, got i32" - confirmed missing by a real repro (any()/
+		all() over a list[i32] needed an explicit bool(item) wrapper to
+		compile at all, unlike Python's own `if item:`). Reuses
+		_lower_scalar_cast for the actual conversion - the same mechanism
+		bool(x) construction-sugar already goes through, now unconditionally
+		safe for a bool target (see its own comment) so this never needs an
+		enclosing wrap_arithmetic/panic_arithmetic the way a genuine
+		narrowing scalar cast would. '''
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		operand = self._lower_expr( node, bool_cls, strict = False )
+		if operand.type is bool_cls or self.lowering._type_resolver._same_type( operand.type, bool_cls ):
+			return operand
+		if isinstance( operand.type, Scalar ):
+			return self._lower_scalar_cast( bool_cls, operand, node )
+		return self._coerce_or_check_operand( operand, bool_cls, node )
+
 	def _stmt_While( self, node: ast.While ) -> None:
 		if node.orelse:
 			self.lowering.discovery.fail( 'while/else is not supported', node )
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
 		start_label = self._new_label( 'while_start' )
 		end_label = self._new_label( 'while_end' )
 		# the test is positioned right after start_label (re-lowered here
@@ -5694,7 +5826,7 @@ class FunctionLowering:
 		# repeated block, same as _stmt_If's test) so it's genuinely
 		# re-evaluated every time the bottom Jump loops back
 		self._emit( ir.Label( name = start_label ))
-		test = self._lower_expr( node.test, bool_cls )
+		test = self._lower_truth_test( node.test )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
 		# continue_captured unused here - start_label (this loop's own
@@ -6591,8 +6723,7 @@ class FunctionLowering:
 		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
 
 	def _stmt_If( self, node: ast.If ) -> None:
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		test = self._lower_expr( node.test, bool_cls )
+		test = self._lower_truth_test( node.test )
 		else_label = self._new_label( 'if_else' )
 		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
 
@@ -8932,16 +9063,25 @@ class FunctionLowering:
 		obj = self._lower_expr( node.value, None )
 		if isinstance( node.slice, ast.Slice ):
 			return self._lower_slice_subscript( node, obj )
-		getitem_fn = self._find_indexlike_getitem( obj.type )
+		# tuple_type_for checked BEFORE _find_indexlike_getitem, not after:
+		# a HOMOGENEOUS tuple's backing class now also declares a real,
+		# fallible __getitem__ (Sequence[T] conformance, for min()/iter()/
+		# etc. - see tuple_storage.py), so _find_indexlike_getitem would
+		# find it too - but t[0] (a compile-time-constant index) should
+		# always prefer the cheap, infallible direct-field-access rewrite
+		# below over a fallible method call, exactly as it already did for
+		# a heterogeneous tuple (which has no __getitem__ at all). Checking
+		# tuple_type_for first keeps that behavior unconditional, regardless
+		# of whether this particular tuple happens to also conform to
+		# Sequence[T] - confirmed necessary by a real repro/regression: `t
+		# [0]` on tuple[str,str,str] started requiring the enclosing
+		# function to return Result[_,IndexError] the moment homogeneous
+		# tuples gained a real __getitem__, breaking many pre-existing
+		# lib/ call sites that only ever used constant indices.
+		resolved_obj_type = self.lowering._ensure_resolved( obj.type )
+		tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_obj_type )
+		getitem_fn = None if tuple_type is not None else self._find_indexlike_getitem( obj.type )
 		if getitem_fn is None:
-			# tuple[...]'s own constant-index-only element access
-			# (PLAN_TUPLE.md) - checked ahead of the ordinary Ptr/ConstPtr
-			# GetItem fallback below: a heterogeneous tuple has no real
-			# __getitem__ (no single return type to give one), so `t[0]`
-			# can only ever be resolved to plain attribute access on a
-			# COMPILE-TIME-CONSTANT index, never a runtime GetItem
-			resolved_obj_type = self.lowering._ensure_resolved( obj.type )
-			tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_obj_type )
 			if tuple_type is not None:
 				valid_index = (
 					isinstance( node.slice, ast.Constant )
@@ -9804,7 +9944,7 @@ class FunctionLowering:
 		dest = self._new_temp( bool_cls )
 		for i, value_node in enumerate( node.values ):
 			operand_start = len( self._pending_temps )
-			operand = self._lower_expr( value_node, bool_cls )
+			operand = self._lower_truth_test( value_node )
 			self._emit( ir.Assign( dest = dest, src = operand ))
 			self._flush_branch_temps( operand_start, dest, operand )
 			if i < len( node.values ) - 1:
@@ -9845,8 +9985,7 @@ class FunctionLowering:
 		# releasing an uninitialized C local - a real, reproducible stack-
 		# overflow crash (release_object on stack garbage), not just a
 		# leak/UAF, confirmed via direct testing.
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		cond = self._lower_expr( node.test, bool_cls )
+		cond = self._lower_truth_test( node.test )
 		else_label = self._new_label( 'ifexp_else' )
 		end_label = self._new_label( 'ifexp_end' )
 		dest = self._new_temp( expected_type ) if expected_type is not None else None
@@ -13278,6 +13417,26 @@ class FunctionLowering:
 		# patch the SAME object in place afterward, not rebuilt - mirrors
 		# _expr_Lambda's own "reused afterward" convention exactly
 		provisional.return_type = self.lowering._substitute_type_params( target.return_type, type_params, full_args )
+		if isinstance( provisional.return_type, GeneratorType ):
+			# target itself is a delegating wrapper (-> Generator[T,E]/
+			# Iterator[...], no yield of its own - e.g. a @protocol
+			# Iterable[T].__iter__ method, or iter() itself, forwarding to
+			# a real generator call) whose element/error types were only
+			# return-only-inferable - the substitute_type_params() call just
+			# above rebuilds a fresh, still-ABSTRACT GeneratorType from
+			# target's own annotation (correct for an ordinary function, but
+			# not for one of these: the real return value `provisional`'s
+			# body actually produces is a concrete generator backing class,
+			# already computed above as actual_return_type, then silently
+			# discarded once bindings absorbed it). Re-run the SAME pass-
+			# through resolution ensure_generator_synthesized's non-yield
+			# branch already does elsewhere, now that `provisional` (id
+			# never seen before - freshly built above) has a real body and
+			# real, substituted parameter types to resolve its own call
+			# against - confirmed necessary by a real repro (a for-loop
+			# consuming iter(...)'s result otherwise saw the bare abstract
+			# GeneratorType, not a real __next__-bearing class).
+			self.lowering._type_resolver.ensure_generator_synthesized( provisional )
 		provisional.qualname = real_spec.qualname
 		real_spec.monomorphized = provisional # the real key, for a FUTURE fully-concrete lookup (e.g. an explicit foo[Concrete,Other](...) call elsewhere)
 		pending_spec.monomorphized = provisional # the pending key, for a FUTURE bare call with the same already-known args

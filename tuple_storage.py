@@ -1,9 +1,10 @@
 # stdlib imports:
+import ast
 from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import RCClass, TupleType, Variable
+from mpy_types import RCClass, Specialization, TupleType, Variable
 
 '''
 Synthesizes and memoizes the real runtime representation of every distinct
@@ -23,10 +24,12 @@ shape (lowering.py's _expr_Tuple), the exact same "no-__init__ degrades to
 field=value sugar" convention _lower_allocate_fields already applies to any
 class with no real __init__, and the same direct-Allocate shape
 _lower_bound_method_closure already uses to build a ClosureType value with
-no synthesized __init__ of its own either. This means TupleStorage never
-needs to synthesize a real ast.FunctionDef body the way union_storage.py's
-_build_member_constructor does for a union member - there is nothing here
-that ever needs a real AST body at all.
+no synthesized __init__ of its own either. TupleStorage.get() ALSO now
+synthesizes real ast.FunctionDef bodies (unlike a union member's constructor,
+built entirely from mpy_types objects with no AST at all) for HOMOGENEOUS
+tuples only (every elem_types entry equal): __getitem__/__iter__, declaring
+Sequence[T]/Iterable[T] conformance - see get()'s own comment for why a
+source-text-then-ast.parse approach was used instead of hand-building nodes.
 '''
 
 class TupleStorage:
@@ -109,6 +112,7 @@ class TupleStorage:
 		)
 		tt.backing = backing
 		self._tuple_type_by_backing[ id( backing ) ] = tt
+		self._declare_sequence_conformance( tt, backing )
 		# scheduled here (not left for lowering.py's own construction-site
 		# scheduling to discover) so a tuple[...] type reached ONLY through
 		# an annotation - a parameter/return type/field that's never locally
@@ -117,6 +121,65 @@ class TupleStorage:
 		# schedule(payload_cls) call for the same reason
 		self.schedule( backing )
 		return backing
+
+	def _declare_sequence_conformance( self, tt: TupleType, backing: RCClass ) -> None:
+		''' HOMOGENEOUS tuples only (every elem_types entry the same type) -
+		e.g. tuple[i32,i32,i32] conforms to Sequence[i32]/Iterable[i32];
+		tuple[i32,str] (heterogeneous - no single element type) conforms to
+		neither, and gets no methods synthesized here at all. Compared by
+		qualname, not `==`/`is` - two annotation occurrences of "the same"
+		type aren't always identity-equal (see TypeResolver._same_type's own
+		docstring) and a bare dataclass `==` walks the whole object
+		structurally, which is unsafe/wrong for a Type (same reasoning
+		TypeVar.bound_satisfied_by's own comment gives).
+
+		Building real ast.FunctionDef bodies via source text + ast.parse,
+		not hand-built ast.* node graphs (unlike e.g. type_resolver.py's
+		_synthesize_rcclass_destructor) - __getitem__'s own if/return chain
+		(one branch per tuple index) is far simpler to express as a small
+		Python template than to hand-assemble node-by-node, and the element
+		type / this tuple's own backing class (neither has a plain,
+		reliably-resolvable-by-name spelling from an arbitrary calling
+		module) are attached directly via node.resolved_type - the same
+		"synthesized code names a concrete Type object directly, bypassing
+		ordinary scope resolution" escape hatch discovery.py's own
+		visit_Name already documents. '''
+		if not tt.elem_types:
+			return
+		elem_type = tt.elem_types[0]
+		if any( t.qualname != elem_type.qualname for t in tt.elem_types ):
+			return
+		sequence_protocol = self.discovery.find_name_or_none( 'Sequence' )
+		iterable_protocol = self.discovery.find_name_or_none( 'Iterable' )
+		if sequence_protocol is None or iterable_protocol is None:
+			# builtins.Sequence/Iterable genuinely don't exist in every
+			# compile (e.g. import_builtins=False test fixtures) - a
+			# homogeneous tuple simply doesn't conform to anything in that
+			# world, same as it never did before this feature existed; only
+			# __getitem__(usize)/self._N-style constant-index access
+			# (unaffected by any of this) still works.
+			return
+		index_checks = '\n'.join(
+			f'\tif i == {i}:\n\t\treturn Result.Ok( self._{i} )' for i in range( len( tt.elem_types ))
+		)
+		src = (
+			f'def __getitem__( self, i: usize ) -> Result[__ElemT__, IndexError]:\n'
+			f'{index_checks}\n'
+			f'\treturn Result.Err( IndexError() )\n'
+			f'def __iter__( self ) -> Generator[__ElemT__, StopIteration]:\n'
+			f'\treturn _sequence_iter( self )\n' # bare call - T/S both ordinarily inferable (S from self, T reverse-unified through S's own Sequence[T] bound - see Lowering._unify_type_param)
+		)
+		module_ast = ast.parse( src )
+		resolved_by_placeholder = { '__ElemT__': elem_type }
+		for node in ast.walk( module_ast ):
+			if isinstance( node, ast.Name ) and node.id in resolved_by_placeholder:
+				node.resolved_type = resolved_by_placeholder[ node.id ]
+		with self.discovery.scope_context( backing ):
+			for fn_node in module_ast.body:
+				assert isinstance( fn_node, ast.FunctionDef )
+				self.discovery._parse_function( fn_node, backing )
+		backing.protocols.append( self.discovery._get_or_create_specialization( sequence_protocol, [ elem_type ] ))
+		backing.protocols.append( self.discovery._get_or_create_specialization( iterable_protocol, [ elem_type ] ))
 
 	def tuple_type_for( self, cls: object ) -> TupleType|None:
 		''' the reverse of get() - given a (already-resolved, concrete)

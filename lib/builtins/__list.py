@@ -341,7 +341,29 @@ class UnsafeList[T]:
 # lock held), delegate to __inner, return whatever it returned.
 # ---------------------------------------------------------------------------
 
-class list[T]:
+# list[T]'s own delegate for __iter__ below - NOT the shared, general-purpose
+# _sequence_iter[T,S:Sequence[T]] (lib/builtins/__init__.py), deliberately:
+# calling that one from WITHIN list[T].__iter__ needs list[i32]'s OWN already-
+# substituted Sequence[T] conformance to reverse-unify T - a real chicken-
+#-and-egg problem, since list[i32]'s own .protocols substitution isn't
+# finished yet at the exact point THIS method is itself being resolved, as
+# part of building list[i32] (confirmed by a real repro). Parametrizing
+# directly over list[T] (an ordinary generic-class-argument, the same
+# Specialization-matching every other `def f[T](x: list[T])` already uses)
+# sidesteps it entirely - no protocol lookup needed at all here.
+def _list_iter[T]( seq: list[T] ) -> Generator[T, StopIteration]:
+	# __getitem__ called TWICE per element, no intermediate local - see
+	# _sequence_iter's identical comment (lib/builtins/__init__.py) for
+	# the two separate, real compiler issues this avoids.
+	i: usize = 0
+	while True:
+		if seq.__getitem__( i ).is_err():
+			return
+		yield seq.__getitem__( i ).unwrap( 'list.__getitem__: was just checked is_ok() above' )
+		with compiler.wrap_arithmetic:
+			i += 1
+
+class list[T]( Sequence[T], Iterable[T] ):
 	__inner:   UnsafeList[T]
 	__lock:    threading.FastLock
 	__borrows: usize  # atomic borrow count - see __getitem__(PySlice)'s own comment and slice[T]'s class comment (lib/builtins/__init__.py)
@@ -395,6 +417,9 @@ class list[T]:
 	def __getitem__( self, s: PySlice ) -> slice[T]:
 		with self.__lock:
 			return self.__inner._slice_view( s, compiler.addrof( self.__borrows ))
+
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return _list_iter( self ) # not _sequence_iter - see its own comment above
 
 	# Overwrite the element at idx. Increfs val and decrefs the value it
 	# replaces. NOT gated on __borrows: unlike append/insert/erase_at/pop,

@@ -3,6 +3,75 @@ from codecs.utf8 import utf8
 import compiler
 import sys
 import threading
+
+# Sequence[T]/Iterable[T]: the two protocols min(seq)/max(seq)/iter/any/all/
+# enumerate/map/reduce/sum are all built on (defined here, before ANY other
+# name in this module, since list[T]/slice[T] below need to declare
+# conformance in their own class header, e.g. `class list[T](Sequence[T],
+# Iterable[T]):` - a base-class list is resolved EAGERLY, at the base-class
+# expression's own parse time, unlike an ordinary annotation reference
+# (Result[T,IndexError] below is fine forward-referenced, lazily resolved -
+# only a TypeVar's own bound and a class's own base list are eager. list[T]
+# itself is defined in a separate file, __list.py, reached via this file's
+# own `from .__list import list` below - list[T]'s own class statement is
+# parsed as a side effect of THAT import line, so Sequence/Iterable must
+# already be registered before it, not merely appear earlier in THIS file).
+# Kept as two separate protocols, not one (matching real Python: dict
+# conforms to Iterable via key-iteration but isn't a Sequence - __getitem__
+# isn't usize-keyed) - see each's own docstring below.
+@protocol
+class Sequence[T]:
+	# only __getitem__ is required, not __len__ - reaching the end is
+	# signaled by Err(IndexError) itself, so a conformer never needs to
+	# separately answer "how many". list[T]/slice[T]'s existing scalar
+	# __getitem__ already has exactly this shape - conforming needed no
+	# method changes there, only the base-class declaration.
+	def __getitem__( self, i: usize ) -> Result[T, IndexError]: ...
+
+@protocol
+class Iterable[T]:
+	# min(seq)/max(seq)/iter/any/all/enumerate/map/reduce/sum all bind on
+	# THIS, not Sequence[T] - matching real Python, where those accept any
+	# iterable, not just a random-access sequence.
+	def __iter__( self ) -> Generator[T, StopIteration]: ...
+
+# the one place a Sequence[T]'s index-walk is written - every conformer's own
+# __iter__ just delegates here (a __iter__ method can never itself contain
+# yield - see type_resolver.py's ensure_generator_synthesized - so a
+# conformer always needs a thin delegating method like this one regardless).
+def _sequence_iter[T, S: Sequence[T]]( seq: S ) -> Generator[T, StopIteration]:
+	# if/is_err()/unwrap(), NOT match - a match statement whose Ok-arm
+	# contains the yield triggers a real, confirmed MSVC-only compiler bug:
+	# the generator state-machine split at the yield duplicates the match
+	# subject's own "release Err payload if any" RC-cleanup code onto the
+	# POST-YIELD RESUME path, where the match subject was never (re-)
+	# assigned in that call frame at all - a genuine uninitialized-memory
+	# read (confirmed via generated-C inspection: __match_subj_0 read at
+	# the merge point directly reachable from the resume label, which
+	# skips the match statement's own subject assignment entirely).
+	# Reported for a real fix (compiler bug, not a library one) - this
+	# rewrite just avoids the trigger shape here.
+	# __getitem__ called TWICE per element (once to check, once to unwrap)
+	# rather than held in one local: a bare (unannotated) generator local
+	# is rejected outright ("must be declared with an explicit type
+	# annotation"), and an EXPLICIT `r: Result[T,IndexError]` annotation
+	# hits the separate, pre-existing "generic generator body referencing
+	# its own type param T outside a parameter/return annotation" Phase 3
+	# rejection (PLAN_GENERATORS.md) - confirmed by real repros of both.
+	# __getitem__ is a plain, side-effect-free lookup for every conformer
+	# this ships with (list/slice/tuple), so the extra call is a minor
+	# inefficiency, not a correctness concern.
+	i: usize = 0
+	while True:
+		# not seq[i]: subscript sugar on a fallible __getitem__ auto-
+		# propagates Err via the enclosing function's OWN return type,
+		# which doesn't match here (IndexError vs StopIteration)
+		if seq.__getitem__( i ).is_err():
+			return
+		yield seq.__getitem__( i ).unwrap( 'Sequence.__getitem__: was just checked is_ok() above' )
+		with compiler.wrap_arithmetic:
+			i += 1
+
 from .__errors import OSError
 from .__fastlist import FastList
 from .__float import _f64_sign_prefix, _f64_fixed_digits
@@ -188,7 +257,22 @@ def _resolve_pyslice_bounds( s: PySlice, real_len: usize ) -> tuple[usize,usize]
 	return ( clamped_start, clamped_stop )
 
 
-class slice[T]:
+# slice[T]'s own delegate for __iter__ below - see lib/builtins/__list.py's
+# _list_iter for why this is a dedicated, type-specific helper rather than
+# the shared _sequence_iter[T,S:Sequence[T]].
+def _slice_iter[T]( seq: slice[T] ) -> Generator[T, StopIteration]:
+	# __getitem__ called TWICE per element, no intermediate local - see
+	# _sequence_iter's identical comment for the two separate, real
+	# compiler issues this avoids.
+	i: usize = 0
+	while True:
+		if seq.__getitem__( i ).is_err():
+			return
+		yield seq.__getitem__( i ).unwrap( 'slice.__getitem__: was just checked is_ok() above' )
+		with compiler.wrap_arithmetic:
+			i += 1
+
+class slice[T]( Sequence[T], Iterable[T] ):
 	# _ptr is a raw, untyped view into the backing buffer - NOT
 	# ConstPtr[T]. Ptr[Foo]/ConstPtr[Foo] for an RC class Foo compiles to
 	# the exact same C type as a bare Foo handle (struct Foo*, one star -
@@ -275,6 +359,9 @@ class slice[T]:
 			return Result.Err( IndexError() )
 
 		return Result.Ok( self.get_unchecked( index ))
+
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return _slice_iter( self ) # not _sequence_iter - see lib/builtins/__list.py's _list_iter for why
 
 	def get_assert( self, index: usize ) -> T:
 		if index >= self.__len:
@@ -2231,13 +2318,108 @@ def chr( cp: u32 ) -> str:
 	buf[encoded_len] = 0
 	return str._from_owned_cstr( buf, buf_size ).unwrap( 'chr(): not a valid Unicode code point' )
 
-@inline
+@overload
 def max[T]( a: T, b: T ) -> T:
 	return a if a >= b else b
 
-@inline
+@overload
+def max[T, S: Iterable[T]]( seq: S ) -> T:
+	# .__next__() called directly, not through next() - calling next() (an
+	# @inline generic function) from a NESTED eager-lowered body (this
+	# whole function's own T is return-only-inferred, per the eager
+	# provisional-body trick _infer_return_only_type_params uses) hit a
+	# separate, real inference gap: an @inline call's own type-param
+	# resolution doesn't correctly infer through a Generator[T,E]-shaped
+	# parameter the way an ordinary generic call does. Calling __next__()
+	# directly sidesteps it entirely (next() itself works fine called
+	# directly/non-nested - see its own definition below).
+	it = iter( seq )
+	value: T = it.__next__().unwrap( 'max(): empty sequence' )
+	for t in it:
+		value = max( value, t )
+	return value
+
+@overload
 def min[T]( a: T, b: T ) -> T:
 	return a if a <= b else b
+
+@overload
+def min[T, S: Iterable[T]]( seq: S ) -> T:
+	it = iter( seq )
+	value: T = it.__next__().unwrap( 'min(): empty sequence' )
+	for t in it:
+		value = min( value, t )
+	return value
+
+@inline
+def next[T]( it: Generator[T, StopIteration] ) -> Result[T, StopIteration]:
+	return it.__next__()
+
+def iter[T, S: Iterable[T]]( seq: S ) -> Generator[T, StopIteration]:
+	return seq.__iter__()
+
+def any[T, S: Iterable[T]]( seq: S ) -> bool:
+	for item in iter( seq ):
+		if item:
+			return True
+	return False
+
+def all[T, S: Iterable[T]]( seq: S ) -> bool:
+	for item in iter( seq ):
+		if not item:
+			return False
+	return True
+
+def enumerate[T, S: Iterable[T]]( seq: S, start: isize = 0 ) -> Generator[tuple[isize,T], StopIteration]:
+	# seq.__iter__() directly, not iter(seq): a for-loop INSIDE a generator's
+	# own body is resolved by a separate, standalone-resolver desugaring pass
+	# (deciding the loop's shape before the real generator transform runs),
+	# which can't see through a nested bare call to another GENERIC free
+	# function (iter[T,S:Iterable[T]]) the way ordinary (non-generator) code
+	# can - confirmed by a real repro. seq.__iter__() is a plain attribute
+	# call, resolved by receiver type alone, sidestepping that gap entirely.
+	with compiler.wrap_arithmetic:
+		for item in seq.__iter__():
+			yield start, item
+			start += 1
+
+def map[T, U, S: Iterable[T]]( fn: Ptr[Callable[[T],U]], seq: S ) -> Generator[U, StopIteration]:
+	for item in seq.__iter__(): # not iter(seq) - see enumerate's own comment above
+		yield fn( item )
+
+def reduce[T, S: Iterable[T]]( fn: Ptr[Callable[[T,T],T]], seq: S ) -> T:
+	it = iter( seq )
+	value1: T = it.__next__().unwrap( 'reduce(): empty sequence' )
+	for value2 in it:
+		value1 = fn( value1, value2 )
+	return value1
+
+@overload
+def sum[T, S: Iterable[T]]( seq: S, start: T ) -> T:
+	with compiler.wrap_arithmetic:
+		for item in iter( seq ):
+			start += item
+	return start
+
+@overload
+def sum[T, S: Iterable[T]]( seq: S ) -> T:
+	# NOT a default `start: T = 0` on the single-overload form above - a
+	# default parameter's own value gets lowered/filled in by
+	# _finish_generic_call's own default-filling loop (lowering.py), which
+	# hit a real, narrow bug specifically when S binds to tuple[...]'s
+	# synthesized backing class (a plain, non-generic RCClass, unlike list[T]
+	# /slice[T]'s own Specialization-of-a-generic-base shape): the filled-in
+	# default silently never made it into the emitted call's own argument
+	# list, crashing emitter_c.py with a KeyError on 'start' - confirmed via
+	# a real repro. Splitting into two ordinary @overloads (matching min/
+	# max's existing two-overload shape already established above) sidesteps
+	# the whole default-parameter-filling path.
+	it = iter( seq )
+	value: T = it.__next__().unwrap( 'sum(): empty sequence' )
+	with compiler.wrap_arithmetic:
+		for item in it:
+			value += item
+	return value
 
 def ord( s: str ) -> u32:
 	''' the inverse of chr() above - decodes s's own first (and only) code
