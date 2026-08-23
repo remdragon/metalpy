@@ -7091,6 +7091,45 @@ def main() -> i32:
 		return 3
 	return 0
 ''' ),
+			# a Closure[...]-typed struct FIELD, called directly off an
+			# instance (obj.field(...), no intermediate local extraction) -
+			# previously failed to compile at all ("'work' is not callable
+			# on ...") since _try_lower_closure_call only ever recognized a
+			# bare Name callee, and _try_lower_indirect_call's own Attribute
+			# branch handles Ptr[Callable[...]] fields but never
+			# ClosureType ones. The established workaround everywhere else
+			# in this codebase (lib/tcpserver.py's _ConnectionJob,
+			# lib/threading.py/lib/asyncfile.py's _PoolWorker.run_forever)
+			# extracted the field to a local first - this confirms that
+			# extraction is no longer necessary.
+			( 'closure_typed_field_called_directly', '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def add( self, n: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x + n
+
+class Job:
+	work: Closure[[i32], i32]
+
+	def __init__( self, w: Closure[[i32], i32] ) -> None:
+		self.work = w
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	c: Closure[[i32], i32] = w.add
+	j: Job = Job( c )
+	if j.work( 8 ) != 50:
+		return 1
+	if j.work( 100 ) != 142:
+		return 2
+	return 0
+''' ),
 		] )
 
 
@@ -7300,6 +7339,66 @@ def main() -> i32:
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 10
 	return diff
+''' ),
+			# a nested def CAPTURING a Closure and calling it directly inside
+			# its own body (h(...), rewritten by _rewrite_captures_into_env_
+			# reads into env.h(...) - an Attribute callee, not a bare Name)
+			# - previously failed to compile ("'h' is not callable on ...
+			# $$lambda$$env"): _static_type_of_value_expr had no branch for
+			# the compiler.cast(...) shape that rewrite produces, so even
+			# _try_lower_closure_call's Attribute branch couldn't resolve
+			# the receiver's static type to recognize h as a ClosureType.
+			( 'nested_def_capturing_a_closure_and_calling_it_directly', '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def add( self, n: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x + n
+
+def outer( w: Worker ) -> i32:
+	h: Closure[[i32], i32] = w.add
+	def inner() -> i32:
+		return h( 8 )
+	return inner()
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	if outer( w ) != 50:
+		return 1
+	return 0
+''' ),
+			# the exact shape from the original bug report - a LAMBDA (not a
+			# nested def) capturing a Closure and calling it directly inside
+			# its own body
+			( 'lambda_capturing_a_closure_and_calling_it_directly', '''
+class Worker:
+	x: i32
+
+	@staticmethod
+	def make( v: i32 ) -> Worker:
+		return Worker.__allocate__( x = v )
+
+	def add( self, n: i32 ) -> i32:
+		with compiler.wrap_arithmetic:
+			return self.x + n
+
+def call_it( f: Closure[[], i32] ) -> i32:
+	return f()
+
+def outer( w: Worker ) -> i32:
+	h: Closure[[i32], i32] = w.add
+	return call_it( lambda: h( 8 ) )
+
+def main() -> i32:
+	w: Worker = Worker.make( 42 )
+	if outer( w ) != 50:
+		return 1
+	return 0
 ''' ),
 		] )
 

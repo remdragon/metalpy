@@ -5438,6 +5438,64 @@ class Tests( unittest.TestCase ):
 		# user-supplied 5 - not just the user-supplied argument alone
 		self.assertEqual( len( call_indirects[0].args ), 2 )
 
+	def test_closure_typed_field_called_directly_emits_callindirect_with_self_prepended( self ) -> None:
+		# obj.field(...) where field: Closure[[...],...] - previously fell
+		# through every recognizer to _attr_lookup_callable's generic
+		# "'work' is not callable on ..." diagnostic, since
+		# _try_lower_closure_call only ever matched a bare Name callee and
+		# _try_lower_indirect_call's own Attribute branch only recognizes
+		# Ptr[Callable[...]] fields (type_resolver._callable_type_of), never
+		# ClosureType ones. Same self-prepended calling convention as the
+		# bare-Name case above.
+		code = '\n'.join([
+			'class Worker:',
+			'	x: i32',
+			'	@staticmethod',
+			'	def make( v: i32 ) -> Worker:',
+			'		return Worker.__allocate__( x = v )',
+			'	def add( self, n: i32 ) -> i32:',
+			'		with compiler.wrap_arithmetic:',
+			'			return self.x + n',
+			'',
+			'class Job:',
+			'	work: Closure[[i32], i32]',
+			'	def __init__( self, w: Closure[[i32], i32] ) -> None:',
+			'		self.work = w',
+			'',
+			'def main() -> i32:',
+			'	w: Worker = Worker.make( 1 )',
+			'	c: Closure[[i32], i32] = w.add',
+			'	j: Job = Job( c )',
+			'	return j.work( 5 )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		call_indirects = [ i for i in fn.instructions if isinstance( i, ir.CallIndirect ) ]
+		self.assertEqual( len( call_indirects ), 1 )
+		self.assertEqual( len( call_indirects[0].args ), 2 )
+
+	def test_non_callable_field_still_rejected_by_closure_call_recognizer( self ) -> None:
+		# guards the new Attribute branch above against over-matching: a
+		# plain scalar field must still fail with the pre-existing generic
+		# diagnostic, not be silently accepted as a closure call
+		code = '\n'.join([
+			'class Job:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'def main() -> i32:',
+			'	j: Job = Job( 5 )',
+			'	return j.x( 5 )',
+		])
+		self._import( code )
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( "'x' is not callable on" in e for e in self.discovery.errors.errors ),
+			f'expected a not-callable diagnostic, got: {self.discovery.errors.errors}',
+		)
+
 	def test_bound_method_on_monomorphized_generic_class_works( self ) -> None:
 		# Box[T].get isn't itself generic (method.type_params is empty -
 		# T comes from the CLASS's own specialization, already concrete by

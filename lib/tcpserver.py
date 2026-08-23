@@ -50,35 +50,6 @@ class InlineDispatcher( ConnectionDispatcher ):
 		on_connection( conn )
 
 
-# _ConnectionJob - a plain-field-call indirection around a known compiler
-# gap: calling a Closure THROUGH another closure's own captured environment
-# (`lambda: h(conn)` where `h` is itself a captured Closure local) fails to
-# compile ("'h' is not callable on ...$$lambda$$env"). Every existing
-# lambda-wrapped call in this codebase (asyncfile.py, http/server.py) only
-# ever wraps a call to a plain function/method - never a captured Closure
-# variable - so this is genuinely unexercised territory, not a previously-
-# fixed case. Calling a Closure stored in an ordinary field from within a
-# plain bound method (self.__on_connection(self.__conn), no lambda
-# involved) works fine - the same shape _handle_connection's own
-# `handler(request)` already relies on - so this class sidesteps the gap
-# rather than needing a compiler fix to unblock this module.
-class _ConnectionJob:
-	__conn:          tcp.TcpConnection
-	__on_connection: Closure[[tcp.TcpConnection], None]
-
-	def __init__( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
-		self.__conn = conn
-		self.__on_connection = on_connection
-
-	def run( self ) -> None:
-		# extract to a local before calling - a Closure-typed FIELD isn't
-		# directly callable either (same gap _PoolWorker.run_forever's own
-		# `work: Closure[...] = job.work` extraction already works around,
-		# see lib/threading.py and lib/asyncfile.py's identical pattern)
-		on_connection: Closure[[tcp.TcpConnection], None] = self.__on_connection
-		on_connection( self.__conn )
-
-
 class ThreadPerConnectionDispatcher( ConnectionDispatcher ):
 	''' one real, unbounded, fire-and-forget OS thread per accepted
 	connection (threading.Thread starts immediately - there is nothing to
@@ -92,8 +63,7 @@ class ThreadPerConnectionDispatcher( ConnectionDispatcher ):
 	pool instead. '''
 	@virtual
 	def dispatch( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
-		job: _ConnectionJob = _ConnectionJob( conn, on_connection )
-		t: threading.Thread = threading.Thread( job.run )
+		t: threading.Thread = threading.Thread( lambda: on_connection( conn ))
 
 
 class ThreadPoolDispatcher( ConnectionDispatcher ):
@@ -128,8 +98,7 @@ class ThreadPoolDispatcher( ConnectionDispatcher ):
 
 	@virtual
 	def dispatch( self, conn: tcp.TcpConnection, on_connection: Closure[[tcp.TcpConnection], None] ) -> None:
-		job: _ConnectionJob = _ConnectionJob( conn, on_connection )
-		self.__pool.submit( job.run )
+		self.__pool.submit( lambda: on_connection( conn ))
 
 
 class TcpServer:

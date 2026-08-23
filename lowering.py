@@ -4470,6 +4470,20 @@ class FunctionLowering:
 			if owner_type is None:
 				return None
 			return self.lowering._attr_lookup( owner_type, node.attr, node ).type
+		if ( isinstance( node, ast.Call ) and isinstance( node.func, ast.Attribute )
+				and isinstance( node.func.value, ast.Name ) and node.func.value.id == 'compiler'
+				and node.func.attr == 'cast' and len( node.args ) == 2 ):
+			# compiler.cast(T, x) - the env-read rewrite
+			# _rewrite_captures_into_env_reads produces for a captured name
+			# inside a lambda/nested-def body (env.field becomes
+			# compiler.cast(env_type, erased_env).field). Mirrors
+			# _lower_compiler_cast's own target-type resolution, without ever
+			# lowering node.args[1] - this node is never evaluated here, only
+			# inspected, same as every other branch above.
+			target_type = getattr( node.args[0], 'resolved_type', None )
+			if target_type is None:
+				target_type = self.lowering._try_resolve_namespace( node.args[0] )
+			return target_type
 		return None
 
 	def _lower_compiler_sizeof( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
@@ -12260,17 +12274,38 @@ class FunctionLowering:
 		# my_closure(a, b) where my_closure: Closure[[A,B],R] - a call
 		# THROUGH a closure VALUE (see _lower_bound_method_closure). Same
 		# "try a shape, None means try the next one" convention as
-		# _try_lower_indirect_call just above, scoped to a bare Name callee
-		# for the identical reason (a general expression callee needs care
-		# to evaluate it exactly once - deferred there too)
-		if not isinstance( node.func, ast.Name ):
-			return None
-		name = self.lowering.discovery.find_name_or_none( node.func.id )
-		if not isinstance( name, Variable ):
-			return None
-		self.lowering._ensure_resolved( name )
-		closure_type = self._narrowed_type_of_name( node.func.id, name.type )
-		if not isinstance( closure_type, ClosureType ):
+		# _try_lower_indirect_call just above. Two callee shapes, same
+		# double-evaluation-safety discipline _try_lower_indirect_call's own
+		# Name/Attribute split documents: a bare Name (my_closure(...)) and
+		# an Attribute (obj.field(...), a Closure-typed FIELD read off obj -
+		# this also transparently covers a lambda/nested-def capturing a
+		# Closure and calling it directly in its own body, since
+		# _rewrite_captures_into_env_reads rewrites that capture into an
+		# Attribute read off the synthesized env BEFORE lowering ever sees
+		# it) both resolve their closure_type via a purely static lookup
+		# before evaluating node.func for real, exactly like
+		# _try_lower_indirect_call's own two shapes.
+		if isinstance( node.func, ast.Name ):
+			name = self.lowering.discovery.find_name_or_none( node.func.id )
+			if not isinstance( name, Variable ):
+				return None
+			self.lowering._ensure_resolved( name )
+			closure_type = self._narrowed_type_of_name( node.func.id, name.type )
+			if not isinstance( closure_type, ClosureType ):
+				return None
+		elif isinstance( node.func, ast.Attribute ):
+			receiver_type = self._static_type_of_value_expr( node.func.value )
+			if receiver_type is None:
+				return None
+			if self.lowering._find_method( receiver_type, node.func.attr ) is not None:
+				return None # a real method exists with this name - an ordinary method call, not a field call
+			field = self.lowering._find_field( receiver_type, node.func.attr )
+			if field is None:
+				return None # no such field either - let _resolve_callee's own Attribute path give the accurate diagnostic
+			closure_type = self.lowering._type_resolver._closure_type_of( field.type )
+			if closure_type is None:
+				return None
+		else:
 			return None
 		self.lowering._ensure_resolved( closure_type )
 		if any( isinstance( a, ast.Starred ) for a in node.args ):
@@ -12279,7 +12314,7 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'a closure call takes no keyword arguments: {ast.unparse(node)}', node )
 		if len( node.args ) != len( closure_type.arg_types ):
 			self.lowering.discovery.fail(
-				f'{node.func.id}(...) takes {len(closure_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
+				f'{ast.unparse(node.func)}(...) takes {len(closure_type.arg_types)} argument(s), got {len(node.args)}: {ast.unparse(node)}',
 				node,
 			)
 		closure_operand = self._lower_expr( node.func, None )
