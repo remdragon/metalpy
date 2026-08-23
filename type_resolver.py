@@ -219,6 +219,15 @@ class TypeResolver:
 		# temp, same "global across every generator function, never reset
 		# per-function" reasoning as _for_desugar_counter just above
 		self._gen_send_capture_counter = 0
+		# unique __gen_match_subj_N suffix for _reserve_generator_match_
+		# subject_fields's own promoted-field reservation - same "global,
+		# never reset per-function" reasoning as _for_desugar_counter.
+		# Deliberately a SEPARATE counter from visit_Match's own _label_id
+		# (which still runs unconditionally, even for a promoted match, to
+		# mint its own scratch self.locals[...] bookkeeping key) - keeping
+		# the two namespaces distinct avoids any confusion between a
+		# promoted field's real name and a match's internal bookkeeping key
+		self._match_subj_desugar_counter = 0
 
 	def _ensure_sys_free_scheduled( self ) -> None:
 		if self._sys_free_scheduled:
@@ -834,6 +843,90 @@ class TypeResolver:
 			if isinstance( node, ast.AnnAssign ) and isinstance( node.target, ast.Name ):
 				ref_resolver.locals[ node.target.id ] = self.discovery.visit( node.annotation )
 		return ref_resolver._type_of_expr( expr )
+
+	def _reserve_generator_match_subject_fields( self, fn: Function ) -> dict[str,Type]:
+		''' A `match` statement's own subject temp (visit_Match's own
+		__match_subj_N) is ordinary compiler scaffolding built by a LATER,
+		generic pass (visit_Match, run during the synthesized $$__next__/
+		$$__resume__ method's own normal per-function resolution) - by the
+		time that runs, this generator's own backing RCClass has ALREADY
+		been built from _collect_generator_locals's fixed field list, so
+		__match_subj_N stays a plain, non-promoted C local. When one of the
+		match's own arms contains a yield, that's unsound: the arm's own
+		post-yield resume goto (lowering.py's _lower_generator_yield) jumps
+		DIRECTLY into a fresh call frame, skipping over the subject's own
+		declaration+init entirely, so any code physically reachable only
+		via that resume path (in particular the match's own generic
+		trailing "release whichever variant's payload wasn't consumed"
+		cleanup - cfg.py's ordinary scope-exit decref for whatever
+		RC-tracked local __match_subj_N happens to be) reads it
+		uninitialized - confirmed via a real repro, independently flagged
+		by both MSVC (/W4 C4700) and gcc (-Wmaybe-uninitialized), tracing
+		to a genuine potential release_object() on a garbage pointer, not
+		just a benign skipped check.
+
+		Fix: reserve a REAL promoted field for the subject of any match
+		statement whose own cases contain a yield ANYWHERE (over-promotion
+		is safe - same posture _collect_generator_locals's own docstring
+		already takes for every other generator local, deliberately not
+		trying to prove more precisely which SPECIFIC arms actually need
+		it), BEFORE _build_generator_backing_class ever runs, so the field
+		exists in time. Runs EARLY (mirrors _desugar_generator_for_loops's
+		own early, in-place fn.node.body pass) and reuses _resolve_expr_
+		type_for_desugar (the SAME "type an arbitrary expression from AST
+		alone, before any real lowering exists" trick that method's own
+		docstring notes is already proven by visit_Match itself) rather
+		than running any part of the real, generic match-desugaring early
+		- doing so would risk the SAME statement subtree being visited (and
+		possibly transformed) TWICE, once here and once for real later,
+		which _ReferenceResolver's other rewrites (is-None narrowing,
+		generic-call resolution, ...) are not proven idempotent against.
+		This method only READS node.cases/node.subject, never mutates or
+		desugars the match itself - the real desugaring still happens
+		exactly once, at its normal time, in visit_Match below, which
+		reads back the tag this method leaves on qualifying nodes
+		(generator_promoted_subject_stem) and builds a `self.<stem> = ...`
+		field write instead of a bare local when it's set.
+
+		Silently declines (no tag, no reservation) when the subject's type
+		can't be resolved this early (e.g. a still-generic bound) - the
+		match falls back to today's existing (potentially still-unsound for
+		this one shape) plain-local behavior rather than crashing; a
+		real type-resolution failure, if any, still surfaces normally once
+		visit_Match itself runs for real. '''
+		extra_locals: dict[str,Type] = {}
+		for node in self._walk_generator_body( fn.node.body ):
+			if not isinstance( node, ast.Match ):
+				continue
+			if isinstance( node.subject, ast.Name ):
+				# a bare-Name subject aliases an EXISTING binding (lowering.
+				# py's own _is_aliasing_expr: "Name/Attribute reads are the
+				# only currently-supported expression forms that alias
+				# existing state") - visit_Match's own borrow=is_match_
+				# subject-and-is_alias path already gives it a pure BORROW,
+				# never an owned scope-exit decref of its own, so this exact
+				# bug can't reach it regardless of a yield inside an arm -
+				# nothing to promote. Excluding it also sidesteps having to
+				# duplicate match_clears_name's own "unchecked result"
+				# clearing (only ever meaningful for a bare-Name subject) for
+				# a promoted field write, which reaches a different branch of
+				# lowering.py's _stmt_Assign that doesn't consult it at all
+				continue
+			has_yield = any(
+				isinstance( n, ( ast.Yield, ast.YieldFrom ))
+				for case in node.cases
+				for n in self._walk_generator_body( case.body )
+			)
+			if not has_yield:
+				continue
+			subject_type = self._resolve_expr_type_for_desugar( fn, node.subject )
+			if subject_type is None:
+				continue
+			stem = f'__gen_match_subj_{self._match_subj_desugar_counter}'
+			self._match_subj_desugar_counter += 1
+			node.generator_promoted_subject_stem = stem
+			extra_locals[ stem ] = subject_type
+		return extra_locals
 
 	def _desugar_range_for( self, fn: Function, node: ast.For ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 4 - `for x in range(...): BODY`
@@ -2809,6 +2902,13 @@ class TypeResolver:
 			yield_from_extra_locals = self._desugar_generator_yield_from( fn, elem_type, error_type )
 			extra_locals = self._desugar_generator_for_loops( fn )
 			extra_locals.update( yield_from_extra_locals )
+			# match-subject-crosses-a-yield promotion (see this method's own
+			# docstring) - must run AFTER the for-loop/yield-from desugars
+			# above (which may introduce new while-loop shapes but never new
+			# match statements) and BEFORE _collect_generator_locals/
+			# _build_generator_backing_class below, so a qualifying match's
+			# reserved field exists in the backing class in time.
+			extra_locals.update( self._reserve_generator_match_subject_fields( fn ))
 			self._validate_generator_defer_sites( fn )
 			defer_sites = self._desugar_generator_defer_sites( fn )
 			self._validate_and_tag_generator_value_returns( fn, elem_type, error_type )
@@ -6984,37 +7084,67 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		unique = self._label_id
 		self._label_id += 1
 		subj_name = f'__match_subj_{unique}'
-		subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = self.visit( node.subject ))
-		ast.copy_location( subj_assign, node )
-		# two attributes lowering.py's own _stmt_Assign reads (getattr(...,
-		# default), same bridging technique visit_Call's own resolved_callee
-		# already uses) - see cfg.py's unchecked-Result tracking. Always set
-		# is_match_subject: __match_subj_N is compiler-internal scaffolding
-		# that the if-chain below only ever reads via raw tag Compares
-		# (never is_ok()/is_err()/etc), so if it were tracked like an
-		# ordinary Result-typed local, nothing would ever clear it and every
-		# match over a Result would falsely report an unchecked result.
-		# match_clears_name is set only when the subject is a bare Name:
-		# ordinary aliasing assignment deliberately does NOT propagate a
-		# clear back to its source (see cfg.py's "Independent tracking"),
-		# but `match r:` genuinely IS the inspection of r itself, so the
-		# original name needs an explicit clear here that a plain alias
-		# assign wouldn't give it for free
-		subj_assign.is_match_subject = True
-		if isinstance( node.subject, ast.Name ):
-			subj_assign.match_clears_name = node.subject.id
-		subj_ref = ast.Name( id = subj_name, ctx = ast.Load() )
-		ast.copy_location( subj_ref, node )
-		# __match_subj_N is built directly here, never dispatched through
-		# self.visit()/visit_Assign - so unlike an ordinary Assign, nothing
-		# populates self.locals[subj_name] for free. _match_pattern's own
-		# new `case None:`/`case str(c):` handling (unlike the pre-existing
-		# `case Result.Ok(x):` handling, which reads the union off the
-		# PATTERN's own text, never the subject) needs the subject's own
-		# static type to know which union this leaf/None belongs to - same
-		# type inference visit_Assign already gives an ordinary local for
-		# free, just done explicitly here since this Assign bypasses that path
-		self.locals[subj_name] = self._type_of_expr( node.subject )
+		subj_value = self.visit( node.subject )
+		# _reserve_generator_match_subject_fields (run EARLY, before this
+		# generator's own backing class was built - see its own docstring)
+		# tags a match whose subject's ownership needs to survive a yield
+		# inside one of this match's own arms - promote the subject into
+		# the reserved REAL field instead of an ordinary, non-promoted
+		# local in that case, otherwise unchanged from before.
+		promoted_stem = getattr( node, 'generator_promoted_subject_stem', None )
+		if promoted_stem is not None:
+			subj_assign = ast.Assign( targets = [ self.resolver._self_attr( promoted_stem, node ) ], value = subj_value )
+			ast.copy_location( subj_assign, node )
+			subject_type = self._type_of_expr( node.subject )
+			# an RC-typed promoted field's construction-time placeholder is
+			# a bare zero, not a real prior object - the SAME live-flag
+			# guard every other RC-typed promoted local's own reassignment
+			# already needs (PLAN_GENERATORS.md Phase 5) applies here
+			# unchanged; _apply_live_flag_guards is a plain, self-contained
+			# AST transform over a statement list, safe to call directly
+			# here even though this runs at a different time than its
+			# usual caller (_rename_and_track_liveness, during THIS SAME
+			# generator's rename pass, well before this match was ever
+			# desugared)
+			subj_assign_stmts = (
+				self.resolver._apply_live_flag_guards( [ subj_assign ], { promoted_stem } )
+				if subject_type is not None and subject_type.is_rc() else [ subj_assign ]
+			)
+			subj_ref = self.resolver._self_attr( promoted_stem, node )
+			self.locals[subj_name] = subject_type
+		else:
+			subj_assign = ast.Assign( targets = [ ast.Name( id = subj_name, ctx = ast.Store() ) ], value = subj_value )
+			ast.copy_location( subj_assign, node )
+			# two attributes lowering.py's own _stmt_Assign reads (getattr(...,
+			# default), same bridging technique visit_Call's own resolved_callee
+			# already uses) - see cfg.py's unchecked-Result tracking. Always set
+			# is_match_subject: __match_subj_N is compiler-internal scaffolding
+			# that the if-chain below only ever reads via raw tag Compares
+			# (never is_ok()/is_err()/etc), so if it were tracked like an
+			# ordinary Result-typed local, nothing would ever clear it and every
+			# match over a Result would falsely report an unchecked result.
+			# match_clears_name is set only when the subject is a bare Name:
+			# ordinary aliasing assignment deliberately does NOT propagate a
+			# clear back to its source (see cfg.py's "Independent tracking"),
+			# but `match r:` genuinely IS the inspection of r itself, so the
+			# original name needs an explicit clear here that a plain alias
+			# assign wouldn't give it for free
+			subj_assign.is_match_subject = True
+			if isinstance( node.subject, ast.Name ):
+				subj_assign.match_clears_name = node.subject.id
+			subj_assign_stmts = [ subj_assign ]
+			subj_ref = ast.Name( id = subj_name, ctx = ast.Load() )
+			ast.copy_location( subj_ref, node )
+			# __match_subj_N is built directly here, never dispatched through
+			# self.visit()/visit_Assign - so unlike an ordinary Assign, nothing
+			# populates self.locals[subj_name] for free. _match_pattern's own
+			# new `case None:`/`case str(c):` handling (unlike the pre-existing
+			# `case Result.Ok(x):` handling, which reads the union off the
+			# PATTERN's own text, never the subject) needs the subject's own
+			# static type to know which union this leaf/None belongs to - same
+			# type inference visit_Assign already gives an ordinary local for
+			# free, just done explicitly here since this Assign bypasses that path
+			self.locals[subj_name] = self._type_of_expr( node.subject )
 		# only meaningful at this top level (never threaded into
 		# _match_pattern's own recursive calls against an EXTRACTED
 		# payload - see _match_pattern's own comment on why): lets a
@@ -7211,8 +7341,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			case_infos.append( ( False, entry_narrowed ))
 		self._narrowed = self._merge_case_narrowing( case_infos )
 		if singleton_body is not None:
-			return [ subj_assign, *singleton_body ]
-		return [ subj_assign, chain ] if chain is not None else [ subj_assign ]
+			return [ *subj_assign_stmts, *singleton_body ]
+		return [ *subj_assign_stmts, chain ] if chain is not None else subj_assign_stmts
 
 	def _merge_case_narrowing( self, case_infos: list[tuple[bool,dict[str,list[Type]]]] ) -> dict[str,list[Type]]:
 		''' the N-ary, type_resolver.py-level analogue of cfg.py's own
