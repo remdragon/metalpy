@@ -1044,11 +1044,41 @@ class Lowering:
 	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
 		# PLAN_GENERATORS.md Phase 3 - a non-failing probe (same posture as
 		# _find_method above): "this type has no __next__" is a normal
-		# outcome (falls through to the __len__/__getitem__ indexable path),
-		# not an error. Shape validation (does __next__ actually return
-		# T|None) happens once, in _lower_for_over_iterator itself, where a
-		# real error location is available.
+		# outcome, not an error. Shape validation (does __next__ actually
+		# return T|None) happens once, in _lower_for_over_iterator itself,
+		# where a real error location is available. Only ever called on a
+		# type _stmt_For has ALREADY confirmed conforms to IteratorProtocol[T] (see
+		# _type_conforms_to_protocol) - never a raw duck-typing probe.
 		return self._find_method( owner_type, '__next__' )
+
+	def _type_conforms_to_protocol( self, owner_type: Type|None, protocol: ClassLike ) -> bool:
+		''' does the resolved concrete type declare conformance to
+		`protocol` (a bare Protocol/ClassLike, e.g. the real Iterator or
+		Iterable class object - not parametrized) - a membership check
+		against .protocols, mirroring mpy_types.TypeVar.bound_satisfied_by's
+		own bare-Protocol case (discovery.py's _validate_protocol_
+		conformance already verified, at that class's own definition, that
+		every required method actually exists - this doesn't re-verify
+		that, just asks "did this class declare it"). Identity-compares
+		each declared protocol's own unparametrized .base, so this matches
+		regardless of which concrete T the class happened to parametrize
+		it with (list[i32]'s own Iterable[i32] conformance still matches a
+		bare `protocol=Iterable` lookup here). '''
+		resolved = self._ensure_resolved( owner_type )
+		base = resolved.base if isinstance( resolved, Specialization ) else resolved
+		if isinstance( base, TupleType ):
+			# tuple[...] isn't an RCClass itself - a homogeneous tuple's
+			# declared protocol conformance lives on its lazily-synthesized
+			# backing RCClass instead (tuple_storage.py); a heterogeneous
+			# tuple has no backing at all (never conforms to anything)
+			base = base.backing
+		if not isinstance( base, RCClass ):
+			return False
+		for p in base.protocols:
+			p_base = p.base if isinstance( p, Specialization ) else p
+			if p_base is protocol:
+				return True
+		return False
 
 	def _is_range_call( self, node: ast.expr ) -> str|None:
 		# range(...) is textually recognized as compiler sugar, same as
@@ -1675,36 +1705,40 @@ class Lowering:
 				base = actual.base if isinstance( actual, Specialization ) else actual
 				if isinstance( base, TupleType ):
 					base = base.backing
-				skip_reentrant = isinstance( actual, Specialization ) and id( actual ) in self._type_resolver.monomorphizer._building
-				if isinstance( actual, Specialization ) and isinstance( base, RCClass ) and not skip_reentrant:
-					# _building guard (skip_reentrant) - see mpy_types.py's
-					# identical guard on TypeVar.bound_satisfied_by for the
-					# full "why" (a real repro: this SAME reentrant-
-					# monomorphize shape, reached through a different call
-					# chain, caused a RecursionError without it).
-					base = self._type_resolver.monomorphizer.monomorphize_class( actual )
-				if isinstance( base, RCClass ) and not skip_reentrant:
-					# skip_reentrant gates the WHOLE lookup, not just the
-					# monomorphize call above: base.protocols would still be
-					# base's own ABSTRACT, unsubstituted list in the reentrant
-					# case (base fell back to actual.base, never substituted) -
-					# unifying against THOSE args binds the outer type param to
-					# the WRONG (abstract, wrong-class) TypeVar instead of the
-					# real concrete type, which is worse than leaving it
-					# unbound (confirmed by a real repro: a generated `Result.
-					# Err(StopIteration())` construction inside _sequence_iter
-					# [T,slice[i32]] ended up with T bound to slice[T]'s OWN
-					# unrelated T instead of i32, surfacing far downstream as
-					# "Specialization not concrete" rather than a clean "T
-					# unbound" - silently wrong data flow, not just a locally
-					# imprecise check the way bound_satisfied_by's identical
-					# skip is safe to allow, since binding is the whole point
-					# here, not just a true/false verdict).
+				if isinstance( base, RCClass ):
 					for entry in base.protocols:
-						if isinstance( entry, Specialization ) and entry.base is declared.bound.base:
-							for b_arg, e_arg in zip( declared.bound.args, entry.args ):
-								self._unify_type_param( type_params, b_arg, e_arg, bindings, node, context_qualname )
-							break
+						if not ( isinstance( entry, Specialization ) and entry.base is declared.bound.base ):
+							continue
+						entry_args = entry.args
+						if isinstance( actual, Specialization ):
+							# base here is still the ABSTRACT class template
+							# (actual.base) - substitute its declared protocol
+							# args against actual.args directly, rather than
+							# fully building actual via monomorphize_class
+							# first (the old approach, which re-entered
+							# monomorphize_class whenever actual was its OWN
+							# still-in-progress build - e.g. set[T]'s __iter__
+							# body needing set[T]'s own Sequence[T] conformance
+							# to reverse-unify T - and had to skip the whole
+							# lookup via a _building guard to avoid either a
+							# RecursionError or binding to the wrong, still-
+							# abstract TypeVar; skipping instead silently left
+							# T unbound forever, confirmed by a real repro: the
+							# shared _sequence_iter's return type never
+							# resolved past its abstract T the first time any
+							# caller's __iter__ actually needed it). A
+							# protocol entry's own .base is always the
+							# Protocol, never `actual`'s class, so
+							# substituting just its args can't re-enter
+							# monomorphize_class for `actual` at all - no
+							# guard needed.
+							entry_args = [
+								self._type_resolver.monomorphizer.substitute_type_params( a, base.type_params or [], actual.args )
+								for a in entry_args
+							]
+						for b_arg, e_arg in zip( declared.bound.args, entry_args ):
+							self._unify_type_param( type_params, b_arg, e_arg, bindings, node, context_qualname )
+						break
 			return
 		if isinstance( declared, Specialization ):
 			# _as_specialization, not a bare isinstance(actual, Specialization)
@@ -6390,7 +6424,7 @@ class FunctionLowering:
 		self.lowering.schedule( type )
 		return var
 
-	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str, panic_errmsg: str|None = None ) -> ir.Operand:
+	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str ) -> ir.Operand:
 		# if `value` is itself a Result[T,E], auto-consume it via the same
 		# OrReturn/OrJump propagation or_return()/checked arithmetic use -
 		# unlike _lower_or_return, a non-Result value is passed through
@@ -6412,17 +6446,6 @@ class FunctionLowering:
 		# lookup here (unlike _result_shape's own find_name_or_none) since
 		# shape being non-None already proves Result is defined
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		if panic_errmsg is not None:
-			# caller has already proven this Err arm unreachable (e.g. a
-			# for-loop's own bounds-checked index) - Unwrap-panic instead of
-			# OrReturn/OrJump, same as `with compiler.panic_arithmetic(...):`,
-			# so this doesn't force the enclosing function to return
-			# Result[_,error_cls] just to propagate an error that can't happen
-			str_cls = self.lowering.discovery.find_name( 'str', node )
-			errmsg_node = ast.Constant( value = panic_errmsg )
-			ast.copy_location( errmsg_node, node )
-			extra = self._lower_expr( errmsg_node, str_cls )
-			return self._consume_checked_result( node, value, result_type, extra = extra )
 		self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
 		return self._consume_checked_result( node, value, result_type, extra = None )
 
@@ -6473,15 +6496,67 @@ class FunctionLowering:
 		# (not once per candidate path) and the resulting operand handed to
 		# whichever real consumption path applies, so an iterable expression
 		# with a side effect (most commonly: a generator CONSTRUCTOR call)
-		# is never evaluated twice - _lower_for_over_indexable used to lower
-		# node.iter itself; it now takes the already-lowered operand instead,
-		# the same way _lower_for_over_iterator does
+		# is never evaluated twice - _lower_for_over_iterator's own obj
+		# parameter is always this already-lowered operand, never re-derived
+		# from node.iter itself.
+		#
+		# Strict IteratorProtocol[T]/Iterable[T] protocol dispatch, no
+		# structural duck-typing (confirmed with the user - a for-loop
+		# subject must DECLARE conformance, not merely happen to have
+		# matching method names): an object that's ALREADY an iterator (a
+		# real generator, or any hand-written IteratorProtocol[T] conformer)
+		# drives its own __next__() directly, unchanged from before. An
+		# Iterable[T] conformer (list/
+		# set/tuple/VariadicTuple/dict/...) gets its __iter__() called ONCE
+		# here to obtain a real iterator, which then drives the exact same
+		# __next__()-consumption path - "iter() on an iterator returns
+		# itself" is subsumed by the FIRST branch already handling a
+		# self-iterating object without ever needing to call __iter__() on
+		# it at all, rather than needing every IteratorProtocol[T] conformer
+		# to also separately implement Iterable[T].__iter__ returning self.
+		#
+		# This is a real, confirmed correctness fix, not just stricter
+		# typing: the old __len__/__getitem__(usize) duck-typing this
+		# replaced would have silently misused dict[K,V]'s own __getitem__
+		# (key: K) as if it were positional 0..len indexing for `for k in
+		# some_dict:` whenever K happened to be usize-compatible - dict
+		# never declares __next__ directly, so it always fell to that path.
 		obj = self._lower_expr( node.iter, None )
-		next_fn = self.lowering._find_iterator_next_method( obj.type )
-		if next_fn is not None:
+		iterator_protocol = self.lowering.discovery.find_name( 'IteratorProtocol', node )
+		iterable_protocol = self.lowering.discovery.find_name( 'Iterable', node )
+		if self.lowering._type_conforms_to_protocol( obj.type, iterator_protocol ):
+			next_fn = self.lowering._find_iterator_next_method( obj.type )
+			assert next_fn is not None, 'internal compiler error: IteratorProtocol[T] conformance declared without a real __next__'
 			self._lower_for_over_iterator( node, obj, next_fn )
+		elif self.lowering._type_conforms_to_protocol( obj.type, iterable_protocol ):
+			iter_fn = self.lowering._find_method( obj.type, '__iter__' )
+			assert iter_fn is not None, 'internal compiler error: Iterable[T] conformance declared without a real __iter__'
+			self.lowering._ensure_resolved( iter_fn )
+			# __iter__'s own declared return type (Generator[T,StopIteration])
+			# is still the bare, unresolved GeneratorType annotation until
+			# its own passthrough body ("return _sequence_iter(self)"-shaped)
+			# gets synthesized - mirrors lower_function's own identical
+			# safety-net call for an ordinary generator reached with no
+			# earlier caller (PLAN_GENERATORS.md).
+			self.lowering._type_resolver.ensure_generator_synthesized( iter_fn )
+			self.lowering.schedule( iter_fn.return_type )
+			iterator_dest = self._new_temp( iter_fn.return_type )
+			self._emit( ir.Call( dest = iterator_dest, target = iter_fn, receiver = obj, args = [], kwargs = {} ))
+			next_fn = self.lowering._find_iterator_next_method( iterator_dest.type )
+			if next_fn is None:
+				self.lowering.discovery.fail(
+					f'{obj.type.qualname if obj.type else "?"}.__iter__() returned '
+					f'{iterator_dest.type.qualname if iterator_dest.type else "?"}, which does not conform to '
+					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node)}',
+					node,
+				)
+			self._lower_for_over_iterator( node, iterator_dest, next_fn )
 		else:
-			self._lower_for_over_indexable( node, obj )
+			self.lowering.discovery.fail(
+				f'for loop requires an IteratorProtocol[T] or Iterable[T] conformer, got '
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
+				node,
+			)
 
 	def _lower_for_range( self, node: ast.For ) -> None:
 		call = node.iter
@@ -6547,112 +6622,6 @@ class FunctionLowering:
 		incr = self._new_temp( usize_cls )
 		self._emit( ir.AddWrap( dest = incr, left = target_var, right = ir.Const( type = usize_cls, value = 1 ) ))
 		self._emit( ir.Assign( dest = target_var, src = incr ))
-		self._emit( ir.Jump( target = start_label ))
-		self._emit( ir.Label( name = end_label ))
-
-	def _lower_for_over_indexable( self, node: ast.For, obj: ir.Operand ) -> None:
-		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-
-		len_fn = self.lowering._find_method( obj.type, '__len__' )
-		getitem_fn = self._find_indexlike_getitem( obj.type )
-		missing = [ name for name, fn in (( '__len__', len_fn ), ( '__getitem__', getitem_fn )) if fn is None ]
-		if missing:
-			self.lowering.discovery.fail(
-				f'for loop needs {" and ".join(missing)} (or a __next__() returning T|None) on '
-				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
-				node,
-			)
-
-		unique = self._label_id
-		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
-		self._emit( ir.Assign( dest = obj_var, src = obj ))
-
-		self.lowering._ensure_resolved( len_fn )
-		if self.lowering._type_resolver._result_shape( len_fn.return_type ) is not None:
-			self.lowering.discovery.fail(
-				f'for loop iteration requires an infallible __len__() - '
-				f'{obj.type.qualname if obj.type else "?"}.__len__() returns '
-				f'{len_fn.return_type.qualname}, which can fail - this __len__() call is '
-				f'compiler-synthesized (no source position exists to attach .unwrap()/'
-				f'.or_return() to); iterate manually via while+__getitem__ instead: {ast.unparse(node)}',
-				node,
-			)
-		self.lowering.schedule( len_fn.return_type )
-		len_dest = self._new_temp( len_fn.return_type )
-		self._emit( ir.Call( dest = len_dest, target = len_fn, receiver = obj_var, args = [], kwargs = {} ))
-		len_var = self._declare_hidden_local( f'__for_len_{unique}', len_dest.type, node )
-		self._emit( ir.Assign( dest = len_var, src = len_dest ))
-
-		index_var = self._declare_hidden_local( f'__for_index_{unique}', usize_cls, node )
-		self._emit( ir.Assign( dest = index_var, src = ir.Const( type = usize_cls, value = 0 ) ))
-
-		start_label = self._new_label( 'for_start' )
-		continue_label = self._new_label( 'for_continue' )
-		end_label = self._new_label( 'for_end' )
-
-		self._emit( ir.Label( name = start_label ))
-		test = ast.Compare( left = self.lowering._synth_name( index_var.stem, node ), ops = [ ast.Lt() ], comparators = [ self.lowering._synth_name( len_var.stem, node ) ] )
-		ast.copy_location( test, node )
-		cond = self._lower_expr( test, bool_cls )
-		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
-
-		# the snapshot is taken here, BEFORE the loop target's own binding -
-		# that binding (e.g. `s2 = obj[index]`) happens fresh every
-		# iteration, exactly like any other loop-body statement (matches
-		# foo4: a value reassigned each iteration is expected to be stable
-		# across the back edge, not confined-and-torn-down)
-		loop_snapshot = self._cfg.snapshot()
-		subscript = ast.Subscript(
-			value = self.lowering._synth_name( obj_var.stem, node ),
-			slice = self.lowering._synth_name( index_var.stem, node ),
-			ctx = ast.Load(),
-		)
-		ast.copy_location( subscript, node )
-		# __getitem__ is expected to always be fallible in practice (it must
-		# be able to report IndexError/KeyError) - this read is compiler-
-		# synthesized (no source position for the user to attach .unwrap()/
-		# .or_return() to), so it keeps auto-consuming a Result exactly like
-		# _expr_Subscript used to unconditionally do, unlike ordinary
-		# user-written `x[i]` (see _expr_Subscript's own comment)
-		subscript.is_for_loop_element_read = True
-		bind = ast.Assign( targets = [ node.target ], value = subscript )
-		ast.copy_location( bind, node )
-		# _lower_stmt (not a direct self._stmt_Assign(bind) call) - this bind
-		# is lowered exactly ONCE at compile time but its own temps (e.g. the
-		# raw __getitem__ Result temp behind node.target, before Unwrap/
-		# OrReturn extracts+increfs its payload) need a PER-ITERATION decref,
-		# same as any other loop-body statement (matches this method's own
-		# comment above: "happens fresh every iteration, exactly like any
-		# other loop-body statement") - a bare self._stmt_Assign(bind) call
-		# skips _lower_stmt's own pending-temps save/reset/flush wrapper
-		# entirely, so that Result temp silently leaked into the ENCLOSING
-		# ast.For statement's own pending-temps list instead, flushed only
-		# ONCE, textually after the whole loop - reading UNINITIALIZED stack
-		# garbage as an ObjectHeader* and decref'ing it whenever the loop body
-		# never runs at all (e.g. an empty slice), a real, confirmed crash
-		# (illegal instruction / segfault, nondeterministic - stale/garbage
-		# stack reused as a fake RC object) via `for x in sys.argv[1:]:` with
-		# no extra command-line arguments.
-		self._lower_stmt( bind )
-
-		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
-		# Phase 8 - see _lower_for_range's own identical call/comment
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
-
-		# see _lower_for_range's own identical comment on continue_captured
-		if continue_captured:
-			self._emit( ir.Label( name = continue_label ))
-		incr = self._new_temp( usize_cls )
-		self._emit( ir.AddWrap( dest = incr, left = index_var, right = ir.Const( type = usize_cls, value = 1 ) ))
-		self._emit( ir.Assign( dest = index_var, src = incr ))
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
@@ -6865,9 +6834,8 @@ class FunctionLowering:
 		self._emit( ir.Label( name = start_label ))
 		# snapshot at the VERY TOP of the loop, before next_var's own
 		# per-iteration rebind AND before the loop target's own binding -
-		# same reasoning _lower_for_over_indexable's identical comment gives
-		# (both bindings are fresh every iteration, not confined-and-torn-
-		# down across it) - taken here, before ANY of that, so loop_back_
+		# both bindings are fresh every iteration, not confined-and-torn-
+		# down across it - taken here, before ANY of that, so loop_back_
 		# edge()'s later reconciliation sees next_var (like the target) as
 		# absent from entry/present at the back edge and decrefs its stale
 		# value right before jumping back to start_label. A raw ir.Assign
@@ -9807,19 +9775,6 @@ class FunctionLowering:
 		index = self._lower_expr( node.slice, getitem_fn.parameters[0].type )
 		call_dest = self._new_temp( getitem_fn.return_type )
 		self._emit( ir.Call( dest = call_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
-		if getattr( node, 'is_for_loop_element_read', False ):
-			# a for-loop's own per-iteration bind (_lower_for_over_indexable) -
-			# compiler-synthesized, no source position to attach .unwrap()/
-			# .or_return() to, and __getitem__ is expected to always be
-			# fallible in practice - keep auto-consuming here specifically.
-			# panic_errmsg (not None/or_return-propagation): the loop's own
-			# `index < len` test already proves this Err arm unreachable, so
-			# requiring the enclosing function to return Result[_,IndexError]
-			# just to compile an ordinary `for x in some_list:` would be wrong
-			return self._maybe_consume_result(
-				node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES,
-				panic_errmsg = 'for-loop: element index out of range (internal - should be unreachable)',
-			)
 		return call_dest
 
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
