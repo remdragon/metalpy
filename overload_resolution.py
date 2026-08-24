@@ -374,8 +374,31 @@ def resolve_call(
 			combo_targets.append(( combo, found[0].target ))
 
 	if unresolved:
+		# combo holds each slot's own decomposed LEAF (arg_leaves - every
+		# candidate is matched per-leaf, since a leaf can win independently
+		# of its siblings), not the slot's own real, undecomposed argument
+		# type - fine when the two agree (an ordinary, single-leaf
+		# argument), but silently misleading whenever they don't: a bare
+		# `Result[bytes,CodecError]` passed directly (never unwrapped) has
+		# TWO leaves, Ok(bytes) and Err(CodecError) - if only the Err leaf
+		# fails to match anything, the reported combo shows just
+		# `codecs.CodecError` with no indication that's a decomposed
+		# fragment of a whole `Result` argument, not literally what the
+		# caller wrote - confirmed via a real repro (`re.compile(b)`,
+		# `b: Result[bytes,CodecError]` from a forgotten `.unwrap()`)
+		# reporting `('codecs.CodecError',): no matching overload`, which
+		# reads as if a bare CodecError were passed positionally. Naming
+		# the real slot type alongside the leaf whenever they differ turns
+		# that into `(codecs.CodecError [leaf of argument 1's actual type
+		# builtins.Result[bytes,codecs.CodecError]],): no matching overload`.
+		original_by_slot: dict[int|str,Type] = { **{ i: a for i, a in enumerate( args ) }, **kwargs }
+		def _describe_combo_slot( slot: int|str, leaf: Type ) -> str:
+			original = original_by_slot[slot]
+			if same_type( original, leaf ):
+				return leaf.qualname
+			return f'{leaf.qualname} [leaf of argument {slot!r}\'s actual type {original.qualname}]'
 		parts = [
-			f'{tuple( t.qualname for t in combo )}: ' + (
+			f'{tuple( _describe_combo_slot( call_slots[i], t ) for i, t in enumerate( combo ))}: ' + (
 				f'ambiguous - matches {[c.target.qualname for c in found]}' if found else 'no matching overload'
 			)
 			for combo, found in unresolved
