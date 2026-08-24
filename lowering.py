@@ -1623,6 +1623,10 @@ class Lowering:
 			self.schedule( del_fn )
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
+	_OR_THROW_ALTERNATIVES = (
+		'or_throw() propagates any leaf not caught by an except clause of the innermost enclosing try to the caller, '
+		'exactly like or_return() - there is no other way for the enclosing function to receive it'
+	)
 	_FALLIBLE_METHOD_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
 
@@ -1856,6 +1860,30 @@ class _LoopContext:
 	continue_captured: bool = False
 
 
+@dataclass
+class TryHandler:
+	''' one `except T:`/`except (A,B) as e:` clause of the innermost
+	enclosing try (FunctionLowering._try_stack) - `leaves` are the
+	resolved error-class leaves this clause covers (each may itself be
+	one class, or several for a tuple-of-classes clause). `bind` is the
+	real, already-registered local Variable `as NAME` binds (see
+	_stmt_Try), or None for a bare `except T:`. '''
+	leaves: list[Type]
+	label: str
+	bind: 'Variable|None'
+
+
+@dataclass
+class TryContext:
+	''' one entry of FunctionLowering._try_stack - the try statement
+	currently being lowered. Consulted only by .or_throw() (_lower_or_throw)
+	textually inside its own body, in the SAME function - an inner try's
+	uncovered leaf does NOT search an outer try's own handlers (see
+	_lower_or_throw's own comment); only the top-of-stack entry is ever read. '''
+	handlers: list[TryHandler]
+	end_label: str
+
+
 class FunctionLowering:
 	'''
 	Everything Lowering.lower_function/lower_global need that's scoped to ONE
@@ -1954,6 +1982,12 @@ class FunctionLowering:
 		# _lower_with_context_manager) - unique per with-statement in this
 		# function, only for the synthesized ctx-holding local's own stem
 		self._with_ctx_id = 0
+		# try/except/else/finally - only .or_throw() textually inside the
+		# CURRENT try body (same function) consults this; see TryContext's
+		# own docstring. Only the top entry is ever read - nested try does
+		# NOT fall back to an outer try's own handlers (a documented scope
+		# limitation, not a bug - see _lower_or_throw)
+		self._try_stack: list[TryContext] = []
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
 		# _inlining_stack (by id(target)) is the reentrancy guard - a target
 		# already present means direct or mutual @inline recursion, rejected
@@ -4772,8 +4806,9 @@ class FunctionLowering:
 		function ever truly ends - defer/errdefer's own "single armed slot,
 		replayed once" contract can't represent more than one such visit.
 		match statements are already desugared to chained ast.If by the
-		time lowering.py runs (mirroring _stmt_diverges's own assumption),
-		and this compiler has no try/except, so those aren't handled here. '''
+		time lowering.py runs (mirroring _stmt_diverges's own assumption).
+		try/except (ast.Try) is handled by _stmt_may_break_or_continue
+		itself, below. '''
 		return any( self._stmt_may_break_or_continue( stmt, in_nested_loop = False ) for stmt in body )
 
 	def _stmt_may_break_or_continue( self, stmt: ast.stmt, in_nested_loop: bool ) -> bool:
@@ -4783,7 +4818,155 @@ class FunctionLowering:
 			return any( self._stmt_may_break_or_continue( s, in_nested_loop = True ) for s in stmt.body )
 		if isinstance( stmt, ( ast.If, ast.With )):
 			return any( self._stmt_may_break_or_continue( s, in_nested_loop ) for s in stmt.body )
+		if isinstance( stmt, ast.Try ):
+			# a break/continue anywhere in body/orelse/finalbody/any handler's
+			# own body still belongs to the SAME enclosing loop - mirrors
+			# _loop_has_reachable_break's own already-existing ast.Try walk
+			lists = [ stmt.body, stmt.orelse, stmt.finalbody ] + [ h.body for h in stmt.handlers ]
+			return any( self._stmt_may_break_or_continue( s, in_nested_loop ) for lst in lists for s in lst )
 		return False
+
+	def _stmt_TryStar( self, node: ast.stmt ) -> None:
+		# ast.TryStar (`try: ... except* T:`) reuses ast.ExceptHandler for
+		# its own handlers, so it isn't distinguishable from ast.Try by
+		# shape alone - dispatched here separately (by class name, see
+		# _lower_stmt) purely to reject it with a clear, dedicated message
+		# rather than whatever _stmt_Try's own except-clause validation
+		# would happen to say about it
+		self.lowering.discovery.fail( f'except* (exception groups) is not supported: {ast.unparse(node)}', node )
+
+	def _stmt_Try( self, node: ast.Try ) -> None:
+		''' limited try/except/else/finally - NOT real exceptions, no
+		`raise`/unwinding: the only way control ever reaches an except
+		handler is `.or_throw()` (_lower_or_throw), called on a Result-typed
+		expression textually inside this try's own body, in this SAME
+		function (self._try_stack, consulted only while THIS body is being
+		lowered). Mirrors _lower_with_context_manager's own already-debugged
+		shape for `finally` - see that method's docstring for the full
+		"why no new lexical scope, why register-then-disarm-and-inline"
+		story; `as NAME` binds an ordinary, function-scoped local exactly
+		like with's own NAME does, just built directly here (there's no
+		AST-level expression for "the narrowed Err payload of this
+		already-lowered or_throw() receiver" for an ast.Assign to reference -
+		see the Variable construction below).
+
+		Nested try: only the INNERMOST enclosing try's own handlers are ever
+		consulted by or_throw() - an inner try's own uncovered leaf does NOT
+		search an outer try's own handlers, it goes straight to the
+		function-return fallback. A documented scope limitation, not a bug -
+		see _lower_or_throw's own comment. '''
+		if self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'try-statement is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+		if self._loop_depth > 0 and (
+			self._body_may_break_or_continue_to_enclosing_loop( node.body )
+			or self._body_may_break_or_continue_to_enclosing_loop( node.orelse )
+			or any( self._body_may_break_or_continue_to_enclosing_loop( h.body ) for h in node.handlers )
+		):
+			self.lowering.discovery.fail(
+				'try-statement is not allowed inside a loop when its body/else/except-handlers can break/continue out '
+				f'of that loop - call another function and use try/except inside that instead: {ast.unparse(node)}', node,
+			)
+
+		handlers: list[TryHandler] = []
+		for h in node.handlers:
+			if h.type is None:
+				self.lowering.discovery.fail( f'bare `except:` is not supported - name the specific error class(es): {ast.unparse(node)}', h )
+			type_exprs = h.type.elts if isinstance( h.type, ast.Tuple ) else [ h.type ]
+			leaves: list[Type] = []
+			for te in type_exprs:
+				resolved = self.lowering._type_resolver._try_resolve_namespace( te )
+				if resolved is None or not isinstance( resolved, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+					self.lowering.discovery.fail( f'except clause must name a class: {ast.unparse(te)}', te )
+				if getattr( resolved, 'stem', None ) == 'Exception':
+					self.lowering.discovery.fail(
+						f'bare `except Exception:` is not supported - name the specific error class(es): {ast.unparse(node)}', h,
+					)
+				leaves.append( resolved )
+			label = self._new_label( 'except' )
+			bind_var: Variable|None = None
+			if h.name is not None:
+				bind_type = leaves[0] if len( leaves ) == 1 else self.lowering.discovery._get_or_create_union( leaves )
+				if len( leaves ) > 1:
+					self.lowering._union_storage.get( bind_type ) # ensures bind_type's own tag/data storage exists by emit time
+				self.lowering.schedule( bind_type )
+				needs_uid_suffix = self._mark_fresh_local_declared( h.name )
+				fn = self._current_fn
+				bind_var = Variable(
+					stem = h.name, qualname = f'{fn.qualname}.{h.name}', file = fn.file, line = getattr( h, 'lineno', None ),
+					type = bind_type, needs_uid_suffix = needs_uid_suffix,
+				)
+				fn.add_name( bind_var.stem, bind_var )
+			handlers.append( TryHandler( leaves = leaves, label = label, bind = bind_var ))
+		end_label = self._new_label( 'try_end' )
+
+		exit_flag: Variable|None = None
+		if node.finalbody:
+			# registered BEFORE the body is lowered, exactly like
+			# _lower_with_context_manager's own __exit__ - covers every
+			# early-exit path reached from inside body/else/any handler
+			# (return, or an uncovered or_throw() leaf propagating out)
+			self._register_defer_block( is_err_only = False, body = node.finalbody, node = node, allow_inside_loop = True )
+			exit_flag = self._defer_flags[-1]
+
+		self._try_stack.append( TryContext( handlers = handlers, end_label = end_label ))
+		try:
+			for stmt in node.body:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+		finally:
+			self._try_stack.pop()
+
+		for stmt in node.orelse:
+			try:
+				self._lower_stmt( stmt )
+			except CompileError:
+				continue
+
+		tail = node.orelse if node.orelse else node.body
+		tail_diverges = bool( tail ) and self._stmt_diverges( tail[-1] )
+		reachable = not tail_diverges
+		if reachable:
+			self._emit( ir.Jump( target = end_label ))
+
+		for handler, h in zip( handlers, node.handlers ):
+			self._emit( ir.Label( name = handler.label ))
+			if handler.bind is not None:
+				# the emitter unconditionally assigns handler.bind's own
+				# payload before jumping to this exact label (ir.OrThrow's
+				# dispatch - see _emit_or_throw_leaf_case) - definitely
+				# assigned on entry here, same reasoning
+				# _declare_hidden_local/@inline's own parameter binding
+				# already rely on mark_live() for (see its own docstring)
+				self._cfg.mark_live( handler.bind.stem )
+			for stmt in h.body:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+			if not h.body or not self._stmt_diverges( h.body[-1] ):
+				reachable = True
+				self._emit( ir.Jump( target = end_label ))
+
+		if reachable:
+			self._emit( ir.Label( name = end_label ))
+			if node.finalbody:
+				# disarm the registered defer and inline finalbody directly
+				# here - the SAME already-debugged shape
+				# _lower_with_context_manager uses for its own __exit__,
+				# just at this construct's own (possibly multi-path)
+				# fallthrough merge point instead of a single body's own end
+				bool_cls = self.lowering.discovery.find_name( 'bool', node )
+				assert exit_flag is not None
+				self._emit( ir.Assign( dest = exit_flag, src = ir.Const( type = bool_cls, value = False )))
+				for stmt in node.finalbody:
+					try:
+						self._lower_stmt( stmt )
+					except CompileError:
+						continue
 
 	def _static_type_of_value_expr( self, node: ast.expr ) -> Type|None:
 		# compile-time-only: the static type of a value-shaped expression
@@ -7099,6 +7282,26 @@ class FunctionLowering:
 						return True
 		return False
 
+	def _try_diverges( self, node: ast.Try ) -> bool:
+		''' 3-way generalization of _stmt_diverges's own ast.If case, for a
+		try statement: true iff EVERY reachable path out of body/else/
+		handlers already diverges - i.e. nothing can fall through to the
+		try statement's own natural end. Does NOT factor in finalbody's own
+		divergence - _stmt_diverges' own ast.Try branch checks that
+		separately (finally runs on every path, including the ones this
+		already counts as diverging, so it can't change the answer here
+		either way); _stmt_Try's own fallthrough-inline decision (whether to
+		disarm and inline finalbody directly, vs. leave it to fire once from
+		the function's real epilogue on every path already diverging) reuses
+		this same computation. '''
+		tail = node.orelse if node.orelse else node.body
+		if not tail or not self._stmt_diverges( tail[-1] ):
+			return False
+		for h in node.handlers:
+			if not h.body or not self._stmt_diverges( h.body[-1] ):
+				return False
+		return True
+
 	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
 		''' true if `stmt` never falls through to the statement after it -
 		either structurally (return/break/continue) or because it's a bare
@@ -7143,6 +7346,15 @@ class FunctionLowering:
 				bool( stmt.body ) and self._stmt_diverges( stmt.body[-1] )
 				and bool( stmt.orelse ) and self._stmt_diverges( stmt.orelse[-1] )
 			)
+		if isinstance( stmt, ast.Try ):
+			# finalbody itself diverging (a bare `return`/panic in a
+			# `finally:` block) makes the WHOLE construct diverge
+			# regardless of body/else/handlers - it runs unconditionally on
+			# every exit path, so nothing downstream is ever reachable
+			# either way. Otherwise: see _try_diverges's own docstring
+			if stmt.finalbody and self._stmt_diverges( stmt.finalbody[-1] ):
+				return True
+			return self._try_diverges( stmt )
 		if (
 			isinstance( stmt, ast.While ) and isinstance( stmt.test, ast.Constant ) and stmt.test.value is True
 			and not self._loop_has_reachable_break( stmt.body )
@@ -13702,6 +13914,99 @@ class FunctionLowering:
 			return None
 		return unwrapped
 
+	def _lower_or_throw( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
+		''' <result_expr>.or_throw() - like or_return() above (same "no real
+		method, recognized by AST shape alone" story - see _lower_or_return's
+		own comment), except each leaf of the Err branch first checks the
+		INNERMOST enclosing try's own except clauses (self._try_stack[-1],
+		textually inside this SAME function - see TryContext's own
+		docstring) before falling back to EXACTLY or_return()'s own
+		propagate-to-the-caller behavior for any leaf left uncovered (or
+		every leaf, when there's no enclosing try at all - self._try_stack
+		empty). Nested try does NOT search past the innermost one - only
+		ever reads self._try_stack[-1], never walks the rest of the stack -
+		a documented scope limitation (see _stmt_Try's own docstring), not a
+		bug.
+
+		Can't just reuse _consume_checked_result (it always emits an
+		unconditional OrReturn/OrJump - there's no way to thread a per-leaf
+		dispatch table through it) - this replays its checked-result
+		bookkeeping (unchecked-result clearing, epilogue-label lookup) by
+		hand instead, then builds ir.OrThrow directly. '''
+		if node.args or node.keywords:
+			self.lowering.discovery.fail( f'or_throw() takes no arguments: {ast.unparse(node)}', node )
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'or_throw() is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+		if self._in_inline_splice_prelude:
+			# unlike or_return(), or_throw() has no inline_exit shape at all
+			# (ir.OrThrow's own docstring) - rejected outright rather than
+			# generalized, for now
+			self.lowering.discovery.fail(
+				f'@inline: or_throw() is not supported before the final return of a multi-statement body: {ast.unparse(node)}', node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		if shape is None:
+			self.lowering.discovery.fail( f'or_throw() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		result_type, error_cls = shape
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+
+		ctx = self._try_stack[-1] if self._try_stack else None
+		all_leaves = self.lowering._type_resolver._atomic_leaves( error_cls )
+		dispatch: list[ir.ThrowLeaf] = []
+		covered_leaves: list[Type] = []
+		if ctx is not None:
+			for leaf in all_leaves:
+				handler = next( ( h for h in ctx.handlers if leaf in h.leaves ), None )
+				if handler is not None:
+					dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.bind, label = handler.label ))
+					covered_leaves.append( leaf )
+
+		self.lowering._type_resolver._require_or_throw_return(
+			node, result_cls, error_cls, covered_leaves, self.lowering._OR_THROW_ALTERNATIVES, fn = self._current_fn,
+		)
+
+		# same bookkeeping _consume_checked_result runs for or_return() -
+		# see its own comment on why both are needed
+		if isinstance( receiver, Variable ):
+			self._cfg.clear_result( receiver.stem )
+		try:
+			self._cfg.check_unchecked_results( None )
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+
+		unwrapped = self._new_temp( result_type )
+		all_covered = len( covered_leaves ) == len( all_leaves )
+		if all_covered:
+			# every leaf dispatches straight into a handler - no
+			# propagation path exists at all, so the enclosing function's
+			# own epilogue/return-type machinery is never touched (also
+			# matches _require_or_throw_return's own "no requirement at
+			# all" contract above)
+			self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch ))
+		else:
+			tracked_operand = receiver if isinstance( receiver, Variable ) else None
+			label = self._cfg.current_epilogue_label( tracked_operand )
+			if label is not None:
+				self._emit( ir.OrThrow(
+					dest = unwrapped, value = receiver, dispatch = dispatch, target = label, return_slot = self._return_value_var,
+				))
+			else:
+				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+				self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch, epilogue = replay ))
+
+		# same borrow-then-incref rationale as _consume_checked_result's own
+		# identical tail (see its own comment) - a no-op for a non-RC
+		# result_type
+		for instr in self._cfg.incref( unwrapped.type, unwrapped ):
+			self._emit( instr )
+
+		if not want_result:
+			self._emit( ir.MarkUsed( operand = unwrapped ))
+			return None
+		return unwrapped
+
 	def _lower_parameter_default( self, target: Function, param: Parameter ) -> ir.Operand:
 		''' an omitted argument's default VALUE, lowered in the DEFINING
 		function/class's own module/scope - not the caller's: a default
@@ -15059,6 +15364,14 @@ class FunctionLowering:
 			# fails there, with the same message as before.
 			receiver = self._lower_expr( node.func.value, None )
 			return self._lower_or_return( node, receiver, want_result )
+
+		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_throw':
+			# <result_expr>.or_throw() - same recognition shape as or_return()
+			# just above (see its own comment) - discovery.py rejects a
+			# user-written `def or_throw(...)` outright, on any class, the
+			# same way
+			receiver = self._lower_expr( node.func.value, None )
+			return self._lower_or_throw( node, receiver, want_result )
 
 		# each recognizer returns None (not an error) when this call doesn't
 		# match its own construction-sugar shape at all, falling through to

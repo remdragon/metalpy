@@ -2905,6 +2905,15 @@ class Discovery( ast.NodeVisitor ):
 				node,
 			)
 
+		if node.name == 'or_throw':
+			# same reservation as 'or_return' above, for Result[T,E].or_throw() -
+			# see _lower_or_throw's own comment
+			self.fail(
+				f"'or_throw' is reserved for the compiler's own Result[T,E].or_throw() - it can't be defined as a real "
+				f'function or method: {qualname}',
+				node,
+			)
+
 		is_overload = False
 		is_static = False
 		is_classmethod = False

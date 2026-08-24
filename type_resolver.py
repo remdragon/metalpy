@@ -3925,6 +3925,32 @@ class TypeResolver:
 				node,
 			)
 
+	def _require_or_throw_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, covered_leaves: list[Type], alternatives: str, fn: Function|None = None ) -> None:
+		''' like _require_result_return, but for .or_throw(): only the
+		leaves of error_cls NOT already covered by covered_leaves (the
+		innermost enclosing try's own except-clause dispatch) need to be
+		coverable by the enclosing function's own return type. If every
+		leaf is covered by an except clause, the function's return type is
+		under NO obligation at all - unlike or_return(), which always
+		requires full coverage. '''
+		wanted = [ leaf for leaf in self._atomic_leaves( error_cls ) if leaf not in covered_leaves ]
+		if not wanted:
+			return
+		return_type = fn.return_type if fn is not None else None
+		spec = self._as_specialization( return_type )
+		covered = False
+		if fn is not None and spec is not None and spec.base is result_cls and len( spec.args ) == 2:
+			fn_error_leaves = self._atomic_leaves( spec.args[1] )
+			covered = all( leaf in fn_error_leaves for leaf in wanted )
+		if not covered:
+			want = ' | '.join( sorted( leaf.stem for leaf in wanted ))
+			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
+			self.discovery.fail(
+				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
+				f'(or a wider union covering it) ({where}) - {alternatives}',
+				node,
+			)
+
 	def _require_chained_result_return( self, node: ast.AST, result_cls: ClassLike, error_classes: list[ClassLike], alternatives: str, fn: Function|None = None ) -> None:
 		''' Same coverage/widening contract as _require_result_return, but for
 		several fallible steps chained in one statement (AugAssign's Subscript-
@@ -5030,6 +5056,23 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					# down not being recognized as exhaustive, and ultimately
 					# into a spurious "falls off the end" the definite-return
 					# check this bug was found alongside would otherwise wrongly reject).
+					receiver_spec = self.resolver._as_specialization( receiver_type )
+					receiver_cls_base = receiver_spec.base if receiver_spec is not None else receiver_type
+					if (
+						receiver_cls_base is self.discovery.find_name_or_none( 'Result' )
+						and receiver_spec is not None and receiver_spec.args
+					):
+						return receiver_spec.args[0]
+					return None
+				if node.func.attr == 'or_throw':
+					# <result_expr>.or_throw() - same Ok-path type as
+					# or_return() above (see that branch's comment); or_throw
+					# additionally may dispatch into an except handler on the
+					# Err path, but that never changes the Ok-path type
+					receiver_type = self._type_of_expr( node.func.value )
+					if receiver_type is None:
+						return None
+					receiver_type = self.resolver.ensure_resolved( receiver_type )
 					receiver_spec = self.resolver._as_specialization( receiver_type )
 					receiver_cls_base = receiver_spec.base if receiver_spec is not None else receiver_type
 					if (

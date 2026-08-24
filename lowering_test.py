@@ -9240,6 +9240,68 @@ class InOperatorRealBuiltinsTests( unittest.TestCase ):
 		calls = [ i for i in lowered.instructions if isinstance( i, ir.Call ) ]
 		self.assertTrue( any( c.target.stem == '__contains__' for c in calls ))
 
+# --- try/except/.or_throw() ------------------------------------------------
+
+class TryExceptOrThrowLoweringTests( unittest.TestCase ):
+	''' limited try/except/else/finally + Result.or_throw() (see PLAN in the
+	task/commit that added this) - real builtins needed (list[T].__getitem__'s
+	real Result[T,IndexError], str's real __str__/f-string support), same
+	reason InOperatorRealBuiltinsTests keeps its own import_builtins=True
+	setUp instead of sharing the main Tests class's minimal fixture. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def test_or_throw_dispatches_to_matching_except_handler( self ) -> None:
+		# list[T].__getitem__ declares -> Result[T,IndexError] - a single
+		# OPAQUE leaf (not a union), fully covered by the one except clause
+		# below, so this needs no ir.OrReturn/ir.OrJump widening code at all
+		# (foo() itself declares no Result return type, and needs none -
+		# _require_or_throw_return's own "no requirement when every leaf is
+		# covered" contract)
+		code = '\n'.join([
+			'def foo() -> None:',
+			'	ar: list[str] = list[str]()',
+			'	try:',
+			"		print( ar[0].or_throw() )",
+			'	except IndexError as e:',
+			'		compiler.decref( e )',
+		])
+		mod = self._import( code )
+		foo_fn = mod.get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		fn = self.compiler._lower( foo_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+		throws = [ i for i in fn.instructions if isinstance( i, ir.OrThrow ) ]
+		self.assertEqual( len( throws ), 1, f'expected exactly one ir.OrThrow, got: {fn.instructions!r}' )
+		throw = throws[0]
+		# fully covered - no propagate-to-caller fallback shape at all
+		self.assertEqual( throw.epilogue, [] )
+		self.assertIsNone( throw.target )
+		self.assertIsNone( throw.return_slot )
+		self.assertEqual( len( throw.dispatch ), 1, f'expected exactly one dispatch entry (IndexError is a single opaque leaf), got: {throw.dispatch!r}' )
+		leaf = throw.dispatch[0]
+		self.assertEqual( leaf.leaf.qualname, 'builtins.IndexError' )
+		self.assertIsNotNone( leaf.bind )
+		self.assertEqual( leaf.bind.stem, 'e' )
+		self.assertEqual( leaf.bind.type.qualname, 'builtins.IndexError' )
+
+		# the handler's own label is a real Label somewhere in this
+		# function's instructions, and leaf.label jumps into it
+		labels = { i.name for i in fn.instructions if isinstance( i, ir.Label ) }
+		self.assertIn( leaf.label, labels )
+
+		# no or_return()-style unconditional propagation anywhere in this
+		# function - or_throw()'s own Err branch is fully handled by the
+		# dispatch above, not by a separate OrReturn/OrJump
+		self.assertFalse( any( isinstance( i, ( ir.OrReturn, ir.OrJump )) for i in fn.instructions ))
+
 # --- @inline (PLAN_INLINE.md) -------------------------------------------
 
 class InlineTests( unittest.TestCase ):

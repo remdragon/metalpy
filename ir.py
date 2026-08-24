@@ -435,6 +435,44 @@ class OrJump( Instruction ):
 		return f'OrJump( dest={self.dest!r}, value={self.value!r}, target={self.target!r}, return_slot={self.return_slot!r} )'
 
 @dataclass( kw_only = True )
+class ThrowLeaf:
+	''' one covered leaf of an ir.OrThrow's own error type - matched by
+	identity against the Err branch's runtime tag (same identity-leaf
+	convention _atomic_leaves/_union_member already use). `bind` is the
+	real local Variable `except T as e:` binds (None for a bare `except
+	T:`) - emitter_c.py assigns the narrowed payload into it, as an
+	ordinary already-registered local, before jumping to `label`. '''
+	leaf: Type
+	bind: 'Variable|None'
+	label: str
+
+@dataclass( kw_only = True )
+class OrThrow( Instruction ):
+	''' Result.or_throw(): like OrReturn/OrJump, but each leaf of the Err
+	branch's error type is checked against `dispatch` first - a leaf
+	matched there jumps straight into that except handler (binding its
+	payload if the clause names one), NEVER touching the enclosing
+	function's own return type at all. Only a leaf with NO entry in
+	dispatch falls back to exactly OrReturn's (target is None) or OrJump's
+	(target is a real epilogue label) own propagate-to-caller behavior -
+	`epilogue`/`target`/`return_slot` mirror those two instructions
+	exactly, and are only ever consulted along that uncovered-leaf path
+	(built and legality-checked by lowering.py only when at least one leaf
+	is actually uncovered - see _lower_or_throw). No inline_exit field:
+	.or_throw() inside an @inline splice's pre-return statements is
+	rejected outright (see discovery.py/_lower_or_throw), unlike
+	.or_return(), which supports it. '''
+	dest: Temp
+	value: Operand # a Result[T,E]
+	dispatch: list[ThrowLeaf]
+	epilogue: list['Instruction'] = field( default_factory = list )
+	target: str|None = None # None -> real C `return`, matching OrReturn; a real label -> `goto`, matching OrJump
+	return_slot: 'Variable|None' = None # only meaningful when target is not None
+
+	def test_repr( self ) -> str:
+		return f'OrThrow( dest={self.dest!r}, value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
+
+@dataclass( kw_only = True )
 class Unwrap( Instruction ): # Result.unwrap(errmsg): Err -> panic(errmsg); Ok -> dest = payload
 	dest: Temp
 	value: Operand # a Result[T,E]
