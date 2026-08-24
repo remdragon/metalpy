@@ -6540,8 +6540,40 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return result
 
 		if narrow_member is None or subject_name is None:
+			# self.locals is unscoped - a plain Assign inside either branch
+			# (visit_Assign) permanently overwrites it, so without saving/
+			# restoring around each branch a conditional reassignment (e.g.
+			# `if True: pattern = 'x'` when pattern was `str|None`) would
+			# leak its narrower type past the WHOLE if, even though the
+			# branch might not have executed. Recompute the post-if type per
+			# name as the merge of both branches (falling back to the
+			# pre-if type for a branch that left it untouched), same as
+			# cfg.py's real join logic - except when one branch diverges
+			# (_stmt_diverges), where only the other branch's ending value
+			# reaches the join at all.
+			locals_before = dict( self.locals )
 			node.body = _visit_stmts( node.body )
+			locals_after_body = self.locals
+			body_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
+			self.locals = dict( locals_before )
 			node.orelse = _visit_stmts( node.orelse )
+			locals_after_orelse = self.locals
+			orelse_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
+			if body_terminates and not orelse_terminates:
+				self.locals = locals_after_orelse
+			elif orelse_terminates and not body_terminates:
+				self.locals = locals_after_body
+			else:
+				merged: dict[str,Type] = {}
+				for key in set( locals_before ) | set( locals_after_body ) | set( locals_after_orelse ):
+					before_type = locals_before.get( key )
+					body_type = locals_after_body.get( key, before_type )
+					orelse_type = locals_after_orelse.get( key, before_type )
+					if body_type is not None and body_type is orelse_type:
+						merged[key] = body_type
+					elif before_type is not None:
+						merged[key] = before_type
+				self.locals = merged
 			return node
 
 		narrowed_body = node.body if is_not else node.orelse
@@ -6753,10 +6785,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		precise - identical tradeoff to _type_of_expr's own narrowed
 		lookup falling back for a multi-element set). '''
 		case_entry_narrowed = dict( self._narrowed )
+		case_entry_locals = dict( self.locals )
 		try:
 			self.generic_visit( node )
 		finally:
 			self._narrowed = case_entry_narrowed
+			# same stale-leak hazard as self._narrowed above, but for
+			# self.locals: the loop might run zero times, so a plain Assign
+			# inside its body (visit_Assign unconditionally overwrites
+			# self.locals) must not be assumed to have happened once back
+			# outside - confirmed via a real regression (`pattern: str|None
+			# = None; for arg in args: pattern = arg; if not pattern: ...`
+			# wrongly stopped recognizing the trailing bare-truthiness check
+			# as a narrowable union, because self.locals still held the
+			# loop body's plain str type instead of pattern's real
+			# declared str|None).
+			self.locals = case_entry_locals
 		return node
 
 	def visit_BoolOp( self, node: ast.BoolOp ) -> ast.expr:
