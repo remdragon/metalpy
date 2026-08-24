@@ -6353,6 +6353,27 @@ class FunctionLowering:
 		# re-evaluated every time the bottom Jump loops back
 		self._emit( ir.Label( name = start_label ))
 		test = self._lower_truth_test( node.test )
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: the condition is lowered
+		# ONCE here (Python-level), but the resulting C instructions sit
+		# physically between start_label and the back-edge Jump below, so
+		# they RE-EXECUTE every real iteration. Any RC temp retained while
+		# evaluating it (e.g. Part B's own retain-on-read for a chained
+		# field receiver, `self.a.b`) needs a decref EVERY iteration too -
+		# the ordinary once-per-statement flush _lower_stmt's own wrapper
+		# provides only fires once, AFTER this whole method returns,
+		# confirmed as a real per-iteration leak (compiler.refcount()
+		# regression: a generator's own `while i < b.v:`, b a captured
+		# field, leaked one reference per resumption). Flushed here,
+		# unconditionally, before JumpIfFalse even reads `test` - safe
+		# even though `test` itself is one of the flushed temps:
+		# ir.DeleteTemp is a pure bookkeeping no-op at emission time ("C
+		# block scoping already handles temp lifetime" - emitter_c.py's own
+		# comment), so `test`'s C variable stays perfectly readable
+		# immediately after. Every OTHER temp the condition created (in
+		# particular any Part-B-retained receiver) gets its real decref
+		# here instead, every single iteration, exactly matching how many
+		# times the matching Incref actually ran.
+		self._flush_pending_temps()
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
 		# continue_captured unused here - start_label (this loop's own

@@ -111,9 +111,22 @@ def _object_header_prologue() -> str:
 	since the field's own C type depends on _target_os, which is only known
 	once emit_c() itself has set it (module-level constants can't see that -
 	see _target_os's own docstring on why it's set inside emit_c(), not at
-	import time). '''
+	import time). On POSIX, a genuine `#include <pthread.h>` right here,
+	NOT left to emit_c()'s own general required_headers collection loop -
+	that loop runs LATER, after this whole prologue (this is the very
+	FIRST thing emit_c() assembles) - confirmed as a real bug, not just
+	theoretical ordering pedantry: without a real prior declaration in
+	scope, `pthread_mutex_t lock;` here silently fell back to C's
+	legacy "implicit int" behavior on gcc (no error, just a wrong field
+	type - every subsequent `pthread_mutex_init(&obj->$header.lock, ...)`
+	call site then failed as "incompatible pointer type", since the field
+	was actually a plain int). A repeated `#include <pthread.h>` is always
+	safe (real header, standard include guards) even if something else in
+	the program ALSO required it independently - never a redundant include
+	system's problem to avoid, that's what include guards are for. '''
 	field = _PROLOGUE_HEADER_FIELD_PTHREAD if _target_uses_pthread_lock() else _PROLOGUE_HEADER_FIELD_WINDOWS
-	return _PROLOGUE_HEADER_FIXED + field + '} ObjectHeader;\n'
+	header_include = '#include <pthread.h>\n' if _target_uses_pthread_lock() else ''
+	return header_include + _PROLOGUE_HEADER_FIXED + field + '} ObjectHeader;\n'
 
 # only needed where an ir.Incref is actually emitted (see emit_c) - a
 # program that only ever gives up references (or never touches an RCClass
