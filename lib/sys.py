@@ -274,18 +274,9 @@ _raw_argc: i32 = 0
 _raw_argv: Ptr[Ptr[u8]] = None
 
 @compiler.target( os = 'windows' )
-def _wcslen( ptr: ConstPtr[u16], max_len: usize ) -> usize:
-	n: usize = 0
-	with compiler.wrap_arithmetic:
-		while n < max_len and ptr[n] != 0:
-			n += 1
-	return n
-
-@compiler.target( os = 'windows' )
 def _build_argv() -> list[str]:
 	from windows.kernel32 import GetCommandLineW, LocalFree
 	from windows.shell32 import CommandLineToArgvW
-	from codecs.utf16 import utf16
 
 	result: list[str] = list[str]()
 	argc: i32 = 0
@@ -297,14 +288,10 @@ def _build_argv() -> list[str]:
 		with compiler.panic_arithmetic( 'argc is never negative once positive-checked above' ):
 			count: usize = usize( argc )
 		i: usize = 0
-		with compiler.panic_arithmetic( 'bounded by count/wcslen, cannot overflow' ):
+		with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
 			while i < count:
 				w: ConstPtr[u16] = argv_w[i]
-				n: usize = _wcslen( w, 1_000_000 )
-				byte_len: usize = n * 2
-				buf = bytearray( byte_len )
-				memcpy( buf.get_ptr(), compiler.cast( ConstPtr[u8], w ), byte_len )
-				s: str = utf16.decode( buf ).unwrap( 'sys.argv: invalid UTF-16 in argument' )
+				s: str = str.from_utf16( w, 1_000_000 ).unwrap( 'sys.argv: invalid UTF-16 in argument' )
 				result.append( s )
 				i += 1
 	return result

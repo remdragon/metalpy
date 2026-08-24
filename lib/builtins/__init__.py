@@ -684,7 +684,28 @@ class str:
 				# but now the release failed and src isn't usable anymore because of @move
 				# e is a OwnershipError.SharedReference, which carries the object back to us
 				return str.from_cstr( src2.get_const_ptr(), byte_size )
-	
+
+	@staticmethod
+	def from_utf16( ptr: ConstPtr[u16], max_len: usize ) -> Result[str,CodecError]:
+		'''
+		build a str from a null-terminated UTF-16 (native-endianness) buffer
+		- e.g. a Win32 LPCWSTR. max_len bounds the terminator scan, in u16
+		units, not including it (mirrors sys.cstrlen's own max_length cap
+		for u8 C strings).
+		'''
+		from codecs.utf16 import utf16
+		n: usize = 0
+		with compiler.wrap_arithmetic:
+			while n < max_len and ptr[n] != 0:
+				n += 1
+		if n == max_len:
+			return Result.Err( CodecError( 'utf-16le', 'missing null terminator' ))
+		with compiler.panic_arithmetic( 'bounded by max_len, cannot overflow' ):
+			byte_len: usize = n * 2
+		buf = bytearray( byte_len )
+		sys.memcpy( buf.get_ptr(), compiler.cast( ConstPtr[u8], ptr ), byte_len )
+		return utf16.decode( buf )
+
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
 	
