@@ -154,9 +154,9 @@ def main() -> i32:
 # globals_test.py's own test_narrowed_read_concurrent_stress, stressing
 # _expr_Attribute's is_narrowed branch (Acquire, GetAttr, extract payload,
 # Incref, Release, all one critical section) against a concurrent writer,
-# without relying on this compiler's own separate (and today unsupported)
-# "assign inside `if x is None:`, narrow on the merged path afterward" field
-# shape - g is never reassigned to None here, so the narrowed branch is
+# without relying on this compiler's own separate "assign
+# inside `if x is None:`, narrow on the merged path afterward" field shape -
+# g is never reassigned to None here, so the narrowed branch is
 # unconditionally taken on every read; a torn/freed read would surface as
 # a garbage/incorrect .x value, caught below.
 _NARROWED_FIELD_READ_CONCURRENT_STRESS = '''
