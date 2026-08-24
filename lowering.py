@@ -4917,6 +4917,34 @@ class FunctionLowering:
 			return any( self._stmt_may_break_or_continue( s, in_nested_loop ) for lst in lists for s in lst )
 		return False
 
+	def _body_contains_return( self, body: list[ast.stmt] ) -> bool:
+		''' true if `return` appears anywhere in `body` (recursively, through
+		nested if/while/for/with/try - match is already desugared to chained
+		ast.If by the time lowering.py runs). Used to reject `return` inside a
+		try-statement's own `finally:` body: `finally` is captured ONCE
+		(_register_defer_block) and replayed via goto at every early-exit
+		path the try/except construct has, PLUS inlined directly at its own
+        normal-fallthrough point - a real `return` baked into that captured
+		replay would fire from whichever of those unrelated call sites
+		happens to replay it, discarding that path's own actual return value
+		(Python's own well-known finally-return footgun, made structurally
+		worse here since one `return` would silently execute at multiple,
+		textually-unrelated points instead of just shadowing the one
+		enclosing try/except it lexically appears in). '''
+		return any( self._stmt_contains_return( stmt ) for stmt in body )
+
+	def _stmt_contains_return( self, stmt: ast.stmt ) -> bool:
+		if isinstance( stmt, ast.Return ):
+			return True
+		if isinstance( stmt, ast.With ):
+			return any( self._stmt_contains_return( s ) for s in stmt.body )
+		if isinstance( stmt, ( ast.For, ast.While, ast.If )):
+			return any( self._stmt_contains_return( s ) for s in stmt.body + stmt.orelse )
+		if isinstance( stmt, ast.Try ):
+			lists = [ stmt.body, stmt.orelse, stmt.finalbody ] + [ h.body for h in stmt.handlers ]
+			return any( self._stmt_contains_return( s ) for lst in lists for s in lst )
+		return False
+
 	def _stmt_TryStar( self, node: ast.stmt ) -> None:
 		# ast.TryStar (`try: ... except* T:`) reuses ast.ExceptHandler for
 		# its own handlers, so it isn't distinguishable from ast.Try by
@@ -4991,6 +5019,12 @@ class FunctionLowering:
 				fn.add_name( bind_var.stem, bind_var )
 			handlers.append( TryHandler( leaves = leaves, label = label, bind = bind_var ))
 		end_label = self._new_label( 'try_end' )
+
+		if node.finalbody and self._body_contains_return( node.finalbody ):
+			self.lowering.discovery.fail(
+				'finally: return statements are not allowed inside a finally block - a return here would silently '
+				f'discard whatever the try/except was actually about to return: {ast.unparse(node)}', node,
+			)
 
 		exit_flag: Variable|None = None
 		if node.finalbody:

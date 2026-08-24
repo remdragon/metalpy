@@ -277,6 +277,59 @@ def main() -> i32:
 	return 0
 '''
 
+_ALL_PARTS_TOGETHER = '''
+class Counter:
+	n: i32
+
+def bump( c: Counter ) -> None:
+	with compiler.wrap_arithmetic:
+		c.n = c.n + 1
+
+class SomeError:
+	pass
+
+def risky( bad: bool ) -> Result[i32, SomeError]:
+	if bad:
+		return Result.Err( SomeError() )
+	return Result.Ok( 3 )
+
+def run( c: Counter, bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		v: i32 = risky( bad ).or_throw() # always runs
+	except SomeError as e: # only runs if there's an unhandled Result
+		result = -1
+	else: # only runs if no except triggered
+		result = v
+	finally: # always runs, even on the early-return path below
+		bump( c )
+	return result
+
+def run_early_return( c: Counter ) -> i32:
+	try:
+		return 42
+	except SomeError as e:
+		return -1
+	finally:
+		bump( c )
+
+def main() -> i32:
+	c: Counter = Counter( n = 0 )
+	if run( c, False ) != 3:
+		return 1
+	if c.n != 1:
+		return 2
+	if run( c, True ) != -1:
+		return 3
+	if c.n != 2:
+		return 4
+	if run_early_return( c ) != 42:
+		return 5
+	if c.n != 3:
+		return 6
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile try/except tests' )
 class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
@@ -300,6 +353,12 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_or_throw_with_no_enclosing_try_is_like_or_return( self ) -> None:
 		self.assert_programs_run([ ( 'or_throw_no_try', _OR_THROW_WITH_NO_ENCLOSING_TRY_IS_LIKE_OR_RETURN ) ])
+
+	def test_all_parts_together_matches_python_shape( self ) -> None:
+		# try body always runs; except only runs on an unhandled Result;
+		# else only runs when no except fired; finally always runs, even on
+		# an early return out of the try body
+		self.assert_programs_run([ ( 'all_parts_together', _ALL_PARTS_TOGETHER ) ])
 
 
 # --- compile-error coverage (no real C compiler needed) ---------------------
@@ -454,6 +513,35 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		if fn.resolve is not None:
 			fn.resolve()
 		self.assertTrue( any( 'nested Result' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	def test_return_inside_finally_is_rejected( self ) -> None:
+		# Python's own well-known footgun: a return in finally silently
+		# discards whatever the try/except was actually about to return -
+		# rejected outright here rather than allowed
+		code = '\n'.join([
+			'def run() -> i32:',
+			'	try:',
+			'		pass',
+			'	finally:',
+			'		return 1',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'finally' in e and 'return' in e for e in errors ), errors )
+
+	def test_return_inside_nested_if_within_finally_is_rejected( self ) -> None:
+		# the rejection recurses through nested if/while/for/with/try, not
+		# just a bare top-level return statement
+		code = '\n'.join([
+			'def run( x: bool ) -> i32:',
+			'	try:',
+			'		pass',
+			'	finally:',
+			'		if x:',
+			'			return 1',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'finally' in e and 'return' in e for e in errors ), errors )
 
 	def test_nested_result_as_union_leaf_is_rejected( self ) -> None:
 		code = '\n'.join([
