@@ -10422,7 +10422,154 @@ def main() -> i32:
 		return 4
 	return 0
 ''' ),
+			# for-loop iteration over an RC-element tuple[T,...] with ZERO
+			# elements - the exact shape of a real, confirmed bug
+			# (lowering.py's _lower_for_over_indexable, fixed separately -
+			# "Fix for-loop-over-indexable RC element temp leaking outside
+			# the loop"): the loop body never running at all used to leak a
+			# per-iteration temp's cleanup outside the loop, reading
+			# uninitialized stack memory as an ObjectHeader*. VariadicTuple
+			# has no direct __next__ (only __iter__, used by min/max/sum/
+			# etc., not by `for x in t:` itself - list[T] has the identical
+			# split), so `for x in some_tuple:` genuinely goes through
+			# _lower_for_over_indexable, not the generator path - this is a
+			# real regression guard, not a redundant check.
+			( 'empty_and_single_element_iteration_no_crash', '''
+class Elem:
+	pass
+
+def main() -> i32:
+	empty: tuple[Elem, ...] = tuple( list[Elem]() )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		for e in empty:
+			count += 1
+	if count != 0:
+		return 1
+	single_src: list[Elem] = list[Elem]()
+	single_src.append( Elem() )
+	single: tuple[Elem, ...] = tuple( single_src )
+	count = 0
+	with compiler.wrap_arithmetic:
+		for e in single:
+			count += 1
+	if count != 1:
+		return 2
+	return 0
+''' ),
+			# RC-correctness across a full for-loop: no leak, no premature
+			# free of any element once the loop (and its own per-iteration
+			# binds) finishes
+			( 'iteration_rc_refcount_stable_across_full_loop', '''
+class Elem:
+	pass
+
+def main() -> i32:
+	xs: list[Elem] = list[Elem]()
+	a: Elem = Elem()
+	b: Elem = Elem()
+	c: Elem = Elem()
+	xs.append( a )
+	xs.append( b )
+	xs.append( c )
+	t: tuple[Elem, ...] = tuple( xs )
+	before_a: usize = compiler.refcount( a )
+	before_b: usize = compiler.refcount( b )
+	before_c: usize = compiler.refcount( c )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		for e in t:
+			count += 1
+	if count != 3:
+		return 1
+	if compiler.refcount( a ) != before_a:
+		return 2
+	if compiler.refcount( b ) != before_b:
+		return 3
+	if compiler.refcount( c ) != before_c:
+		return 4
+	return 0
+''' ),
+			# slicing edge cases: empty source, empty result (both an
+			# explicit empty range and inverted bounds), out-of-range
+			# clamping, a full unbounded slice, and slice-of-a-slice
+			( 'slicing_edge_cases', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	empty: tuple[i32, ...] = tuple( list[i32]() )
+	if len( empty[0:5] ) != 0: # slicing an empty tuple
+		return 1
+	if len( t[1:1] ) != 0: # explicit empty range
+		return 2
+	if len( t[2:0] ) != 0: # inverted bounds
+		return 3
+	if len( t[1:99] ) != 2: # out-of-range clamps
+		return 4
+	full = t[:]
+	if len( full ) != 3 or not ( full == t ):
+		return 5
+	mid = t[0:2]
+	inner = mid[1:2]
+	if len( inner ) != 1 or inner.__getitem__( 0 ).unwrap( 'idx' ) != 2:
+		return 6
+	return 0
+''' ),
+			# iterate a SLICE result directly, and iterate the same tuple
+			# twice + nested (no shared mutable iterator state - each for-
+			# loop is its own independent index walk, not a stored cursor)
+			( 'iterate_slice_result_and_repeated_nested_iteration', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t[1:3]:
+			total += v
+	if total != 5:
+		return 1
+	total1: i32 = 0
+	total2: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t:
+			total1 += v
+		for v in t:
+			total2 += v
+	if total1 != 6 or total2 != 6:
+		return 2
+	pairs: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t:
+			for w in t:
+				pairs += 1
+	if pairs != 9:
+		return 3
+	return 0
+''' ),
 		] )
+
+	def test_variadic_tuple_slice_step_is_rejected( self ) -> None:
+		# unlike the fixed-arity tuple[T0,T1,...] (its own dedicated
+		# _lower_tuple_slice), tuple[T,...] goes through the generic
+		# __getitem__(slice) dispatch (_lower_slice_subscript) - same
+		# rejection, different code path
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	xs: list[i32] = list[i32]()',
+			'	xs.append( 1 )',
+			'	t: tuple[i32, ...] = tuple( xs )',
+			'	s = t[0:1:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
 
 
 class UnionLeafCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
