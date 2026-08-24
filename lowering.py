@@ -6594,7 +6594,23 @@ class FunctionLowering:
 		subscript.is_for_loop_element_read = True
 		bind = ast.Assign( targets = [ node.target ], value = subscript )
 		ast.copy_location( bind, node )
-		self._stmt_Assign( bind )
+		# _lower_stmt (not a direct self._stmt_Assign(bind) call) - this bind
+		# is lowered exactly ONCE at compile time but its own temps (e.g. the
+		# raw __getitem__ Result temp behind node.target, before Unwrap/
+		# OrReturn extracts+increfs its payload) need a PER-ITERATION decref,
+		# same as any other loop-body statement (matches this method's own
+		# comment above: "happens fresh every iteration, exactly like any
+		# other loop-body statement") - a bare self._stmt_Assign(bind) call
+		# skips _lower_stmt's own pending-temps save/reset/flush wrapper
+		# entirely, so that Result temp silently leaked into the ENCLOSING
+		# ast.For statement's own pending-temps list instead, flushed only
+		# ONCE, textually after the whole loop - reading UNINITIALIZED stack
+		# garbage as an ObjectHeader* and decref'ing it whenever the loop body
+		# never runs at all (e.g. an empty slice), a real, confirmed crash
+		# (illegal instruction / segfault, nondeterministic - stale/garbage
+		# stack reused as a fake RC object) via `for x in sys.argv[1:]:` with
+		# no extra command-line arguments.
+		self._lower_stmt( bind )
 
 		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
 		try:

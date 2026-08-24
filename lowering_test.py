@@ -4377,6 +4377,78 @@ class Tests( unittest.TestCase ):
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertIn( 'Unwrap', kinds )
 
+	def test_for_over_indexable_rc_element_decref_stays_inside_loop_body( self ) -> None:
+		# a real, confirmed bug found while fixing the two tests above: the
+		# per-iteration bind (`bind = ast.Assign(...)`) used to be lowered
+		# via a bare self._stmt_Assign(bind) call instead of self._lower_stmt
+		# (bind) - skipping _lower_stmt's own pending-temps save/reset/flush
+		# wrapper entirely. For an RC-typed __getitem__ payload, the raw
+		# Result temp behind node.target then leaked into the ENCLOSING
+		# ast.For statement's own pending-temps list instead of getting its
+		# own per-iteration flush, and was decref'd exactly ONCE, after the
+		# whole loop - reading UNINITIALIZED stack memory as an
+		# ObjectHeader* whenever the loop body never ran at all (a real,
+		# confirmed crash via `for arg in sys.argv[1:]: print(arg)` with no
+		# extra command-line arguments - empty slice, zero iterations).
+		#
+		# Needs the REAL builtins Result/slice[T] (not a synthetic @cstruct
+		# stand-in like the two tests above use) - confirmed empirically
+		# that a synthetic, non-union Result shim doesn't reproduce this at
+		# all (no separate Decref of the union's own v_Ok arm exists for
+		# it in the first place, unlike the real tagged-union Result). A
+		# real-compile-and-run reproduction is similarly unreliable (an
+		# uninitialized-memory read/an extra decref on a still-referenced
+		# object is UB, and doesn't reliably crash or show a wrong refcount
+		# under every build configuration/compiler - confirmed empirically
+		# that a real repro crashes when built via mpy.py's own CLI but not
+		# when built through this test suite's own compile-and-run harness).
+		# This checks the actual INVARIANT directly instead: the Result's
+		# own v_Ok-arm Decref must appear BEFORE the loop's back-edge Jump
+		# (i.e. genuinely inside the loop body, flushed every iteration),
+		# not after it.
+		code = '\n'.join([
+			'def main( xs: list[str] ) -> i32:',
+			'	ys = xs[1:]',
+			'	for y in ys:',
+			'		pass',
+			'	return 0',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		back_edge_indices = [
+			i for i, instr in enumerate( fn.instructions )
+			if type( instr ).__name__ == 'Jump' and instr.target.startswith( '__for_start_' )
+		]
+		self.assertEqual( len( back_edge_indices ), 1, 'expected exactly one for-loop back-edge Jump' )
+		back_edge = back_edge_indices[0]
+		# the leaked instruction's own shape (matches the real bug's C
+		# output exactly): GetAttr(...,attr='data') -> GetAttr(...,
+		# attr='v_Ok') -> Decref(value=<that v_Ok temp>) - a real,
+		# str-payload Result union being torn down. Filtering on
+		# `attr == 'v_Ok'` distinguishes this from the loop's OWN `y`
+		# variable's own, always-correctly-scoped Decref (index 70 in a
+		# real dump of this exact program) and from slice[str]/list[str]'s
+		# own unrelated cleanup Decrefs in the function epilogue.
+		ok_temp_ids = {
+			instr.dest.id for instr in fn.instructions
+			if type( instr ).__name__ == 'GetAttr' and instr.attr == 'v_Ok'
+		}
+		self.assertTrue( ok_temp_ids, 'expected at least one v_Ok GetAttr extracting the Result payload' )
+		v_ok_decref_indices = [
+			i for i, instr in enumerate( fn.instructions )
+			if type( instr ).__name__ == 'Decref'
+			and getattr( instr.value, 'id', None ) in ok_temp_ids
+		]
+		self.assertTrue( v_ok_decref_indices, 'expected a Decref of the Result\'s own v_Ok payload' )
+		self.assertTrue(
+			all( d < back_edge for d in v_ok_decref_indices ),
+			f'the Result\'s v_Ok Decref landed AFTER the loop back-edge Jump (index {back_edge}) - '
+			f'v_ok_decref_indices={v_ok_decref_indices} - this is the leaked-post-loop-flush bug: the '
+			f'element temp only gets decref\'d once (after the loop), not per iteration',
+		)
+
 	def test_for_over_indexable_missing_dunders_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'class Box:',
