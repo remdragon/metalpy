@@ -4123,6 +4123,37 @@ def main() -> i32:
 		return compute( 10 ) - 10
 ''', expected_exit = 0 )
 
+	def test_large_stack_frame_links_and_runs( self ) -> None:
+		# MSVC's own /Od backend silently emits `call __chkstk` in any
+		# function prologue whose local frame exceeds one page (4KB) - a
+		# freestanding no_crt build has no CRT to supply it (confirmed via a
+		# real LNK2019 "unresolved external symbol __chkstk" before
+		# linker_c.py's own _build_chkstk_obj started supplying an
+		# independently-assembled shim - see msvc_no_crt_missing_chkstk
+		# memory). 4096 i32 elements (16KB) spans 4 pages, exercising the
+		# shim's actual multi-page probe loop, not just its single-page fast
+		# path - clang/gcc need no such symbol at all (LLVM's own
+		# clang_rt.builtins already supplies the equivalent for a no_crt
+		# build), so this is a no-op assertion there, just extra coverage.
+		self._compile_and_run( '''
+@cstruct
+class BufLarge:
+	items: i32[4096] = 0
+
+def compute( x: i32 ) -> i32:
+	buf: BufLarge = BufLarge()
+	with compiler.wrap_arithmetic:
+		i: usize = usize( 0 )
+		while i < usize( 4096 ):
+			buf.items[i] = x + i32( i )
+			i += usize( 1 )
+		return buf.items[usize(4095)] - ( x + 4095 )
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return compute( 10 )
+''', expected_exit = 0 )
+
 class RequiresCrtDecoratorTests( unittest.TestCase ):
 	# @requires_crt (see mpy_types.Function.requires_crt/compiler.py's
 	# Compiler.requires_crt) - a library function marks itself, and if it's
