@@ -292,6 +292,7 @@ def _build_argv() -> list[str]:
 	argv_w: Ptr[Ptr[u16]] = CommandLineToArgvW( GetCommandLineW(), compiler.addrof( argc ))
 	if argv_w is None:
 		return result
+	defer( LocalFree( compiler.cast( Ptr[None], argv_w )))
 	if argc > 0:
 		with compiler.panic_arithmetic( 'argc is never negative once positive-checked above' ):
 			count: usize = usize( argc )
@@ -306,7 +307,6 @@ def _build_argv() -> list[str]:
 				s: str = utf16.decode( buf ).unwrap( 'sys.argv: invalid UTF-16 in argument' )
 				result.append( s ).unwrap( 'sys.argv: too many arguments' )
 				i += 1
-	LocalFree( compiler.cast( Ptr[None], argv_w ))
 	return result
 
 @compiler.target( os = not 'windows' )
