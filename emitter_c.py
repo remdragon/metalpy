@@ -2902,6 +2902,7 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	# just an ordinary re-assignment, not a second declaration
 	needs_return_value = any(
 		( isinstance( instr, ir.OrJump ) and instr.return_slot is not None )
+		or ( isinstance( instr, ir.OrThrow ) and instr.return_slot is not None ) # or_throw()'s own uncovered-leaf fallback, once a defer/errdefer is active - same shape as OrJump
 		or ( isinstance( instr, ir.Return ) and isinstance( instr.value, Variable ) and instr.value.stem == '__return_value' )
 		or ( isinstance( instr, ir.Label ) and instr.name.startswith( '__epilogue_' ) ) # _new_label('epilogue') -> '__epilogue_N__' - NOT a bare 'epilogue' substring test: _new_label('inline_epilogue') -> '__inline_epilogue_N__' also contains 'epilogue' but is a totally unrelated @inline splice-scope merge label (build_inline_scope_ladder's own, never touches __return_value at all) - a real, confirmed false-positive-triggered -Wunused-variable on a genuinely never-needed __return_value once one of those coexists in the same function with nothing that actually needs the real one
 		for instr in fn.instructions
@@ -3520,6 +3521,9 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return _emit_or_return( instr, function, declared )
 	if isinstance( instr, ir.OrJump ):
 		return _emit_or_jump( instr )
+	if isinstance( instr, ir.OrThrow ):
+		assert function is not None, 'ir.OrThrow requires the enclosing function (for its own uncovered-leaf return-type fallback)'
+		return _emit_or_throw( instr, function, declared )
 	if isinstance( instr, ir.WidenResult ):
 		return _emit_widen_result( instr )
 	if isinstance( instr, ir.Unwrap ):
@@ -3656,6 +3660,127 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 		# normal fallthrough
 		lines.append( f'\t\t{_emit_operand(instr.exited_flag)} = true;' )
 	lines.append( f'\t\tgoto {_c_label(instr.target)};' )
+	lines.append( '\t}' )
+	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
+	lines.extend( _mark_used_if_none( instr.dest ))
+	return lines
+
+def _emit_or_throw_leaf_case( instr: 'ir.OrThrow', leaf_type: Type, payload_expr: str, function: Function, declared: set[str] ) -> list[str]:
+	''' the body of ONE leaf's own `case`/single-leaf branch inside
+	_emit_or_throw - either dispatches into an except handler (a leaf
+	covered by instr.dispatch) or falls back to exactly OrReturn's/
+	OrJump's own propagate-to-caller shape (an uncovered leaf) - see
+	ir.OrThrow's own docstring. Matched by qualname, same convention
+	_union_member/_atomic_leaves already use.
+
+	Every case body here lives inside its OWN switch-case `{ }` block (see
+	_emit_or_throw) - an except-clause bind Variable is therefore declared
+	by the CALLER, before the switch, not here: `except (A, B) as e:`
+	produces one dispatch entry per leaf, each landing in a DIFFERENT case
+	block, and a C local declared inside one case's own block scope isn't
+	visible from another - only a hoisted, shared declaration lets both
+	cases assign into the same `e`. '''
+	entry = next( ( d for d in instr.dispatch if d.leaf.qualname == leaf_type.qualname ), None )
+	if entry is not None:
+		lines: list[str] = []
+		if entry.bind is not None:
+			bind_c = _c_local_name( entry.bind )
+			if entry.bind.type.qualname == leaf_type.qualname:
+				lines.append( f'\t\t{bind_c} = {payload_expr};' ) # plain leaf, or `except T as e:` with a single covered leaf
+			else:
+				# `except (A, B) as e:` - e's own type is the anonymous A|B
+				# union (see lowering.py's _stmt_Try) - widen this ONE
+				# leaf's payload into it, same shape _emit_widen_error's own
+				# single-class branch uses
+				assert isinstance( entry.bind.type, TaggedUnion ), f'{entry.bind.type!r}: except-clause bind is neither the single leaf nor a union of them'
+				ordinal, battr = _union_member( entry.bind.type, leaf_type )
+				btag_f, bdata_f = _union_tag_data_fields( entry.bind.type )
+				bfield = _field_name( f'v_{battr.stem}' )
+				lines.append( f'\t\t{bind_c}.{btag_f} = {ordinal};' )
+				lines.append( f'\t\t{bind_c}.{bdata_f}.{bfield} = {payload_expr};' )
+		lines.append( f'\t\tgoto {_c_label(entry.label)};' )
+		return lines
+	# uncovered leaf - propagate to the enclosing function exactly like
+	# OrReturn (instr.target is None) or OrJump (instr.target is a real
+	# epilogue label) already do, widening just THIS leaf (not the whole
+	# error union) into the target error type - see _emit_widen_error's
+	# own single-class branch, reached here because leaf_type itself is
+	# never a union (each dispatch entry/switch case is already one atomic leaf)
+	tag_f, data_f, _ok_f, err_f = _result_tag_data_names( instr.value.type )
+	epilogue_lines = _emit_instructions( instr.epilogue, function = function, declared = declared )
+	if instr.target is None:
+		ret_ctype = c_type( function.return_type )
+		e_fn = _result_error_type( function.return_type )
+		return [
+			f'\t\t{ret_ctype} __err;',
+			f'\t\t__err.{tag_f} = 1;',
+			*_emit_widen_error( f'__err.{data_f}.{err_f}', e_fn, payload_expr, leaf_type ),
+			*epilogue_lines,
+			'\t\treturn __err;',
+		]
+	assert instr.return_slot is not None
+	slot = _emit_operand( instr.return_slot )
+	e_fn = _result_error_type( instr.return_slot.type )
+	return [
+		f'\t\t{slot}.{tag_f} = 1;',
+		*_emit_widen_error( f'{slot}.{data_f}.{err_f}', e_fn, payload_expr, leaf_type ),
+		*epilogue_lines,
+		f'\t\tgoto {_c_label(instr.target)};',
+	]
+
+def _emit_or_throw( instr: 'ir.OrThrow', function: Function, declared: set[str] ) -> list[str]:
+	# Result.or_throw() - like _emit_or_return/_emit_or_jump's own `if
+	# (value.tag==1) {...}` shape, but the Err branch first dispatches per
+	# LEAF of the error type (see ir.OrThrow's own docstring): a plain
+	# opaque error type (E is not itself a union) has exactly one leaf, no
+	# switch needed at all; a real anonymous error union switches on its
+	# own runtime tag, one case per member, each independently either
+	# jumping into a handler or falling back to ordinary propagation.
+	value = _emit_operand( instr.value )
+	dest = _emit_operand( instr.dest )
+	tag_f, data_f, ok_f, err_f = _result_tag_data_names( instr.value.type )
+	e_op = _result_error_type( instr.value.type )
+	err_expr = f'({value}).{data_f}.{err_f}'
+	lines: list[str] = []
+	# every except-clause bind is declared ONCE here, at this function's
+	# own FLAT scope (never inside the `if (tag==1) { ... }`/switch-case
+	# blocks below) - the handler body itself (referencing this bind) is
+	# emitted separately, at a `goto`-reached Label OUTSIDE those nested
+	# blocks entirely (see lowering.py's _stmt_Try: body/handlers all
+	# share one flat per-function scope, goto-separated, same convention
+	# every other construct in this module already follows), so a
+	# declaration confined to the `if`'s own C block scope would already
+	# be out of scope by the time the handler body reads it - confirmed by
+	# a real "use of undeclared identifier" compile error under clang
+	# before this hoist. Also covers why a tuple except-clause's bind
+	# can't be declared inside its own switch-case block either - see
+	# _emit_or_throw_leaf_case's own docstring. Deduped by id() (Variable
+	# is an unhashable plain dataclass) while keeping a stable (first-
+	# seen) order - a tuple except-clause's several dispatch entries share
+	# the SAME bind object.
+	seen_bind_ids: set[int] = set()
+	binds = []
+	for d in instr.dispatch:
+		if d.bind is not None and id( d.bind ) not in seen_bind_ids:
+			seen_bind_ids.add( id( d.bind ))
+			binds.append( d.bind )
+	for bind in binds:
+		bind_c = _c_local_name( bind )
+		if bind_c not in declared:
+			declared.add( bind_c )
+			lines.append( f'\t{_declarator( bind.type, bind_c )};' )
+	lines.append( f'\tif ( ({value}).{tag_f} == 1 ) {{' )
+	if isinstance( e_op, TaggedUnion ) and e_op.file is None:
+		op_tag, op_data = _union_tag_data_fields( e_op )
+		lines.append( f'\t\tswitch ( ({err_expr}).{op_tag} ) {{' )
+		for i, op_attr in enumerate( e_op.attributes ):
+			payload_expr = f'({err_expr}).{op_data}.{_field_name(f"v_{op_attr.stem}")}'
+			lines.append( f'\t\t\tcase {i}: {{' )
+			lines.extend( '\t' + l for l in _emit_or_throw_leaf_case( instr, op_attr.type, payload_expr, function, declared ))
+			lines.append( '\t\t\t}' ) # every case body above ends in goto/return - no break needed, never falls through
+		lines.append( '\t\t}' )
+	else:
+		lines.extend( _emit_or_throw_leaf_case( instr, e_op, err_expr, function, declared ))
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
 	lines.extend( _mark_used_if_none( instr.dest ))

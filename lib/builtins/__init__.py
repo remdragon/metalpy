@@ -201,6 +201,21 @@ class Result[T,E]:
 	# lowering.py's _consume_checked_result, which every or_return() call
 	# actually goes through.
 
+	# or_throw() - same reserved-name/no-real-body/AST-shape-recognized
+	# story as or_return() just above (also rejected outright by
+	# discovery.py's _parse_function). Like or_return() on the Ok branch;
+	# on the Err branch, each leaf of E first checks the INNERMOST
+	# enclosing try's own except clauses (only valid textually inside a
+	# try body, in the SAME function) and jumps into a matching handler
+	# instead of propagating, when one covers that leaf - equivalent to:
+	#     if self.is_err():
+	#         match self.data.v_Err:                # conceptually - real
+	#             case <a covered leaf>: goto <that except clause>
+	#             case _: compiler.early_return( self.data.v_Err )  # uncovered leaves only
+	#     ok: T = self.data.v_Ok
+	#     return ok
+	# See lowering.py's _lower_or_throw/_stmt_Try and ir.OrThrow.
+
 	@overload
 	def unwrap( self, errmsg: str ) -> T:
 		...

@@ -1295,6 +1295,24 @@ class Discovery( ast.NodeVisitor ):
 			self.fail( f'{base.qualname} expects {len(type_params)} type argument(s), got {len(arg_nodes)}', node )
 
 		args = [ self.visit( arg_node ) for arg_node in arg_nodes ]
+		if base is self.find_name_or_none( 'Result' ) and len( args ) == 2:
+			# Result[T,E] may not itself nest another Result anywhere inside
+			# T or E (directly, or as one leaf of a union) - a double-wrapped
+			# Result is never a legitimate shape (just a confusing way to
+			# spell the outer Result's own Ok/Err again) and banning it
+			# outright removes a real ambiguity for the general auto-
+			# or_throw() machinery: an unbound generic parameter's argument
+			# being Result-shaped can now always be safely auto-unwrapped,
+			# since a caller can never have "genuinely meant" a nested
+			# Result there - see feedback_auto_or_return_scope memory
+			for arg in args:
+				for leaf in arg.leaves():
+					if self._result_shape_or_none( leaf ) is not None:
+						self.fail(
+							f'Result[T,E] cannot itself contain a nested Result - {leaf.qualname} inside '
+							f'{arg.qualname} is itself Result[...]: {ast.unparse(node)}',
+							node,
+						)
 		return self._get_or_create_specialization( base, args )
 
 	def _result_shape_or_none( self, t: Type ) -> 'tuple[Type,Type]|None':
@@ -2901,6 +2919,15 @@ class Discovery( ast.NodeVisitor ):
 			# reserved, not any particular shape of definition.
 			self.fail(
 				f"'or_return' is reserved for the compiler's own Result[T,E].or_return() - it can't be defined as a real "
+				f'function or method: {qualname}',
+				node,
+			)
+
+		if node.name == 'or_throw':
+			# same reservation as 'or_return' above, for Result[T,E].or_throw() -
+			# see _lower_or_throw's own comment
+			self.fail(
+				f"'or_throw' is reserved for the compiler's own Result[T,E].or_throw() - it can't be defined as a real "
 				f'function or method: {qualname}',
 				node,
 			)
