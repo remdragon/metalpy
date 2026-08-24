@@ -618,7 +618,7 @@ class Worker:
 		state: _ReactorState|None = self.__reactor_state
 		if state is not None:
 			state.live_tasks.fetch_add( 1 )
-		self.__pending_tasks.append( task ).unwrap( 'Worker.schedule: queue overflow' )
+		self.__pending_tasks.append( task )
 		self.__poke_wake()
 
 	def request_shutdown( self ) -> None:
@@ -656,7 +656,7 @@ class Worker:
 	def __requeue_by_state( self, f: fiber.Fiber ) -> None:
 		match f.state():
 			case fiber.FiberState.IDLE:
-				self.__idle_pool.append( f ).unwrap( 'Worker: idle pool overflow' )
+				self.__idle_pool.append( f )
 				# the task that just ran to completion is no longer live -
 				# balances the +1 its own originating schedule() call made,
 				# however many park()/unpark() cycles happened in between
@@ -673,7 +673,7 @@ class Worker:
 				# fiber.park() (not signal-driven) isn't in __waiting, so
 				# it takes the normal path unchanged.
 				if not self.__is_waiting_on_signal( f ):
-					self.__ready_to_unpark.append( f ).unwrap( 'Worker: ready-to-unpark queue overflow' )
+					self.__ready_to_unpark.append( f )
 			case fiber.FiberState.RUNNING:
 				sys.panic( 'Worker: fiber reported RUNNING after being switched out of - internal bug' )
 
@@ -702,14 +702,14 @@ class Worker:
 			case Signal.FdReady( fdr ):
 				if not self.__is_registered( fdr.fd ):
 					self.__poller.register( fdr.fd, fdr.want_read, fdr.want_write ).unwrap( 'Worker._wait_on_signal: poller register failed' )
-					self.__registered_fds.append( fdr.fd ).unwrap( 'Worker._wait_on_signal: registered-fd list overflow' )
+					self.__registered_fds.append( fdr.fd )
 			case Signal.Completion( _ ):
 				pass   # nothing to register - the completing thread pokes wake_external() directly, see __drain_completed_waits
 		cur: fiber.Fiber|None = fiber.current()
 		if cur is None:
 			sys.panic( 'Worker._wait_on_signal: no current fiber - must be called from inside a task this Worker is running' )
 		pw: _PendingWait = _PendingWait( signal = signal, waiting_fiber = cur )
-		self.__waiting.append( pw ).unwrap( 'Worker._wait_on_signal: waiting-list overflow' )
+		self.__waiting.append( pw )
 		fiber.park()
 		if self.__shutting_down.load():
 			return Result.Err( WaitError.Shutdown( None ))
@@ -775,9 +775,9 @@ class Worker:
 			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__drain_expired_waits: index in bounds by construction' )
 			d: f64 = w.waiting_fiber.get_deadline()
 			if d != fiber.NO_DEADLINE and now >= d:
-				expired.append( w ).unwrap( 'Worker.__drain_expired_waits: expired-list overflow' )
+				expired.append( w )
 			else:
-				still_waiting.append( w ).unwrap( 'Worker.__drain_expired_waits: rebuild overflow' )
+				still_waiting.append( w )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		if expired.__len__() == 0:
@@ -790,7 +790,7 @@ class Worker:
 			# variable's type is only ever declared once per function
 			ew: _PendingWait = expired.__getitem__( j ).unwrap( 'Worker.__drain_expired_waits: index in bounds by construction' )
 			ew.timed_out = True
-			self.__ready_to_unpark.append( ew.waiting_fiber ).unwrap( 'Worker.__drain_expired_waits: ready-to-unpark queue overflow' )
+			self.__ready_to_unpark.append( ew.waiting_fiber )
 			match ew.signal:
 				case Signal.FdReady( fdr ):
 					if self.__is_registered( fdr.fd ) and not self.__fd_still_waited_on( fdr.fd ):
@@ -831,10 +831,10 @@ class Worker:
 				case Signal.Completion( handle ):
 					done = handle.is_done()
 			if done:
-				self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_completed_waits: ready-to-unpark queue overflow' )
+				self.__ready_to_unpark.append( w.waiting_fiber )
 				progressed = True
 			else:
-				still_waiting.append( w ).unwrap( 'Worker.__drain_completed_waits: rebuild overflow' )
+				still_waiting.append( w )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__waiting = still_waiting
@@ -858,7 +858,7 @@ class Worker:
 		while i < n:
 			existing: poller.SOCKET = self.__registered_fds.__getitem__( i ).unwrap( 'Worker.__forget_registered_fd: index in bounds by construction' )
 			if existing != fd:
-				kept.append( existing ).unwrap( 'Worker.__forget_registered_fd: rebuild overflow' )
+				kept.append( existing )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__registered_fds = kept
@@ -884,7 +884,7 @@ class Worker:
 		i: usize = 0
 		while i < n:
 			w: _PendingWait = self.__waiting.__getitem__( i ).unwrap( 'Worker.__drain_waiting_for_shutdown: index in bounds by construction' )
-			self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__drain_waiting_for_shutdown: ready-to-unpark queue overflow' )
+			self.__ready_to_unpark.append( w.waiting_fiber )
 			match w.signal:
 				case Signal.FdReady( fdr ):
 					if self.__is_registered( fdr.fd ):
@@ -971,10 +971,10 @@ class Worker:
 					case Signal.Completion( _ ):
 						pass   # never matched via an fd-based poller event - see __drain_completed_waits
 				if matched:
-					self.__ready_to_unpark.append( w.waiting_fiber ).unwrap( 'Worker.__check_signals: ready-to-unpark queue overflow' )
+					self.__ready_to_unpark.append( w.waiting_fiber )
 					progressed = True
 				else:
-					still_waiting.append( w ).unwrap( 'Worker.__check_signals: rebuild overflow' )
+					still_waiting.append( w )
 				with compiler.wrap_arithmetic:
 					j = j + 1
 			self.__waiting = still_waiting
@@ -1122,7 +1122,7 @@ class Reactor:
 		while i < num_workers:
 			w: Worker = Worker()
 			w._attach_reactor_state( state )
-			self.__workers.append( w ).unwrap( 'Reactor.__init__: worker list overflow' )
+			self.__workers.append( w )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__threads = list[threading.Thread]()
@@ -1148,7 +1148,7 @@ class Reactor:
 		while i < n:
 			w: Worker = self.__workers.__getitem__( i ).unwrap( 'Reactor.run: worker index in bounds by construction' )
 			t: threading.Thread = threading.Thread( w.drain_fully )
-			self.__threads.append( t ).unwrap( 'Reactor.run: thread list overflow' )
+			self.__threads.append( t )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		n_threads: usize = self.__threads.__len__()

@@ -200,7 +200,7 @@ def _parent_name( name: str ) -> str|None:
 	parent_parts: list[str] = list[str]()
 	for i in range( parent_count ):
 		part: str = parts.__getitem__( i ).unwrap( 'unreachable: i bounded by parent_count < count' )
-		parent_parts.append( part ).unwrap( 'unreachable: fresh list, cannot overflow' )
+		parent_parts.append( part )
 	sep: str = '.'
 	return sep.join( parent_parts )
 
@@ -221,7 +221,7 @@ class Logger:
 		self.level = level
 
 	def addHandler( self, handler: Handler ) -> None:
-		self.handlers.append( handler ).unwrap( 'Logger.addHandler: append failed' )
+		self.handlers.append( handler )
 
 	def _parent( self ) -> Logger|None:
 		parent_name: str|None = _parent_name( self.name )

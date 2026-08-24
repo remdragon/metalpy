@@ -4469,7 +4469,7 @@ class Tests( unittest.TestCase ):
 			'class Box:',
 			'	y: i32',
 			'',
-			'	def __getitem__( self, s: PySlice ) -> Result[i32,MyError]:',
+			'	def __getitem__( self, s: slice ) -> Result[i32,MyError]:',
 			'		return Result.__allocate__( x = self.y )',
 			'',
 			'def foo( b: Box ) -> i32:',
@@ -10247,9 +10247,9 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 	the compile-time-constant fold in isolation, and emitter_c_test.py's
 	FStringTests covers real end-to-end compile-and-run behavior; this
 	class checks the actual IR SHAPE the runtime path produces (proving
-	it's really UnsafeList[str]/slice[str]/str.concat, not N-1 chained
-	str.__add__ calls) and the conversion/error-reporting rules a pure
-	instruction-shape check can't see from emitter_c_test.py alone. '''
+	it's really UnsafeList[str]/str.concat, not N-1 chained str.__add__
+	calls) and the conversion/error-reporting rules a pure instruction-
+	shape check can't see from emitter_c_test.py alone. '''
 	maxDiff = None
 
 	def setUp( self ) -> None:
@@ -10274,7 +10274,7 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		# f"{x}" alone (x: str, a real runtime value - not foldable) -
 		# len(node.values) == 1, PLAN_FSTRINGS.md's own short-circuit: the
 		# FormattedValue's own str-typed operand is used directly, no
-		# UnsafeList/slice/str.concat machinery at all
+		# UnsafeList/str.concat machinery at all
 		self._import( '\n'.join([
 			'def main( x: str ) -> str:',
 			'	return f"{x}"',
@@ -10282,25 +10282,21 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertEqual( self._allocates_of( fn, 'UnsafeList' ), [] )
-		self.assertEqual( self._allocates_of( fn, 'slice' ), [] )
 		self.assertEqual( self._calls_to( fn, 'concat' ), [] )
 		# the Return's own value IS x's own parameter, reused directly - no
 		# synthesized alias, no __str__ call (x is already str-typed)
 		ret = next( i for i in fn.instructions if isinstance( i, ir.Return ) )
 		self.assertIs( ret.value, fn.function.parameters[0] )
 
-	def test_multipart_runtime_path_uses_unsafelist_slice_concat_not_chained_add( self ) -> None:
+	def test_multipart_runtime_path_uses_unsafelist_concat_not_chained_add( self ) -> None:
 		# f"{a}{b}" (a, b: str, both real runtime values) - exactly 2
 		# parts, so exactly 2 UnsafeList[str].append() calls, exactly 1
-		# UnsafeList[str] Allocate, exactly 1 as_slice() call (its own
-		# slice[str] Allocate happens INSIDE as_slice()'s own compiled
-		# body, not here - see lowering.py's own _expr_JoinedStr comment
-		# on reusing the already-existing as_slice() instead of hand-
-		# building a slice via a direct ir.Allocate the way this used to,
-		# before as_slice() existed), exactly 1 str.concat call - as_slice() itself
-		# returns a bare slice[T], no Result, so nothing to unwrap for it)
-		# and, the actual point of this whole pass, ZERO calls to str.__add__
-		# (proving this ISN'T N-1 chained string concatenation)
+		# UnsafeList[str] Allocate, exactly 1 str.concat call taking that
+		# SAME buffer directly (str.concat's own parameter type is
+		# UnsafeList[str] - no intermediate view/copy step at all anymore,
+		# see lowering.py's own _expr_JoinedStr comment) and, the actual
+		# point of this whole pass, ZERO calls to str.__add__ (proving this
+		# ISN'T N-1 chained string concatenation)
 		self._import( '\n'.join([
 			'def main( a: str, b: str ) -> str:',
 			'	return f"{a}{b}"',
@@ -10309,7 +10305,6 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertEqual( len( self._allocates_of( fn, 'UnsafeList' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '.append' )), 2 )
-		self.assertEqual( len( self._calls_to( fn, 'as_slice' )), 1 )
 		self.assertEqual( len( self._calls_to( fn, '.concat' )), 1 )
 		self.assertEqual( self._calls_to( fn, '__add__' ), [] )
 
@@ -11046,11 +11041,10 @@ class ListLiteralTests( unittest.TestCase ):
 		self.assertEqual( len( append_calls ), 2 )
 		# both append calls target the SAME constructed list instance
 		self.assertIs( append_calls[0].receiver, append_calls[1].receiver )
-		unwrap_calls = [ c for c in calls if c.target.stem == 'unwrap' ]
-		self.assertEqual( len( unwrap_calls ), 2 )
-		# unwrap()'s own return value (None) is never assigned to a dest -
-		# only its side effect (panic on Err) matters
-		self.assertTrue( all( c.dest is None for c in unwrap_calls ) )
+		# append()'s own return value (None, not a Result) is never assigned
+		# to a dest - only its side effect matters, mirroring _expr_Set's
+		# own add() handling
+		self.assertTrue( all( c.dest is None for c in append_calls ) )
 
 	def test_empty_list_literal_is_construction_only( self ) -> None:
 		fn = self._assert_accepted( '\n'.join([

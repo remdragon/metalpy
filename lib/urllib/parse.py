@@ -241,7 +241,7 @@ def urlencode( query: list[tuple[str,str]] ) -> str:
 	for i in range( n ):
 		pair: tuple[str,str] = query.__getitem__( i ).unwrap( 'urlencode: index in bounds by construction' )
 		encoded: str = quote_plus( pair[0] ) + '=' + quote_plus( pair[1] )
-		parts.append( encoded ).unwrap( 'urlencode: append failed' )
+		parts.append( encoded )
 	return '&'.join( parts )
 
 def parse_qsl( qs: str ) -> Result[list[tuple[str,str]], UrlParseError]:
@@ -265,7 +265,7 @@ def parse_qsl( qs: str ) -> Result[list[tuple[str,str]], UrlParseError]:
 		kv: tuple[str,str,str] = piece.partition( '=' )
 		key: str = unquote_plus( kv[0] ).or_return()
 		value: str = unquote_plus( kv[2] ).or_return()
-		result.append( ( key, value )).unwrap( 'parse_qsl: append failed' )
+		result.append( ( key, value ))
 	return Result.Ok( result )
 
 # ---------------------------------------------------------------------------
@@ -399,7 +399,7 @@ def _remove_dot_segments( path: str ) -> str:
 		elif seg == '.':
 			continue
 		else:
-			resolved.append( seg ).unwrap( '_remove_dot_segments: append failed' )
+			resolved.append( seg )
 
 	trailing_slash: bool = False
 	if n > 0:

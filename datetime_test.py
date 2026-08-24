@@ -440,7 +440,7 @@ def main() -> i32:
 	i: i32 = 0
 	while i < n:
 		w: Worker = Worker()
-		workers.append( w ).unwrap( 'worker append failed' )
+		workers.append( w )
 		with compiler.wrap_arithmetic:
 			i += 1
 
@@ -453,7 +453,7 @@ def main() -> i32:
 	nw: usize = workers.__len__()
 	while j < nw:
 		w2: Worker = workers.__getitem__( j ).unwrap( 'index in bounds by construction' )
-		threads.append( threading.Thread( w2.run ) ).unwrap( 'thread append failed' )
+		threads.append( threading.Thread( w2.run ) )
 		with compiler.wrap_arithmetic:
 			j += 1
 

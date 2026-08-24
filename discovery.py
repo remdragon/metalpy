@@ -1440,7 +1440,7 @@ class Discovery( ast.NodeVisitor ):
 		# _substituted_overload's own sub_impl (monomorphize.py) calls this
 		# once per implementation when substituting an @overload group
 		# declared inside a generic class - list[T].__getitem__'s two
-		# leaves (idx: usize, s: PySlice) both qualname to
+		# leaves (idx: usize, s: slice) both qualname to
 		# 'builtins.list.__getitem__', so the SECOND leaf's own
 		# monomorphization request silently returned the FIRST leaf's
 		# already-cached Specialization instead of creating its own - every

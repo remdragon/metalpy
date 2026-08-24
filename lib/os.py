@@ -48,7 +48,7 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 			name_size: usize = name_len + 1
 		name: str = str.from_cstr( name_ptr, name_size ).unwrap( 'os.listdir: invalid UTF-8 in filename' )
 		if name != '.' and name != '..':
-			entries.append( name ).unwrap( 'os.listdir: too many directory entries' )
+			entries.append( name )
 		if not FindNextFileA( handle, compiler.addrof( data )):
 			break
 	return Result.Ok( entries )
@@ -78,7 +78,7 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 			name_size: usize = name_len + 1
 		name: str = str.from_cstr( name_ptr, name_size ).unwrap( 'os.listdir: invalid UTF-8 in filename' )
 		if name != '.' and name != '..':
-			entries.append( name ).unwrap( 'os.listdir: too many directory entries' )
+			entries.append( name )
 	return Result.Ok( entries )
 
 
@@ -411,9 +411,9 @@ class path:
 					if len( kept ) > 0:
 						kept.pop().unwrap( 'os.path.normpath: pop failed' )
 					elif root == '':
-						kept.append( part ).unwrap( 'os.path.normpath: append failed' )
+						kept.append( part )
 					continue
-				kept.append( part ).unwrap( 'os.path.normpath: append failed' )
+				kept.append( part )
 
 		joined: str = sep.join( kept )
 		if root != '':
@@ -491,7 +491,7 @@ class path:
 				new_common: list[str] = list[str]()
 				k: usize = 0
 				while k < j:
-					new_common.append( common_parts.__getitem__( k ).unwrap( 'os.path.commonpath: index in bounds by construction' )).unwrap( 'os.path.commonpath: append failed' )
+					new_common.append( common_parts.__getitem__( k ).unwrap( 'os.path.commonpath: index in bounds by construction' ))
 					k += 1
 				common_parts = new_common
 
@@ -521,11 +521,11 @@ class path:
 			up_count: usize = len( start_parts ) - i
 			k: usize = 0
 			while k < up_count:
-				rel_parts.append( '..' ).unwrap( 'os.path.relpath: append failed' )
+				rel_parts.append( '..' )
 				k += 1
 			j: usize = i
 			while j < len( target_parts ):
-				rel_parts.append( target_parts.__getitem__( j ).unwrap( 'os.path.relpath: index in bounds by construction' )).unwrap( 'os.path.relpath: append failed' )
+				rel_parts.append( target_parts.__getitem__( j ).unwrap( 'os.path.relpath: index in bounds by construction' ))
 				j += 1
 
 		if len( rel_parts ) == 0:

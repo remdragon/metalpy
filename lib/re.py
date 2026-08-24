@@ -266,8 +266,8 @@ class CharClass:
 		self.negate = negate
 
 	def add_range( self, lo: u32, hi: u32 ) -> None:
-		self.lo.append( lo ).unwrap( 're: CharClass.add_range' )
-		self.hi.append( hi ).unwrap( 're: CharClass.add_range' )
+		self.lo.append( lo )
+		self.hi.append( hi )
 
 	def contains( self, cp: u32 ) -> bool:
 		found: bool = False
@@ -335,13 +335,13 @@ def _append_fragment( dest: list[Op], frag: list[Op] ) -> None:
 	n: usize = len( frag )
 	while i < n:
 		src_op: Op = frag.__getitem__( i ).unwrap( 're: fragment index' )
-		dest.append( _clone_op_at_offset( src_op, offset )).unwrap( 're: fragment append' )
+		dest.append( _clone_op_at_offset( src_op, offset ))
 		with compiler.wrap_arithmetic:
 			i += 1
 
 def _single_op_fragment( op: Op ) -> list[Op]:
 	out: list[Op] = list[Op]()
-	out.append( op ).unwrap( 're: single op fragment' )
+	out.append( op )
 	return out
 
 
@@ -542,11 +542,11 @@ class Parser:
 		if self._at_end() or self._peek_byte() != _BYTE_PIPE:
 			return Result.Ok( first )
 		branches: list[list[Op]] = list[list[Op]]()
-		branches.append( first ).unwrap( 're: parse_alt' )
+		branches.append( first )
 		while not self._at_end() and self._peek_byte() == _BYTE_PIPE:
 			self._advance_byte()
 			nxt: list[Op] = self.parse_concat().or_return()
-			branches.append( nxt ).unwrap( 're: parse_alt' )
+			branches.append( nxt )
 		return Result.Ok( self._build_alternation( branches ))
 
 	def _build_alternation( self, branches: list[list[Op]] ) -> list[Op]:
@@ -812,7 +812,7 @@ class Parser:
 			cc: CharClass = self._shorthand_class_for_byte( b )
 			self._advance_byte()
 			idx: usize = len( self.classes )
-			self.classes.append( cc ).unwrap( 're: register shorthand class' )
+			self.classes.append( cc )
 			return Result.Ok( _single_op_fragment( _op_in( idx )))
 		if b == 98:  # 'b' - zero-width word boundary (outside a class; \b
 			self._advance_byte()  # inside a class means backspace instead - see _class_member_cp)
@@ -943,7 +943,7 @@ class Parser:
 				cc.add_range( lo, lo )
 		self._advance_byte()  # consume ']'
 		idx: usize = len( self.classes )
-		self.classes.append( cc ).unwrap( 're: register class' )
+		self.classes.append( cc )
 		return Result.Ok( _single_op_fragment( _op_in( idx )))
 
 	def _class_has_range_after( self ) -> bool:
@@ -1157,7 +1157,7 @@ def _clone_usize_list( src: list[usize] ) -> list[usize]:
 	i: usize = 0
 	n: usize = len( src )
 	while i < n:
-		out.append( src.__getitem__( i ).unwrap( 're: clone usize list' )).unwrap( 're: clone usize list append' )
+		out.append( src.__getitem__( i ).unwrap( 're: clone usize list' ))
 		with compiler.wrap_arithmetic:
 			i += 1
 	return out
@@ -1167,7 +1167,7 @@ def _clone_bool_list( src: list[bool] ) -> list[bool]:
 	i: usize = 0
 	n: usize = len( src )
 	while i < n:
-		out.append( src.__getitem__( i ).unwrap( 're: clone bool list' )).unwrap( 're: clone bool list append' )
+		out.append( src.__getitem__( i ).unwrap( 're: clone bool list' ))
 		with compiler.wrap_arithmetic:
 			i += 1
 	return out
@@ -1273,8 +1273,8 @@ class Matcher:
 		slot_set: list[bool] = list[bool]()
 		i: usize = 0
 		while i < n_slots:
-			slot_values.append( 0 ).unwrap( 're: run_at init slots' )
-			slot_set.append( False ).unwrap( 're: run_at init slots' )
+			slot_values.append( 0 )
+			slot_set.append( False )
 			with compiler.wrap_arithmetic:
 				i += 1
 		return self._run_from( start_pos, slot_values, slot_set, 0, False )
@@ -1430,7 +1430,7 @@ class Matcher:
 					op.target_b, sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ),
 					last_group, last_group_set,
 				)
-				stack.append( frame ).unwrap( 're: run_at push split frame' )
+				stack.append( frame )
 				pc = op.target_a
 				continue
 			elif op.kind == OpKind.JUMP:
@@ -1575,9 +1575,9 @@ class Match:
 		while i <= count:
 			g: str|None = self.group( i )
 			if g is None:
-				out.append( GroupResult( '', False )).unwrap( 're: Match.groups append' )
+				out.append( GroupResult( '', False ))
 			else:
-				out.append( GroupResult( g, True )).unwrap( 're: Match.groups append' )
+				out.append( GroupResult( g, True ))
 			with compiler.wrap_arithmetic:
 				i += 1
 		return out
@@ -1627,9 +1627,9 @@ class Match:
 				lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.regs slot' )
 				hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.regs slot' )
 				with compiler.panic_arithmetic( 're: Match.regs: offset does not fit in i32' ):
-					out.append(( i32( lo ), i32( hi ))).unwrap( 're: Match.regs append' )
+					out.append(( i32( lo ), i32( hi )))
 			else:
-				out.append(( i32( -1 ), i32( -1 ))).unwrap( 're: Match.regs append' )
+				out.append(( i32( -1 ), i32( -1 )))
 			with compiler.wrap_arithmetic:
 				i += 1
 		return out
@@ -1682,8 +1682,8 @@ class Pattern:
 		_append_fragment( prog, _single_op_fragment( _op_save( 0 )))
 		_append_fragment( prog, body )
 		tail: list[Op] = list[Op]()
-		tail.append( _op_save( 1 )).unwrap( 're: compile tail' )
-		tail.append( _op_match()).unwrap( 're: compile tail' )
+		tail.append( _op_save( 1 ))
+		tail.append( _op_match())
 		_append_fragment( prog, tail )
 		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags, parser.group_names, byte_mode ))
 
@@ -1835,7 +1835,7 @@ class Pattern:
 			g: str|None = mm.group()
 			if g is None:
 				sys.panic( 're: findall: whole match text unexpectedly unset' )
-			out.append( g ).unwrap( 're: findall append' )
+			out.append( g )
 			pos = _advance_pos_after_match( mm, s )
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
 		return out
@@ -1898,13 +1898,13 @@ class Pattern:
 			end: usize|None = mm.end()
 			if end is None:
 				sys.panic( 're: split: whole match end unexpectedly unset' )
-			out.append( _substr( s.get_cstr(), last_end, start )).unwrap( 're: split append' )
+			out.append( _substr( s.get_cstr(), last_end, start ))
 			last_end = end
 			with compiler.wrap_arithmetic:
 				n += 1
 			pos = _advance_pos_after_match( mm, s )
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
-		out.append( _substr( s.get_cstr(), last_end, s.byte_len())).unwrap( 're: split append' )
+		out.append( _substr( s.get_cstr(), last_end, s.byte_len()))
 		return out
 
 

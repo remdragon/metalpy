@@ -796,7 +796,7 @@ def main() -> i32:
 	req_headers: HTTPHeaders = HTTPHeaders()
 	req_headers.set( 'X-Api-Key', 'sw0rdfish' )
 	secrets: list[str] = list[str]()
-	secrets.append( 'sw0rdfish' ).unwrap( 'append' )
+	secrets.append( 'sw0rdfish' )
 	r: Response = s.get( 'http://127.0.0.1:18775/', headers = req_headers, log = _capture, sensitive_values = secrets ).unwrap( 'client request' )
 	t.join()
 

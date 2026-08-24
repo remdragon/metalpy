@@ -168,11 +168,8 @@ class JSONValue:
 
 	def array_append( self, value: JSONValue ) -> Result[None, JSONError]:
 		arr = self.as_array().or_return()
-		match arr.append( value ):
-			case Result.Ok( _ ):
-				return Result.Ok( None )
-			case Result.Err( _ ):
-				return Result.Err( JSONError.Overflow( None ))
+		arr.append( value )
+		return Result.Ok( None )
 
 	def array_get( self, index: usize ) -> Result[JSONValue, JSONError]:
 		arr = self.as_array().or_return()
@@ -683,7 +680,7 @@ def _dump_value( value: JSONValue ) -> Result[str, JSONError]:
 			while arr_i < arr_count:
 				elem: JSONValue = arr.__getitem__( arr_i ).unwrap( 'dumps: index in bounds by construction' )
 				piece: str = _dump_value( elem ).or_return()
-				arr_pieces.append( piece ).unwrap( 'dumps: append failed' )
+				arr_pieces.append( piece )
 				with compiler.panic_arithmetic( 'walking a list of known length index-by-index cannot overflow usize' ):
 					arr_i += 1
 			return Result.Ok( str( '[' ) + str( ',' ).join( arr_pieces ) + str( ']' ))
@@ -695,7 +692,7 @@ def _dump_value( value: JSONValue ) -> Result[str, JSONError]:
 				k: str = obj.key_at( obj_i ).unwrap( 'dumps: index in bounds by construction' )
 				v: JSONValue = obj.value_at( obj_i ).unwrap( 'dumps: index in bounds by construction' )
 				entry: str = _json_escape_string( k ) + str( ':' ) + _dump_value( v ).or_return()
-				obj_pieces.append( entry ).unwrap( 'dumps: append failed' )
+				obj_pieces.append( entry )
 				with compiler.panic_arithmetic( 'walking a dict of known length index-by-index cannot overflow usize' ):
 					obj_i += 1
 			return Result.Ok( str( '{' ) + str( ',' ).join( obj_pieces ) + str( '}' ))
@@ -864,7 +861,7 @@ def _tokenize_path( path: str ) -> Result[list[PathToken], JSONError]:
 			if digit_count == 0 or digit_count > 9 or j >= n or data[j] != _ASCII_RBRACKET:
 				return Result.Err( JSONError.InvalidPath( i ))
 			idx: usize = _parse_bounded_digits( data, digit_start, digit_count )
-			tokens.append( PathToken.Index( idx )).unwrap( '_tokenize_path: append failed' )
+			tokens.append( PathToken.Index( idx ))
 			with compiler.panic_arithmetic( 'advancing one byte past a known-in-bounds bracket cannot overflow usize' ):
 				i = j + 1
 			# an index token may be directly followed by another '[' (chained
@@ -887,7 +884,7 @@ def _tokenize_path( path: str ) -> Result[list[PathToken], JSONError]:
 			with compiler.panic_arithmetic( 'walking a path of known length index-by-index cannot overflow usize' ):
 				while i < n and data[i] != _ASCII_DOT and data[i] != _ASCII_LBRACKET:
 					i += 1
-			tokens.append( PathToken.Key( path[start:i] )).unwrap( '_tokenize_path: append failed' )
+			tokens.append( PathToken.Key( path[start:i] ))
 			if i < n and data[i] == _ASCII_DOT:
 				with compiler.panic_arithmetic( 'advancing one byte past a known-in-bounds dot cannot overflow usize' ):
 					i += 1
@@ -958,11 +955,8 @@ def _set_path_tokens( container: JSONValue, tokens: list[PathToken], idx: usize,
 						case Result.Err( _ ):
 							return Result.Err( JSONError.IndexOutOfBounds( None ))
 				elif i == n:
-					match arr.append( value ):
-						case Result.Ok( _ ):
-							return Result.Ok( None )
-						case Result.Err( _ ):
-							return Result.Err( JSONError.Overflow( None ))
+					arr.append( value )
+					return Result.Ok( None )
 				else:
 					return Result.Err( JSONError.IndexOutOfBounds( None ))
 			next_tok2: PathToken = tokens.__getitem__( next_idx ).unwrap( '_set_path_tokens: index in bounds by construction' )
@@ -971,11 +965,8 @@ def _set_path_tokens( container: JSONValue, tokens: list[PathToken], idx: usize,
 				return _set_path_tokens( existing2, tokens, next_idx, value )
 			elif i == n:
 				fresh2: JSONValue = _child_container_for_token( next_tok2 )
-				match arr.append( fresh2 ):
-					case Result.Ok( _ ):
-						return _set_path_tokens( fresh2, tokens, next_idx, value )
-					case Result.Err( _ ):
-						return Result.Err( JSONError.Overflow( None ))
+				arr.append( fresh2 )
+				return _set_path_tokens( fresh2, tokens, next_idx, value )
 			else:
 				return Result.Err( JSONError.IndexOutOfBounds( None ))
 

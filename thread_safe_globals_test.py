@@ -91,14 +91,14 @@ def main() -> i32:
 	i: i32 = 0
 	while i < 32:
 		r: Reader = Reader()
-		readers.append( r ).unwrap( 'append failed' )
-		threads.append( threading.Thread( r.run ) ).unwrap( 'append failed' )
+		readers.append( r )
+		threads.append( threading.Thread( r.run ) )
 		with compiler.wrap_arithmetic:
 			i = i + 1
 	i = 0
 	while i < 8:
 		w: Writer = Writer()
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			i = i + 1
 	k: usize = 0
@@ -191,8 +191,8 @@ def main() -> i32:
 	i: i32 = 0
 	while i < 64:
 		w: Worker = Worker()
-		workers.append( w ).unwrap( 'append failed' )
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		workers.append( w )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			i = i + 1
 	k: usize = 0

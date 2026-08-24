@@ -202,7 +202,7 @@ class ZipReader:
 		with compiler.panic_arithmetic( 'bounded by entry count, cannot overflow' ):
 			while i < len( self.__entries ):
 				info: ZipInfo = self.__entries.__getitem__( i ).unwrap( 'i < len(entries)' )
-				names.append( info.filename ).unwrap( 'namelist: append failed' )
+				names.append( info.filename )
 				i += 1
 		return names
 
@@ -343,7 +343,7 @@ def _read_central_directory( reader: BinaryReader, eocd: _EndOfCentralDirectory 
 				flags         = hdr.flags,
 				header_offset = hdr.local_header_offset,
 			)
-			entries.append( info ).unwrap( '_read_central_directory: append failed' )
+			entries.append( info )
 			i += 1
 	return Result.Ok( entries )
 
@@ -430,7 +430,7 @@ class ZipWriter:
 				flags         = 0,
 				header_offset = header_offset,
 			)
-		self.__written.append( _WrittenEntry( info )).unwrap( 'writestr: bookkeeping append failed' )
+		self.__written.append( _WrittenEntry( info ))
 		return Result.Ok( None )
 
 	def write( self, path_on_disk: str, arcname: str, compress_type: i32 = ZIP_DEFLATED ) -> Result[None, ZipError]:

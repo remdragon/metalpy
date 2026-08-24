@@ -348,7 +348,7 @@ def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 		info: _AddrInfo = node[0]
 		addr_ptr: Ptr[SockAddrIn] = compiler.cast( Ptr[SockAddrIn], info.ai_addr )
 		found: SockAddrIn = addr_ptr[0]
-		results.append( SockAddrIn( sin_family = found.sin_family, sin_port = _htons( port ), sin_addr = found.sin_addr )).unwrap( 'resolve v4: append' )
+		results.append( SockAddrIn( sin_family = found.sin_family, sin_port = _htons( port ), sin_addr = found.sin_addr ))
 		cur = info.ai_next
 	freeaddrinfo( res_head )
 	return Result.Ok( results )
@@ -374,7 +374,7 @@ def _resolve_v6( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 			sin6_addr_8 = found.sin6_addr_8, sin6_addr_9 = found.sin6_addr_9, sin6_addr_10 = found.sin6_addr_10, sin6_addr_11 = found.sin6_addr_11,
 			sin6_addr_12 = found.sin6_addr_12, sin6_addr_13 = found.sin6_addr_13, sin6_addr_14 = found.sin6_addr_14, sin6_addr_15 = found.sin6_addr_15,
 			sin6_scope_id = found.sin6_scope_id,
-		)).unwrap( 'resolve v6: append' )
+		))
 		cur = info.ai_next
 	freeaddrinfo( res_head )
 	return Result.Ok( results )
@@ -1070,10 +1070,10 @@ def resolve( host: str, family: i32 = AF_INET ) -> Result[list[str], OSError]:
 		candidates: list[SockAddrIn6] = _resolve_v6( host, u16( 0 ), SOCK_STREAM ).or_return()
 		for i in range( len( candidates )):
 			addr: SocketAddr = _sockaddr_in6_to_addr( candidates.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
-			out.append( addr.host ).unwrap( 'resolve: append' )
+			out.append( addr.host )
 	else:
 		candidates4: list[SockAddrIn] = _resolve_v4( host, u16( 0 ), SOCK_STREAM ).or_return()
 		for i in range( len( candidates4 )):
 			addr4: SocketAddr = _sockaddr_in_to_addr( candidates4.__getitem__( i ).unwrap( 'resolve: candidate index' )).or_return()
-			out.append( addr4.host ).unwrap( 'resolve: append' )
+			out.append( addr4.host )
 	return Result.Ok( out )

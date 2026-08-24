@@ -207,7 +207,7 @@ class XMLNode:
 			c: XMLNode = e.children.__getitem__( i ).unwrap( 'child_elements: index in bounds by construction' )
 			match c:
 				case XMLNode.Element( ed ):
-					out.append( ed ).unwrap( 'child_elements: append failed' )
+					out.append( ed )
 				case _:
 					pass
 			with compiler.wrap_arithmetic:
@@ -618,7 +618,7 @@ def _parse_element( s: str, pos: usize, scope: list[tuple[str,str]] ) -> Result[
 				j += 1
 		if dup:
 			return Result.Err( XMLError.DuplicateAttribute( attr_name_pos ))
-		raw_attrs.append(( aname, avalue, attr_name_pos )).unwrap( '_parse_element: raw_attrs append failed' )
+		raw_attrs.append(( aname, avalue, attr_name_pos ))
 
 	self_closing: bool = False
 	if ch == _ASCII_SLASH:
@@ -639,9 +639,9 @@ def _parse_element( s: str, pos: usize, scope: list[tuple[str,str]] ) -> Result[
 		aname2: str = entry[0]
 		avalue2: str = entry[1]
 		if aname2 == 'xmlns':
-			new_bindings.append(( '', avalue2 )).unwrap( '_parse_element: new_bindings append failed' )
+			new_bindings.append(( '', avalue2 ))
 		elif aname2.startswith( 'xmlns:' ):
-			new_bindings.append(( aname2[6:], avalue2 )).unwrap( '_parse_element: new_bindings append failed' )
+			new_bindings.append(( aname2[6:], avalue2 ))
 		with compiler.wrap_arithmetic:
 			k += 1
 
@@ -651,13 +651,13 @@ def _parse_element( s: str, pos: usize, scope: list[tuple[str,str]] ) -> Result[
 		m: usize = 0
 		sn: usize = len( scope )
 		while m < sn:
-			combined.append( scope.__getitem__( m ).unwrap( '_parse_element: index in bounds by construction' )).unwrap( '_parse_element: combined append failed' )
+			combined.append( scope.__getitem__( m ).unwrap( '_parse_element: index in bounds by construction' ))
 			with compiler.wrap_arithmetic:
 				m += 1
 		m2: usize = 0
 		nn: usize = len( new_bindings )
 		while m2 < nn:
-			combined.append( new_bindings.__getitem__( m2 ).unwrap( '_parse_element: index in bounds by construction' )).unwrap( '_parse_element: combined append failed' )
+			combined.append( new_bindings.__getitem__( m2 ).unwrap( '_parse_element: index in bounds by construction' ))
 			with compiler.wrap_arithmetic:
 				m2 += 1
 		child_scope = combined
@@ -698,7 +698,7 @@ def _parse_element( s: str, pos: usize, scope: list[tuple[str,str]] ) -> Result[
 						auri = u3
 					case Result.Err( _ ):
 						return Result.Err( XMLError.UnboundPrefix( apos3 ))
-		resolved_attrs.append(( aname3, auri, avalue3 )).unwrap( '_parse_element: resolved_attrs append failed' )
+		resolved_attrs.append(( aname3, auri, avalue3 ))
 		with compiler.wrap_arithmetic:
 			k2 += 1
 
@@ -737,11 +737,11 @@ def _parse_children( s: str, pos: usize, expected_tag: str, scope: list[tuple[st
 					return Result.Ok(( nodes, p2 + 1 ))
 			elif s.startswith( '<!--', p ):
 				comment_parsed = _parse_comment( s, p ).or_return()
-				nodes.append( XMLNode.Comment( comment_parsed[0] )).unwrap( '_parse_children: append failed' )
+				nodes.append( XMLNode.Comment( comment_parsed[0] ))
 				p = comment_parsed[1]
 			elif s.startswith( '<![CDATA[', p ):
 				cdata_parsed = _parse_cdata( s, p ).or_return()
-				nodes.append( XMLNode.CData( cdata_parsed[0] )).unwrap( '_parse_children: append failed' )
+				nodes.append( XMLNode.CData( cdata_parsed[0] ))
 				p = cdata_parsed[1]
 			elif s.startswith( '<?', p ):
 				found2: isize = s.find( '?>', p )
@@ -753,11 +753,11 @@ def _parse_children( s: str, pos: usize, expected_tag: str, scope: list[tuple[st
 					p = e2 + 2
 			else:
 				child_parsed = _parse_element( s, p, scope ).or_return()
-				nodes.append( child_parsed[0] ).unwrap( '_parse_children: append failed' )
+				nodes.append( child_parsed[0] )
 				p = child_parsed[1]
 		else:
 			text_parsed = _parse_decoded_run( s, p, _ASCII_LT ).or_return()
-			nodes.append( XMLNode.Text( text_parsed[0] )).unwrap( '_parse_children: append failed' )
+			nodes.append( XMLNode.Text( text_parsed[0] ))
 			p = text_parsed[1]
 
 
@@ -783,26 +783,26 @@ def _dump_node( node: XMLNode ) -> str:
 			return '<![CDATA[' + cd + ']]>'
 		case XMLNode.Element( e ):
 			pieces: list[str] = list[str]()
-			pieces.append( '<' + e.tag ).unwrap( '_dump_node: append failed' )
+			pieces.append( '<' + e.tag )
 			i: usize = 0
 			an: usize = len( e.attributes )
 			while i < an:
 				attr: tuple[str,str,str] = e.attributes.__getitem__( i ).unwrap( '_dump_node: index in bounds by construction' )
-				pieces.append( ' ' + attr[0] + '="' + _escape_attr( attr[2] ) + '"' ).unwrap( '_dump_node: append failed' )
+				pieces.append( ' ' + attr[0] + '="' + _escape_attr( attr[2] ) + '"' )
 				with compiler.wrap_arithmetic:
 					i += 1
 			cn: usize = len( e.children )
 			if cn == 0:
-				pieces.append( '/>' ).unwrap( '_dump_node: append failed' )
+				pieces.append( '/>' )
 				return ''.join( pieces )
-			pieces.append( '>' ).unwrap( '_dump_node: append failed' )
+			pieces.append( '>' )
 			j: usize = 0
 			while j < cn:
 				child: XMLNode = e.children.__getitem__( j ).unwrap( '_dump_node: index in bounds by construction' )
-				pieces.append( _dump_node( child )).unwrap( '_dump_node: append failed' )
+				pieces.append( _dump_node( child ))
 				with compiler.wrap_arithmetic:
 					j += 1
-			pieces.append( '</' + e.tag + '>' ).unwrap( '_dump_node: append failed' )
+			pieces.append( '</' + e.tag + '>' )
 			return ''.join( pieces )
 
 

@@ -51,13 +51,12 @@ class ZoneInfo:
 
 	def get_ttinfo( self, timestamp: i64 ) -> TTInfo:
 		# hand-rolled binary search over transition_times (list[i64]), NOT
-		# lib/bisect.py's bisect_right - bisect_right takes arr: slice[T],
-		# and slice[T] IS constructible now (UnsafeList[T].as_slice(), see
-		# BisectTests/RawDict._lower_bound; list[T][a:b] slice syntax now
-		# offers the same for a locked list[T] too, RAII-tracked via
-		# slice[T]'s own __init__/__del__, see __list.py's own comment - not
-		# yet wired up here, a real follow-up opportunity, not attempted
-		# this pass). Separately, a generic
+		# lib/bisect.py's bisect_right - bisect_right takes arr: UnsafeList
+		# [T] directly (see BisectTests/RawDict._lower_bound), but
+		# transition_times here is a locked list[T]; bridging the two would
+		# need an explicit copy into a scratch UnsafeList[T] first - not yet
+		# wired up here, a real follow-up opportunity, not attempted this
+		# pass. Separately, a generic
 		# key=lambda call here would also hit PLAN_LAMBDA.md's documented
 		# "not attempted end to end" gap - this sidesteps both at once, at
 		# the cost of a few duplicated lines instead of a shared helper.

@@ -2483,8 +2483,8 @@ def main() -> i32:
 			( 'subscript_target_list_i32_element_augassign_fallback', '''
 def helper() -> Result[i32, IndexError]:
 	x: list[i32] = list[i32]()
-	x.append( 10 ).unwrap( 'x' )
-	x.append( 20 ).unwrap( 'x' )
+	x.append( 10 )
+	x.append( 20 )
 	with compiler.wrap_arithmetic:
 		x[0] += 5
 	if x.__getitem__( 0 ).unwrap( 'x' ) != 15:
@@ -2516,7 +2516,7 @@ class Counter:
 
 def helper() -> Result[i32, IndexError]:
 	x: list[Counter] = list[Counter]()
-	x.append( Counter( n = 0 )).unwrap( 'x' )
+	x.append( Counter( n = 0 ))
 	i: i32 = 0
 	while i < 50:
 		x[0] += 1
@@ -5398,11 +5398,9 @@ class ListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'list_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
 	if x.__len__() != 3:
 		return 1
 	g0: Result[i32,IndexError] = x.__getitem__( 0 )
@@ -5439,7 +5437,7 @@ def main() -> i32:
 			( 'list_rc_element_getitem_unwrap_chained_on_bare_receiver', '''
 def main() -> i32:
 	x: list[int] = list[int]()
-	x.append( int( 5 )).unwrap( 'x' )
+	x.append( int( 5 ))
 	got: int = x.__getitem__( 0 ).unwrap( 'getitem failed' )
 	if got != int( 5 ):
 		return 1
@@ -5454,9 +5452,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,BorrowError] = x.append( compiler.cast( i32, i ))
-			if ar.is_err():
-				return 9
+			x.append( compiler.cast( i32, i ))
 			i += 1
 	if x.__len__() != 20:
 		return 1
@@ -5481,14 +5477,12 @@ def main() -> i32:
 			( 'erase_at_preserves_positional_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	r3: Result[None,BorrowError] = x.append( 40 )
-	r4: Result[None,BorrowError] = x.append( 50 )
-	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
-		return 9
-	er: Result[None,IndexError|BorrowError] = x.erase_at( 2 )
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
+	x.append( 40 )
+	x.append( 50 )
+	er: Result[None,IndexError] = x.erase_at( 2 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -5513,14 +5507,10 @@ def main() -> i32:
 			( 'insert_shifts_tail_right_and_preserves_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
-	ir: Result[None,BorrowError] = x.insert( 1, 99 )
-	if ir.is_err():
-		return 8
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
+	x.insert( 1, 99 )
 	if x.__len__() != 4:
 		return 1
 	g0: Result[i32,IndexError] = x.__getitem__( 0 )
@@ -5542,13 +5532,9 @@ def main() -> i32:
 			( 'insert_past_end_clamps_to_append', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	if r0.is_err() or r1.is_err():
-		return 9
-	ir: Result[None,BorrowError] = x.insert( 100, 30 )
-	if ir.is_err():
-		return 8
+	x.append( 10 )
+	x.append( 20 )
+	x.insert( 100, 30 )
 	if x.__len__() != 3:
 		return 1
 	g2: Result[i32,IndexError] = x.__getitem__( 2 )
@@ -5570,11 +5556,9 @@ def set_it( x: list[i32] ) -> Result[None,IndexError]:
 
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
 	sr: Result[None,IndexError] = set_it( x )
 	if sr.is_err():
 		return 7
@@ -5594,10 +5578,8 @@ def main() -> i32:
 			( 'list_str_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,BorrowError] = x.append( 'hello' )
-	r1: Result[None,BorrowError] = x.append( 'world' )
-	if r0.is_err() or r1.is_err():
-		return 9
+	x.append( 'hello' )
+	x.append( 'world' )
 	if x.__len__() != 2:
 		return 1
 	g0: Result[str,IndexError] = x.__getitem__( 0 )
@@ -5616,9 +5598,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,BorrowError] = x.append( 'item' )
-			if ar.is_err():
-				return 9
+			x.append( 'item' )
 			i += 1
 	if x.__len__() != 20:
 		return 1
@@ -5657,9 +5637,7 @@ class Holder:
 		self.items = list[i32]()
 
 	def add( self, v: i32 ) -> None:
-		r: Result[None,BorrowError] = self.items.append( v )
-		if r.is_err():
-			sys.panic( 'append failed' )
+		self.items.append( v )
 
 def main() -> i32:
 	h: Holder = Holder()
@@ -5714,9 +5692,7 @@ class Triple:
 
 def main() -> i32:
 	xs: list[Triple] = list[Triple]()
-	r1: Result[None,BorrowError] = xs.append( Triple( 5 ))
-	if r1.is_err():
-		return 1
+	xs.append( Triple( 5 ))
 	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
 	if g1.is_err():
 		return 2
@@ -5766,12 +5742,10 @@ def main() -> i32:
 			( 'list_str_erase_at_preserves_order_and_refcounts', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,BorrowError] = x.append( 'a' )
-	r1: Result[None,BorrowError] = x.append( 'b' )
-	r2: Result[None,BorrowError] = x.append( 'c' )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
-	er: Result[None,IndexError|BorrowError] = x.erase_at( 1 )
+	x.append( 'a' )
+	x.append( 'b' )
+	x.append( 'c' )
+	er: Result[None,IndexError] = x.erase_at( 1 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 2:
@@ -5886,7 +5860,7 @@ class Pusher:
 		while i < 1000:
 			with compiler.wrap_arithmetic:
 				v: i32 = self.base + i
-			self.target.append( v ).unwrap( 'append failed' )
+			self.target.append( v )
 			with compiler.wrap_arithmetic:
 				i += 1
 
@@ -5898,7 +5872,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 1000
 		p: Pusher = Pusher.make( l, base )
-		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( p.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -5936,7 +5910,7 @@ class Pusher:
 		while i < 1000:
 			with compiler.wrap_arithmetic:
 				v: i32 = self.base + i
-			self.target.append( v ).unwrap( 'append failed' )
+			self.target.append( v )
 			with compiler.wrap_arithmetic:
 				i += 1
 
@@ -5951,7 +5925,7 @@ class Consumer:
 
 	def run( self ) -> None:
 		while self.popped < 8000:
-			r: Result[i32, IndexError|BorrowError] = self.source.pop()
+			r: Result[i32, IndexError] = self.source.pop()
 			if r.is_ok():
 				v: i32 = r.unwrap( 'checked is_ok' )
 				with compiler.wrap_arithmetic:
@@ -5968,7 +5942,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 1000
 		p: Pusher = Pusher.make( l, base )
-		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( p.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -6010,7 +5984,7 @@ class ItemPusher:
 			with compiler.wrap_arithmetic:
 				v: i32 = self.base + i
 			it: Item = Item.make( v )
-			self.target.append( it ).unwrap( 'append failed' )
+			self.target.append( it )
 			compiler.decref( it )
 			with compiler.wrap_arithmetic:
 				i += 1
@@ -6023,7 +5997,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 250
 		p: ItemPusher = ItemPusher.make( l, base )
-		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( p.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -6166,107 +6140,6 @@ def main() -> i32:
 		return 1
 	if result_b.load() != 222:
 		return 2
-	return 0
-''' ),
-			# real cross-thread stress test for list[T][a:b] slice syntax's
-			# RAII borrow tracking: N threads hammer append() on a list while
-			# the MAIN thread holds a live slice[T] view, then lets it go
-			# (del view) - a closed-form accounting check (every attempt is
-			# EITHER blocked with BorrowError OR succeeds, counted
-			# separately, and the two counts plus the list's own final
-			# length must all agree exactly) proves the borrow genuinely
-			# serializes against real concurrent mutation attempts, not just
-			# single-threaded reasoning - and that releasing it happens
-			# automatically via slice[T].__del__ (RAII), with no manual
-			# release call, unlike the old borrow_slice()/release_borrow()
-			# API this replaces. The busy-wait on `started` (same pattern
-			# independent_per_thread_slots above already uses) maximizes the
-			# chance every hammering thread has actually begun racing before
-			# the main thread drops the view - without it, a slow thread
-			# start could let every attempt land AFTER the view's __del__,
-			# proving nothing.
-			( 'slice_syntax_blocks_concurrent_mutation_and_unblocks_on_del', '''
-import threading
-import atomic
-
-class Hammerer:
-	target:  list[i32]
-	started: atomic.Atomic[i32]
-	blocked: atomic.Atomic[i32]
-	ok:      atomic.Atomic[i32]
-
-	@staticmethod
-	def make( target: list[i32], started: atomic.Atomic[i32], blocked: atomic.Atomic[i32], ok: atomic.Atomic[i32] ) -> Hammerer:
-		return Hammerer.__allocate__( target = target, started = started, blocked = blocked, ok = ok )
-
-	def run( self ) -> None:
-		self.started.fetch_add( 1 )
-		i: i32 = 0
-		while i < 20000:
-			if self.target.append( 1 ).is_ok():
-				self.ok.fetch_add( 1 )
-			else:
-				self.blocked.fetch_add( 1 )
-			with compiler.wrap_arithmetic:
-				i += 1
-
-def main() -> i32:
-	l: list[i32] = list[i32]()
-	started = atomic.Atomic[i32]( 0 )
-	blocked = atomic.Atomic[i32]( 0 )
-	ok      = atomic.Atomic[i32]( 0 )
-
-	view: slice[i32] = l[0:l.__len__()]
-
-	threads: list[threading.Thread] = list[threading.Thread]()
-	t: i32 = 0
-	while t < 4:
-		h: Hammerer = Hammerer.make( l, started, blocked, ok )
-		threads.append( threading.Thread( h.run ) ).unwrap( 'append failed' )
-		with compiler.wrap_arithmetic:
-			t += 1
-
-	while started.load() < 4:
-		pass
-	# also wait for real, observed contention (not just thread startup)
-	# before releasing - under extreme scheduler oversubscription (e.g. 16
-	# parallel test shards, each spawning their own threads), a bare
-	# `started.load() < 4` busy-wait can race: all 4 hammering threads can
-	# run their ENTIRE workload to completion in one scheduling burst
-	# before this thread's own busy-wait ever gets a chance to notice and
-	# release, making `blocked` a coin flip instead of a near-certainty.
-	# 20000 iterations/thread (vs the smaller count this used to have)
-	# makes that one-uninterrupted-burst scenario far less likely on its
-	# own already; waiting for a real blocked count on top removes the
-	# remaining race on THAT assertion specifically.
-	while blocked.load() < 100:
-		pass
-
-	# view's own length, captured before `del` ends its lifetime - the
-	# borrow-count decrement (unblocking every hammering thread) happens
-	# right here, inside del, entirely automatically
-	view_len: usize = view.__len__()
-	del view
-
-	i: usize = 0
-	while i < 4:
-		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
-		th.join()
-		with compiler.wrap_arithmetic:
-			i += 1
-
-	if view_len != 0:
-		return 1
-	if blocked.load() == 0:
-		return 2
-	if ok.load() == 0:
-		return 3
-	with compiler.wrap_arithmetic:
-		total: i32 = blocked.load() + ok.load()
-	if total != 80000:
-		return 4
-	if l.__len__() != usize( ok.load() ):
-		return 5
 	return 0
 ''' ),
 		], timeout = 30 )
@@ -7212,7 +7085,7 @@ def main() -> i32:
 	rc0: usize = compiler.refcount( c )
 
 	lst = list[Closure[[], None]]()
-	lst.append( c ).unwrap( 'append failed' )
+	lst.append( c )
 	rc1: usize = compiler.refcount( c )
 	with compiler.wrap_arithmetic:
 		if rc1 != rc0 + 1:
@@ -7693,7 +7566,7 @@ def main() -> i32:
 	threads: list[threading.Thread] = list[threading.Thread]()
 	i: usize = 0
 	while i < 8:
-		threads.append( threading.Thread( closure ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( closure ) )
 		with compiler.wrap_arithmetic:
 			i += 1
 	i = 0
@@ -7980,7 +7853,7 @@ def main() -> i32:
 	if '-'.join( empty ) != '':
 		return 2
 	single: list[str] = list[str]()
-	single.append( 'solo' ).unwrap( 'append failed' )
+	single.append( 'solo' )
 	if '-'.join( single ) != 'solo':
 		return 3
 	return 0
@@ -9590,7 +9463,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 100
 		w: DictWriter = DictWriter.make( d, base )
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -9645,7 +9518,7 @@ def main() -> i32:
 	inc: Incrementer = Incrementer.make( d )
 	t: i32 = 0
 	while t < 8:
-		threads.append( threading.Thread( inc.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( inc.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -9703,7 +9576,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 50
 		w: StrDictWriter = StrDictWriter.make( d, base )
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -9733,13 +9606,13 @@ def main() -> i32:
 class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/bisect.py's bisect_left/bisect_right (direct T-vs-T comparison)
 	and bisect_left_by_key/bisect_right_by_key (key: Ptr[Callable[[T],K]]
-	extractor, T and K allowed to differ) - and UnsafeList[T].as_slice(),
-	the slice[T] view bridge these need arr: slice[T] parameters from.
-	Never compiled/run anywhere before this - lib/builtins/__RawDict.py used
-	to hand-roll its own binary search specifically because bisect.py's
-	key= couldn't be made to work (no Callable[...] support, then no
-	slice[T] construction path); RawDict._lower_bound now calls
-	bisect_left_by_key for real (see DictTests). '''
+	extractor, T and K allowed to differ) - both operate directly on an
+	arr: UnsafeList[T] (no view/copy of their own; see lib/bisect.py's own
+	comment). Never compiled/run anywhere before this - lib/builtins/
+	__RawDict.py used to hand-roll its own binary search specifically
+	because bisect.py's key= couldn't be made to work (no Callable[...]
+	support, then no way to pass it a plain buffer reference); RawDict.
+	_lower_bound now calls bisect_left_by_key for real (see DictTests). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -9751,111 +9624,10 @@ class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
 		single executable (one build for the whole class); a nonzero exit is
 		decoded back to the failing sub-program and its own return code. '''
 		self.assert_programs_run([
-			( 'as_slice_over_value_typed_elements', '''
-def main() -> i32:
-	arr: UnsafeList[i32] = UnsafeList[i32]()
-	arr.append( 10 )
-	arr.append( 20 )
-	arr.append( 30 )
-	s: slice[i32] = arr.as_slice()
-	if len( s ) != 3:
-		return 1
-	if s.get_unchecked( 0 ) != 10 or s.get_unchecked( 1 ) != 20 or s.get_unchecked( 2 ) != 30:
-		return 2
-	return 0
-''' ),
-			# as_slice() over an EMPTY list - _slot_ptr(0) is deliberately not
-			# bounds-checked against __len for exactly this case (see its own
-			# docstring); a zero-length slice must still be constructible and
-			# safe (nothing can read through it - every real read goes
-			# through an index < len() check first)
-			( 'as_slice_over_empty_list', '''
-def main() -> i32:
-	arr: UnsafeList[i32] = UnsafeList[i32]()
-	s: slice[i32] = arr.as_slice()
-	if len( s ) != 0:
-		return 1
-	return 0
-''' ),
-			# as_slice() over an RC element type (str) - slice[T]'s own _ptr is
-			# untyped (ConstPtr[None]) and get_unchecked already does the
-			# compiler.is_rc(T) handle-vs-value branch - confirms the two
-			# containers' buffer layouts genuinely agree for RC T too
-			( 'as_slice_over_rc_elements', '''
-def main() -> i32:
-	arr: UnsafeList[str] = UnsafeList[str]()
-	arr.append( 'apple' )
-	arr.append( 'banana' )
-	arr.append( 'cherry' )
-	s: slice[str] = arr.as_slice()
-	if s.get_unchecked( 0 ) != 'apple':
-		return 1
-	if s.get_unchecked( 1 ) != 'banana':
-		return 2
-	if s.get_unchecked( 2 ) != 'cherry':
-		return 3
-	return 0
-''' ),
-			# get_unchecked's own Incref for RC T, bound to a named local -
-			# above's 'apple'/'banana'/'cherry' are all string LITERALS, which
-			# compile to immortal (ref_count == METALPY_IMMORTAL_REFCOUNT)
-			# static objects whose Incref/Decref are silent no-ops (see
-			# emitter_c.py's retain_object/release_object) - that masks this
-			# entire bug class. heap_str() builds a genuine, normally-
-			# refcounted heap string at runtime instead - concatenating two
-			# CONSTANT strings (e.g. 'heap_' + 'string') gets constant-folded
-			# back into a single immortal literal (confirmed empirically),
-			# but 'heap_' + str(n) can't be, since n is a plain i32 parameter.
-			( 'get_unchecked_increfs_rc_element_bound_to_local', '''
-def heap_str( n: i32 ) -> str:
-	return 'heap_' + str( n )
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		x: str = heap_str( 1 )
-		arr: UnsafeList[str] = UnsafeList[str]()
-		arr.append( x )
-		s: slice[str] = arr.as_slice()
-		before: usize = compiler.refcount( x )
-		got: str = s.get_unchecked( 0 )
-		after: usize = compiler.refcount( x )
-		if after != before + 1:
-			return 1
-		if got != x:
-			return 2
-		compiler.decref( got )
-		restored: usize = compiler.refcount( x )
-		if restored != before:
-			return 3
-	return 0
-''' ),
-			# same non-literal-heap-string setup, but the read is INLINE
-			# (never bound to a name) - the exact shape lib/bisect.py's own
-			# get_unchecked calls use. get_unchecked's own Incref and the
-			# compiler's automatic scope-exit Decref on the unnamed temp
-			# holding the comparison's operand must cancel out net zero.
-			( 'get_unchecked_inline_read_is_refcount_neutral', '''
-def heap_str( n: i32 ) -> str:
-	return 'inline_' + str( n )
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		x: str = heap_str( 1 )
-		arr: UnsafeList[str] = UnsafeList[str]()
-		arr.append( x )
-		s: slice[str] = arr.as_slice()
-		before: usize = compiler.refcount( x )
-		if s.get_unchecked( 0 ) != x:
-			return 1
-		after: usize = compiler.refcount( x )
-		if after != before:
-			return 2
-	return 0
-''' ),
 			# bisect_left/bisect_right over an RC element type (str) end to
 			# end - every prior bisect test here uses a non-RC T (i32/Node),
 			# so this is the first real exercise of bisect.py's inline
-			# get_unchecked calls against RC elements.
+			# __getitem__(...).unwrap(...) reads against RC elements.
 			( 'bisect_left_and_right_over_rc_elements', '''
 import bisect
 
@@ -9869,35 +9641,11 @@ def main() -> i32:
 		arr.append( heap_str( 2 ) )
 		arr.append( heap_str( 2 ) )
 		arr.append( heap_str( 3 ) )
-		s: slice[str] = arr.as_slice()
 		target: str = heap_str( 2 )
-		if bisect.bisect_left( s, target ) != 1:
+		if bisect.bisect_left( arr, target ) != 1:
 			return 1
-		if bisect.bisect_right( s, target ) != 3:
+		if bisect.bisect_right( arr, target ) != 3:
 			return 2
-	return 0
-''' ),
-			# repeated named-local + explicit compiler.decref reads over many
-			# iterations with a fresh heap (non-literal) string each time -
-			# mirrors FStringTests' own repeated_fstring_construction_does_
-			# not_leak_or_double_free stress shape; a leak grows memory
-			# silently but a double-free/UAF here crashes the process,
-			# turning a wrong exit code into a hard failure.
-			( 'repeated_slice_get_unchecked_read_does_not_leak_or_double_free', '''
-def heap_str( n: i32 ) -> str:
-	return 'value_' + str( n )
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		for i in range( 1000 ):
-			x: str = heap_str( 7 )
-			arr: UnsafeList[str] = UnsafeList[str]()
-			arr.append( x )
-			s: slice[str] = arr.as_slice()
-			got: str = s.get_unchecked( 0 )
-			if got != heap_str( 7 ):
-				return 1
-			compiler.decref( got )
 	return 0
 ''' ),
 			( 'bisect_left_and_right_direct_comparison', '''
@@ -9910,17 +9658,16 @@ def main() -> i32:
 	arr.append( 3 )
 	arr.append( 5 )
 	arr.append( 7 )
-	s: slice[i32] = arr.as_slice()
-	if bisect.bisect_left( s, 3 ) != 1:
+	if bisect.bisect_left( arr, 3 ) != 1:
 		return 1
-	if bisect.bisect_right( s, 3 ) != 3:
+	if bisect.bisect_right( arr, 3 ) != 3:
 		return 2
-	if bisect.bisect_left( s, 0 ) != 0:
+	if bisect.bisect_left( arr, 0 ) != 0:
 		return 3
-	if bisect.bisect_right( s, 100 ) != 5:
+	if bisect.bisect_right( arr, 100 ) != 5:
 		return 4
 	empty: UnsafeList[i32] = UnsafeList[i32]()
-	if bisect.bisect_left( empty.as_slice(), 5 ) != 0:
+	if bisect.bisect_left( empty, 5 ) != 0:
 		return 5
 	return 0
 ''' ),
@@ -9945,10 +9692,9 @@ def main() -> i32:
 	arr.append( Node( hash = 3, payload = 2 ))
 	arr.append( Node( hash = 5, payload = 3 ))
 	key: Ptr[Callable[[Node],u64]] = hash_of
-	s: slice[Node] = arr.as_slice()
-	if bisect.bisect_left_by_key( s, u64( 3 ), key ) != 1:
+	if bisect.bisect_left_by_key( arr, u64( 3 ), key ) != 1:
 		return 1
-	if bisect.bisect_right_by_key( s, u64( 3 ), key ) != 3:
+	if bisect.bisect_right_by_key( arr, u64( 3 ), key ) != 3:
 		return 2
 	return 0
 ''' ),
@@ -10066,8 +9812,8 @@ def main() -> i32:
 			( 'list_of_tuple_as_explicit_constructor_type_argument', '''
 def main() -> i32:
 	entries: list[tuple[str,str]] = list[tuple[str,str]]()
-	entries.append( ( "Content-Type", "text/plain" ) ).unwrap( 'append' )
-	entries.append( ( "X-Test", "1" ) ).unwrap( 'append' )
+	entries.append( ( "Content-Type", "text/plain" ) )
+	entries.append( ( "X-Test", "1" ) )
 	if len( entries ) != 2:
 		return 1
 	first: tuple[str,str] = entries.__getitem__( 0 ).unwrap( 'idx' )
@@ -12389,7 +12135,7 @@ def main() -> i32:
 
 class SliceSyntaxTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - dispatches through an ordinary
-	__getitem__(PySlice) overload (lowering.py's _lower_slice_subscript),
+	__getitem__(slice) overload (lowering.py's _lower_slice_subscript),
 	so any type declaring one supports slice syntax; str/bytearray/
 	memoryview are the built-in ones. str's slicing is byte-offset, not
 	this codebase's own Unicode-codepoint s[i] convention - see
@@ -12502,6 +12248,33 @@ def main() -> i32:
 		return 2
 	if len( b[2:1] ) != 0:
 		return 3
+	return 0
+''' ),
+			# bytes had no slice syntax at all before (no __getitem__(slice)
+			# overload) - this is new coverage, not a regression guard.
+			# Clamping semantics mirror bytearray's own test above exactly;
+			# content (not just length) is checked via decode() since bytes
+			# has no __eq__ of its own.
+			( 'bytes_slice_out_of_range_bounds_clamp', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	buf: bytearray = bytearray( 5 )
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	b: bytes = bytes( buf )
+	if utf8.decode( b[1:4] ).unwrap( 'decode failed' ) != 'ell':
+		return 1
+	if len( b[1000:2000] ) != 0:
+		return 2
+	if len( b[4:1] ) != 0:
+		return 3
+	if utf8.decode( b[0:1000] ).unwrap( 'decode failed' ) != 'hello':
+		return 4
 	return 0
 ''' ),
 			( 'memoryview_slice_out_of_range_bounds_clamp', '''
@@ -13074,7 +12847,7 @@ def main() -> i32:
 class GenericClassOverloadMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' discovery.py's _get_or_create_specialization cached its result keyed
 	purely by a STRING (base.qualname + args' qualnames) - found while
-	giving list[T]/UnsafeList[T] a second __getitem__ overload (PySlice, for
+	giving list[T]/UnsafeList[T] a second __getitem__ overload (slice, for
 	slice syntax) alongside their existing single-index one. monomorphize.
 	py's _substituted_overload (used whenever a generic class's own
 	@overload group gets specialized, e.g. list[T].__getitem__ specialized
@@ -13085,7 +12858,7 @@ class GenericClassOverloadMonomorphizationRealCompileTests( test_support.RealCom
 	specialization request silently hit the cache under the SAME key the
 	first leaf's request had already populated, returning the FIRST leaf's
 	monomorphized Function instead of creating its own. Confirmed via a real
-	repro: list[i32].__getitem__(PySlice) resolved to the SAME (usize-
+	repro: list[i32].__getitem__(slice) resolved to the SAME (usize-
 	taking) implementation as list[i32].__getitem__(usize), regardless of
 	which overload should have matched. Fixed by keying the cache on
 	(id(base), name) instead of name alone - base is always the same
@@ -13230,7 +13003,7 @@ class OverloadedGetitemDispatchTests( test_support.RealCompileMixin, CompilerTes
 	repro during development, a @cstruct with def __getitem__(self, i: i32),
 	broke when this first required an exact usize match instead of picking
 	whichever candidate is Scalar-typed at all). RangeKey (a plain @cstruct,
-	not a Scalar) stands in for the eventual real second leaf (PySlice, not
+	not a Scalar) stands in for the eventual real second leaf (slice, not
 	added yet) - it only needs to NOT be a Scalar, to confirm the fix
 	structurally prefers the Scalar (index-like) leaf over a compound one,
 	the same shape the real slice-syntax feature will need. '''
@@ -15992,7 +15765,7 @@ def main() -> i32:
 	empty_list: list[i32] = list[i32]()
 	if empty_list:
 		return 1
-	empty_list.append( 1 ).unwrap( 'append failed' )
+	empty_list.append( 1 )
 	if not empty_list:
 		return 2
 
@@ -16428,8 +16201,8 @@ def add_two( x: i32 ) -> i32:
 
 def main() -> i32:
 	arr: list[Ptr[Callable[[i32],i32]]] = list[Ptr[Callable[[i32],i32]]]()
-	arr.append( add_one ).unwrap( 'append' )
-	arr.append( add_two ).unwrap( 'append' )
+	arr.append( add_one )
+	arr.append( add_two )
 	f: Ptr[Callable[[i32],i32]] = arr.__getitem__( 0 ).unwrap( 'getitem' )
 	result0: i32 = f( 5 )
 	result1: i32 = arr.__getitem__( 1 ).unwrap( 'getitem' )( 5 )
@@ -18637,7 +18410,7 @@ class FStringTests( test_support.RealCompileMixin, CompilerTestCase ):
 		single executable (one build for the whole class); a nonzero exit is
 		decoded back to the failing sub-program and its own return code. '''
 		self.assert_programs_run([
-			# exercises the real N-part runtime path (UnsafeList[str]/slice[str]/
+			# exercises the real N-part runtime path (UnsafeList[str]/
 			# str.concat) - a and b are real runtime parameters (not folded away
 			# by compile_time_transformer.py), so this is the test that actually
 			# proves the whole pass end to end, not just compile-time folding
@@ -19758,9 +19531,9 @@ def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		xs: list[i32] = list[i32]()
-		xs.append( 1 ).unwrap( 'append failed' )
-		xs.append( 2 ).unwrap( 'append failed' )
-		xs.append( 3 ).unwrap( 'append failed' )
+		xs.append( 1 )
+		xs.append( 2 )
+		xs.append( 3 )
 		g = double_all( xs )
 		a = g.__next__()
 		match a:
@@ -19806,9 +19579,9 @@ def make_and_partially_consume( xs: list[i32] ) -> None:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		xs: list[i32] = list[i32]()
-		xs.append( 1 ).unwrap( 'append failed' )
-		xs.append( 2 ).unwrap( 'append failed' )
-		xs.append( 3 ).unwrap( 'append failed' )
+		xs.append( 1 )
+		xs.append( 2 )
+		xs.append( 3 )
 		if compiler.refcount( xs ) != 1:
 			return 1
 		make_and_partially_consume( xs )
@@ -20601,9 +20374,9 @@ def consume_fully( xs: list[Box] ) -> None:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		xs: list[Box] = list[Box]()
-		xs.append( Box( v = 10 ) ).unwrap( 'append failed' )
-		xs.append( Box( v = 20 ) ).unwrap( 'append failed' )
-		xs.append( Box( v = 30 ) ).unwrap( 'append failed' )
+		xs.append( Box( v = 10 ) )
+		xs.append( Box( v = 20 ) )
+		xs.append( Box( v = 30 ) )
 		consume_fully( xs )
 		if compiler.refcount( xs ) != 1:
 			return 1
@@ -22563,16 +22336,16 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> i32:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 		return 42
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t as v:
-		log.append( v ).unwrap( 'overflow' )
+		log.append( v )
 	if log.__len__() != 3:
 		return 1
 	if log.__getitem__( 0 ).unwrap( 'idx' ) != 1:
@@ -22593,15 +22366,15 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t:
-		log.append( 99 ).unwrap( 'overflow' )
+		log.append( 99 )
 	if log.__len__() != 3:
 		return 1
 	return 0
@@ -22618,13 +22391,13 @@ class Trace:
 	def __enter__( self ) -> None:
 		pass
 	def __exit__( self ) -> None:
-		self.log.append( 7 ).unwrap( 'overflow' )
+		self.log.append( 7 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t:
-		log.append( 1 ).unwrap( 'overflow' )
+		log.append( 1 )
 		return 0
 	return 1
 ''' )
@@ -22647,16 +22420,16 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t:
-		log.append( 99 ).unwrap( 'overflow' )
-	log.append( 3 ).unwrap( 'overflow' )
+		log.append( 99 )
+	log.append( 3 )
 	if log.__len__() != 4:
 		return 1
 	if log.__getitem__( 3 ).unwrap( 'idx' ) != 3:
@@ -22822,16 +22595,16 @@ class Trace:
 		self.log = log
 		self.tag = tag
 	def __enter__( self ) -> None:
-		self.log.append( self.tag ).unwrap( 'overflow' )
+		self.log.append( self.tag )
 	def __exit__( self ) -> None:
 		with compiler.wrap_arithmetic:
-			self.log.append( self.tag + 100 ).unwrap( 'overflow' )
+			self.log.append( self.tag + 100 )
 
 def main() -> i32:
 	log = list[i32]()
 	with Trace( log, 1 ):
 		with Trace( log, 2 ):
-			log.append( 0 ).unwrap( 'overflow' )
+			log.append( 0 )
 	if log.__len__() != 5:
 		return 1
 	expected: list[i32] = [ 1, 2, 0, 102, 101 ]
@@ -22860,7 +22633,7 @@ class Trace:
 	def __enter__( self ) -> None:
 		pass
 	def __exit__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 
 def main() -> i32:
 	log = list[i32]()
@@ -22903,9 +22676,9 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -22946,7 +22719,7 @@ class Trace:
 	def __enter__( self ) -> None:
 		pass
 	def __exit__( self ) -> None:
-		self.log.append( 7 ).unwrap( 'overflow' )
+		self.log.append( 7 )
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -23055,7 +22828,7 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 99 ).unwrap( 'overflow' )
+		self.log.append( 99 )
 	def __exit__( self ) -> None:
 		pass
 
@@ -23064,7 +22837,7 @@ def main() -> i32:
 	i: usize = 0
 	while i < 3:
 		with compiler.wrap_arithmetic:
-			log.append( i32( i )).unwrap( 'overflow' )
+			log.append( i32( i ))
 			i = i + 1
 	with Trace( log ):
 		pass

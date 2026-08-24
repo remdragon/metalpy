@@ -730,7 +730,7 @@ class int:
 			with compiler.panic_arithmetic( 'bounded by radix <= 16, cannot overflow' ):
 				digit_index: usize = usize( digit_value )
 				digit_index_end: usize = digit_index + 1
-			digits.append( digit_chars._byte_slice( digit_index, digit_index_end )).unwrap( '_to_radix_digits: append failed' )
+			digits.append( digit_chars._byte_slice( digit_index, digit_index_end ))
 			magnitude = result[0]
 		count: usize = digits.__len__()
 		ordered: list[str] = list[str]() # most-significant digit first
@@ -738,7 +738,7 @@ class int:
 		with compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):
 			while i > 0:
 				i -= 1
-				ordered.append( digits.__getitem__( i ).unwrap( '_to_radix_digits: index in bounds by construction' )).unwrap( '_to_radix_digits: append failed' )
+				ordered.append( digits.__getitem__( i ).unwrap( '_to_radix_digits: index in bounds by construction' ))
 		return ''.join( ordered )
 
 	@private
@@ -780,14 +780,14 @@ class int:
 		while end > 3:
 			with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
 				start: usize = end - 3
-			groups.append( digits._byte_slice( start, end )).unwrap( '_decimal_digits_with_grouping: append failed' )
+			groups.append( digits._byte_slice( start, end ))
 			end = start
-		groups.append( digits._byte_slice( 0, end )).unwrap( '_decimal_digits_with_grouping: append failed' )
+		groups.append( digits._byte_slice( 0, end ))
 		group_count: usize = groups.__len__()
 		ordered: list[str] = list[str]() # most-significant GROUP first
 		i: usize = group_count
 		with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
 			while i > 0:
 				i -= 1
-				ordered.append( groups.__getitem__( i ).unwrap( '_decimal_digits_with_grouping: index in bounds by construction' )).unwrap( '_decimal_digits_with_grouping: append failed' )
+				ordered.append( groups.__getitem__( i ).unwrap( '_decimal_digits_with_grouping: index in bounds by construction' ))
 		return sep.join( ordered )

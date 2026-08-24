@@ -8923,33 +8923,18 @@ class FunctionLowering:
 			#)
 			self._emit( ir.Call( dest = None, target = append, receiver = buf, args = [ part ], kwargs = {} ))
 
-		# UnsafeList[str].as_slice() - a real slice[str] view over the WHOLE
-		# buffer, exactly n elements (the buffer is pre-sized to exactly
-		# len(node.values) and never appended to more than that many times -
-		# same "provably always Ok" reasoning append's own unwrap above
-		# relies on). Used to be a hand-rolled get_ptr(0)+CastWrap+direct
-		# ir.Allocate sequence, written before as_slice() existed at all
-		# (as_slice() was added later, for lib/bisect.py's own wiring, and
-		# nobody circled back to simplify this) - as_slice() already does
-		# the identical thing (buf.__raw._slot_ptr(0), cast to ConstPtr
-		# [None], wrapped in a slice[T]) as one real library call, the same
-		# "look up method by name, emit one ir.Call" pattern init/append
-		# above already use, not a special one-off.
-		as_slice = concrete_cls.get_local_or_raise( 'as_slice' )
-		self.lowering._ensure_resolved( as_slice ) # see init's own comment on why this is needed
-		self.lowering.schedule( as_slice.return_type )
-		for p in ( as_slice.parameters or [] ):
-			self.lowering.schedule( p.type )
-		view = self._new_temp( as_slice.return_type )
-		self._emit( ir.Call( dest = view, target = as_slice, receiver = buf, args = [], kwargs = {} ))
-
+		# str.concat( buf ) directly - concat's own parameter type is
+		# UnsafeList[str] (matches buf exactly), so no bridging step is
+		# needed here at all (this used to build a slice[str] view over buf
+		# first, back when concat took slice[str] - that view type is gone
+		# now, see PLAN_STR_FORMAT.md/list.__getitem__(slice) history).
 		concat = self.lowering._find_method( str_type, 'concat' )
 		self.lowering._ensure_resolved( concat )
 		self.lowering.schedule( concat.return_type )
 		for p in ( concat.parameters or [] ):
 			self.lowering.schedule( p.type )
 		dest = self._new_temp( str_type )
-		self._emit( ir.Call( dest = dest, target = concat, receiver = None, args = [ view ], kwargs = {} ))
+		self._emit( ir.Call( dest = dest, target = concat, receiver = None, args = [ buf ], kwargs = {} ))
 		return dest
 
 	def _lower_bound_method_closure( self, node: ast.Attribute, obj: ir.Operand, method: Function, expected_type: Type|None ) -> ir.Operand:
@@ -9486,40 +9471,11 @@ class FunctionLowering:
 		assert append_fn is not None, 'internal compiler error: list[T] has no append method'
 		self.lowering._ensure_resolved( append_fn )
 		self.lowering.schedule( append_fn.return_type )
-		# _find_method only ever returns a plain Function (deliberately
-		# None for an Overload group - see its own docstring), but
-		# Result.unwrap is one now (a str/Ptr[Callable[[E],str]] overload) -
-		# mirror _find_method's own lookup (chain_lookup for a CStruct/
-		# RCClass, else the raw .names dict - Result itself is a
-		# TaggedUnion, neither) and take the group's own (single, real)
-		# implementation, same idiom _lower_call's compiler.__raw_free__
-		# handling already uses for sys.free
-		resolved_result_type = self.lowering._ensure_resolved( append_fn.return_type )
-		if isinstance( resolved_result_type, ( CStruct, RCClass )):
-			raw_unwrap = resolved_result_type.chain_lookup( 'unwrap' )
-		else:
-			names = getattr( resolved_result_type, 'names', None )
-			raw_unwrap = names.get( 'unwrap' ) if isinstance( names, dict ) else None
-		raw_unwrap = self.lowering._resolve_scalar_name( raw_unwrap )
-		unwrap_fn = raw_unwrap.implementations[0] if isinstance( raw_unwrap, Overload ) else raw_unwrap
-		assert isinstance( unwrap_fn, Function ), 'internal compiler error: list[T].append does not return a Result with unwrap()'
-		self.lowering._ensure_resolved( unwrap_fn )
-		self.lowering.schedule( unwrap_fn.return_type )
-		errmsg_node = ast.Constant( value = 'list literal: append failed' )
-		ast.copy_location( errmsg_node, node )
 		for elt in node.elts:
 			operand = self._lower_expr( elt, elem_type )
-			append_dest = self._new_temp( append_fn.return_type )
-			self._emit( ir.Call( dest = append_dest, target = append_fn, receiver = dest, args = [ operand ], kwargs = {} ))
-			errmsg = self._lower_expr( errmsg_node, unwrap_fn.parameters[0].type )
-			# unwrap()'s own return value (T=None here, list[T].append's own
-			# Result[None,OverflowError]) is never read - only its side
-			# effect (panic on Err) matters, so no destination temp: T=None
-			# compiles to a real C `void` return, and a real ir.Call dest
-			# expects an actual value to assign, not void - same "dest=None
-			# for a call whose result isn't used" convention _stmt_Expr's
-			# own bare-call-statement handling already relies on
-			self._emit( ir.Call( dest = None, target = unwrap_fn, receiver = append_dest, args = [ errmsg ], kwargs = {} ))
+			# dest=None: append()'s return value (None) is never read, only
+			# its side effect - mirrors _expr_Set's own add() handling below
+			self._emit( ir.Call( dest = None, target = append_fn, receiver = dest, args = [ operand ], kwargs = {} ))
 		return dest
 
 	def _expr_Set( self, node: ast.Set, expected_type: Type|None ) -> ir.Operand:
@@ -9570,19 +9526,19 @@ class FunctionLowering:
 
 	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
 		''' x[a:b] / x[:b] / x[a:] - dispatches through an ordinary
-		__getitem__(PySlice) overload (PySlice: a start/stop range
+		__getitem__(slice) overload (slice: a start/stop range
 		descriptor, lib/builtins/__init__.py), resolved via
 		_find_dunder_for_arg - the caller here already knows the exact arg
-		type (PySlice), exactly that helper's designed use case, unlike the
+		type (slice), exactly that helper's designed use case, unlike the
 		plain-index path's _find_indexlike_getitem. Replaces the old
 		hardcoded 3-type (str/bytearray/memoryview) own _byte_slice/
 		_SLICE_LENGTH_METHOD dispatch - any type declaring a
-		__getitem__(PySlice) overload now supports slice syntax generically
+		__getitem__(slice) overload now supports slice syntax generically
 		(str/bytearray/memoryview keep byte-offset semantics via their own
-		overload bodies; list[T]/UnsafeList[T] return a borrowed slice[T]
-		view instead of a copy - see their own __getitem__(PySlice)).
+		overload bodies; list[T] returns a fresh copy, UnsafeList[T] a
+		borrowed slice[T] view - see their own __getitem__(slice)).
 		stop's default (omitted upper bound) is left for the CALLEE's own
-		overload body to resolve (PySlice.stop is nullable) rather than
+		overload body to resolve (slice.stop is nullable) rather than
 		hardcoded here per type, since only the callee knows the right unit
 		(str's real __len__() is a codepoint count, wrong for its own
 		byte-offset slicing - see str.byte_len() vs str.__len__()). No
@@ -9594,20 +9550,20 @@ class FunctionLowering:
 		assert isinstance( node_slice, ast.Slice )
 		if node_slice.step is not None:
 			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
-		pyslice_cls = self.lowering._ensure_resolved( self.lowering.discovery.find_name( 'PySlice', node ))
-		getitem_fn = self._find_dunder_for_arg( obj.type, '__getitem__', pyslice_cls )
+		slice_cls = self.lowering._ensure_resolved( self.lowering.discovery.find_name( 'slice', node ))
+		getitem_fn = self._find_dunder_for_arg( obj.type, '__getitem__', slice_cls )
 		if getitem_fn is None:
 			self.lowering.discovery.fail(
 				f'slicing is not supported for {obj.type.qualname if obj.type else "?"} '
-				f'(no __getitem__(PySlice) overload): {ast.unparse(node)}',
+				f'(no __getitem__(slice) overload): {ast.unparse(node)}',
 				node,
 			)
 		self.lowering._ensure_resolved( getitem_fn )
 		self.lowering.schedule( getitem_fn.return_type )
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-		start_field = self.lowering._find_field( pyslice_cls, 'start' )
-		stop_field = self.lowering._find_field( pyslice_cls, 'stop' )
-		assert start_field is not None and stop_field is not None, 'internal compiler error: PySlice missing start/stop fields'
+		start_field = self.lowering._find_field( slice_cls, 'start' )
+		stop_field = self.lowering._find_field( slice_cls, 'stop' )
+		assert start_field is not None and stop_field is not None, 'internal compiler error: slice missing start/stop fields'
 		if node_slice.lower is not None:
 			start = self._lower_expr( node_slice.lower, start_field.type )
 		else:
@@ -9622,17 +9578,17 @@ class FunctionLowering:
 			stop_value = self._lower_expr( node_slice.upper, usize_cls )
 			stop = self._coerce_or_check_operand( stop_value, stop_field.type, node_slice.upper )
 		else:
-			# no upper bound given - PySlice.stop is nullable specifically
+			# no upper bound given - slice.stop is nullable specifically
 			# so this "unbounded" state survives all the way into the
 			# callee's own overload body, rather than being resolved here
 			# against a hardcoded per-type length method
 			none_node = ast.Constant( value = None )
 			ast.copy_location( none_node, node )
 			stop = self._lower_expr( none_node, stop_field.type )
-		pyslice_dest = self._new_temp( pyslice_cls )
-		self._emit( ir.Allocate( dest = pyslice_dest, cls = pyslice_cls, fields = { 'start': start, 'stop': stop } ))
+		slice_dest = self._new_temp( slice_cls )
+		self._emit( ir.Allocate( dest = slice_dest, cls = slice_cls, fields = { 'start': start, 'stop': stop } ))
 		dest = self._new_temp( getitem_fn.return_type )
-		self._emit( ir.Call( dest = dest, target = getitem_fn, receiver = obj, args = [ pyslice_dest ], kwargs = {} ))
+		self._emit( ir.Call( dest = dest, target = getitem_fn, receiver = obj, args = [ slice_dest ], kwargs = {} ))
 		# plain sugar for obj.__getitem__(slice) - see _expr_Subscript's own
 		# comment for why this doesn't auto-consume a fallible result
 		return dest
@@ -11208,7 +11164,7 @@ class FunctionLowering:
 		''' like self.lowering._find_method(owner_type, '__getitem__'), but
 		Overload-aware for the ordinary x[i] (non-slice) subscript path -
 		once a type gains a second __getitem__ overload for slice syntax
-		(a compound range-descriptor argument, e.g. PySlice), this picks the
+		(a compound range-descriptor argument, e.g. slice), this picks the
 		leaf whose single parameter is a plain Scalar rather than silently
 		treating the whole Overload group as "no such method" the way a bare
 		_find_method does (same real gap _find_dunder_for_arg's own docstring
