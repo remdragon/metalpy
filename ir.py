@@ -614,6 +614,32 @@ class ReleaseGlobalLock( Instruction ):
 		return f'ReleaseGlobalLock( var={self.var.qualname!r} )'
 
 @dataclass( kw_only = True )
+class AcquireFieldLock( Instruction ):
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part B - the AcquireGlobalLock/
+	ReleaseGlobalLock pair's per-OBJECT counterpart: marks the START of the
+	one critical section a single instance-field READ or WRITE needs (B.3's
+	"lock the access, not the statement" - never spans more than one field
+	access, so two accesses to the same object's fields in the same
+	statement/method get two separate critical sections, not one wrapping
+	both - this is what keeps B.4's same-thread reentrancy hazard from ever
+	materializing for straight-line code). `obj` is the RECEIVER operand
+	(not a Variable, unlike AcquireGlobalLock's `var` - the lock lives in
+	the object's OWN ObjectHeader, keyed off whichever expression currently
+	holds the reference, not off any particular binding of it). '''
+	obj: Operand
+
+	def test_repr( self ) -> str:
+		return f'AcquireFieldLock( obj={self.obj!r} )'
+
+@dataclass( kw_only = True )
+class ReleaseFieldLock( Instruction ):
+	''' the matching END marker for AcquireFieldLock. '''
+	obj: Operand
+
+	def test_repr( self ) -> str:
+		return f'ReleaseFieldLock( obj={self.obj!r} )'
+
+@dataclass( kw_only = True )
 class RefCount( Instruction ): # compiler.refcount(x) - reads x's current header refcount
 	dest: Temp
 	value: Operand
