@@ -343,6 +343,45 @@ def main() -> i32:
 
 	# --- from_str parsing, incl. edge cases -----------------------------
 
+	def test_bare_literal_sugars_into_int_construction( self ) -> None:
+		# a bare int literal where `int` (the arbitrary-precision RCClass,
+		# not any fixed-width scalar) is the expected type used to hard-fail
+		# ("an int literal cannot be used where builtins.int is expected")
+		# in every one of these ordinary contexts - _expr_Constant now
+		# rewrites it into an explicit int(literal) construction call
+		# instead, the same thing a user would otherwise have to spell out
+		# by hand.
+		checks = [
+			'local annotated assignment: x: int = 5',
+			'class attribute default: count: int = 42',
+			'return statement: a function declared -> int',
+			'function-call argument: take_int(99)',
+			'a negative literal',
+		]
+		self._assert_program_succeeds( '''
+class Foo:
+	count: int = 42
+
+def make_int() -> int:
+	return -17
+
+def take_int( x: int ) -> i32:
+	return x.to_i32().unwrap( 'a' )
+
+def main() -> i32:
+	x: int = 5
+	if x.to_i32().unwrap('b') != 5:
+		return 1
+	f = Foo()
+	if f.count.to_i32().unwrap('c') != 42:
+		return 2
+	if make_int().to_i32().unwrap('d') != -17:
+		return 3
+	if take_int( 99 ) != 99:
+		return 4
+	return 0
+''', checks )
+
 	def test_from_str( self ) -> None:
 		checks = [
 			'"98765" parses to 98765',

@@ -8413,6 +8413,31 @@ class FunctionLowering:
 				f'write an explicit cast (e.g. {expected_type.stem}(...)) or use an integer literal: {ast.unparse(node)}',
 				node,
 			)
+		# builtins.int (arbitrary-precision) is the one RCClass a bare int
+		# literal sugars into directly - `x: int = 0`/`count: int = 0`
+		# (a class attribute default)/`return 0` (a function declared
+		# -> int) are all extremely ordinary code, and int's own single-
+		# i32-parameter __init__ makes "construct int from this literal"
+		# unambiguous - unlike the general "b: Box = 0" RCClass case this
+		# method deliberately keeps rejecting below (see the generator_
+		# zero_rc_field comment), so this is scoped to int specifically,
+		# not a blanket literal-into-any-RCClass relaxation. Rewrites to
+		# an ordinary `int(literal)` construction call and re-dispatches
+		# through the general Call path - the SAME thing a user would
+		# have to write by hand today, just implicit here. The nested
+		# literal argument's own expected_type is i32 (int.__init__'s
+		# declared parameter type, a Scalar), not this method's own
+		# int-RCClass expected_type, so it falls through the ordinary
+		# scalar-literal path below unaffected on its own re-entry - no
+		# risk of this branch firing twice for the same value.
+		if type( node.value ) is int:
+			int_type = self.lowering.discovery.find_name_or_none( 'int' )
+			if int_type is not None and expected_type is int_type:
+				call_node = ast.Call( func = ast.Name( id = 'int', ctx = ast.Load() ), args = [ ast.Constant( value = node.value ) ], keywords = [] )
+				ast.copy_location( call_node, node )
+				ast.copy_location( call_node.func, node )
+				ast.copy_location( call_node.args[0], node )
+				return self._lower_expr( call_node, expected_type )
 		# a literal being lowered against a CONCRETE, non-union expected type -
 		# verify the literal's own Python value kind could plausibly represent
 		# it at all (the same coarse stem-compatibility _LITERAL_COMPATIBLE_
