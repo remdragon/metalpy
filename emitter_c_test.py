@@ -4265,6 +4265,198 @@ def main() -> i32:
 		return needs_crt() - 42
 ''', expected_exit = 0 )
 
+class CompilerErrorIntrinsicTests( CompilerTestCase ):
+	# compiler.error(msg) - a real compile-time diagnostic library code can
+	# raise itself (see PLAN_NONETYPE_GENERIC_VALUE.md). No real C compile
+	# needed here - compiler.error(...) always fails at DISCOVERY time
+	# (lowering.py's _lower_compiler_error), same as any other
+	# discovery.fail() call, so a plain CompilerTestCase._run() + errors
+	# check is enough, mirroring every other "rejected at compile time"
+	# test in this file (e.g. FixedSizeArrayFieldTests).
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_reachable_call_fails_with_the_exact_message( self ) -> None:
+		self._run( '''
+def boom() -> i32:
+	compiler.error( 'a custom, purpose-authored message' )
+	return 0
+
+def main() -> i32:
+	return boom()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'a custom, purpose-authored message', self.discovery.errors.errors[0] )
+
+	def test_unreachable_call_never_fires( self ) -> None:
+		# same reachability-gating every other compile-time-only construct
+		# in this compiler already has (@requires_crt, sys.panic, ...) - a
+		# function that's never actually called is never lowered, so its
+		# own compiler.error(...) call never runs
+		self._run( '''
+def boom() -> i32:
+	compiler.error( 'must never fire' )
+	return 0
+
+def main() -> i32:
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_non_literal_argument_is_rejected( self ) -> None:
+		self._run( '''
+def boom( msg: str ) -> i32:
+	compiler.error( msg )
+	return 0
+
+def main() -> i32:
+	return boom( 'not a literal' )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'string-literal argument', self.discovery.errors.errors[0] )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class TypeIsGenericParamRealCompileTests( unittest.TestCase ):
+	# type(V) is T / type(V) is not T, where V is a generic class's own
+	# type parameter used bare (not an ordinary value) - see
+	# PLAN_NONETYPE_GENERIC_VALUE.md and type_resolver.py's own
+	# _try_fold_type_is_if. The critical property under test isn't just
+	# "does the boolean fold to the right answer" (type_resolver_test.py's
+	# own unit tests already cover that at the AST level) - it's that the
+	# UNTAKEN branch is never even lowered for a specialization that
+	# doesn't match, confirmed here via a real compile+run: a
+	# compiler.error(...) call placed in the untaken branch must never
+	# fire, for ANY V it doesn't apply to (a real repro found this exact
+	# gap - lowering.py's _stmt_If lowers BOTH branches of every `if`
+	# unconditionally, with no general dead-branch elimination for a
+	# merely-constant-folded condition, so this fold has to eliminate the
+	# branch at the AST level itself, before lowering ever sees it).
+	def _compile_and_run( self, source: str, expected_exit: int ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_untaken_branch_for_non_matching_v_is_never_compiled( self ) -> None:
+		self._compile_and_run( '''
+class Box[V]:
+	def check( self ) -> i32:
+		if type( V ) is None:
+			compiler.error( 'must never fire for V=i32' )
+			return 1
+		return 0
+
+def main() -> i32:
+	b: Box[i32] = Box[i32]()
+	return b.check()
+''', expected_exit = 0 )
+
+	def test_taken_branch_for_matching_v_still_compiles_and_runs( self ) -> None:
+		self._compile_and_run( '''
+class Box[V]:
+	def is_none_type( self ) -> bool:
+		if type( V ) is None:
+			return True
+		return False
+
+def main() -> i32:
+	b_none: Box[None] = Box[None]()
+	b_i32: Box[i32] = Box[i32]()
+	if not b_none.is_none_type():
+		return 1
+	if b_i32.is_none_type():
+		return 2
+	return 0
+''', expected_exit = 0 )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class DictNoneValueTypeRealCompileTests( unittest.TestCase ):
+	# dict[K, None] (and by extension set[None]) - PLAN_NONETYPE_GENERIC_
+	# VALUE.md's own scoped resolution: None can never be a Ptr[V]-erasure-
+	# backed generic container's value type (Ptr[None] already means
+	# "opaque erased pointer" everywhere else in this compiler - RawDict's
+	# own key_ptr/value_ptr fields - and that collides with "a real pointer
+	# to a NoneType value" the moment V is monomorphized to NoneType,
+	# producing a genuine C void*-deref type error). UnsafeDict.__init__
+	# now catches this with a clean, purpose-written compiler.error(...)
+	# message instead of letting it reach the C compiler.
+	def test_dict_none_value_type_is_rejected_with_a_clear_message( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	d: dict[str, None] = dict[str, None]()
+	return 0
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertTrue( discovery.errors.errors )
+		self.assertIn( 'dict[K, None]', discovery.errors.errors[0] )
+
+	def test_ordinary_dict_value_type_is_unaffected( self ) -> None:
+		# regression guard for the guard itself - the type(V) is None check
+		# must fold away to nothing for every OTHER value type, not just
+		# avoid firing at runtime (see TypeIsGenericParamRealCompileTests'
+		# own docstring for why "avoid firing at runtime" alone wouldn't
+		# have been enough)
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d['a'] = 1
+	d['b'] = 2
+	with compiler.wrap_arithmetic:
+		return d['a'].unwrap( 'missing a' ) + d['b'].unwrap( 'missing b' ) - 3
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, 0, f'exe exited {result.returncode} (stderr: {result.stderr})' )
+
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
 	def test_global_constructor_referencing_a_forward_declared_sibling_class( self ) -> None:

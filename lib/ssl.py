@@ -1090,10 +1090,10 @@ class SSLSocket:
 #
 # Given that, every method that would need to actually DO something routes
 # through _MACOS_SSL_NOT_YET_IMPLEMENTED - a deliberately undefined name, not
-# a typo. MetalPy has no compiler.error(...)/compiler.static_assert(...)
-# intrinsic to raise a custom compile-time message (confirmed absent from
-# discovery.py/compile_time_transformer.py), so this is the mechanism that
-# exists: referencing an undefined name inside a function body only gets
+# a typo. A real compiler.error(msg) intrinsic now exists (added for
+# PLAN_NONETYPE_GENERIC_VALUE.md), but this file predates it and hasn't been
+# migrated - the undefined-name trick still works the same way: referencing
+# an undefined name inside a function body only gets
 # type-checked once something actually reaches/calls that function (stage 2
 # - "walk the tree from main and determine everything touched by main" per
 # ARCHITECTURE.md). A program that merely `import ssl` and never touches TLS
