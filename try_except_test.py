@@ -423,6 +423,51 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		errors = self.discovery.errors.errors
 		self.assertTrue( any( 'generator' in e for e in errors ), errors )
 
+	def test_nested_result_in_ok_position_is_rejected( self ) -> None:
+		# Result[T,E] may never itself contain a Result (directly, or as a
+		# union leaf) - see discovery.py's visit_Subscript. This isn't just
+		# hygiene: it removes a real ambiguity for the general auto-
+		# or_throw() machinery, where an unbound generic parameter's
+		# argument being Result-shaped is now always safe to auto-unwrap,
+		# since a caller can never have "genuinely meant" a nested Result.
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def bad() -> Result[Result[i32, ErrorA], ErrorA]:',
+			'	pass',
+		])
+		mod = self._import( code )
+		fn = mod.get_local( 'bad' )
+		if fn.resolve is not None:
+			fn.resolve()
+		self.assertTrue( any( 'nested Result' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	def test_nested_result_in_err_position_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def bad() -> Result[i32, Result[i32, ErrorA]]:',
+			'	pass',
+		])
+		mod = self._import( code )
+		fn = mod.get_local( 'bad' )
+		if fn.resolve is not None:
+			fn.resolve()
+		self.assertTrue( any( 'nested Result' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	def test_nested_result_as_union_leaf_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def bad() -> Result[i32, ErrorA | Result[i32, ErrorA]]:',
+			'	pass',
+		])
+		mod = self._import( code )
+		fn = mod.get_local( 'bad' )
+		if fn.resolve is not None:
+			fn.resolve()
+		self.assertTrue( any( 'nested Result' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
 
 if __name__ == '__main__':
 	unittest.main()

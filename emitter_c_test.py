@@ -505,7 +505,10 @@ def main() -> i32:
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		kinds = [ type( i ).__name__ for i in main_lf.instructions ]
 		self.assertIn( 'AddCheck', kinds )
-		self.assertIn( 'OrReturn', kinds )
+		# auto-inserted (no enclosing try here) - degrades to exactly
+		# or_return()'s own semantics, general auto-or_throw() rule (see
+		# lowering.py's _auto_or_throw)
+		self.assertIn( 'OrThrow', kinds )
 		src = emitter_c.emit_function( main_lf )
 		self.assertIn( '__metalpy_add_overflow', src )
 		self.assertIn( 'tag == 1', src )
@@ -11890,10 +11893,16 @@ def main() -> i32:
 	x: i32 = maybe_get()
 	return 0
 ''' )
+		# `x: i32 = maybe_get()` is now case 2 of the general auto-or_throw()
+		# rule (Result[i32,OverflowError] flowing into an i32-typed target) -
+		# it auto-.or_throw()s instead of reaching the old dest-typing bug
+		# this test used to pin down, and THAT then fails to compile because
+		# main() (-> i32) can't propagate OverflowError anywhere - still
+		# exactly one clean discovery error, still no emitter crash, just a
+		# different (and more informative) message
 		errors = self.discovery.errors.errors
 		self.assertEqual( len( errors ), 1 )
-		self.assertIn( 'expected intrinsics.i32', errors[0] )
-		self.assertIn( 'got builtins.Result', errors[0] )
+		self.assertIn( 'requires the enclosing function to return Result', errors[0] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_result_returning_call_assigned_to_matching_result_type_still_compiles( self ) -> None:

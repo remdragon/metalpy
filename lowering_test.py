@@ -899,13 +899,9 @@ class Tests( unittest.TestCase ):
 		# arithmetic defaults to Check mode (Result[T,OverflowError]) - see
 		# the Lowering class docstring - and main() returns None, which can't
 		# propagate that error, so plain `a + 1` here is a compile error
-		# rather than silently falling back to wrapping. `a + 1` now
-		# dispatches through i32.__add__ (a real dunder, needing real
-		# builtins.Result/OverflowError - no more hand-rolled local stand-ins
-		# for those), whose own generic _FALLIBLE_METHOD_ALTERNATIVES message
-		# only names panic_arithmetic (not wrap/saturate_arithmetic - it
-		# doesn't know it's specifically backing an arithmetic opcode, unlike
-		# the old fallback's own opcode-specific _ALTERNATIVES_BY_ERROR)
+		# rather than silently falling back to wrapping. `a + 1` dispatches
+		# through i32.__add__ (a real dunder, needing real builtins.Result/
+		# OverflowError - no more hand-rolled local stand-ins for those)
 		code = '\n'.join([
 			'def main() -> None:',
 			'	a: i32 = 1',
@@ -915,7 +911,13 @@ class Tests( unittest.TestCase ):
 		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
-		self.assertIn( 'panic_arithmetic', self.discovery.errors.errors[0] )
+		# no longer eagerly consumed inside _lower_arithmetic_op itself - the
+		# raw Result now flows out and is auto-.or_throw()'d by
+		# _coerce_or_check_operand's own case-2 hook once `b: i32 = ...`
+		# tries to assign it, so the "how to avoid this" message is or_throw()'s
+		# own generic alternatives text now, not _FALLIBLE_METHOD_ALTERNATIVES
+		self.assertIn( 'requires the enclosing function to return Result', self.discovery.errors.errors[0] )
+		self.assertIn( 'try/except', self.discovery.errors.errors[0] )
 		# lower_function's per-statement recovery boundary skips just the
 		# failing statement - b is never assigned. Unlike the old fallback
 		# (which validated Result-coverage BEFORE emitting anything), the
@@ -990,8 +992,11 @@ class Tests( unittest.TestCase ):
 		# a function OTHER than main (main can never return Result, since it
 		# takes no arguments to be called with the error) that returns
 		# Result[None,OverflowError] - every Check op is immediately followed
-		# by an OrReturn (Result.or_return()'s own semantics), consuming the
-		# Result and continuing with the unwrapped i32 value. The dunder
+		# by an auto-inserted OrThrow (the general auto-or_throw() rule -
+		# see lowering.py's _auto_or_throw - which degrades to exactly
+		# or_return()'s own semantics with an empty dispatch table whenever
+		# there's no enclosing try, as here), consuming the Result and
+		# continuing with the unwrapped i32 value. The dunder
 		# path's error type is the REAL builtins.OverflowError (i32.__add__'s
 		# own, fixed at __scalar_dunders.py's own import time) - checked()'s
 		# own return annotation must reference that SAME class for
@@ -1071,7 +1076,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t0 ),
 			ir.AddCheck( dest = t0, left = a, right = add_other ),
 			ir.DeclareTemp( temp = t1 ),
-			ir.OrReturn( dest = t1, value = t0 ),
+			ir.OrThrow( dest = t1, value = t0, dispatch = [] ),
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
@@ -1079,7 +1084,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t2 ),
 			ir.SubCheck( dest = t2, left = a, right = sub_other ),
 			ir.DeclareTemp( temp = t3 ),
-			ir.OrReturn( dest = t3, value = t2 ),
+			ir.OrThrow( dest = t3, value = t2, dispatch = [] ),
 			ir.Assign( dest = c, src = t3 ),
 			ir.DeleteTemp( temp = t3 ),
 			ir.DeleteTemp( temp = t2 ),
@@ -1087,7 +1092,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t4 ),
 			ir.MulCheck( dest = t4, left = a, right = mul_other ),
 			ir.DeclareTemp( temp = t5 ),
-			ir.OrReturn( dest = t5, value = t4 ),
+			ir.OrThrow( dest = t5, value = t4, dispatch = [] ),
 			ir.Assign( dest = d, src = t5 ),
 			ir.DeleteTemp( temp = t5 ),
 			ir.DeleteTemp( temp = t4 ),
@@ -1606,7 +1611,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t0 ),
 			ir.Div( dest = t0, left = a, right = floordiv_other ),
 			ir.DeclareTemp( temp = t1 ),
-			ir.OrReturn( dest = t1, value = t0 ),
+			ir.OrThrow( dest = t1, value = t0, dispatch = [] ),
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
@@ -1614,7 +1619,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t2 ),
 			ir.Mod( dest = t2, left = a, right = mod_other ),
 			ir.DeclareTemp( temp = t3 ),
-			ir.OrReturn( dest = t3, value = t2 ),
+			ir.OrThrow( dest = t3, value = t2, dispatch = [] ),
 			ir.Assign( dest = c, src = t3 ),
 			ir.DeleteTemp( temp = t3 ),
 			ir.DeleteTemp( temp = t2 ),
@@ -1638,11 +1643,12 @@ class Tests( unittest.TestCase ):
 		# signed `//` in the default checked mode can raise ZeroDivisionError OR
 		# OverflowError (INT_MIN/-1), so the required error type is their union
 		self.assertIn( 'Result[_,OverflowError | ZeroDivisionError]', self.discovery.errors.errors[0] )
-		self.assertIn( 'panic_arithmetic', self.discovery.errors.errors[0] )
+		self.assertIn( 'try/except', self.discovery.errors.errors[0] )
 		# see test_binop_without_arithmetic_context_is_a_compile_error's own
-		# comment - the dunder path's Result-coverage check runs only at the
-		# final consumption step, after the inline splice has already
-		# emitted its own (dead, unread) instructions
+		# comment - the raw Div Result flows out unconsumed and only gets
+		# auto-.or_throw()'d (and its coverage checked) once `b: i32 = ...`
+		# tries to assign it - the inline splice has already emitted its
+		# own (dead, unread) instructions by then
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Assign', 'DeclareTemp', 'Div', 'Return', 'FuncEnd' ] )
 
@@ -1678,7 +1684,7 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertIn( 'DivWrap', kinds ) # wrap mode uses DivWrap (INT_MIN/-1 wraps inline); still zero-checked -> Result[_,ZeroDivisionError]
-		self.assertIn( 'OrReturn', kinds )
+		self.assertIn( 'OrThrow', kinds ) # auto-inserted (no enclosing try here) - degrades to exactly or_return()'s own semantics
 		self.assertNotIn( 'Unwrap', kinds ) # no panic - wrap_arithmetic doesn't imply panic_arithmetic
 
 	def test_binop_floordiv_is_a_compile_error_in_every_non_panic_mode( self ) -> None:
@@ -1704,7 +1710,7 @@ class Tests( unittest.TestCase ):
 				comp.import_code( code, filename = Path( '__test__.py' ))
 				fn = comp._lower( disco.main )
 				self.assertIn( 'Result[_,ZeroDivisionError]', disco.errors.errors[0] )
-				self.assertIn( 'panic_arithmetic', disco.errors.errors[0] )
+				self.assertIn( 'try/except', disco.errors.errors[0] )
 				# see test_binop_without_arithmetic_context_is_a_compile_error's
 				# own comment - partial (dead) inline-splice instructions leak
 				# into the recovered function body
@@ -1727,9 +1733,14 @@ class Tests( unittest.TestCase ):
 
 	def test_binop_with_unconsumed_result_operand_is_rejected( self ) -> None:
 		# Result[T,E] is itself a @union - without this guard, an unconsumed
-		# b[i] (Result[i32,MyError], since x[i] no longer auto-consumes)
-		# would silently decompose into per-leaf (T, E) arithmetic instead
-		# of erroring - see _reject_unconsumed_result_operand
+		# b[i] (Result[i32,MyError]) would silently decompose into per-leaf
+		# (T, E) arithmetic instead of being auto-.or_throw()'d - see
+		# _reject_unconsumed_result_operand/_auto_or_throw. foo() doesn't
+		# return Result[_,MyError], so the auto-inserted or_throw() itself
+		# fails to compile (nowhere for the error to propagate to) - the
+		# SAME observable outcome (a compile error) the old hard rejection
+		# produced, just via the general auto-or_throw() rule now instead
+		# of a bespoke "consume it first" message
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -1754,13 +1765,15 @@ class Tests( unittest.TestCase ):
 			foo_fn.resolve()
 		self.compiler._lower( foo_fn )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'consume it first', self.discovery.errors.errors[0] )
+		self.assertIn( 'requires the enclosing function to return Result', self.discovery.errors.errors[0] )
 
 	def test_eq_with_unconsumed_result_operand_is_rejected( self ) -> None:
 		# same guard, ==/!= path (_lower_eq_or_ne) - a fallible comparison's
 		# own Result is left unconsumed on purpose (see its docstring), but
 		# an unrelated unconsumed Result flowing INTO a comparison operand
-		# must still be rejected, not silently decomposed as a union
+		# still gets auto-.or_throw()'d instead of silently decomposing as
+		# a union - see test_binop_with_unconsumed_result_operand_is_
+		# rejected's own identical comment
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -1784,7 +1797,7 @@ class Tests( unittest.TestCase ):
 			foo_fn.resolve()
 		self.compiler._lower( foo_fn )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'consume it first', self.discovery.errors.errors[0] )
+		self.assertIn( 'requires the enclosing function to return Result', self.discovery.errors.errors[0] )
 
 	def test_unaryop_invert_is_unconditional( self ) -> None:
 		# ~ has no overflow concept - always a single opcode, works fine in
@@ -1880,7 +1893,7 @@ class Tests( unittest.TestCase ):
 			ir.DeclareTemp( temp = t0 ),
 			ir.NegCheck( dest = t0, operand = a ),
 			ir.DeclareTemp( temp = t1 ),
-			ir.OrReturn( dest = t1, value = t0 ),
+			ir.OrThrow( dest = t1, value = t0, dispatch = [] ),
 			ir.Assign( dest = b, src = t1 ),
 			ir.DeleteTemp( temp = t1 ),
 			ir.DeleteTemp( temp = t0 ),
@@ -1906,9 +1919,16 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		fn = self._lower_main()
-		self.assertIn( 'wrap_arithmetic', self.discovery.errors.errors[0] )
+		# no longer eagerly consumed inside _lower_arithmetic_op itself (see
+		# test_binop_without_arithmetic_context_is_a_compile_error's own
+		# identical comment) - the opcode-specific wrap_arithmetic/
+		# panic_arithmetic alternatives text only existed on that OLD eager
+		# path; the general auto-or_throw() rule that now catches this uses
+		# its own generic try/except-or-consume-explicitly message instead
+		self.assertIn( 'requires the enclosing function to return Result', self.discovery.errors.errors[0] )
+		self.assertIn( 'try/except', self.discovery.errors.errors[0] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'Return', 'FuncEnd' ] )
+		self.assertEqual( kinds, [ 'FuncStart', 'Assign', 'DeclareTemp', 'NegCheck', 'Return', 'FuncEnd' ] )
 
 	def test_unaryop_not_emits_not_instruction( self ) -> None:
 		# needs builtins for the intrinsic `bool` type
@@ -4464,11 +4484,14 @@ class Tests( unittest.TestCase ):
 		self.assertIn( '__len__', self.discovery.errors.errors[0] )
 		self.assertIn( '__getitem__', self.discovery.errors.errors[0] )
 
-	def test_subscript_with_getitem_returning_result_is_not_auto_consumed( self ) -> None:
+	def test_subscript_with_getitem_returning_result_is_now_auto_consumed( self ) -> None:
 		# obj[i] is plain sugar for obj.__getitem__(i), nothing more - when
-		# __getitem__ is fallible the caller gets the raw Result[T,E] back
-		# and must consume it explicitly, exactly like ==/!= already does;
-		# no auto-.or_return() sugar (that's reserved for checked arithmetic)
+		# __getitem__ is fallible the caller gets the raw Result[T,E] back.
+		# PLAN_CHECKED_ARITHMETIC_GAP.md's whole point: `v: i32 = b[i]` used
+		# to be a hard type-mismatch (zero sugar at all) - now the general
+		# auto-or_throw() rule's case 2 (Result flowing into a context
+		# wanting its own T directly) picks it up here too, exactly like a
+		# declared-Result-typed checked-arithmetic target already does
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -4483,17 +4506,18 @@ class Tests( unittest.TestCase ):
 			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
 			'		return Result.__allocate__( x = self.y )',
 			'',
-			'def foo( b: Box, i: usize ) -> i32:',
+			'def foo( b: Box, i: usize ) -> Result[i32,MyError]:',
 			'	v: i32 = b[i]',
-			'	return v',
+			'	return Result( x = v )',
 		])
 		self._import( code )
 		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
 		if foo_fn.resolve is not None:
 			foo_fn.resolve()
-		self.compiler._lower( foo_fn )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'expected intrinsics.i32, got __test__.Result', self.discovery.errors.errors[0] )
+		fn = self.compiler._lower( foo_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'OrThrow', kinds )
 
 	def test_subscript_with_getitem_returning_result_consumed_explicitly_still_works( self ) -> None:
 		# the explicit-consumption escape hatch: b[i].or_return() still
@@ -4527,9 +4551,12 @@ class Tests( unittest.TestCase ):
 		getitem_errors = [ e for e in self.discovery.errors.errors if 'b[i]' in e or '__getitem__' in e ]
 		self.assertEqual( getitem_errors, [] )
 
-	def test_slice_subscript_with_getitem_returning_result_is_not_auto_consumed( self ) -> None:
-		# x[a:b] is the same plain sugar as x[i] - _lower_slice_subscript
-		# stopped auto-consuming too, mirroring _expr_Subscript's own change
+	def test_slice_subscript_with_getitem_returning_result_is_now_auto_consumed( self ) -> None:
+		# x[a:b] is the same plain sugar as x[i] - _lower_slice_subscript's
+		# own Result now auto-consumes too, mirroring _expr_Subscript's own
+		# identical case-2 auto-or_throw() (see
+		# test_subscript_with_getitem_returning_result_is_now_auto_consumed's
+		# own comment for the full story)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -4544,18 +4571,19 @@ class Tests( unittest.TestCase ):
 			'	def __getitem__( self, s: slice ) -> Result[i32,MyError]:',
 			'		return Result.__allocate__( x = self.y )',
 			'',
-			'def foo( b: Box ) -> i32:',
+			'def foo( b: Box ) -> Result[i32,MyError]:',
 			'	v: i32 = b[0:1]',
-			'	return v',
+			'	return Result( x = v )',
 		])
 		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		foo_fn = self.discovery.modules['__test__'].get_local( 'foo' )
 		if foo_fn.resolve is not None:
 			foo_fn.resolve()
-		self.compiler._lower( foo_fn )
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'expected intrinsics.i32, got __test__.Result', self.discovery.errors.errors[0] )
+		fn = self.compiler._lower( foo_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'OrThrow', kinds )
 
 	def test_subscript_with_getitem_returning_non_result_two_arg_generic_is_not_consumed( self ) -> None:
 		# _maybe_consume_result (Stage 4: now routed through _result_shape)
@@ -4677,7 +4705,10 @@ class Tests( unittest.TestCase ):
 			foo_fn.resolve()
 		fn = self.compiler._lower( foo_fn )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'OrReturn', kinds )
+		# auto-inserted (no enclosing try here) - degrades to exactly
+		# or_return()'s own semantics, same general auto-or_throw() rule
+		# every other auto-consumption site now shares (see _auto_or_throw)
+		self.assertIn( 'OrThrow', kinds )
 		setitem_errors = [ e for e in self.discovery.errors.errors if 'b[i]' in e or '__setitem__' in e ]
 		self.assertEqual( setitem_errors, [] )
 
@@ -7631,7 +7662,10 @@ class Tests( unittest.TestCase ):
 		fn = self.compiler._lower( checked_fn )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
 		self.assertIn( 'AddCheck', kinds )
-		self.assertIn( 'OrJump', kinds )
+		# auto-inserted (no enclosing try here) or_throw() targets the same
+		# epilogue label OrJump used to (see ir.OrThrow's own target field) -
+		# general auto-or_throw() rule, see _auto_or_throw
+		self.assertIn( 'OrThrow', kinds )
 		self.assertNotIn( 'OrReturn', kinds )
 		# epilogue's errdefer guard is the two-JumpIfFalse (flag, then
 		# is_err()) shape - the is_err() check itself (DeclareTemp+Call)
@@ -7757,7 +7791,11 @@ class Tests( unittest.TestCase ):
 			checked_fn.resolve()
 		fn = self.compiler._lower( checked_fn )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'OrReturn', kinds )
+		# auto-inserted (no enclosing try here) - degrades to exactly
+		# or_return()'s own semantics (a real C `return`, target=None) -
+		# general auto-or_throw() rule, see _auto_or_throw
+		self.assertIn( 'OrThrow', kinds )
+		self.assertNotIn( 'OrReturn', kinds )
 		self.assertNotIn( 'OrJump', kinds )
 		self.assertNotIn( 'Jump', kinds )
 		self.assertNotIn( 'Label', kinds )
@@ -8709,9 +8747,23 @@ class Tests( unittest.TestCase ):
 		lowered = self.compiler._lower( mod.get_local( 'f' ))
 		kinds = [ type( i ).__name__ for i in lowered.instructions ]
 		self.assertIn( 'CastCheck', kinds )
-		self.assertIn( 'OrReturn', kinds )
+		# x's own raw CastCheck Result flows unconsumed into Result.Ok(x) as
+		# a generic-inferred argument for T - _lower_and_infer_call_args'
+		# own auto_consume_hint_arg hook auto-.or_throw()'s it there (case 2
+		# of the general auto-or_throw() rule) instead of eagerly at `x = ...`
+		self.assertIn( 'OrThrow', kinds )
 
 	def test_non_literal_cast_without_result_return_is_a_compile_error( self ) -> None:
+		# x is assigned but never used again at all (no annotation, no
+		# later read) - stays a raw, uninspected Result[u32,OverflowError]
+		# all the way to function end, where cfg.py's own (separate,
+		# already-correct, untouched by this whole change) unchecked-
+		# result tracking is what actually catches it now, not an eager
+		# Result-coverage check at the assignment itself. That check raises
+		# past FunctionLowering.run()'s own per-statement recovery boundary
+		# (it isn't a per-statement check), so this needs its own explicit
+		# CompileError catch instead of reading self.discovery.errors after
+		# an ordinary (non-raising) _lower() call
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
 			'class OverflowError: pass',
 			'',
@@ -8719,8 +8771,9 @@ class Tests( unittest.TestCase ):
 			'	x = u32( s )',
 		])
 		mod = self._import( code )
-		self.compiler._lower( mod.get_local( 'f' ))
-		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ))
+		with self.assertRaises( CompileError ) as ctx:
+			self.compiler._lower( mod.get_local( 'f' ))
+		self.assertIn( "Result value 'x' was never inspected", str( ctx.exception ))
 
 	def test_wrap_arithmetic_cast_has_no_result( self ) -> None:
 		code = '\n'.join([
@@ -8982,6 +9035,10 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 
 	def test_bare_result_returning_call_statement_is_a_compile_error( self ) -> None:
+		# `get()` as a bare statement is discarded (case 1 of the general
+		# auto-or_throw() rule) - no longer a hard "discarded here" rejection
+		# on its own; it auto-.or_throw()'s the call's Result, which THEN
+		# fails to compile because main() can't propagate MyError anywhere
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
 			'class MyError: pass',
 			'',
@@ -8994,7 +9051,7 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertTrue( any( 'discarded' in e for e in self.discovery.errors.errors ) )
+		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ) )
 
 	def test_one_branch_checks_other_doesnt_is_a_compile_error( self ) -> None:
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
@@ -9155,10 +9212,10 @@ class Tests( unittest.TestCase ):
 		# type_resolver.py's own pre-pass (see type_resolver_test.py's own
 		# test_generic_call_on_receiver_local_is_left_untagged) and routes
 		# through _lower_class_generic_method_call/_emit_generic_call
-		# instead of _lower_call's own shared tail - closed by adding the
-		# same discard check directly to _emit_generic_call, which is the
-		# actual shared tail for every generic-call dispatch path (explicit
-		# Name[T](...), inferred, and class-generic-method alike)
+		# instead of _lower_call's own shared tail - _emit_generic_call has
+		# its own copy of the shared case-1 discard-consumption logic
+		# (_finish_call_result), so a discarded Result from THIS path auto-
+		# .or_throw()s too, exactly like _lower_call's own shared tail
 		code = self._RESULT_FIXTURE + '\n' + '\n'.join([
 			'class MyError: pass',
 			'',
@@ -9174,7 +9231,7 @@ class Tests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ) )
+		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ) )
 
 	# --- T|None leaf coercion (_lower_expr/_coerce_into_union) -------------
 
@@ -9517,6 +9574,10 @@ class InlineTests( unittest.TestCase ):
 		self.assertTrue( any( 'recursive inlining' in e for e in self.discovery.errors.errors ))
 
 	def test_inline_discarding_a_result_returning_call_is_rejected( self ) -> None:
+		# `make()` (an @inline call) as a bare statement is discarded (case 1
+		# of the general auto-or_throw() rule) - it auto-.or_throw()'s the
+		# splice's own trailing Result, which THEN fails to compile because
+		# main() can't propagate MyError anywhere
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -9535,7 +9596,7 @@ class InlineTests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ))
+		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ))
 
 	def test_inline_is_ok_still_clears_cfg_unchecked_result_tracking( self ) -> None:
 		# a receiver-based generic-class method (is_ok, inherited genericity
@@ -10266,7 +10327,7 @@ class ReturnOnlyTypeParamInferenceTests( unittest.TestCase ):
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertTrue( any( 'discarded here' in e for e in self.discovery.errors.errors ))
+		self.assertTrue( any( 'requires the enclosing function to return Result' in e for e in self.discovery.errors.errors ))
 
 # --- compiler.fetch_unicode_table('upper'|'lower') ---------------------------
 

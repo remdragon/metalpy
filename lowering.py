@@ -1627,8 +1627,15 @@ class Lowering:
 		'or_throw() propagates any leaf not caught by an except clause of the innermost enclosing try to the caller, '
 		'exactly like or_return() - there is no other way for the enclosing function to receive it'
 	)
-	_FALLIBLE_METHOD_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
+	# shared "alternatives" text for the general auto-or_throw() rule (a
+	# discarded Result statement, or a Result flowing into a context wanting
+	# its own Ok payload directly) - wrap in try/except to catch specific
+	# leaves, or consume it explicitly first
+	_AUTO_CONSUME_ALTERNATIVES = (
+		'wrap this in try/except to catch specific error leaves, or consume it yourself first '
+		'via .unwrap()/.or_return()/match'
+	)
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST, context_qualname: str ) -> None:
 		# generalized over an explicit type_params list (rather than always
@@ -2998,11 +3005,22 @@ class FunctionLowering:
 			):
 				widened = self._maybe_widen_return_result( node, value, fn_type )
 				if widened is None:
-					self.lowering.discovery.fail(
-						f'{ast.unparse(node)}: function returns '
-						f'{fn_type.qualname if fn_type else "None"}, not {value.type.qualname if value.type else "?"}',
-						node,
-					)
+					# case 2 of the general auto-or_throw() rule (see _auto_or_
+					# throw's own docstring): `return a + b` inside a function
+					# declared to return plain T (not Result[T,E]) - this
+					# method lowers `value` with strict=False (see this
+					# method's own comment above), so it never reaches
+					# _coerce_or_check_operand's own identical hook; reuses
+					# the exact same shared probe instead of a second copy of
+					# the guard
+					consumed = self._maybe_auto_consume_result( node, value, fn_type, self.lowering._AUTO_CONSUME_ALTERNATIVES )
+					if consumed is None:
+						self.lowering.discovery.fail(
+							f'{ast.unparse(node)}: function returns '
+							f'{fn_type.qualname if fn_type else "None"}, not {value.type.qualname if value.type else "?"}',
+							node,
+						)
+					widened = consumed
 				return_value = widened
 		try:
 			self._cfg.check_unchecked_results( value )
@@ -3674,6 +3692,20 @@ class FunctionLowering:
 			broken = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True, needs_uid_suffix = needs_uid_suffix )
 			fn.add_name( broken.stem, broken )
 			raise
+		# NOTE: deliberately does NOT auto-.or_throw() an unannotated fresh
+		# local just because its RHS happens to be Result-shaped - `r =
+		# some_fallible_call()` (no annotation) has always captured the raw
+		# Result, precisely so it can be inspected via .is_ok()/match right
+		# after (confirmed by real fixtures: test_fallible_init_shape_has_
+		# ok_err_branches, match's own __match_subj_N desugaring reaching
+		# this SAME path). Case 1/2 of the general auto-or_throw() rule
+		# (_coerce_or_check_operand, _stmt_Return, discard sites - see
+		# _auto_or_throw's own docstring) still fire the moment `var` is
+		# later used somewhere that actually wants its own T rather than
+		# the whole Result - an unannotated arithmetic result that's never
+		# inspected as a Result and only ever flows into a T-typed context
+		# still ends up auto-consumed there, just one statement later than
+		# it used to be eagerly consumed at its own declaration
 		var = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type, needs_uid_suffix = needs_uid_suffix )
 		fn.add_name( var.stem, var )
 		self.lowering.schedule( var.type )
@@ -4105,7 +4137,17 @@ class FunctionLowering:
 				# matches what the delegated path below would compute
 				# anyway (_is_aliasing_expr never treats a bare BinOp as
 				# aliasing, regardless of its operands)
-				result = self._lower_binop_values( node, existing, right, existing.type )
+				# _lower_binop_values is called directly here (not through
+				# _lower_expr, which _expr_BinOp's own callers get for free) -
+				# its own raw, possibly-still-Result-shaped return needs the
+				# SAME case-2 auto-or_throw() coercion _lower_expr's tail
+				# would otherwise apply, or an unconsumed checked-arithmetic
+				# Result would get passed straight to _cfg_assign/ir.Assign
+				# below - confirmed via a real repro (auto_or_throw_test.py's
+				# own AugAssign coverage): `lst[0] += 10` compiled to invalid
+				# C, passing a raw Result struct where __setitem__'s plain-T
+				# parameter was declared
+				result = self._coerce_or_check_operand( self._lower_binop_values( node, existing, right, existing.type ), existing.type, node )
 				self._cfg.unnarrow( node.target.id )
 				self._cfg_assign( existing, result, is_alias = False, node = node )
 				return
@@ -4146,7 +4188,9 @@ class FunctionLowering:
 				# field's pointee changed, not the struct holding the field)
 				self._emit_iplace_dunder_call( node, iplace_method, old, right )
 				return
-			result = self._lower_binop_values( node, old, right, attr_var.type )
+			# see the Name-target branch's identical comment on why this
+			# needs its own explicit case-2 coercion
+			result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, attr_var.type ), attr_var.type, node )
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> += value, inside __init__ construction itself -
 				# same definite-assignment/self-escape tracking an ordinary
@@ -4181,7 +4225,9 @@ class FunctionLowering:
 				old = self._new_temp( elem_type )
 				self._emit( ir.GetItem( dest = old, obj = obj, index = index ))
 				right = self._lower_expr( node.value, old.type )
-				result = self._lower_binop_values( node, old, right, old.type )
+				# see the Name-target branch's identical comment on why this
+				# needs its own explicit case-2 coercion
+				result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, old.type ), old.type, node )
 				self._emit( ir.SetItem( obj = obj, index = index, value = result ))
 			else:
 				# a real __getitem__/__setitem__ pair. Tries an __iadd__-
@@ -4241,15 +4287,26 @@ class FunctionLowering:
 					self.lowering._type_resolver._require_chained_result_return(
 						node.target, result_cls, error_classes, self.lowering._SUBSCRIPT_ALTERNATIVES, fn = self._current_fn,
 					)
-				old = self._consume_checked_result( node.target, get_dest, get_shape[0], extra = None ) if get_shape is not None else get_dest
-				result = self._lower_binop_values( node, old, right, old.type )
+				# pre_checked=True: coverage for BOTH steps' error types was
+				# already validated together above via
+				# _require_chained_result_return - _auto_or_throw must not
+				# re-validate (and re-report) either one on its own
+				old = (
+					self._auto_or_throw( node.target, get_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = True, pre_checked = True )
+					if get_shape is not None else get_dest
+				)
+				assert old is not None # want_result=True above guarantees this
+				# see the Name-target branch's identical comment on why this
+				# needs its own explicit case-2 coercion (setitem_fn's own
+				# `val` parameter wants old.type directly, never a Result)
+				result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, old.type ), old.type, node )
 				if setitem_fn.return_type is self.lowering.discovery.get_none_type():
 					self._emit( ir.Call( dest = None, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
 				else:
 					set_dest = self._new_temp( setitem_fn.return_type )
 					self._emit( ir.Call( dest = set_dest, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
 					if set_shape is not None:
-						self._consume_checked_result( node.target, set_dest, set_shape[0], extra = None )
+						self._auto_or_throw( node.target, set_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = False, pre_checked = True )
 		else:
 			self.lowering.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
 
@@ -6574,56 +6631,47 @@ class FunctionLowering:
 		return var
 
 	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str, panic_errmsg: str|None = None ) -> ir.Operand:
-		# if `value` is itself a Result[T,E], auto-consume it via the same
-		# OrReturn/OrJump propagation or_return()/checked arithmetic use -
-		# unlike _lower_or_return, a non-Result value is passed through
-		# unchanged rather than rejected, since not every method this is
-		# used for (__getitem__, __len__) is necessarily fallible. Uses
-		# find_name_or_none (not find_name) - unlike every other Result
-		# lookup in this file, this one runs speculatively for ANY value,
-		# so a program that never defines Result at all (or hasn't
-		# imported builtins) must not hard-fail here just because this
-		# particular value happens not to be Result-shaped
-		shape = self.lowering._type_resolver._result_shape( value.type )
-		if shape is None:
-			return value
-		result_type, error_cls = shape
-		# find_name, not value.type.base - value.type may already be the
-		# real, monomorphized Result object itself (not a Specialization
-		# wrapper) by the time _result_shape above succeeds - see
-		# Monomorphizer.origin_of's own docstring. Safe to use the raising
-		# lookup here (unlike _result_shape's own find_name_or_none) since
-		# shape being non-None already proves Result is defined
-		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		# if `value` is itself a Result[T,E], auto-consume it - unlike
+		# _lower_or_return, a non-Result value is passed through unchanged
+		# rather than rejected, since not every method this is used for
+		# (__getitem__, __len__) is necessarily fallible.
 		if panic_errmsg is not None:
 			# caller has already proven this Err arm unreachable (e.g. a
 			# for-loop's own bounds-checked index) - Unwrap-panic instead of
-			# OrReturn/OrJump, same as `with compiler.panic_arithmetic(...):`,
+			# or_throw(), same as `with compiler.panic_arithmetic(...):`,
 			# so this doesn't force the enclosing function to return
-			# Result[_,error_cls] just to propagate an error that can't happen
+			# Result[_,error_cls] just to propagate an error that can't happen.
+			# Uses find_name_or_none (not find_name) via _result_shape - unlike
+			# every other Result lookup in this file, this one runs
+			# speculatively for ANY value, so a program that never defines
+			# Result at all must not hard-fail here just because this
+			# particular value happens not to be Result-shaped
+			shape = self.lowering._type_resolver._result_shape( value.type )
+			if shape is None:
+				return value
+			result_type, _error_cls = shape
 			str_cls = self.lowering.discovery.find_name( 'str', node )
 			errmsg_node = ast.Constant( value = panic_errmsg )
 			ast.copy_location( errmsg_node, node )
 			extra = self._lower_expr( errmsg_node, str_cls )
 			return self._consume_checked_result( node, value, result_type, extra = extra )
-		self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
-		return self._consume_checked_result( node, value, result_type, extra = None )
+		result = self._auto_or_throw( node, value, alternatives, want_result = True )
+		assert result is not None # want_result=True above guarantees this
+		return result
 
-	def _reject_unconsumed_result_operand( self, node: ast.AST, operand: ir.Operand ) -> None:
+	def _reject_unconsumed_result_operand( self, node: ast.AST, operand: ir.Operand ) -> ir.Operand:
 		# an unconsumed Result[T,E] used directly as a binop/comparison
-		# operand is (unlike __len__/__getitem__ above) never legitimate -
-		# Result is itself a @union, so left unchecked it would silently
-		# fall into the ordinary union leaf-pair dispatch and get decomposed
-		# into per-leaf (T, E) arithmetic/comparison instead of erroring
-		shape = self.lowering._type_resolver._result_shape( operand.type )
-		if shape is None:
-			return
-		result_type, error_cls = shape
-		self.lowering.discovery.fail(
-			f'operand is a Result[{result_type.qualname},{error_cls.qualname}] - consume it first '
-			f'via .unwrap()/.or_return()/match: {ast.unparse(node)}',
-			node,
-		)
+		# operand is (unlike __len__/__getitem__ above) never legitimate as-
+		# is - Result is itself a @union, so left unchecked it would
+		# silently fall into the ordinary union leaf-pair dispatch and get
+		# decomposed into per-leaf (T, E) arithmetic/comparison instead of
+		# erroring. Auto-.or_throw()s it instead of hard-rejecting - the
+		# general case-1/case-2 rule (see _auto_or_throw) applies here too:
+		# `(a + b) + c` needs a + b's own leftover Result auto-consumed
+		# before it can become the outer +'s own left operand.
+		result = self._auto_or_throw( node, operand, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = True )
+		assert result is not None # want_result=True above guarantees this
+		return result
 
 	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
 		# mirrors _stmt_Assign's Name-target "reuse existing, else infer/
@@ -7733,6 +7781,21 @@ class FunctionLowering:
 		# _lower_binop_values' own float-same-type check) is responsible for
 		# validating the ACTUAL requirement itself in that case.
 		if strict:
+			# case 2 of the general auto-or_throw() rule (see _auto_or_throw's
+			# own docstring): a Result[T,E]-shaped operand flowing into a
+			# context that wants T directly (not the whole Result) gets
+			# implicitly .or_throw()'d, then the UNWRAPPED T is re-run
+			# through this same coercion pipeline (it may still need e.g.
+			# scalar widening against expected_type, now that its type is T
+			# instead of Result[T,E]). Guarded (inside the shared probe) on
+			# expected_type itself NOT also being Result-shaped - mirrors
+			# _maybe_widen_return_result's own "op_shape/fn_shape both
+			# Result" guard - so an explicit `x: Result[T,E] = a + b` (or a
+			# Result-typed argument/return) keeps capturing the raw,
+			# unconsumed Result exactly as written.
+			consumed = self._maybe_auto_consume_result( node, operand, expected_type, self.lowering._AUTO_CONSUME_ALTERNATIVES, context = context )
+			if consumed is not None:
+				return consumed
 			self._check_assignable( operand, expected_type, node, context = context )
 		return operand
 
@@ -10178,8 +10241,8 @@ class FunctionLowering:
 		# decomposed into per-leaf (T, E) arithmetic instead of erroring -
 		# an unconsumed Result operand here almost always means the user
 		# forgot to .unwrap()/.or_return() a fallible x[i]/x.method() first
-		self._reject_unconsumed_result_operand( node, left )
-		self._reject_unconsumed_result_operand( node, right )
+		left = self._reject_unconsumed_result_operand( node, left )
+		right = self._reject_unconsumed_result_operand( node, right )
 
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
@@ -10338,22 +10401,22 @@ class FunctionLowering:
 		shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
 		assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
 		success_type = shape[1][0].type
-		error_type = shape[1][1].type
 		mode = self._arithmetic_mode[-1]
 		extra = mode.extra if isinstance( mode, arithmetic_mode.ArithmeticPanic ) else None
 		if extra is None:
-			# same requirement _lower_arithmetic_op's own Check-mode opcodes
-			# already enforce before emitting OrReturn/OrJump - missing here
-			# let an @fallible_arithmetic dunder call (int.__floordiv__/
-			# __mod__ via `//`/`%`, or a Scalar-registered arithmetic dunder)
-			# silently emit an OrReturn/OrJump into a function whose return
-			# type can't represent the error at all, crashing at C emission
-			# time instead of failing to compile cleanly - confirmed via a
-			# real repro (`r: int = a // b` inside a function declared -> i32)
-			result_cls = self.lowering.discovery.find_name( 'Result', node )
-			self.lowering._type_resolver._require_result_return(
-				node, result_cls, error_type, self.lowering._FALLIBLE_METHOD_ALTERNATIVES, fn = self._current_fn,
-			)
+			# Check mode (the default): `result` just flows out here, raw and
+			# unconsumed - the general case-1 (discarded statement)/case-2
+			# (flowing into a T-typed context) auto-or_throw() rule picks it
+			# up downstream, exactly like checked arithmetic's own Check-mode
+			# opcodes now do (see _lower_arithmetic_op). This is how //, %,
+			# and fallible comparison dunders gained or_throw()/try-except
+			# support, not just or_return()'s old unconditional-propagate
+			# behavior.
+			return result
+		# Panic mode (explicit user opt-in via `with compiler.
+		# panic_arithmetic(...):`) - unaffected by this whole file's auto-
+		# or_throw() generalization: still an immediate Unwrap-panic, still
+		# consumed eagerly right here, never left for a downstream hook.
 		return self._consume_checked_result( node, result, success_type, extra )
 
 	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
@@ -10376,19 +10439,17 @@ class FunctionLowering:
 		# produces Result[result_type,<error_type>], where <error_type> is a
 		# single marker class (most ops) or the anonymous UNION of several
 		# (signed Div/Mod -> ZeroDivisionError|OverflowError; checked float / ->
-		# ZeroDivisionError|FloatingPointError). How that Result gets consumed
-		# depends on `extra`: the default (extra is None) uses OrReturn,
-		# mirroring Result.or_return()'s own semantics, and needs somewhere for
-		# the error to propagate to; `with compiler.panic_arithmetic(msg):`
-		# (extra is the lowered msg operand) uses Unwrap instead, which panics
-		# immediately and so has no such requirement
+		# ZeroDivisionError|FloatingPointError). `with compiler.panic_
+		# arithmetic(msg):` (extra is the lowered msg operand) still consumes
+		# eagerly via Unwrap, which panics immediately and needs nowhere to
+		# propagate to. The default (extra is None) does NOT eagerly consume
+		# here anymore - the raw Result just flows out, picked up downstream
+		# by the general case-1 (discarded statement)/case-2 (flowing into a
+		# T-typed context) auto-or_throw() rule, exactly the same mechanism
+		# .or_throw()/or_return() already use - see _auto_or_throw's own
+		# docstring for why this is now the ONE place that logic lives.
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		error_type, alternatives = self._resolve_checked_error( node, opcode, result_type )
-		if extra is None:
-			# validated before anything gets emitted - a mid-statement
-			# failure here must not leave partial instructions behind for
-			# the per-statement recovery boundary to silently keep
-			self.lowering._type_resolver._require_result_return( node, result_cls, error_type, alternatives, fn = self._current_fn )
+		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
 		return self._emit_checked_op( node, opcode, operand_kwargs, result_type, result_cls, error_type, extra )
 
 	def _resolve_checked_error( self, node: ast.AST, opcode: type, result_type: Type ) -> tuple[ClassLike,str]:
@@ -10426,13 +10487,21 @@ class FunctionLowering:
 		# its operand(s) (left/right for a binop, operand for USub/cast)
 		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_cls ] )
 		# the emitter declares a local variable of this Result type; the
-		# struct definition must exist even though the Check op's result
-		# is consumed inline (OrReturn/OrJump/Unwrap) — schedule it now
-		# so monomorphize_class emits it into compiler.tagged_unions
+		# struct definition must exist even though the Check op's result is
+		# often consumed inline (Unwrap in panic mode, or_throw() downstream
+		# otherwise) — schedule it now so monomorphize_class emits it into
+		# compiler.tagged_unions
 		self.lowering.schedule( check_type )
 		check_dest = self._new_temp( check_type )
 		self._emit( opcode( dest = check_dest, **operand_kwargs ))
-		return self._consume_checked_result( node, check_dest, result_type, extra )
+		if extra is not None:
+			# panic mode - still consumes eagerly, unaffected by the general
+			# auto-or_throw() rule (see _lower_arithmetic_op's own comment)
+			return self._consume_checked_result( node, check_dest, result_type, extra )
+		# Check mode (the default) - the raw, unconsumed Result[result_type,
+		# error_cls] flows straight out; case-1/case-2 auto-or_throw() picks
+		# it up downstream (see _auto_or_throw)
+		return check_dest
 
 	def _build_generator_error_defer_replay( self ) -> list[ir.Instruction]:
 		''' PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - lowers
@@ -11586,7 +11655,7 @@ class FunctionLowering:
 		# on both operands, before either can reach the union-leaf dispatch
 		# below and get silently decomposed into a per-leaf (T, E) compare
 		# (see _lower_binop_values' own identical guard/comment)
-		self._reject_unconsumed_result_operand( node, left )
+		left = self._reject_unconsumed_result_operand( node, left )
 
 		method = self._find_dunder_for_arg( left.type, method_name, left.type )
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
@@ -11612,7 +11681,7 @@ class FunctionLowering:
 		# silently widening) blind - both are reinstated manually below in
 		# the same order _coerce_or_check_operand itself would try them.
 		right = self._lower_expr( node.comparators[0], right_hint, strict = False )
-		self._reject_unconsumed_result_operand( node, right )
+		right = self._reject_unconsumed_result_operand( node, right )
 		if right.type is not left.type:
 			if self._is_safe_scalar_widening( right.type, left.type ):
 				widened = self._new_temp( left.type )
@@ -13561,6 +13630,27 @@ class FunctionLowering:
 			param.stem: self._lower_expr( expr, self.lowering._substitute_type_params( param.type, type_params, partial_args ), strict = False )
 			for param, expr in keyword
 		}
+		# strict=False above deliberately skips _coerce_or_check_operand's own
+		# case-2 auto-or_throw() hook (a HINT-only lowering, not a real
+		# requirement yet - see this method's own comment above) - same as
+		# _lower_binary_operands' own identical strict=False lowering, this
+		# reinstates it manually right here: an unconsumed Result[T,E]
+		# argument (e.g. `Result.Ok(c)` where `c = a + b` left c as a raw
+		# Result[u32,OverflowError]) would otherwise reach _unify_type_param
+		# below still Result-shaped and get "inferred as both u32 and
+		# Result[u32,OverflowError]" instead of just binding T=u32. Skipped
+		# whenever the param's own (possibly still-abstract/unbound)
+		# declared type is ITSELF Result-shaped - a genuinely nested
+		# Result-typed argument (rare, but legal) must keep flowing through
+		# raw, exactly like every other case-2 site's identical guard
+		args = [
+			self._auto_consume_hint_arg( node, operand, param.type )
+			for ( param, _expr ), operand in zip( positional, args )
+		]
+		kwargs = {
+			param.stem: self._auto_consume_hint_arg( node, kwargs[param.stem], param.type )
+			for param, _expr in keyword
+		}
 		for ( param, _expr ), operand in zip( positional, args ):
 			self._apply_move_hook( param, operand, qualname )
 		for param, _expr in keyword:
@@ -13570,6 +13660,22 @@ class FunctionLowering:
 		for param, _expr in keyword:
 			self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, qualname )
 		return args, kwargs
+
+	def _auto_consume_hint_arg( self, node: ast.AST, operand: ir.Operand, declared_param_type: Type|None ) -> ir.Operand:
+		''' see _lower_and_infer_call_args' own comment on why this exists -
+		reinstates case 2 of the general auto-or_throw() rule for a
+		strict=False, hint-only generic-argument lowering, gated on the
+		PARAM's own still-abstract declared type (not a substituted/bound
+		one - a not-yet-bound bare TypeVar reads as "not Result-shaped"
+		here, same as everywhere else, so the common case (inferring T from
+		an incidentally-Result-shaped argument) auto-consumes) rather than
+		being Result-shaped itself. '''
+		if ( self.lowering._type_resolver._result_shape( operand.type ) is None
+				or self.lowering._type_resolver._result_shape( declared_param_type ) is not None ):
+			return operand
+		consumed = self._auto_or_throw( node, operand, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = True )
+		assert consumed is not None # want_result=True above guarantees this
+		return consumed
 
 	def _lower_generic_construction_args( self, node: ast.Call, target_cls: RCClass, init: Function, expected_type: Type|None ) -> tuple[RCClass|Specialization,Function,list[ir.Operand],dict[str,ir.Operand]]:
 		# Box(...) where Box is generic: target_cls's own concrete type args
@@ -13917,22 +14023,13 @@ class FunctionLowering:
 	def _lower_or_throw( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
 		''' <result_expr>.or_throw() - like or_return() above (same "no real
 		method, recognized by AST shape alone" story - see _lower_or_return's
-		own comment), except each leaf of the Err branch first checks the
-		INNERMOST enclosing try's own except clauses (self._try_stack[-1],
-		textually inside this SAME function - see TryContext's own
-		docstring) before falling back to EXACTLY or_return()'s own
-		propagate-to-the-caller behavior for any leaf left uncovered (or
-		every leaf, when there's no enclosing try at all - self._try_stack
-		empty). Nested try does NOT search past the innermost one - only
-		ever reads self._try_stack[-1], never walks the rest of the stack -
-		a documented scope limitation (see _stmt_Try's own docstring), not a
-		bug.
-
-		Can't just reuse _consume_checked_result (it always emits an
-		unconditional OrReturn/OrJump - there's no way to thread a per-leaf
-		dispatch table through it) - this replays its checked-result
-		bookkeeping (unchecked-result clearing, epilogue-label lookup) by
-		hand instead, then builds ir.OrThrow directly. '''
+		own comment). The real per-leaf dispatch/emission logic is shared
+		with every AUTO-inserted or_throw() site (checked arithmetic,
+		__setitem__/AugAssign, a discarded Result statement, a Result
+		flowing into a T-typed context) via _emit_or_throw - see its own
+		docstring. Only the checks specific to the explicit `.or_throw()`
+		SYNTAX (no-args, generator-body rejection, inline-splice rejection)
+		live here. '''
 		if node.args or node.keywords:
 			self.lowering.discovery.fail( f'or_throw() takes no arguments: {ast.unparse(node)}', node )
 		if self._current_fn is not None and self._current_fn.is_generator_next:
@@ -13942,13 +14039,49 @@ class FunctionLowering:
 		if self._in_inline_splice_prelude:
 			# unlike or_return(), or_throw() has no inline_exit shape at all
 			# (ir.OrThrow's own docstring) - rejected outright rather than
-			# generalized, for now
+			# generalized, for now. The general auto-or_throw() rule has its
+			# own narrow carve-out for this same gap - see _auto_or_throw.
 			self.lowering.discovery.fail(
 				f'@inline: or_throw() is not supported before the final return of a multi-statement body: {ast.unparse(node)}', node,
 			)
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		if shape is None:
 			self.lowering.discovery.fail( f'or_throw() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		return self._emit_or_throw( node, receiver, want_result, alternatives = self.lowering._OR_THROW_ALTERNATIVES )
+
+	def _emit_or_throw( self, node: ast.AST, receiver: ir.Operand, want_result: bool, *, alternatives: str, pre_checked: bool = False ) -> ir.Operand|None:
+		''' The real body of .or_throw() (explicit or auto-inserted alike) -
+		extracted from _lower_or_throw so every auto-insertion site (see its
+		own docstring) can reuse the exact same per-leaf dispatch/emission,
+		not just the literal `.or_throw()` call syntax. Each leaf of the Err
+		branch first checks the INNERMOST enclosing try's own except clauses
+		(self._try_stack[-1], textually inside this SAME function - see
+		TryContext's own docstring) before falling back to EXACTLY
+		or_return()'s own propagate-to-the-caller behavior for any leaf left
+		uncovered (or every leaf, when there's no enclosing try at all -
+		self._try_stack empty). Nested try does NOT search past the
+		innermost one - only ever reads self._try_stack[-1], never walks the
+		rest of the stack - a documented scope limitation (see _stmt_Try's
+		own docstring), not a bug.
+
+		`pre_checked`, when True, skips this method's own
+		_require_or_throw_return coverage call - for a caller (AugAssign's
+		combined get+set subscript chain) that already validated coverage
+		up front via _require_chained_result_return, so the same gap isn't
+		reported twice under two different messages.
+
+		Assumes receiver.type is already known Result[_,_]-shaped (every
+		caller either recognized real `.or_throw()` syntax, which already
+		checked this, or is _auto_or_throw, which only reaches here after
+		its own _result_shape probe succeeded).
+
+		Can't just reuse _consume_checked_result (it always emits an
+		unconditional OrReturn/OrJump - there's no way to thread a per-leaf
+		dispatch table through it) - this replays its checked-result
+		bookkeeping (unchecked-result clearing, epilogue-label lookup) by
+		hand instead, then builds ir.OrThrow directly. '''
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		assert shape is not None
 		result_type, error_cls = shape
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
 
@@ -13963,9 +14096,10 @@ class FunctionLowering:
 					dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.bind, label = handler.label ))
 					covered_leaves.append( leaf )
 
-		self.lowering._type_resolver._require_or_throw_return(
-			node, result_cls, error_cls, covered_leaves, self.lowering._OR_THROW_ALTERNATIVES, fn = self._current_fn,
-		)
+		if not pre_checked:
+			self.lowering._type_resolver._require_or_throw_return(
+				node, result_cls, error_cls, covered_leaves, alternatives, fn = self._current_fn,
+			)
 
 		# same bookkeeping _consume_checked_result runs for or_return() -
 		# see its own comment on why both are needed
@@ -14006,6 +14140,83 @@ class FunctionLowering:
 			self._emit( ir.MarkUsed( operand = unwrapped ))
 			return None
 		return unwrapped
+
+	def _auto_or_throw( self, node: ast.AST, value: ir.Operand, alternatives: str, *, want_result: bool = True, pre_checked: bool = False ) -> ir.Operand|None:
+		''' The ONE general rule this whole file's auto-consumption story
+		now boils down to: whenever a Result[T,E]-shaped value is (1) a
+		discarded statement (want_result=False) or (2) flowing into a
+		context that wants T directly rather than the whole Result (see
+		_coerce_or_check_operand's own case-2 hook) - insert an implicit
+		.or_throw() (NOT .or_return()) exactly as if the user had written
+		it. Since or_throw() degrades to or_return()'s own unconditional-
+		propagate behavior whenever there's no enclosing try (self.
+		_try_stack empty, or every leaf uncovered), this is the single
+		mechanism that now backs checked arithmetic, __setitem__/AugAssign,
+		a bare discarded fallible call, AND `x: i32 = arr[0]` alike - see
+		PLAN_CHECKED_ARITHMETIC_GAP.md (now closed) for the gap this
+		unifies away.
+
+		A non-Result `value` passes straight through unchanged - not every
+		caller's value is necessarily fallible (mirrors _maybe_consume_
+		result's own identical "pass through, don't reject" contract).
+
+		The @inline multi-statement splice prelude is a narrow, deliberate
+		carve-out: ir.OrThrow has no inline_exit shape (see its own
+		docstring / _lower_or_throw's own outright rejection of the real
+		`.or_throw()` syntax there) - falls back to the EXISTING OrReturn/
+		OrJump+inline_exit path (_consume_checked_result) unchanged instead
+		of a redesign. Arithmetic already relied on this fallback before
+		this change; every other newly-auto-consuming site now gets it too,
+		for free, the moment it's reached from inside a splice prelude. '''
+		shape = self.lowering._type_resolver._result_shape( value.type )
+		if shape is None:
+			return value if want_result else None
+		result_type, error_cls = shape
+		if self._in_inline_splice_prelude:
+			if not pre_checked:
+				result_cls = self.lowering.discovery.find_name( 'Result', node )
+				self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
+			unwrapped = self._consume_checked_result( node, value, result_type, extra = None )
+			if not want_result:
+				self._emit( ir.MarkUsed( operand = unwrapped ))
+				return None
+			return unwrapped
+		return self._emit_or_throw( node, value, want_result, alternatives = alternatives, pre_checked = pre_checked )
+
+	def _maybe_auto_consume_result( self, node: ast.AST, operand: ir.Operand, expected_type: Type|None, alternatives: str, *, context: str|None = None ) -> ir.Operand|None:
+		''' case 2 of the general auto-or_throw() rule (see _auto_or_throw's
+		own docstring) as a probe, not an unconditional coercion: returns the
+		freshly unwrapped-and-re-coerced operand when `operand` is
+		Result[T,E]-shaped AND `expected_type` is NOT itself Result-shaped,
+		else None (not applicable - the caller keeps its OWN existing
+		operand/mismatch handling unchanged). _coerce_or_check_operand uses
+		this directly (its ordinary strict=True path); _stmt_Return needs its
+		own separate call to the same probe since it deliberately lowers
+		with strict=False (see its own comment on why) and so never reaches
+		_coerce_or_check_operand's own hook - both must agree on the exact
+		same guard, hence one shared helper instead of two copies of it. '''
+		if ( expected_type is None
+				or self.lowering._type_resolver._result_shape( operand.type ) is None
+				or self.lowering._type_resolver._result_shape( expected_type ) is not None ):
+			return None
+		consumed = self._auto_or_throw( node, operand, alternatives, want_result = True )
+		assert consumed is not None # want_result=True above guarantees this
+		return self._coerce_or_check_operand( consumed, expected_type, node, context = context )
+
+	def _finish_call_result( self, node: ast.AST, result: ir.Operand|None, want_result: bool ) -> ir.Operand|None:
+		''' shared tail for every call-lowering path (_lower_inline_call,
+		_infer_return_only_type_params_inline, _emit_generic_call, and
+		_lower_call's own shared tail) once the call's real result operand
+		is already computed/emitted, regardless of want_result. Case 1 of
+		the general auto-or_throw() rule (see _auto_or_throw's own
+		docstring): a discarded (want_result=False) Result gets implicitly
+		.or_throw()'d instead of the old hard "returns a Result that is
+		discarded here" compile error. A non-Result, or an already-wanted,
+		result passes straight through unchanged. '''
+		if want_result or result is None:
+			return result
+		self._auto_or_throw( node, result, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = False )
+		return None
 
 	def _lower_parameter_default( self, target: Function, param: Parameter ) -> ir.Operand:
 		''' an omitted argument's default VALUE, lowered in the DEFINING
@@ -14101,16 +14312,12 @@ class FunctionLowering:
 				f'@inline {target.qualname}: recursive inlining (directly or through another @inline function) is not supported: {ast.unparse(node)}',
 				node,
 			)
-		if not want_result and cfg.is_result_type( target.return_type ):
-			# same discard check the ordinary call tails already apply -
-			# discovery.py's _is_inline_eligible_body already guarantees
-			# target.node.body ends in exactly one `return <expr>`, so this
-			# can't be sidestepped by inlining instead of calling for real
-			self.lowering.discovery.fail(
-				f'{target.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
+		# a discarded Result return (want_result=False, target.return_type
+		# Result-shaped) is no longer rejected here - case 1 of the general
+		# auto-or_throw() rule (see _auto_or_throw's own docstring) picks it
+		# up at each of this method's own return points below instead
+		# (_finish_call_result), same as the ordinary (non-inline) call
+		# tails now do
 		stmts = target.node.body
 		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
 			stmts = stmts[1:] # strip a leading docstring, same shape discovery.py's _is_inline_eligible_body already validated
@@ -14249,7 +14456,7 @@ class FunctionLowering:
 						target.names.pop( stem, None )
 					else:
 						target.names[stem] = old
-			return result if want_result else None
+			return self._finish_call_result( node, result, want_result )
 		finally:
 			self._inlining_stack.pop()
 			self._owning_module = saved_owning_module
@@ -14504,7 +14711,7 @@ class FunctionLowering:
 						# computed it
 						result = self._lower_expr( return_stmt.value, expected_type )
 						self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
-						return result if want_result else None
+						return self._finish_call_result( node, result, want_result )
 
 					assert scope_label is not None and exited_flag is not None and merge_label is not None
 					# current_epilogue_label()'s own fallback target once
@@ -14572,7 +14779,7 @@ class FunctionLowering:
 					self._emit( ir.Label( name = converge_label ))
 		finally:
 			self._inline_param_alias_ids.difference_update( bound_ids )
-		return result if want_result else None
+		return self._finish_call_result( node, result, want_result )
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# sys.alloc[u8](...) - explicit generic instantiation. Matches call
@@ -14638,6 +14845,13 @@ class FunctionLowering:
 			# REAL validation/binding is _unify_type_param below, not
 			# _lower_expr's own general assignability check
 			operand = self._lower_expr( expr, hint, strict = False )
+			# strict=False above skips _coerce_or_check_operand's own case-2
+			# auto-or_throw() hook - reinstated here, same as _lower_and_
+			# infer_call_args' own identical fix, so an unconsumed Result[T,E]
+			# argument (e.g. an unannotated `c = a + b` passed to a generic
+			# function expecting plain T) unifies against its UNWRAPPED type
+			# instead of conflicting with an already/still-inferring binding
+			operand = self._auto_consume_hint_arg( node, operand, param.type )
 			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, target.qualname )
 			return operand
 
@@ -15115,16 +15329,12 @@ class FunctionLowering:
 		real_spec.monomorphized = provisional # caches the PROVISIONAL BODY for reuse by _lower_inline_call at a future call site - provisional is never independently scheduled/appended to compiler.functions by this variant, matching PLAN_INLINE.md's invariant
 		pending_spec.monomorphized = provisional
 
-		if not want_result and cfg.is_result_type( provisional.return_type ):
-			# same discard check _lower_inline_call itself applies - done
-			# here instead since target.return_type wasn't known yet when
-			# _lower_inline_call ran above (want_result was forced True)
-			self.lowering.discovery.fail(
-				f'{target.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
-		return result if want_result else None
+		# a discarded Result return is auto-consumed here (case 1 of the
+		# general auto-or_throw() rule - _finish_call_result), done here
+		# instead of inside the _lower_inline_call call above since target.
+		# return_type wasn't known yet at that point (want_result was
+		# forced True there specifically to skip its own identical check)
+		return self._finish_call_result( node, result, want_result )
 
 	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, *, already_compiled: bool = False ) -> ir.Operand|None:
 		# schedules the Specialization itself as the compile unit (see
@@ -15157,16 +15367,15 @@ class FunctionLowering:
 		self.lowering.schedule( monomorphized.return_type )
 		for param in monomorphized.parameters or []:
 			self.lowering.schedule( param.type )
-		if not want_result and cfg.is_result_type( monomorphized.return_type ):
-			self.lowering.discovery.fail(
-				f'{monomorphized.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
-		if want_result:
+		# a discarded Result return is no longer hard-rejected here - case 1
+		# of the general auto-or_throw() rule (_finish_call_result, below)
+		# picks it up instead, so this call still needs a real dest to
+		# consume even though the CALLER's own want_result is False
+		force_result = not want_result and cfg.is_result_type( monomorphized.return_type )
+		if want_result or force_result:
 			dest = self._new_temp( expected_type or monomorphized.return_type )
 			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
-			return dest
+			return self._finish_call_result( node, dest, want_result )
 		self._emit( ir.Call( dest = None, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 		return None
 
@@ -15917,26 +16126,25 @@ class FunctionLowering:
 		for param in target.parameters or []:
 			self.lowering.schedule( param.type )
 
-		if not want_result and cfg.is_result_type( target.return_type ):
-			# a bare `foo()` statement whose return value is a Result -
-			# _stmt_Expr is the only caller that ever passes want_result=
-			# False for a call used as a full statement (every other
-			# _lower_call caller threads want_result through from ITS OWN
-			# caller instead), so this is the "value produced, immediately
-			# discarded, never even bound to a name" case from the plan's
-			# validation table. v1 gap: this only covers calls that reach
-			# this shared tail (plain Function targets, and Overload targets
-			# that resolve to one unambiguous implementation without needing
-			# _lower_conditional_dispatch) - a bare-statement call to a
-			# GENERIC Result-returning function/method, or one requiring
-			# runtime union-argument dispatch, isn't covered
-			self.lowering.discovery.fail(
-				f'{target.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
+		# a bare `foo()` statement whose return value is a Result - _stmt_
+		# Expr is the only caller that ever passes want_result=False for a
+		# call used as a full statement (every other _lower_call caller
+		# threads want_result through from ITS OWN caller instead), so this
+		# is the "value produced, immediately discarded, never even bound to
+		# a name" case from the plan's validation table - case 1 of the
+		# general auto-or_throw() rule (_finish_call_result, below) now
+		# picks it up instead of hard-rejecting; force_result routes this
+		# call through the SAME dest-producing machinery `want_result=True`
+		# already uses below, purely so there's something to auto-consume.
+		# v1 gap: this only covers calls that reach this shared tail (plain
+		# Function targets, and Overload targets that resolve to one
+		# unambiguous implementation without needing _lower_conditional_
+		# dispatch) - a bare-statement call to a GENERIC Result-returning
+		# function/method, or one requiring runtime union-argument dispatch,
+		# isn't covered
+		force_result = not want_result and cfg.is_result_type( target.return_type )
 
-		if want_result:
+		if want_result or force_result:
 			target_return_type = target.return_type
 			# a Specialization of a TaggedUnion base (e.g. an unmonomorphized
 			# Result[usize,IndexError]) is just as "already the expected
@@ -15965,7 +16173,7 @@ class FunctionLowering:
 				# call's arguments can never produce the other member)
 				dest = self._new_temp( target_return_type )
 				self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
-				return self._maybe_unwrap_union_arg( dest, narrowed_return_type, owning = True )
+				return self._finish_call_result( node, self._maybe_unwrap_union_arg( dest, narrowed_return_type, owning = True ), want_result )
 			if isinstance( expected_type, TaggedUnion ) and target_return_type is not None and not isinstance( target_return_type_base, ( TaggedUnion, TypeVar )):
 				# a call whose own return type is a plain leaf (e.g. str)
 				# flowing into a T|None-typed slot - dest must be typed as
@@ -16028,7 +16236,7 @@ class FunctionLowering:
 				else:
 					dest = self._new_temp( expected_type or target_return_type )
 			self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
-			return dest
+			return self._finish_call_result( node, dest, want_result )
 		else:
 			self._emit( ir.Call( dest = None, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return None
