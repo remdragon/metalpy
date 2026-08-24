@@ -473,6 +473,31 @@ class OrThrow( Instruction ):
 		return f'OrThrow( dest={self.dest!r}, value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
 
 @dataclass( kw_only = True )
+class Raise( Instruction ):
+	''' `raise EXPR` (lowering.py's _stmt_Raise) - same per-leaf dispatch
+	shape as ir.OrThrow's own Err branch, but `value` here IS the error
+	itself (never a Result - contrast OrThrow.value), so there's no outer
+	Ok/Err tag to check first and no `dest`/Ok-arm at all: a raise never
+	falls through, there's no "otherwise" value. A covered leaf narrows
+	`value`'s payload into its handler's own bind and jumps straight to
+	`label` - no Result is ever built. An uncovered leaf propagates via a
+	REAL function return, built directly from the enclosing function's own
+	declared Result[T,E] return type (or return_slot's, when target is a
+	real epilogue label) - emitter_c.py reuses the exact same
+	_emit_widen_error-based machinery ir.OrThrow's own uncovered-leaf arm
+	already uses, just seeded from `value` directly instead of `(receiver).
+	data.err`. `dispatch`/`epilogue`/`target`/`return_slot` mirror
+	ir.OrThrow's own identical fields. '''
+	value: Operand # the raised error value itself - NOT a Result
+	dispatch: list[ThrowLeaf]
+	epilogue: list['Instruction'] = field( default_factory = list )
+	target: str|None = None # None -> real C `return`; a real label -> `goto`
+	return_slot: 'Variable|None' = None # only meaningful when target is not None
+
+	def test_repr( self ) -> str:
+		return f'Raise( value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
+
+@dataclass( kw_only = True )
 class Unwrap( Instruction ): # Result.unwrap(errmsg): Err -> panic(errmsg); Ok -> dest = payload
 	dest: Temp
 	value: Operand # a Result[T,E]

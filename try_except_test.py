@@ -1,16 +1,20 @@
 # Real-compile-and-run + compile-error regression tests for limited
-# try/except/else/finally + Result.or_throw() (NOT real exceptions - no
-# `raise`, no unwinding: the only way control reaches an except handler is
-# `.or_throw()` called on a Result-typed expression, textually inside that
-# try body, in the same function). See lowering.py's _stmt_Try/_lower_or_throw
-# and ir.OrThrow for the implementation.
+# try/except/else/finally + Result.or_throw() + `raise EXPR` (still not real
+# exceptions/unwinding: control reaches an except handler only via
+# `.or_throw()` on a Result-typed expression, or a `raise EXPR` statement,
+# textually inside that try body, in the same function - a leaf uncovered by
+# the innermost try walks every OUTER enclosing try too, innermost first,
+# before propagating to the function's own return). See lowering.py's
+# _stmt_Try/_emit_or_throw/_stmt_Raise and ir.OrThrow/ir.Raise for the
+# implementation.
 #
 # The compile-error cases (rejection of user-defined or_throw, except*, bare
 # except:, loop-escape, generator-body, insufficient function return-type
-# coverage) don't need a real C compiler at all - those use Discovery/
-# Compiler directly, same pattern lowering_test.py's own rejection tests use.
-# The positive/behavioral cases need a real compile+run (RealCompileMixin),
-# same pattern or_return_rc_test.py uses.
+# coverage, bare/chained raise, dead except clauses) don't need a real C
+# compiler at all - those use Discovery/Compiler directly, same pattern
+# lowering_test.py's own rejection tests use. The positive/behavioral cases
+# need a real compile+run (RealCompileMixin), same pattern or_return_rc_test.py
+# uses.
 
 from pathlib import Path
 import unittest
@@ -219,7 +223,7 @@ def main() -> i32:
 	return 0
 '''
 
-_NESTED_TRY_INNER_UNCOVERED_LEAF_NOT_CAUGHT_BY_OUTER = '''
+_NESTED_TRY_INNER_UNCOVERED_LEAF_CAUGHT_BY_OUTER = '''
 class ErrorA:
 	pass
 
@@ -227,11 +231,10 @@ def risky() -> Result[i32, ErrorA]:
 	return Result.Err( ErrorA() )
 
 def run() -> Result[i32, ErrorA]:
-	# the INNER try has no handler for ErrorA at all - its or_throw() must
-	# propagate straight to run()'s own Result return, WITHOUT ever being
-	# caught by the OUTER try's own `except ErrorA:` even though it's
-	# textually enclosing (a documented scope limitation, not a bug - only
-	# the INNERMOST enclosing try's own handlers are ever consulted)
+	# the INNER try has no handler for ErrorA at all - its or_throw() now
+	# walks the WHOLE enclosing try stack (innermost first), so this leaf
+	# IS caught by the OUTER try's own `except ErrorA:`, even though it's
+	# only textually enclosing, not the innermost try
 	try:
 		try:
 			v: i32 = risky().or_throw()
@@ -244,9 +247,9 @@ def run() -> Result[i32, ErrorA]:
 def main() -> i32:
 	match run():
 		case Result.Ok( v ):
-			return 1 # would wrongly fire if the outer handler had caught it
+			return 0 if v == -1 else 1 # expected: caught by the outer handler
 		case Result.Err( e ):
-			return 0 # expected: propagated all the way out uncaught
+			return 2 # would wrongly fire if the outer handler had NOT caught it
 '''
 
 _OR_THROW_WITH_NO_ENCLOSING_TRY_IS_LIKE_OR_RETURN = '''
@@ -430,6 +433,295 @@ def main() -> i32:
 	return 0
 '''
 
+# Change 1: 3-level nesting - the INNERMOST try's own uncovered leaf must
+# walk PAST two enclosing stack frames (the immediate parent, which also
+# doesn't cover it) to reach the OUTERMOST try's own handler.
+_THREE_LEVEL_NESTED_TRY_WALKS_PAST_TWO_FRAMES = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+def risky() -> Result[i32, ErrorA]:
+	return Result.Err( ErrorA() )
+
+def risky_b( bad: bool ) -> Result[i32, ErrorB]:
+	if bad:
+		return Result.Err( ErrorB() )
+	return Result.Ok( 0 )
+
+def run() -> i32:
+	result: i32 = 0
+	try: # outermost - the only one that covers ErrorA
+		try: # middle - covers ErrorB (genuinely thrown here, just never on
+			# THIS leaf) - irrelevant to the ErrorA leaf below, which must
+			# walk PAST this frame too, not stop here just because this
+			# frame has SOME handler
+			ignored: i32 = risky_b( False ).or_throw()
+			try: # innermost - covers nothing
+				v: i32 = risky().or_throw()
+				result = v
+			finally:
+				pass
+		except ErrorB:
+			result = -2
+	except ErrorA:
+		result = -1
+	return result
+
+def main() -> i32:
+	if run() != -1:
+		return 1
+	return 0
+'''
+
+# Change 1: innermost-first priority - a leaf covered by BOTH an inner and
+# an outer try's handlers must dispatch to the INNER one, never the outer.
+# The outer handler is ALSO genuinely reachable (via `direct`), so it's a
+# real handler, not accidentally dead code (Change 3) - it just must never
+# fire when the leaf goes through the inner try instead.
+_INNERMOST_TRY_WINS_WHEN_BOTH_COVER_SAME_LEAF = '''
+class ErrorA:
+	pass
+
+def risky() -> Result[i32, ErrorA]:
+	return Result.Err( ErrorA() )
+
+def run( direct: bool ) -> i32:
+	result: i32 = 0
+	try:
+		if direct:
+			v: i32 = risky().or_throw() # outer's own handler covers this one directly
+			result = v
+		else:
+			try:
+				v2: i32 = risky().or_throw()
+				result = v2
+			except ErrorA:
+				result = -1 # must fire - the innermost handler
+	except ErrorA:
+		result = -2 # must fire only when direct, never via the inner try's own leaf
+	return result
+
+def main() -> i32:
+	if run( False ) != -1:
+		return 1
+	if run( True ) != -2:
+		return 2
+	return 0
+'''
+
+# Change 1: CFG/RC interaction - an RC-typed local constructed BEFORE the
+# inner try, whose own uncovered leaf now jumps to the OUTER handler, which
+# constructs a FRESH RC local only on that one path. Real compile+run,
+# checking refcount() to confirm no leak/double-free.
+_OUTER_HANDLER_FRESH_RC_LOCAL_VIA_INNER_UNCOVERED_LEAF = '''
+class ErrorA:
+	pass
+
+class Box:
+	n: i32
+
+def risky() -> Result[i32, ErrorA]:
+	return Result.Err( ErrorA() )
+
+def run() -> i32:
+	b: Box = Box( n = -100 )
+	try:
+		try:
+			v: i32 = risky().or_throw() # uncovered by the inner try...
+			b = Box( n = v )
+		finally:
+			pass
+	except ErrorA:
+		b = Box( n = -1 ) # ...caught here instead, a fresh Box only on this path
+		if compiler.refcount( b ) != usize( 1 ):
+			return -999
+	return b.n
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < 100:
+			if run() != -1:
+				return 1
+			i = i + 1
+	return 0
+'''
+
+# Change 2: raise EXPR caught by a same-function except clause, single leaf.
+_RAISE_CAUGHT_BY_SAME_FUNCTION_EXCEPT_SINGLE_LEAF = '''
+class ErrorA:
+	pass
+
+def run( bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		if bad:
+			raise ErrorA()
+		result = 5
+	except ErrorA:
+		result = -1
+	return result
+
+def main() -> i32:
+	if run( False ) != 5:
+		return 1
+	if run( True ) != -1:
+		return 2
+	return 0
+'''
+
+# Change 2: raise EXPR caught by a tuple except-clause, `as e:` binding.
+_RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+def run( which: i32 ) -> i32:
+	result: i32 = 0
+	try:
+		if which == 1:
+			raise ErrorA()
+		if which == 2:
+			raise ErrorB()
+		result = 5
+	except (ErrorA, ErrorB) as e:
+		compiler.decref( e )
+		with compiler.wrap_arithmetic:
+			result = which * 11
+	return result
+
+def main() -> i32:
+	if run( 0 ) != 5:
+		return 1
+	if run( 1 ) != 11:
+		return 2
+	if run( 2 ) != 22:
+		return 3
+	return 0
+'''
+
+# Change 2: THE key test - a single `raise` of a union-typed value where SOME
+# leaves are caught locally and others propagate via a real function return.
+# Exercises the per-leaf split within one raise statement.
+_RAISE_MIXED_COVERED_AND_UNCOVERED_LEAVES_SPLITS_PER_LEAF = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+def pick( which: i32 ) -> ErrorA | ErrorB:
+	if which == 1:
+		return ErrorA()
+	return ErrorB()
+
+def run( which: i32 ) -> Result[i32, ErrorB]:
+	try:
+		raise pick( which )
+	except ErrorA:
+		return Result.Ok( -1 ) # covered locally - no Result ever built for this leaf
+
+def main() -> i32:
+	match run( 1 ):
+		case Result.Ok( v ):
+			if v != -1:
+				return 1
+		case Result.Err( e ):
+			return 2 # would wrongly fire - ErrorA is covered
+	match run( 2 ):
+		case Result.Ok( v ):
+			return 3 # would wrongly fire - ErrorB is uncovered, must propagate
+		case Result.Err( e ):
+			pass
+	return 0
+'''
+
+# Change 2: raise with no enclosing try at all - degrades to plain
+# function-return propagation, mirroring or_throw()'s own identical case.
+_RAISE_WITH_NO_ENCLOSING_TRY_IS_LIKE_OR_RETURN = '''
+class ErrorA:
+	pass
+
+def run( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		raise ErrorA()
+	return Result.Ok( 9 )
+
+def main() -> i32:
+	match run( True ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
+	match run( False ):
+		case Result.Ok( v ):
+			if v != 9:
+				return 2
+		case Result.Err( e ):
+			return 3
+	return 0
+'''
+
+# Change 2: raise AND or_throw() in the same try body, both dispatching to
+# the SAME handler.
+_RAISE_AND_OR_THROW_SAME_TRY_DISPATCH_TO_SAME_HANDLER = '''
+class ErrorA:
+	pass
+
+def risky( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		return Result.Err( ErrorA() )
+	return Result.Ok( 4 )
+
+def run( which: i32 ) -> i32:
+	result: i32 = 0
+	try:
+		if which == 1:
+			raise ErrorA()
+		result = risky( which == 2 ).or_throw()
+	except ErrorA:
+		result = -1
+	return result
+
+def main() -> i32:
+	if run( 0 ) != 4:
+		return 1
+	if run( 1 ) != -1:
+		return 2
+	if run( 2 ) != -1:
+		return 3
+	return 0
+'''
+
+# Change 3: a tuple except-clause where only ONE of two leaves is ever
+# thrown - the whole clause must still NOT be flagged dead.
+_TUPLE_EXCEPT_CLAUSE_ONE_LEAF_NEVER_THROWN_STILL_NOT_DEAD = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+def run() -> i32:
+	result: i32 = 0
+	try:
+		raise ErrorA() # ErrorB is never thrown anywhere in this body
+	except (ErrorA, ErrorB) as e:
+		compiler.decref( e )
+		result = -1
+	return result
+
+def main() -> i32:
+	if run() != -1:
+		return 1
+	return 0
+'''
+
 _ALL_PARTS_TOGETHER = '''
 class Counter:
 	n: i32
@@ -459,10 +751,12 @@ def run( c: Counter, bad: bool ) -> i32:
 	return result
 
 def run_early_return( c: Counter ) -> i32:
+	# plain try/finally, no except clause at all - nothing in this body
+	# ever throws, so an `except SomeError:` here would be flagged as
+	# unreachable dead code (Change 3) - this fixture only cares about
+	# finally running on the early-return path, not dispatch
 	try:
 		return 42
-	except SomeError as e:
-		return -1
 	finally:
 		bump( c )
 
@@ -501,8 +795,8 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 	def test_else_runs_only_on_non_dispatch_fallthrough( self ) -> None:
 		self.assert_programs_run([ ( 'else_fallthrough_only', _ELSE_RUNS_ONLY_ON_NON_DISPATCH_FALLTHROUGH ) ])
 
-	def test_nested_try_inner_uncovered_leaf_not_caught_by_outer( self ) -> None:
-		self.assert_programs_run([ ( 'nested_try_scope', _NESTED_TRY_INNER_UNCOVERED_LEAF_NOT_CAUGHT_BY_OUTER ) ])
+	def test_nested_try_inner_uncovered_leaf_caught_by_outer( self ) -> None:
+		self.assert_programs_run([ ( 'nested_try_scope', _NESTED_TRY_INNER_UNCOVERED_LEAF_CAUGHT_BY_OUTER ) ])
 
 	def test_or_throw_with_no_enclosing_try_is_like_or_return( self ) -> None:
 		self.assert_programs_run([ ( 'or_throw_no_try', _OR_THROW_WITH_NO_ENCLOSING_TRY_IS_LIKE_OR_RETURN ) ])
@@ -521,6 +815,33 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_nested_try_inside_handler_body( self ) -> None:
 		self.assert_programs_run([ ( 'nested_try_inside_handler', _NESTED_TRY_INSIDE_HANDLER_BODY ) ])
+
+	def test_three_level_nested_try_walks_past_two_frames( self ) -> None:
+		self.assert_programs_run([ ( 'three_level_nested', _THREE_LEVEL_NESTED_TRY_WALKS_PAST_TWO_FRAMES ) ])
+
+	def test_innermost_try_wins_when_both_cover_same_leaf( self ) -> None:
+		self.assert_programs_run([ ( 'innermost_wins', _INNERMOST_TRY_WINS_WHEN_BOTH_COVER_SAME_LEAF ) ])
+
+	def test_outer_handler_fresh_rc_local_via_inner_uncovered_leaf( self ) -> None:
+		self.assert_programs_run([ ( 'outer_handler_fresh_rc', _OUTER_HANDLER_FRESH_RC_LOCAL_VIA_INNER_UNCOVERED_LEAF ) ])
+
+	def test_raise_caught_by_same_function_except_single_leaf( self ) -> None:
+		self.assert_programs_run([ ( 'raise_single_leaf', _RAISE_CAUGHT_BY_SAME_FUNCTION_EXCEPT_SINGLE_LEAF ) ])
+
+	def test_raise_caught_by_tuple_except_clause_binding( self ) -> None:
+		self.assert_programs_run([ ( 'raise_tuple_except', _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING ) ])
+
+	def test_raise_mixed_covered_and_uncovered_leaves_splits_per_leaf( self ) -> None:
+		self.assert_programs_run([ ( 'raise_mixed_leaves', _RAISE_MIXED_COVERED_AND_UNCOVERED_LEAVES_SPLITS_PER_LEAF ) ])
+
+	def test_raise_with_no_enclosing_try_is_like_or_return( self ) -> None:
+		self.assert_programs_run([ ( 'raise_no_try', _RAISE_WITH_NO_ENCLOSING_TRY_IS_LIKE_OR_RETURN ) ])
+
+	def test_raise_and_or_throw_same_try_dispatch_to_same_handler( self ) -> None:
+		self.assert_programs_run([ ( 'raise_and_or_throw', _RAISE_AND_OR_THROW_SAME_TRY_DISPATCH_TO_SAME_HANDLER ) ])
+
+	def test_tuple_except_clause_one_leaf_never_thrown_still_not_dead( self ) -> None:
+		self.assert_programs_run([ ( 'tuple_except_one_leaf', _TUPLE_EXCEPT_CLAUSE_ONE_LEAF_NEVER_THROWN_STILL_NOT_DEAD ) ])
 
 
 # --- compile-error coverage (no real C compiler needed) ---------------------
@@ -780,6 +1101,175 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		if fn.resolve is not None:
 			fn.resolve()
 		self.assertTrue( any( 'nested Result' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+	# --- Change 2: raise EXPR rejection coverage ----------------------------
+
+	def test_bare_raise_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def run() -> i32:',
+			'	try:',
+			'		raise',
+			'	except ErrorA:', # unused on purpose; the bare `raise` itself fails first
+			'		pass',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'bare raise' in e for e in errors ), errors )
+
+	def test_raise_from_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'class ErrorB: pass',
+			'',
+			'def run() -> i32:',
+			'	raise ErrorA() from ErrorB()',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'from' in e and 'chaining' in e for e in errors ), errors )
+
+	def test_raise_inside_generator_body_is_rejected( self ) -> None:
+		# same reasoning as test_try_inside_generator_body_is_rejected -
+		# gen()'s body is only lowered once something actually drives it
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def gen() -> Iterator[Result[i32,StopIteration]]:',
+			'	yield 1',
+			'	raise ErrorA()',
+			'',
+			'def main() -> i32:',
+			'	for x in gen():',
+			'		pass',
+			'	return 0',
+		])
+		self._import( code )
+		self.compiler.run()
+		errors = self.discovery.errors.errors
+		self.assertTrue( any( 'generator' in e for e in errors ), errors )
+
+	def test_raise_inside_inline_splice_prelude_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'@cstruct',
+			'class Counter:',
+			'	value: i32',
+			'',
+			'	@inline',
+			'	def bumped( self, by: i32 ) -> i32:',
+			'		if by < 0:',
+			'			raise ErrorA()',
+			'		result: i32 = self.value + by',
+			'		return result',
+			'',
+			'def main() -> i32:',
+			'	c: Counter = Counter( value = 10 )',
+			'	return c.bumped( 5 )',
+		])
+		errors = self._lower_and_get_errors( code, 'main' )
+		self.assertTrue( any( '@inline' in e and 'raise' in e for e in errors ), errors )
+
+	def test_raise_uncovered_leaf_with_insufficient_function_return_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'class ErrorB: pass',
+			'',
+			'def pick( which: i32 ) -> ErrorA | ErrorB:',
+			'	if which == 1:',
+			'		return ErrorA()',
+			'	return ErrorB()',
+			'',
+			'def run( which: i32 ) -> i32:',
+			'	try:',
+			'		raise pick( which )',
+			'	except ErrorB:',
+			'		return -1',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( errors, 'expected a compile error for the uncovered ErrorA leaf' )
+		self.assertTrue( any( 'ErrorA' in e for e in errors ), errors )
+
+	# --- Change 3: dead (never-thrown) except clause ------------------------
+
+	def test_never_thrown_except_clause_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'class ErrorB: pass',
+			'',
+			'def risky() -> Result[i32, ErrorA]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def run() -> i32:',
+			'	try:',
+			'		v: i32 = risky().or_throw()',
+			'	except ErrorA:',
+			'		v = -1',
+			'	except ErrorB:', # never thrown anywhere in this try body
+			'		v = -2',
+			'	return v',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'unreachable' in e and 'ErrorB' in e for e in errors ), errors )
+
+	def test_except_clause_matched_only_via_or_throw_is_not_dead( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def risky() -> Result[i32, ErrorA]:',
+			'	return Result.Err( ErrorA() )',
+			'',
+			'def run() -> i32:',
+			'	try:',
+			'		v: i32 = risky().or_throw()',
+			'	except ErrorA:',
+			'		v = -1',
+			'	return v',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertFalse( errors, errors )
+
+	def test_except_clause_matched_only_via_raise_is_not_dead( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def run() -> i32:',
+			'	try:',
+			'		raise ErrorA()',
+			'	except ErrorA:',
+			'		return -1',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertFalse( errors, errors )
+
+	def test_except_clause_matched_only_via_inner_nested_try_bubbling_up_is_not_dead( self ) -> None:
+		# the direct Change-1 interaction: the OUTER except clause is never
+		# dispatched to by anything textually inside the outer try's own
+		# body directly - only via the INNER try's own uncovered leaf
+		# bubbling up (Change 1) - must still not be flagged dead (Change 3)
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def risky() -> Result[i32, ErrorA]:',
+			'	return Result.Err( ErrorA() )',
+			'',
+			'def run() -> i32:',
+			'	result: i32 = 0',
+			'	try:',
+			'		try:',
+			'			v: i32 = risky().or_throw()',
+			'			result = v',
+			'		finally:',
+			'			pass',
+			'	except ErrorA:',
+			'		result = -1',
+			'	return result',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertFalse( errors, errors )
 
 
 # --- RC stress: sound cross-handler fresh-construction, repeated many times -

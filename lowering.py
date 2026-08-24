@@ -1654,7 +1654,11 @@ class Lowering:
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
 	_OR_THROW_ALTERNATIVES = (
-		'or_throw() propagates any leaf not caught by an except clause of the innermost enclosing try to the caller, '
+		'or_throw() propagates any leaf not caught by an except clause of any enclosing try (innermost first) to the caller, '
+		'exactly like or_return() - there is no other way for the enclosing function to receive it'
+	)
+	_RAISE_ALTERNATIVES = (
+		'raise propagates any leaf not caught by an except clause of any enclosing try (innermost first) to the caller, '
 		'exactly like or_return() - there is no other way for the enclosing function to receive it'
 	)
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
@@ -1903,24 +1907,32 @@ class _LoopContext:
 
 @dataclass
 class TryHandler:
-	''' one `except T:`/`except (A,B) as e:` clause of the innermost
-	enclosing try (FunctionLowering._try_stack) - `leaves` are the
-	resolved error-class leaves this clause covers (each may itself be
-	one class, or several for a tuple-of-classes clause). `bind` is the
-	real, already-registered local Variable `as NAME` binds (see
-	_stmt_Try), or None for a bare `except T:`. '''
+	''' one `except T:`/`except (A,B) as e:` clause of some enclosing try
+	(FunctionLowering._try_stack) - `leaves` are the resolved error-class
+	leaves this clause covers (each may itself be one class, or several
+	for a tuple-of-classes clause). `bind` is the real, already-registered
+	local Variable `as NAME` binds (see _stmt_Try), or None for a bare
+	`except T:`. `matched` is set True the moment ANY leaf of this
+	handler is actually selected by a .or_throw()/raise dispatch anywhere
+	inside this handler's own try body (see
+	_dispatch_leaves_against_try_stack) - an except clause left False once
+	its own try's body is fully lowered is unreachable dead code, a
+	compile error (_stmt_Try's own check, after the try_stack pop). '''
 	leaves: list[Type]
 	label: str
 	bind: 'Variable|None'
+	matched: bool = False
 
 
 @dataclass
 class TryContext:
-	''' one entry of FunctionLowering._try_stack - the try statement
-	currently being lowered. Consulted only by .or_throw() (_lower_or_throw)
-	textually inside its own body, in the SAME function - an inner try's
-	uncovered leaf does NOT search an outer try's own handlers (see
-	_lower_or_throw's own comment); only the top-of-stack entry is ever read. '''
+	''' one entry of FunctionLowering._try_stack - a try statement
+	currently being lowered (nested trys push one entry each, innermost
+	last). Consulted by .or_throw()/raise (_dispatch_leaves_against_try_stack)
+	textually inside its own body, in the SAME function - an uncovered
+	leaf walks the WHOLE stack innermost-first, checking every textually
+	enclosing try's own handlers before falling back to propagating to
+	the caller. '''
 	handlers: list[TryHandler]
 	end_label: str
 
@@ -2023,11 +2035,11 @@ class FunctionLowering:
 		# _lower_with_context_manager) - unique per with-statement in this
 		# function, only for the synthesized ctx-holding local's own stem
 		self._with_ctx_id = 0
-		# try/except/else/finally - only .or_throw() textually inside the
+		# try/except/else/finally - .or_throw()/raise textually inside the
 		# CURRENT try body (same function) consults this; see TryContext's
-		# own docstring. Only the top entry is ever read - nested try does
-		# NOT fall back to an outer try's own handlers (a documented scope
-		# limitation, not a bug - see _lower_or_throw)
+		# own docstring. An uncovered leaf walks the WHOLE stack innermost-
+		# first (_dispatch_leaves_against_try_stack), so a nested try's own
+		# uncovered leaf DOES fall back to an outer try's own handlers.
 		self._try_stack: list[TryContext] = []
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
 		# _inlining_stack (by id(target)) is the reentrancy guard - a target
@@ -5011,25 +5023,39 @@ class FunctionLowering:
 		self.lowering.discovery.fail( f'except* (exception groups) is not supported: {ast.unparse(node)}', node )
 
 	def _stmt_Try( self, node: ast.Try ) -> None:
-		''' limited try/except/else/finally - NOT real exceptions, no
-		`raise`/unwinding: the only way control ever reaches an except
-		handler is `.or_throw()` (_lower_or_throw), called on a Result-typed
-		expression textually inside this try's own body, in this SAME
-		function (self._try_stack, consulted only while THIS body is being
-		lowered). Mirrors _lower_with_context_manager's own already-debugged
-		shape for `finally` - see that method's docstring for the full
-		"why no new lexical scope, why register-then-disarm-and-inline"
-		story; `as NAME` binds an ordinary, function-scoped local exactly
-		like with's own NAME does, just built directly here (there's no
-		AST-level expression for "the narrowed Err payload of this
-		already-lowered or_throw() receiver" for an ast.Assign to reference -
-		see the Variable construction below).
+		''' limited try/except/else/finally - not real unwinding: control
+		reaches an except handler only via `.or_throw()` (_lower_or_throw)
+		or a `raise EXPR` statement (_stmt_Raise), each textually inside
+		this try's own body, in this SAME function (self._try_stack,
+		pushed/popped around the body's own lowering). Mirrors
+		_lower_with_context_manager's own already-debugged shape for
+		`finally` - see that method's docstring for the full "why no new
+		lexical scope, why register-then-disarm-and-inline" story; `as
+		NAME` binds an ordinary, function-scoped local exactly like with's
+		own NAME does, just built directly here (there's no AST-level
+		expression for "the narrowed Err payload of this already-lowered
+		or_throw()/raise dispatch" for an ast.Assign to reference - see the
+		Variable construction below).
 
-		Nested try: only the INNERMOST enclosing try's own handlers are ever
-		consulted by or_throw() - an inner try's own uncovered leaf does NOT
-		search an outer try's own handlers, it goes straight to the
-		function-return fallback. A documented scope limitation, not a bug -
-		see _lower_or_throw's own comment. '''
+		Nested try: an uncovered leaf walks the WHOLE enclosing try stack,
+		innermost first (_dispatch_leaves_against_try_stack, shared by
+		or_throw() and raise) - an inner try's own uncovered leaf DOES
+		search every outer try's own handlers before falling back to the
+		function-return propagation path. This is sound without any new CFG
+		machinery: _stmt_Try is Python-call-stack-recursive, so an outer
+		TryContext's own `handlers` list is still live/mutable while an
+		inner try's body is being lowered, and every handler (inner or
+		outer) is already modeled as diverging from its OWN try's entry
+		snapshot (below) - a goto from anywhere inside an inner try's body
+		is textually still inside the outer try's own body too, already
+		covered by that same conservative model. Labels are function-flat
+		and globally unique (_new_label), so a goto reaching an outer
+		label works exactly like reaching an inner one.
+
+		Dead-except check (after the try_stack pop, below): an except
+		clause whose TryHandler.matched never got set True by any
+		or_throw()/raise dispatch anywhere in this try's own body is
+		unreachable - a compile error. '''
 		if self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
 				f'try-statement is not supported inside a generator body yet: {ast.unparse(node)}', node,
@@ -5121,6 +5147,13 @@ class FunctionLowering:
 		finally:
 			self._try_stack.pop()
 
+		for handler, h in zip( handlers, node.handlers ):
+			if not handler.matched:
+				self.lowering.discovery.fail(
+					f'except {ast.unparse(h.type)}: is unreachable - nothing in this try block ever throws it: {ast.unparse(node)}',
+					h,
+				)
+
 		for stmt in node.orelse:
 			try:
 				self._lower_stmt( stmt )
@@ -5143,9 +5176,9 @@ class FunctionLowering:
 			try:
 				if handler.bind is not None:
 					# the emitter unconditionally assigns handler.bind's own
-					# payload before jumping to this exact label (ir.OrThrow's
-					# dispatch - see _emit_or_throw_leaf_case) - definitely
-					# assigned on entry here, same reasoning
+					# payload before jumping to this exact label (ir.OrThrow's/
+					# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
+					# definitely assigned on entry here, same reasoning
 					# _declare_hidden_local/@inline's own parameter binding
 					# already rely on mark_live() for (see its own docstring).
 					# Must happen INSIDE this branch-confined window (moved
@@ -5242,6 +5275,78 @@ class FunctionLowering:
 						self._lower_stmt( stmt )
 					except CompileError:
 						continue
+
+	def _stmt_Raise( self, node: ast.Raise ) -> None:
+		''' raise EXPR - a bare goto into a matching except handler of any
+		enclosing try (walked innermost-first via
+		_dispatch_leaves_against_try_stack, the same helper .or_throw() (
+		_emit_or_throw) uses), no Result ever built for that covered case -
+		it's a jump, not a value. A leaf uncovered by every enclosing try
+		propagates via a REAL function return instead, built from the
+		enclosing function's own declared Result[T,E] return type (same
+		coverage requirement .or_throw() already enforces via
+		_require_or_throw_return) - see ir.Raise's own docstring for the
+		emitted shape, which reuses _emit_leaf_dispatch_case's existing
+		uncovered-leaf machinery in emitter_c.py.
+
+		No bare `raise` (Python's own re-raise - there is no ambient
+		current exception in this design) and no `raise ... from ...`
+		(exception chaining); same generator-body/@inline-splice-prelude
+		rejections as .or_throw() (_lower_or_throw) - mirrors its wording. '''
+		if node.exc is None:
+			self.lowering.discovery.fail(
+				f'bare raise (re-raise) is not supported - there is no ambient current exception in this design, '
+				f'raise the specific error value instead: {ast.unparse(node)}', node,
+			)
+		if node.cause is not None:
+			self.lowering.discovery.fail( f'raise ... from ... (exception chaining) is not supported: {ast.unparse(node)}', node )
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail( f'raise is not supported inside a generator body yet: {ast.unparse(node)}', node )
+		if self._in_inline_splice_prelude:
+			self.lowering.discovery.fail(
+				f'@inline: raise is not supported before the final return of a multi-statement body: {ast.unparse(node)}', node,
+			)
+
+		value = self._lower_expr( node.exc, None )
+		error_cls = value.type
+		if error_cls is None or not isinstance( error_cls, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+			self.lowering.discovery.fail(
+				f'raise EXPR must be a class instance, got {error_cls.qualname if error_cls else "?"}: {ast.unparse(node)}', node,
+			)
+
+		all_leaves = self.lowering._type_resolver._atomic_leaves( error_cls )
+		dispatch, covered_leaves = self._dispatch_leaves_against_try_stack( all_leaves )
+
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		self.lowering._type_resolver._require_or_throw_return(
+			node, result_cls, error_cls, covered_leaves, self.lowering._RAISE_ALTERNATIVES, fn = self._current_fn,
+		)
+
+		try:
+			self._cfg.check_unchecked_results( value )
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+
+		all_covered = len( covered_leaves ) == len( all_leaves )
+		if all_covered:
+			# every leaf dispatches straight into a handler - no propagation
+			# path exists at all, mirrors _emit_or_throw's own identical
+			# all_covered short-circuit
+			self._flush_pending_temps() # see _stmt_Return's own identical comment: before the terminator, not after
+			self._emit( ir.Raise( value = value, dispatch = dispatch ))
+			return
+
+		tracked_operand = value if isinstance( value, Variable ) else None
+		label = self._cfg.current_epilogue_label( tracked_operand )
+		if label is not None:
+			self._flush_pending_temps()
+			self._emit( ir.Raise(
+				value = value, dispatch = dispatch, target = label, return_slot = self._return_value_var,
+			))
+		else:
+			replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+			self._flush_pending_temps()
+			self._emit( ir.Raise( value = value, dispatch = dispatch, epilogue = replay ))
 
 	def _static_type_of_value_expr( self, node: ast.expr ) -> Type|None:
 		# compile-time-only: the static type of a value-shaped expression
@@ -7668,7 +7773,7 @@ class FunctionLowering:
 		recognized here - NoReturn is overwhelmingly a free-function/sys.*
 		shape (sys.panic, sys.exit, ...), and misses just fall back to
 		today's existing (safe, if incomplete) behavior. '''
-		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
+		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue, ast.Raise )):
 			return True
 		if isinstance( stmt, ast.With ):
 			# a with-block's own exit (__exit__) doesn't change whether
@@ -14425,20 +14530,44 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'or_throw() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
 		return self._emit_or_throw( node, receiver, want_result, alternatives = self.lowering._OR_THROW_ALTERNATIVES )
 
+	def _dispatch_leaves_against_try_stack( self, all_leaves: list[Type] ) -> tuple[list[ir.ThrowLeaf],list[Type]]:
+		''' matches each of `all_leaves` against every enclosing try's own
+		handlers, innermost first (self._try_stack - see TryContext's own
+		docstring) - the first handler found across ANY try context on the
+		stack wins, not just the innermost try's own handlers; a leaf
+		matching nothing anywhere on the stack is left uncovered, for the
+		caller (_emit_or_throw / _stmt_Raise) to propagate to the function's
+		own return type instead. Shared by BOTH .or_throw() and `raise` so
+		this walk - and the matched-handler bookkeeping below (Change 3's
+		dead-except check, see TryHandler's own docstring) - lives in
+		exactly one place. Sound without any new CFG machinery: see
+		_stmt_Try's own docstring for why an outer TryContext is still safe
+		to mutate mid-recursion, and why an inner try's goto reaching an
+		outer handler's label needs no extra confinement. '''
+		dispatch: list[ir.ThrowLeaf] = []
+		covered_leaves: list[Type] = []
+		for leaf in all_leaves:
+			handler = None
+			for ctx in reversed( self._try_stack ):
+				handler = next( ( h for h in ctx.handlers if leaf in h.leaves ), None )
+				if handler is not None:
+					break
+			if handler is not None:
+				handler.matched = True
+				dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.bind, label = handler.label ))
+				covered_leaves.append( leaf )
+		return dispatch, covered_leaves
+
 	def _emit_or_throw( self, node: ast.AST, receiver: ir.Operand, want_result: bool, *, alternatives: str, pre_checked: bool = False ) -> ir.Operand|None:
 		''' The real body of .or_throw() (explicit or auto-inserted alike) -
 		extracted from _lower_or_throw so every auto-insertion site (see its
 		own docstring) can reuse the exact same per-leaf dispatch/emission,
 		not just the literal `.or_throw()` call syntax. Each leaf of the Err
-		branch first checks the INNERMOST enclosing try's own except clauses
-		(self._try_stack[-1], textually inside this SAME function - see
-		TryContext's own docstring) before falling back to EXACTLY
-		or_return()'s own propagate-to-the-caller behavior for any leaf left
-		uncovered (or every leaf, when there's no enclosing try at all -
-		self._try_stack empty). Nested try does NOT search past the
-		innermost one - only ever reads self._try_stack[-1], never walks the
-		rest of the stack - a documented scope limitation (see _stmt_Try's
-		own docstring), not a bug.
+		branch is matched against every enclosing try's own handlers,
+		innermost first (_dispatch_leaves_against_try_stack), falling back
+		to EXACTLY or_return()'s own propagate-to-the-caller behavior for
+		any leaf left uncovered by every enclosing try (or every leaf, when
+		there's no enclosing try at all - self._try_stack empty).
 
 		`pre_checked`, when True, skips this method's own
 		_require_or_throw_return coverage call - for a caller (AugAssign's
@@ -14461,16 +14590,8 @@ class FunctionLowering:
 		result_type, error_cls = shape
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
 
-		ctx = self._try_stack[-1] if self._try_stack else None
 		all_leaves = self.lowering._type_resolver._atomic_leaves( error_cls )
-		dispatch: list[ir.ThrowLeaf] = []
-		covered_leaves: list[Type] = []
-		if ctx is not None:
-			for leaf in all_leaves:
-				handler = next( ( h for h in ctx.handlers if leaf in h.leaves ), None )
-				if handler is not None:
-					dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.bind, label = handler.label ))
-					covered_leaves.append( leaf )
+		dispatch, covered_leaves = self._dispatch_leaves_against_try_stack( all_leaves )
 
 		if not pre_checked:
 			self.lowering._type_resolver._require_or_throw_return(
