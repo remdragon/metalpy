@@ -428,6 +428,30 @@ def main() -> i32:
 	dst.unlink().unwrap( 'unlink failed' )
 	return 0
 ''' ),
+			( 'rename_fails_when_dst_exists', f'''
+from pathlib import Path
+
+def main() -> i32:
+	src: Path = Path( {src_literal} )
+	dst: Path = Path( {dst_literal} )
+	src.write_text( 'src' ).unwrap( 'write src failed' )
+	dst.write_text( 'dst' ).unwrap( 'write dst failed' )
+
+	match src.rename( {dst_literal} ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			pass
+
+	if not src.exists():
+		return 2
+	if dst.read_text().unwrap( 'read_text failed' ) != 'dst':
+		return 3
+
+	src.unlink().unwrap( 'unlink src failed' )
+	dst.unlink().unwrap( 'unlink dst failed' )
+	return 0
+''' ),
 		])
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )

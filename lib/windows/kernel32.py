@@ -315,17 +315,12 @@ def DeleteFileA(
 ) -> bool:
 	...
 
-# MoveFileExA, not the plainer MoveFileA - plain MoveFileA fails if the
-# destination already exists, unlike POSIX rename(2)/Python's os.rename
-# (which atomically replace an existing destination). MOVEFILE_REPLACE_
-# EXISTING restores that POSIX-equivalent replace semantics.
-MOVEFILE_REPLACE_EXISTING: u32 = 0x1
-
-@extern( 'kernel32', 'MoveFileExA' )
-def MoveFileExA(
-	lpExistingFileName: ConstPtr[u8],
-	lpNewFileName: ConstPtr[u8],
-	dwFlags: u32,
+# MoveFileW, not MoveFileA - the *A entry points go through the process'
+# ANSI codepage (CP_ACP), not UTF-8, so they mangle any path outside it.
+@extern( 'kernel32', 'MoveFileW' )
+def MoveFileW(
+	lpExistingFileName: ConstPtr[u16],
+	lpNewFileName: ConstPtr[u16],
 ) -> bool:
 	...
 

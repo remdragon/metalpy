@@ -132,12 +132,26 @@ def unlink( filepath: str ) -> Result[None, OSError]:
 
 
 @compiler.target( os = 'windows' )
+def _to_wide_cstr( s: str ) -> bytearray:
+	''' null-terminated UTF-16LE encoding of s, for the *W Win32 APIs - the
+	*A entry points go through CP_ACP (the process' ANSI codepage), not
+	UTF-8, and mangle anything outside it. bytearray's own zero-init leaves
+	the trailing 2 bytes as the null terminator. '''
+	from codecs.utf16 import utf16
+	encoded: bytes = utf16.encode( s ).unwrap( 'os: invalid UTF-8 in path' )
+	with compiler.panic_arithmetic( 'a real path can never be within 2 bytes of usize::MAX' ):
+		buf = bytearray( len( encoded ) + 2 )
+	sys.memcpy( buf.get_ptr(), encoded.get_const_ptr(), len( encoded ))
+	return buf
+
+@compiler.target( os = 'windows' )
 def rename( src: str, dst: str ) -> Result[None, OSError]:
-	# MoveFileExA, not the plainer MoveFileA - see kernel32.py's own comment
-	# on MOVEFILE_REPLACE_EXISTING for why (POSIX rename(2)/os.rename replace
-	# an existing destination; plain MoveFileA fails instead).
-	from windows.kernel32 import MoveFileExA, GetLastError, MOVEFILE_REPLACE_EXISTING
-	if not MoveFileExA( src.get_cstr(), dst.get_cstr(), MOVEFILE_REPLACE_EXISTING ):
+	# MoveFileW - matches Python's os.rename on Windows, which fails if dst
+	# exists (unlike POSIX rename(2), which replaces it)
+	from windows.kernel32 import MoveFileW, GetLastError
+	src_w: bytearray = _to_wide_cstr( src )
+	dst_w: bytearray = _to_wide_cstr( dst )
+	if not MoveFileW( compiler.cast( ConstPtr[u16], src_w.get_const_ptr() ), compiler.cast( ConstPtr[u16], dst_w.get_const_ptr() )):
 		return Result.Err( OSError( GetLastError() ))
 	return Result.Ok( None )
 
