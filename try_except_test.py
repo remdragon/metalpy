@@ -277,6 +277,159 @@ def main() -> i32:
 	return 0
 '''
 
+_HANDLER_RC_LOCAL_REASSIGNED_ACROSS_TWO_HANDLERS = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+class Box:
+	n: i32
+
+def risky( which: i32 ) -> Result[i32, ErrorA | ErrorB]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	if which == 2:
+		return Result.Err( ErrorB() )
+	return Result.Ok( which )
+
+def run( which: i32 ) -> i32:
+	# b is declared BEFORE the try, then reassigned (a fresh Box each time)
+	# in the try body AND in both handlers - exercises the chained
+	# merge_if's OWNED-reconciliation path (each branch pushes its own
+	# fresh epilogue entry for the same name) generalized past a single
+	# if/else to N handlers
+	b: Box = Box( n = -100 )
+	try:
+		v: i32 = risky( which ).or_throw()
+		b = Box( n = v )
+	except ErrorA:
+		b = Box( n = -1 )
+	except ErrorB:
+		b = Box( n = -2 )
+	return b.n
+
+def main() -> i32:
+	if run( 5 ) != 5:
+		return 1
+	if run( 1 ) != -1:
+		return 2
+	if run( 2 ) != -2:
+		return 3
+	return 0
+'''
+
+# Three-handler chaining stress test: a Widget is fresh-constructed on BOTH
+# the try-body's own fallthrough path AND handler1's own path (same name,
+# same OwnState - the ordinary "ownership agrees" merge at the FIRST
+# pairwise merge_if call), but ABSENT on handler2/handler3's own paths. By
+# the time handler2 is merged in (the SECOND pairwise call), the "combined"
+# side already spans TWO distinct physical instruction blocks (the try
+# body's own captured code AND handler1's own captured code) - either one
+# could be the actual runtime path, so the teardown merge_if hands back for
+# this now-only-on-one-side name must be broadcast onto BOTH, not just the
+# most recently folded one. A missing broadcast would leak Widget on
+# whichever physical block didn't get its own copy of the decref (silent
+# under an ordinary run, but compounds into an observable leak/corruption
+# across many repetitions - see the RC stress test below for that check).
+_THREE_HANDLER_CHAIN_BROADCASTS_TEARDOWN_TO_ALL_PRIOR_BLOCKS = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+class ErrorC:
+	pass
+
+class Widget:
+	n: i32
+
+def risky( which: i32 ) -> Result[i32, ErrorA | ErrorB | ErrorC]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	if which == 2:
+		return Result.Err( ErrorB() )
+	if which == 3:
+		return Result.Err( ErrorC() )
+	return Result.Ok( which )
+
+def run( which: i32 ) -> i32:
+	result: i32 = -1000
+	try:
+		v: i32 = risky( which ).or_throw()
+		w: Widget = Widget( n = v ) # fresh here...
+		result = w.n
+	except ErrorA:
+		w = Widget( n = -1 ) # ...and fresh here too (same shape - no
+		# re-annotation, this language's flat namespace only allows one
+		# `w: Widget = ...` ever; a plain reassign reuses the type already
+		# on record from the try-body's own declaration, still a genuinely
+		# fresh CFG-level binding here since entry_snapshot has no `w`)
+		result = w.n
+	except ErrorB:
+		result = -2 # no Widget at all on this path
+	except ErrorC:
+		result = -3 # nor this one
+	return result
+
+def main() -> i32:
+	if run( 9 ) != 9:
+		return 1
+	if run( 1 ) != -1:
+		return 2
+	if run( 2 ) != -2:
+		return 3
+	if run( 3 ) != -3:
+		return 4
+	return 0
+'''
+
+# Nested try/except inside a handler body of an OUTER try - the outer's own
+# _try_stack entry must be popped before the outer's handlers are lowered
+# (already true - _try_stack push/pop only ever brackets the outer BODY),
+# and the outer's new per-handler enter_branch/restore/merge_if machinery
+# must not interfere with an entirely independent inner try lowered inside
+# that same handler.
+_NESTED_TRY_INSIDE_HANDLER_BODY = '''
+class OuterError:
+	pass
+
+class InnerError:
+	pass
+
+def outer_risky( fail: bool ) -> Result[i32, OuterError]:
+	if fail:
+		return Result.Err( OuterError() )
+	return Result.Ok( 1 )
+
+def inner_risky( fail: bool ) -> Result[i32, InnerError]:
+	if fail:
+		return Result.Err( InnerError() )
+	return Result.Ok( 2 )
+
+def run( outer_fail: bool, inner_fail: bool ) -> i32:
+	result: i32 = 0
+	try:
+		result = outer_risky( outer_fail ).or_throw()
+	except OuterError:
+		try:
+			result = inner_risky( inner_fail ).or_throw()
+		except InnerError:
+			result = -1
+	return result
+
+def main() -> i32:
+	if run( False, False ) != 1:
+		return 1
+	if run( True, False ) != 2:
+		return 2
+	if run( True, True ) != -1:
+		return 3
+	return 0
+'''
+
 _ALL_PARTS_TOGETHER = '''
 class Counter:
 	n: i32
@@ -359,6 +512,15 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 		# else only runs when no except fired; finally always runs, even on
 		# an early return out of the try body
 		self.assert_programs_run([ ( 'all_parts_together', _ALL_PARTS_TOGETHER ) ])
+
+	def test_rc_local_reassigned_across_two_handlers( self ) -> None:
+		self.assert_programs_run([ ( 'handler_rc_reassigned', _HANDLER_RC_LOCAL_REASSIGNED_ACROSS_TWO_HANDLERS ) ])
+
+	def test_three_handler_chain_broadcasts_teardown_to_all_prior_blocks( self ) -> None:
+		self.assert_programs_run([ ( 'three_handler_chain_broadcast', _THREE_HANDLER_CHAIN_BROADCASTS_TEARDOWN_TO_ALL_PRIOR_BLOCKS ) ])
+
+	def test_nested_try_inside_handler_body( self ) -> None:
+		self.assert_programs_run([ ( 'nested_try_inside_handler', _NESTED_TRY_INSIDE_HANDLER_BODY ) ])
 
 
 # --- compile-error coverage (no real C compiler needed) ---------------------
@@ -543,6 +705,69 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		errors = self._lower_and_get_errors( code, 'run' )
 		self.assertTrue( any( 'finally' in e and 'return' in e for e in errors ), errors )
 
+	def test_try_body_local_assigned_after_dispatch_point_unreadable_in_handler( self ) -> None:
+		# CFG/RC integration regression (bug 1): `w` is assigned in the try
+		# body AFTER the .or_throw() dispatch point that jumps into the
+		# handler - the real emitted `goto` skips that assignment on the
+		# handler's own path, so reading `w` from inside the handler must
+		# be rejected, not silently accepted with a stale/uninitialized
+		# value. Every handler is conservatively modeled as diverging from
+		# the try's own ENTRY snapshot (before `v`/`w` exist at all), so
+		# `w` is correctly never live there.
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def risky( bad: bool ) -> Result[i32, ErrorA]:',
+			'	if bad:',
+			'		return Result.Err( ErrorA() )',
+			'	return Result.Ok( 7 )',
+			'',
+			'def run( bad: bool ) -> i32:',
+			'	try:',
+			'		v: i32 = risky( bad ).or_throw()',
+			'		w: i32 = v',
+			'	except ErrorA:',
+			'		return w',
+			'	return w',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( "'w' is not initialized on all code branches" in e for e in errors ), errors )
+
+	def test_fresh_rc_local_after_dispatch_point_unreadable_past_handler( self ) -> None:
+		# CFG/RC integration regression (bug 2): `f` is a fresh RC-class
+		# local constructed in the try body AFTER the .or_throw() dispatch
+		# point - only actually constructed on the Ok path, never on the
+		# handler's own path. Reading f.n after the construct (a spot BOTH
+		# the try-body-fallthrough and the (non-terminating) handler path
+		# can reach) must be rejected - not silently accepted with a
+		# release_object() on a never-constructed pointer at the shared
+		# epilogue (the real heap-corruption hazard this whole integration
+		# closes). Surfaces via the definite-assignment _live mechanism at
+		# the read site, same as bug 1 above - merge_if itself is fine with
+		# `f` being fresh-on-only-one-branch (a genuinely confined local),
+		# it's the LATER read past the merge that's unsound.
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'class Foo:',
+			'	n: i32',
+			'',
+			'def risky( bad: bool ) -> Result[i32, ErrorA]:',
+			'	if bad:',
+			'		return Result.Err( ErrorA() )',
+			'	return Result.Ok( 7 )',
+			'',
+			'def run( bad: bool ) -> i32:',
+			'	try:',
+			'		v: i32 = risky( bad ).or_throw()',
+			'		f: Foo = Foo( n = 1 )',
+			'	except ErrorA:',
+			'		pass',
+			'	return f.n',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( "'f' is not initialized on all code branches" in e for e in errors ), errors )
+
 	def test_nested_result_as_union_leaf_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'class ErrorA: pass',
@@ -555,6 +780,89 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		if fn.resolve is not None:
 			fn.resolve()
 		self.assertTrue( any( 'nested Result' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors )
+
+
+# --- RC stress: sound cross-handler fresh-construction, repeated many times -
+#
+# Same pattern or_return_rc_test.py's own _NAMED_VAR_OR_RETURN_REPEATED uses:
+# loop the whole thing many times INSIDE the compiled program (not spawning
+# the binary externally) - a leaked/over-released refcount compounds across
+# iterations, more likely to surface as an observable failure even without a
+# sanitizer build. Each branch also checks compiler.refcount() immediately
+# after its own fresh construction (must be exactly 1 - no double-incref from
+# a broadcast merge_if extra landing on more physical blocks than it should,
+# no premature free/UAF from missing one it should have).
+
+_RC_STRESS_ACROSS_HANDLERS = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+class ErrorC:
+	pass
+
+class Widget:
+	n: i32
+
+def risky( which: i32 ) -> Result[i32, ErrorA | ErrorB | ErrorC]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	if which == 2:
+		return Result.Err( ErrorB() )
+	if which == 3:
+		return Result.Err( ErrorC() )
+	return Result.Ok( which )
+
+def run( which: i32 ) -> i32:
+	result: i32 = -1000
+	try:
+		v: i32 = risky( which ).or_throw()
+		w: Widget = Widget( n = v )
+		if compiler.refcount( w ) != usize( 1 ):
+			result = -999
+		else:
+			result = w.n
+	except ErrorA:
+		w = Widget( n = -1 ) # plain reassign - see the other 3-handler test's comment on why (no re-annotation)
+		if compiler.refcount( w ) != usize( 1 ):
+			result = -999
+		else:
+			result = w.n
+	except ErrorB:
+		result = -2
+	except ErrorC:
+		result = -3
+	return result
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'unreachable: bounded loop counter' ):
+		i: i32 = 0
+		while i < 1000:
+			which: i32 = i % 4
+			r: i32 = run( which )
+			if which == 0:
+				if r != 0:
+					return 1
+			if which == 1:
+				if r != -1:
+					return 2
+			if which == 2:
+				if r != -2:
+					return 3
+			if which == 3:
+				if r != -3:
+					return 4
+			i += 1
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile try/except RC stress test' )
+class TryExceptRCStressTests( RealCompileMixin, unittest.TestCase ):
+	def test_fresh_construction_across_handlers_repeated_no_leak_or_double_free( self ) -> None:
+		self.assert_programs_run([ ( 'try_except_rc_stress', _RC_STRESS_ACROSS_HANDLERS ) ])
 
 
 if __name__ == '__main__':

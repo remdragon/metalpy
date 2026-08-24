@@ -5035,6 +5035,26 @@ class FunctionLowering:
 			self._register_defer_block( is_err_only = False, body = node.finalbody, node = node, allow_inside_loop = True )
 			exit_flag = self._defer_flags[-1]
 
+		# Handlers are mutually-exclusive alternatives - structurally like
+		# if/elif arms - and get the same enter_branch/snapshot/restore/
+		# merge_if treatment _stmt_If gives its own branches (see this
+		# method's own module-level design notes in the task that produced
+		# this code). The try body/else stay UNCONFINED (matching `with`'s
+		# own precedent - they always execute exactly once when reached,
+		# unlike a handler, which may or may not run at all).
+		#
+		# Wrinkle: a single handler can be the goto target of multiple
+		# .or_throw() call sites scattered through the try body, each with
+		# potentially different live/owned/narrowed state. Real per-
+		# dispatch-site predecessor merging would need a proper multi-
+		# predecessor CFG join - out of scope. Conservative approximation
+		# instead: every handler is modeled as diverging from the try's own
+		# ENTRY snapshot, never from wherever a specific dispatch site sits.
+		# This can only ever be MORE conservative than reality, never
+		# unsound.
+		entry_snapshot = self._cfg.snapshot()
+		outer_instructions = self._instructions
+		self._instructions = []
 		self._try_stack.append( TryContext( handlers = handlers, end_label = end_label ))
 		try:
 			for stmt in node.body:
@@ -5051,27 +5071,101 @@ class FunctionLowering:
 			except CompileError:
 				continue
 
+		body_captured = self._instructions
+		body_end = self._cfg.snapshot()
+
 		tail = node.orelse if node.orelse else node.body
-		tail_diverges = bool( tail ) and self._stmt_diverges( tail[-1] )
-		reachable = not tail_diverges
+		combined_terminates = bool( tail ) and self._stmt_diverges( tail[-1] )
+
+		combined_groups: list[list[ir.Instruction]] = [ body_captured ]
+		combined_end = body_end
+
+		for handler, h in zip( handlers, node.handlers ):
+			self._cfg.restore( entry_snapshot )
+			self._instructions = []
+			self._cfg.enter_branch( entry_snapshot.stack_depth )
+			try:
+				if handler.bind is not None:
+					# the emitter unconditionally assigns handler.bind's own
+					# payload before jumping to this exact label (ir.OrThrow's
+					# dispatch - see _emit_or_throw_leaf_case) - definitely
+					# assigned on entry here, same reasoning
+					# _declare_hidden_local/@inline's own parameter binding
+					# already rely on mark_live() for (see its own docstring).
+					# Must happen INSIDE this branch-confined window (moved
+					# from the old unconfined lowering) so restore() below
+					# correctly tears it back down before the next handler.
+					self._cfg.mark_live( handler.bind.stem )
+				for stmt in h.body:
+					try:
+						self._lower_stmt( stmt )
+					except CompileError:
+						continue
+			finally:
+				self._cfg.exit_branch()
+			handler_captured = self._instructions
+			handler_end = self._cfg.snapshot()
+			# same sense as _stmt_If's own true_terminates: last stmt
+			# diverges (return/break/continue) -> this branch never reaches
+			# the join point at all.
+			handler_terminates = bool( h.body ) and self._stmt_diverges( h.body[-1] )
+
+			# restore to the TRY's own entry snapshot (not combined_end) -
+			# merge_if's own docstring documents its precondition as
+			# "self.bindings is clean of whatever either branch
+			# speculatively pushed" (i.e. exactly entry state); combined_end/
+			# handler_end are passed through as plain DATA parameters
+			# (true_end/false_end) below, entirely independent of whatever
+			# self.bindings currently holds. Restoring to combined_end
+			# instead (tried first) left a stale binding in self.bindings
+			# for any name merge_if's own "fresh on exactly one branch"
+			# path drops (it only ever WRITES self.bindings for a name it
+			# reestablishes - it never deletes one that was already there
+			# but isn't a survivor) - confirmed as a real double-
+			# release_object()/uninitialized-read bug via a real MSVC
+			# compile+run repro (C4700 "uninitialized local variable 'w'
+			# used", then a heap-corruption crash at runtime).
+			self._cfg.restore( entry_snapshot )
+			try:
+				combined_extra, handler_extra, removed = self._cfg.merge_if(
+					entry_snapshot.bindings, combined_end.bindings, handler_end.bindings, self._current_fn.qualname,
+					entry_results = entry_snapshot.results, true_end_results = combined_end.results, false_end_results = handler_end.results,
+					true_terminates = combined_terminates, false_terminates = handler_terminates,
+					true_end_narrowed = combined_end.narrowed, false_end_narrowed = handler_end.narrowed,
+					true_end_live = combined_end.live, false_end_live = handler_end.live,
+				)
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
+			# `removed` only drives Decref instructions already spliced into
+			# combined_extra/handler_extra above - see _stmt_If's own
+			# identical comment on why fn.names must NOT also be touched.
+
+			# combined_extra must land on EVERY physical block folded into
+			# the "combined" side so far - either could be the real runtime
+			# path (a name confined to just ONE prior handler still needs
+			# its own teardown spliced into THAT handler's own block, not
+			# just the most recently merged one).
+			for group in combined_groups:
+				group.extend( combined_extra )
+			handler_captured.extend( handler_extra )
+			combined_groups.append( handler_captured )
+
+			combined_terminates = combined_terminates and handler_terminates
+			combined_end = self._cfg.snapshot()
+
+		self._cfg.restore( combined_end )
+		self._instructions = outer_instructions
+		reachable = not combined_terminates
+
+		for instr in combined_groups[0]:
+			self._emit_captured( instr )
 		if reachable:
 			self._emit( ir.Jump( target = end_label ))
 
-		for handler, h in zip( handlers, node.handlers ):
+		for handler_idx, ( handler, h ) in enumerate( zip( handlers, node.handlers )):
 			self._emit( ir.Label( name = handler.label ))
-			if handler.bind is not None:
-				# the emitter unconditionally assigns handler.bind's own
-				# payload before jumping to this exact label (ir.OrThrow's
-				# dispatch - see _emit_or_throw_leaf_case) - definitely
-				# assigned on entry here, same reasoning
-				# _declare_hidden_local/@inline's own parameter binding
-				# already rely on mark_live() for (see its own docstring)
-				self._cfg.mark_live( handler.bind.stem )
-			for stmt in h.body:
-				try:
-					self._lower_stmt( stmt )
-				except CompileError:
-					continue
+			for instr in combined_groups[handler_idx + 1]:
+				self._emit_captured( instr )
 			if not h.body or not self._stmt_diverges( h.body[-1] ):
 				reachable = True
 				self._emit( ir.Jump( target = end_label ))
