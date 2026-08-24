@@ -13426,43 +13426,28 @@ class FunctionLowering:
 		# authored extensibility (Scalar.names, see discovery.py's
 		# visit_Assign) actually earns its keep: a `SomeClass.__u32__(self)
 		# -> u32: ...` is dispatched here exactly like any other method
-		# call - or, if declared @fallible_arithmetic (e.g. int.__i32__,
-		# a genuine value-range check with no bit-width concept to fall
-		# back on), through the SAME ambient-mode auto-consumption a
-		# narrowing Scalar-to-Scalar T(x) already gets via _lower_scalar_
-		# cast above, so `i32(some_int)` behaves identically regardless of
-		# whether the narrowing is a compiler intrinsic or library-authored
-		# one - EXCEPT under saturate_arithmetic specifically: __i32__'s
-		# own value-range check is genuinely mode-INDEPENDENT (SYNTAX.md's
+		# call - same _mode_qualified_dunder_names/_emit_fallible_method_
+		# call pair binop dispatch already uses for __add__/__wrapped_add__/
+		# __saturated_add__ (see _MODE_DUNDER_PREFIX's own module-level
+		# comment), reused here rather than reimplemented: __i32__'s own
+		# value-range check is genuinely mode-INDEPENDENT (SYNTAX.md's
 		# .to_T() contract - "no meaningful wrapped/saturated value-range
-		# check"), so it can only ever propagate or panic, never clamp.
-		# Mirrors the compiler's OWN intrinsic cast instead, which picks a
-		# DIFFERENT, infallible opcode (CastSaturate) under this mode
-		# rather than reusing the checked opcode's Result - a library-
-		# authored source does the equivalent by dunder NAME instead of
-		# opcode: __saturated_i32__ (infallible, clamps rather than
-		# erring), if the class declares one, wins under this mode alone.
-		if isinstance( self._arithmetic_mode[-1], arithmetic_mode.ArithmeticSaturate ):
-			saturated = self.lowering._find_method( operand.type, f'__saturated_{target_cls.stem}__' )
-			if saturated is not None:
-				self.lowering._ensure_resolved( saturated )
-				self.lowering.schedule( saturated.return_type )
-				dest = self._new_temp( expected_type or saturated.return_type )
-				self._emit( ir.Call( dest = dest, target = saturated, receiver = operand, args = [], kwargs = {} ))
-				return dest
-		dunder = self.lowering._find_method( operand.type, f'__{target_cls.stem}__' )
-		if dunder is None:
-			self.lowering.discovery.fail(
-				f'{operand.type.qualname if operand.type else "?"} has no __{target_cls.stem}__ method - cannot convert to {target_cls.qualname}: {ast.unparse(node)}',
-				node,
-			)
-		if dunder.is_fallible_arithmetic:
-			return self._emit_fallible_method_call( node, dunder, operand, [], expected_type )
-		self.lowering._ensure_resolved( dunder )
-		self.lowering.schedule( dunder.return_type )
-		dest = self._new_temp( expected_type or dunder.return_type )
-		self._emit( ir.Call( dest = dest, target = dunder, receiver = operand, args = [], kwargs = {} ))
-		return dest
+		# check"), so under wrap/saturate mode the qualified name is tried
+		# first and, if the class declares one (e.g. int.__saturated_i32__,
+		# infallible - clamps rather than erring, mirroring the compiler's
+		# OWN intrinsic cast picking a different, infallible opcode
+		# (CastSaturate) under this exact mode), wins; otherwise this falls
+		# through to the base name exactly like binop dispatch's identical
+		# miss does, so a class with nothing registered under the qualified
+		# name needs no special-casing at all.
+		for candidate in self._mode_qualified_dunder_names( f'__{target_cls.stem}__' ):
+			dunder = self.lowering._find_method( operand.type, candidate )
+			if dunder is not None:
+				return self._emit_fallible_method_call( node, dunder, operand, [], expected_type )
+		self.lowering.discovery.fail(
+			f'{operand.type.qualname if operand.type else "?"} has no __{target_cls.stem}__ method - cannot convert to {target_cls.qualname}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _narrowed_type_of_name( self, var_id: str, declared_type: Type ) -> Type:
 		''' declared_type, unless var_id is currently narrowed (cfg.py's
