@@ -7297,6 +7297,13 @@ class FunctionLowering:
 
 	def _stmt_If( self, node: ast.If ) -> None:
 		test = self._lower_truth_test( node.test )
+		# same fix as _stmt_While's own (see its comment): any RC temp
+		# retained while evaluating the test (e.g. a chained-field-read
+		# receiver) must be released before branching, not deferred to
+		# _lower_stmt's post-statement flush - that flush runs only AFTER
+		# both branches are already captured, so a branch ending in
+		# return/break/continue would never see the release at all.
+		self._flush_pending_temps()
 		else_label = self._new_label( 'if_else' )
 		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
 
