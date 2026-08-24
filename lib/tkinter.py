@@ -114,7 +114,7 @@ class Button:
 		my_id: i32 = _next_button_id
 		with compiler.wrap_arithmetic:
 			_next_button_id += 1
-		self.__path = f'.b{int( my_id )}'
+		self.__path = f'.b{my_id}'
 		if not root.eval( f'button {self.__path} -text {{{text}}}' ):
 			sys.panic( f'failed to create Button: {root.last_error()}' )
 

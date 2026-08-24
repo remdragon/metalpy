@@ -9,7 +9,8 @@ visit_JoinedStr). That pass was deliberately narrow-scoped rather than
 open-ended; this file tracks the pieces it left out on purpose, with enough
 design texture that each is independently pickup-able later rather than a bare
 TODO line. Item 4 (float format specs, 'f'/'F' only) has since landed too -
-see its own STATUS note below.
+see its own STATUS note below. Item 6 (implicit scalar-to-str boxing) is now
+fully done too, bool included - see its own STATUS note below.
 
 Why this split happened
 
@@ -373,14 +374,65 @@ Deferred items
 
 6. Implicit scalar-to-str boxing - f"{i}" for i: i32
 
-   RESOLVED for every fixed-width int scalar (i8/u8/i16/u16/i32/u32/i64/
-   u64/i128/u128/isize/usize) and f32/f64: each has a real __str__/
-   __repr__ now (lib/builtins/__scalar_dunders.py's i_str_signed/
-   i_str_unsigned; __float.py's own for f32/f64) - bare f"{x}"/str(x) just
-   works via ordinary method dispatch, no auto-boxing involved (the
-   dunder IS the value's own type's method, same as any class). `bool` is
-   the one remaining scalar with no __str__ of its own - still fails
-   cleanly with "method not found" rather than being silently boxed.
+   STATUS: DONE. Every fixed-width int scalar (i8/u8/i16/u16/i32/u32/i64/
+   u64/i128/u128/isize/usize), f32/f64, AND now bool has a real __str__/
+   __repr__ (lib/builtins/__scalar_dunders.py's i_str_signed/i_str_unsigned/
+   bool_str; __float.py's own for f32/f64) - bare f"{x}"/str(x) just works
+   via ordinary method dispatch, no auto-boxing involved (the dunder IS the
+   value's own type's method, same as any class).
+
+   bool was the one remaining gap (previously failed cleanly with "method
+   not found" rather than being silently boxed) - closed by registering
+   `bool.__str__ = bool.__repr__ = bool_str` the same `Scalar.method = fn`
+   sigil way, with `bool_str` a two-line ternary ('True' if value else
+   'False'). Matches Python's own str(True)/str(False) capitalization
+   exactly, not lowercase - there was no pre-existing metalpy convention for
+   boolean text output to defer to instead (bool had never had __str__ here
+   at all). This also incidentally proves out a ternary returning two FRESH
+   str literal branches compiles/runs correctly post the general IfExp RC
+   fix (item 4's own writeup) - though both branches here are immortal
+   string literals, so this particular call site was never at risk of that
+   bug class regardless.
+
+   compile_time_transformer.py's own f-string constant-folding pass
+   (visit_JoinedStr/_try_fold_formatted_value) previously special-cased
+   bool OUT of folding entirely, with a comment noting bool had no
+   __str__() for the fold to match against - now that it does, bool folds
+   too, EXCEPT for the one combination that still has no runtime
+   counterpart: a bare (no !s/!r) bool value with an explicit format spec
+   (f"{True:>10}") stays unfoldable, since metalpy's bool has no numeric-
+   format-spec dispatch the way Python's own int-subclassing gives it
+   (format(True, 'd') == '1' in real Python - not something lowering.py's
+   runtime path implements for a raw bool operand). An explicit !s/!r
+   conversion plus a spec DOES fold correctly regardless of the original
+   operand's type (f"{True!s:>6}"), since that branch formats the already-
+   converted str text, not the original value.
+
+   Two lib/ call sites that pre-dated this fix and worked around the gap
+   with explicit `int(x)` boxing purely to get a bare, spec-less str
+   conversion (not for any format-spec reason) were simplified back to
+   plain interpolation now that it's unnecessary: lib/logging.py's
+   `_level_name` (`f'Level {int(level)}'` -> `f'Level {level}'`) and
+   lib/tkinter.py's `Button.__init__` (`f'.b{int(my_id)}'` -> `f'.b{my_id}'`).
+   Every OTHER `int(x)` call inside an f-string across lib/ (lib/datetime.py's
+   many `int(x):02d`-shaped calls) is unrelated and was left alone - those
+   use explicit numeric format specs (zero-padding/width), which raw scalar
+   ints still can't dispatch directly (only bare __str__/__repr__ landed
+   here, not a general format-spec path for scalar operands - that's a
+   separate, larger gap, `_lower_dispatch_format_spec`'s own int_type check
+   at lowering.py:8621 only ever matches the BOXED int class), so boxing is
+   still genuinely required there.
+
+   New coverage: scalar_str_test.py's `BoolStrBehaviorTests` (real compile+
+   run: __str__/__repr__, bare f-string interpolation, str() builtin call)
+   alongside its pre-existing int coverage; compile_time_transformer_test.py's
+   `JoinedStrFoldingTests` gained bool-fold/bool-with-spec-stays-unfolded/
+   bool-with-conversion-plus-spec-folds cases, replacing the old single
+   "bool stays unfolded" test that's no longer true. Verified end-to-end
+   (real compile+link+run, not just IR-level success) on all 3 available
+   compilers - clang (default), MSVC (`METALPY_CC=msvc`), and gcc via WSL
+   (`METALPY_CC=gcc`, run from WSL's own python3) - full 1705-test suite
+   clean (0 failures/errors) on every one.
 
 7. `c` (int-as-codepoint) and `n` (locale-aware) type chars
 

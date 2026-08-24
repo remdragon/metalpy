@@ -420,6 +420,19 @@ for t in UNSIGNED_INT_TYPES:
 	emit( f'{t}.__repr__ = i_str_unsigned[{t}]' )
 emit()
 
+# bool: the one remaining scalar PLAN_STR_FORMAT.md item 6 flagged as still
+# missing __str__/__repr__ once every fixed-width int type had one. 'True'/
+# 'False' (not lowercase) to match Python's own str(True)/str(False) exactly -
+# there's no pre-existing metalpy convention for boolean text output to
+# defer to instead (bool has never had __str__ here at all, per
+# compile_time_transformer.py's own long-standing fold-exclusion comment).
+emit( "def bool_str( value: bool ) -> str:" )
+emit( "\treturn 'True' if value else 'False'" )
+emit()
+emit( 'bool.__str__ = bool_str' )
+emit( 'bool.__repr__ = bool_str' )
+emit()
+
 from pathlib import Path
 Path( 'lib/builtins/__scalar_dunders.py' ).write_text( '\n'.join( out ), encoding = 'utf-8' )
 print( f'wrote lib/builtins/__scalar_dunders.py, {len(out)} lines' )
