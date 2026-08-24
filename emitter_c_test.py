@@ -10229,10 +10229,15 @@ class VariadicTupleTests( test_support.RealCompileMixin, CompilerTestCase ):
 	VariadicTuple[T] class (lib/builtins/__vartuple.py, built on the same
 	UnsafeList[T] storage list[T] wraps) rather than a TupleStorage-
 	synthesized fixed layout - see discovery.py's visit_Subscript. The
-	public constructor is `tuple(some_list)`, an ordinary generic-function
-	call inferring T from its argument (confirmed already supported for a
-	bare, non-subscripted generic construction call - no new compiler
-	machinery needed for that part). '''
+	public constructor is `tuple(some_iterable)`, an ordinary generic-
+	function call inferring T (and the source's own Iterable[T] bound) from
+	its argument (confirmed already supported for a bare, non-subscripted
+	generic construction call - no new compiler machinery needed for that
+	part) - accepts any Iterable[T], not just list[T] (an ordinary for-loop
+	over the generic source drives its own __iter__()). __eq__/__ne__
+	(positional + length, real Python's own tuple equality contract) and
+	__str__/__repr__ (Python's own '(1, 2, 3)'/'(x,)'/'()' formatting,
+	including the single-element trailing-comma convention) round it out. '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -10354,6 +10359,67 @@ def main() -> i32:
 		return 1
 	if fixed[0] != 1 or fixed[1] != 2:
 		return 2
+	return 0
+''' ),
+			# tuple(...) accepts any Iterable[T], not just list[T] - here,
+			# ANOTHER tuple[T,...] (a real repro: constructing a copy)
+			( 'construct_from_arbitrary_iterable_not_just_list', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	t: tuple[i32, ...] = tuple( xs )
+	u: tuple[i32, ...] = tuple( t )
+	if len( u ) != 2:
+		return 1
+	if u.__getitem__( 0 ).unwrap( 'idx' ) != 1 or u.__getitem__( 1 ).unwrap( 'idx' ) != 2:
+		return 2
+	return 0
+''' ),
+			( 'equality_positional_and_length_sensitive', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	t: tuple[i32, ...] = tuple( xs )
+	same: tuple[i32, ...] = tuple( xs )
+	if not ( t == same ):
+		return 1
+	if t != same:
+		return 2
+	xs.append( 3 )
+	longer: tuple[i32, ...] = tuple( xs )
+	if t == longer:
+		return 3
+	if not ( t != longer ):
+		return 4
+	ys: list[i32] = list[i32]()
+	ys.append( 2 )
+	ys.append( 1 )
+	reordered: tuple[i32, ...] = tuple( ys )
+	if t == reordered: # same elements, different order - real tuples ARE order-sensitive
+		return 5
+	return 0
+''' ),
+			( 'str_and_repr_match_python_formatting', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	if str( t ) != '(1, 2, 3)':
+		return 1
+	if t.__repr__() != '(1, 2, 3)':
+		return 2
+	single_src: list[i32] = list[i32]()
+	single_src.append( 7 )
+	single: tuple[i32, ...] = tuple( single_src )
+	if str( single ) != '(7,)': # real Python's own trailing-comma convention
+		return 3
+	empty: tuple[i32, ...] = tuple( list[i32]() )
+	if str( empty ) != '()':
+		return 4
 	return 0
 ''' ),
 		] )
