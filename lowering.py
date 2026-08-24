@@ -406,6 +406,11 @@ class Lowering:
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		return FunctionLowering( self, None ).run_global( var )
 
+	def lower_deinit_epilogue( self, ordered_vars: list[Variable] ) -> list[ir.Instruction]:
+		''' emitter_c.py's own __metalpy_deinit() synthesis - see
+		FunctionLowering.run_deinit_epilogue's docstring. '''
+		return FunctionLowering( self, None ).run_deinit_epilogue( ordered_vars )
+
 	# --- __init__ construction (RCCLASS ATTRIBUTE LIFETIME.md) -----------------
 
 	def _init_fallibility( self, fn: Function ) -> bool:
@@ -2464,6 +2469,33 @@ class FunctionLowering:
 				for t in reversed( self._pending_temps ):
 					self._emit( ir.DeleteTemp( temp = t ))
 
+		return self._instructions
+
+	def run_deinit_epilogue( self, ordered_vars: list[Variable] ) -> list[ir.Instruction]:
+		''' debug-mode automatic leak-check epilogue (emitter_c.py's
+		__metalpy_deinit()) - decrefs every global RC variable in
+		`ordered_vars` (caller passes them in REVERSE dependency order,
+		undoing __metalpy_init()'s own construction order - see emitter_c.
+		py's own __metalpy_deinit assembly). Same "real CFGState, fn=None"
+		shape as run_global above (no self/construction of its own), reused
+		here purely for its union-aware decref() (cfg.py's
+		_tag_gated_refcount_instructions) - a nested-union RC global needs
+		the identical runtime tag dispatch an ordinary local/field release
+		already gets, not a hand-rolled duplicate. '''
+		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
+		self._cfg = cfg.CFGState(
+			None,
+			bool_type = bool_cls,
+			new_temp = self._new_temp,
+			new_label = self._new_label,
+			union_storage = self.lowering._union_storage.get,
+			resolve_type = self.lowering._ensure_resolved,
+		)
+		for var in ordered_vars:
+			for instr in self._cfg.decref( var.type, var ):
+				self._emit( instr )
+		for t in reversed( self._pending_temps ):
+			self._emit( ir.DeleteTemp( temp = t ))
 		return self._instructions
 
 	def _emit_epilogue( self, fn: Function, none_type: Type, body_start: int ) -> None:

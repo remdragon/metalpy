@@ -2004,6 +2004,17 @@ _ENTRY_POINT_QUALNAME = 'main'
 def _is_entry_point( function: Function ) -> bool:
 	return function.qualname == _ENTRY_POINT_QUALNAME
 
+# metalpy's own main() is compiled into this private helper, never the real
+# C `main` symbol directly - emit_c() synthesizes a thin, always-present real
+# `int main(argc, argv)` that calls __metalpy_init(), then this, then (debug
+# builds only) the leak-check epilogue __metalpy_deinit() - see emit_c()'s
+# own "whole-program driver" section. Only for the ordinary zero-parameter
+# `def main() -> i32:` shape (_function_prototype's own comment) - the rare
+# lowering-fixture-only parameterized shape keeps the OLD direct-main-is-the-
+# real-entry-point behavior unchanged, since it never reaches this thin-
+# wrapper synthesis at all (no test exercises it through emit_c()).
+_USER_MAIN_C_NAME = '__metalpy_user_main'
+
 def _self_qualname( function: Function ) -> str:
 	# mirrors lowering.py's own lowering-only self synthesis EXACTLY
 	# (Parameter(stem='self', qualname=f'{fn.qualname}.self', type=fn.cls)
@@ -2061,21 +2072,20 @@ def _function_prototype( function: Function ) -> str:
 		params.append( _declarator( p.type, _c_local_name( p )))
 	params_str = ', '.join( params ) if params else 'void'
 	if _is_entry_point( function ):
-		# the real OS/CRT entry point always calls main with (argc, argv,
-		# envp) on the actual calling convention regardless of which
-		# prototype the source declares (a plain C fact, not something
-		# unique to this compiler) - so declaring the C-level signature as
-		# `int main(int argc, char** argv)` costs nothing and lets sys.argv
-		# (lib/sys.py) read real values, via emit_c()'s own argc/argv
-		# capture injected as the first statement of this function's body.
-		# Only for the ordinary, zero-parameter `def main() -> i32:` shape;
-		# a handful of lowering-only test fixtures declare a function
-		# LITERALLY named main with its own parameter for unrelated reasons
-		# (generic dispatch tests, never actually emitted through this path
-		# for real) - preserve the old behavior there rather than silently
-		# dropping a declared parameter from the C signature.
+		# ordinary zero-parameter `def main() -> i32:` shape: compiled into
+		# the private __metalpy_user_main helper, never the real C `main`
+		# symbol - see _USER_MAIN_C_NAME's own comment. No argc/argv here
+		# any more (sys.argv's own real-value capture now happens in the
+		# synthesized real main() wrapper, before this is ever called - see
+		# emit_c()'s own "whole-program driver" section), so plain `void`.
 		if not params:
-			return 'int main( int argc, char** argv )'
+			return f'int {_USER_MAIN_C_NAME}( void )'
+		# rare lowering-fixture-only shape: a handful of test fixtures
+		# declare a function LITERALLY named main with its own parameter for
+		# unrelated reasons (generic dispatch tests, never actually emitted
+		# through emit_c()'s real entry-point synthesis) - preserve the old
+		# "this literal main() IS the real C entry point" behavior rather
+		# than silently dropping a declared parameter from the C signature.
 		return f'int main( {params_str} )'
 	noreturn = '_Noreturn ' if _is_noreturn( function.return_type ) else ''
 	# @extern(lib, symbol) functions are declared with their raw C symbol
@@ -5133,11 +5143,14 @@ def _emit_value_type_bodies( compiler: Compiler ) -> list[str]:
 # --- whole-program driver ------------------------------------------------
 
 
-def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
+def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True ) -> str:
 	''' single C11 translation unit - see the plan's "three-pass emission
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
-	reason to split output across files. '''
+	reason to split output across files. leak_check (mpy.py's own
+	--no-leak-check) only matters in a debug build - it disables the
+	automatic __metalpy_deinit() leak-check epilogue (decref every global,
+	then dump_live_objects()) that otherwise runs after main() returns. '''
 	global _target_os, _target_debug
 	_target_os = compiler.disco.active_target['os']
 	_target_debug = bool( compiler.disco.active_target['debug'] )
@@ -5543,6 +5556,42 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)
+	# automatic debug-mode leak-check epilogue: decref every global RC
+	# variable (REVERSE of __metalpy_init()'s own construction order, so a
+	# global depended on by another global's destructor - mirroring typical
+	# static-destruction ordering - is still valid when its dependent's own
+	# decref runs), then dump whatever's still tracked. Only globals that
+	# actually get a real init CALL (_topologically_sort_globals - same list
+	# __metalpy_init() above already iterates) can hold a real RC value in
+	# the first place; a trivial/all-zero-value-type global never does.
+	# Gated on debug + leak_check (mpy.py's --no-leak-check), AND only when
+	# a real thin main() wrapper is actually going to call it (see main_lf
+	# below - the rare parameterized-main lowering-fixture shape gets no
+	# wrapper at all) - release builds, --no-leak-check builds, and that
+	# rare shape never define this function, rather than defining an unused
+	# one (-Wunused-function on clang). Same "define only what's actually
+	# referenced" treatment every other debug-only PROLOGUE piece gets (see
+	# _prologue_debug_ops).
+	main_lf = next( ( lf for lf in compiler.functions if _is_entry_point( lf.function )), None )
+	main_has_wrapper = main_lf is not None and not main_lf.function.parameters
+	deinit_enabled = _target_debug and leak_check and main_has_wrapper
+	if deinit_enabled:
+		rc_globals_reverse = [
+			g.variable for g in reversed( _topologically_sort_globals( compiler ))
+			if g.variable.type.is_rc()
+		]
+		# reuses cfg.py's own union-aware decref() (via Lowering.
+		# lower_deinit_epilogue) - identical dispatch to an ordinary local/
+		# field release, so a global wrapping a nested-union RC leaf gets
+		# the same runtime tag-check+extract sequence, not a bare pointer
+		# release that would be wrong for it.
+		deinit_instructions = compiler.lowering.lower_deinit_epilogue( rc_globals_reverse )
+		deinit_instructions.append( ir.DumpLiveObjects() )
+		parts.append(
+			'static void __metalpy_deinit( void ) {\n'
+			+ '\n'.join( _emit_instructions( deinit_instructions, function = None, declared = set() ))
+			+ '\n}'
+		)
 	# sys._raw_argc/_raw_argv only actually get DECLARED (see the globals
 	# loop above) when compiler.py's Compiler.run() successfully force-
 	# reaches sys.argv - which no-ops for a deliberately minimal, fixture-
@@ -5556,50 +5605,48 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:
 			src = emit_function( lf )
-			# EXCEPT when no_crt on Windows: there, mainCRTStartup (below) is
-			# the REAL entry point and already calls __metalpy_init() before
-			# calling main() itself - prepending it here too would run it
-			# (and now every global initializer) TWICE. Harmless back when
-			# this only ever did SetConsoleOutputCP (idempotent); a real
-			# double-construction bug now that it also builds RCClass globals.
-			windows_no_crt = no_crt and compiler.disco.active_target['os'] == 'windows'
-			if _is_entry_point( lf.function ):
-				prelude = ''
-				if not lf.function.parameters and has_argv_globals:
-					# captures the real OS-provided argc/argv for sys.argv
-					# (lib/sys.py) - BEFORE __metalpy_init() below, since
-					# that's what actually builds sys.argv itself from these.
-					# Always injected, even for windows_no_crt: harmless
-					# there (mainCRTStartup calls main(0, NULL), so this just
-					# captures the same already-empty defaults).
-					prelude += (
-						f'\t{mangle_qualname( "sys._raw_argc" )} = argc;\n'
-						f'\t{mangle_qualname( "sys._raw_argv" )} = (uint8_t**)argv;\n'
-					)
-				# prepend __metalpy_init() to main() on every target - not just
-				# Windows anymore, since it now also runs global initializers
-				# (PLAN_GLOBAL_INIT.md), needed everywhere, not only the
-				# Windows-specific console-codepage setup - except
-				# windows_no_crt, per this block's own comment above.
+			if _is_entry_point( lf.function ) and lf.function.parameters:
+				# rare lowering-fixture-only shape (_function_prototype's own
+				# comment) - this literal main() IS the real C entry point
+				# (never renamed to __metalpy_user_main), so it still needs
+				# its own __metalpy_init() prelude the old way; no thin
+				# wrapper, no argc/argv capture, no leak-check epilogue for
+				# this shape (never exercised through emit_c() for real).
+				# windows_no_crt still skips it - mainCRTStartup (below)
+				# calls this main() itself and would otherwise double-run
+				# every global initializer.
+				windows_no_crt = no_crt and compiler.disco.active_target['os'] == 'windows'
 				if not windows_no_crt:
-					prelude += '\t__metalpy_init();\n'
-				if not lf.function.parameters and not has_argv_globals:
-					# argc/argv are declared regardless (the real OS/CRT
-					# calling convention, see _function_prototype) but go
-					# unread when nothing reaches sys.argv - mark them
-					# explicitly unused. emit_function's own (void)-marking
-					# (unused_parameter_warning_fixed) only walks
-					# function.parameters; argc/argv are synthesized
-					# straight into the C signature here, never a MetalPy-
-					# level parameter, so they need their own marking.
-					prelude += '\t(void)argc; (void)argv;\n'
-				if prelude:
-					src = src.replace( '{\n', '{\n' + prelude, 1 )
+					src = src.replace( '{\n', '{\n\t__metalpy_init();\n', 1 )
 			parts.append( src )
 
+	if main_has_wrapper:
+		# the real, thin `int main(argc, argv)` - every ordinary program's
+		# actual OS entry point (see _USER_MAIN_C_NAME's own comment).
+		# Always synthesized, even under no_crt: mainCRTStartup (below) is
+		# the real freestanding /ENTRY there, but it calls this main()
+		# directly as a plain function, rather than duplicating its body.
+		argv_capture = (
+			f'\t{mangle_qualname( "sys._raw_argc" )} = argc;\n'
+			f'\t{mangle_qualname( "sys._raw_argv" )} = (uint8_t**)argv;\n'
+		) if has_argv_globals else ''
+		unused_marker = '\t(void)argc; (void)argv;\n' if not has_argv_globals else ''
+		deinit_call = '\t__metalpy_deinit();\n' if deinit_enabled else ''
+		parts.append(
+			'int main( int argc, char** argv ) {\n'
+			+ unused_marker
+			+ argv_capture # BEFORE __metalpy_init() - that's what builds sys.argv itself from these
+			+ '\t__metalpy_init();\n'
+			+ f'\tint __result = {_USER_MAIN_C_NAME}();\n'
+			+ deinit_call
+			+ '\treturn __result;\n'
+			+ '}'
+		)
+
 	# custom entry point when CRT is not linked - the linker expects
-	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls
-	# __metalpy_init() then main() and exits cleanly via the process itself.
+	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls the
+	# real main() (which itself calls __metalpy_init()/__metalpy_deinit())
+	# and exits cleanly via the process itself.
 	# Terminates via sys.exit()'s own mangled C symbol (mangle_qualname
 	# doesn't need a Function object - 'sys.exit' is a known, fixed qualname,
 	# same as _global_init_fn_name's approach) rather than a hardcoded raw
@@ -5610,7 +5657,6 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		parts.append(
 			'#ifdef _WIN32\n'
 			'void mainCRTStartup( void ) {\n'
-			'\t__metalpy_init();\n'
 			# no real argc/argv at a freestanding entry point (the OS loader
 			# never hands them to WinMainCRTStartup-shaped entries the way
 			# it does the UCRT's own main()) - sys.argv (lib/sys.py) just
