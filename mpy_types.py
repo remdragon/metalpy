@@ -328,41 +328,6 @@ class TypeVar( Type ):
 			# conformance (for homogeneous tuples) lives on its lazily-
 			# synthesized backing RCClass instead (see tuple_storage.py)
 			base = base.backing
-		if (
-			isinstance( concrete, Specialization ) and isinstance( base, RCClass ) and resolver is not None
-			and id( concrete ) not in resolver.monomorphizer._building
-		):
-			# `concrete` may still be a bare, not-yet-monomorphized
-			# Specialization (e.g. an explicit type argument like Box[T]
-			# written inside another generic call's own subscript, never
-			# separately eagerly resolved) - unwrapping to .base alone would
-			# read the ABSTRACT class's own unsubstituted .protocols
-			# (confirmed by a real repro: Box[i32] via an explicit `_helper
-			# [T, Box[T]](...)` call site read back `Sequence[Box.T]`,
-			# never `Sequence[i32]`). monomorphize_class is idempotent
-			# (spec.monomorphized short-circuits) and is the single place
-			# .protocols actually gets substituted - same "force it, don't
-			# duplicate the substitution" posture the rest of this method
-			# already takes for base.protocols itself.
-			#
-			# _building guard: monomorphize_class's OWN top-of-function
-			# short-circuit (`if spec.monomorphized is not None: return`)
-			# only catches an ALREADY-FINISHED spec - re-entering THIS SAME
-			# spec while it's still mid-construction (concrete's own class
-			# building its own methods, one of which - e.g. a Sequence-
-			# conforming class's own __iter__ - reaches back here to check
-			# ITS OWN class's conformance) would otherwise rebuild it from
-			# scratch, unboundedly, confirmed by a real repro (RecursionError
-			# via monomorphize_class -> monomorphized_function ->
-			# ensure_generator_synthesized -> resolve_function_body ->
-			# another generic call -> back into THIS check -> monomorphize_
-			# class again, same still-building spec). Skipping in that rare
-			# reentrant case falls back to the abstract base's own
-			# unsubstituted .protocols below - a possibly-imprecise bound
-			# check for that one call, not a crash; every non-reentrant call
-			# (the overwhelming majority) still gets the fully-substituted
-			# version.
-			base = resolver.monomorphizer.monomorphize_class( concrete )
 		if not isinstance( base, RCClass ):
 			return False
 		if not isinstance( self.bound, Specialization ):
@@ -372,19 +337,36 @@ class TypeVar( Type ):
 			f'(type_params, args, resolver) - see bound_satisfied_by\'s own docstring'
 		)
 		concrete_bound = resolver.monomorphizer.substitute_type_params( self.bound, type_params, args )
-		# base.protocols is already fully substituted/concrete here - a
-		# generic RCClass's OWN declared protocol conformance is substituted
-		# by Monomorphizer.monomorphize_class at the same point/via the same
-		# mechanism .attributes/.methods are (see its own comment) - `base`
-		# is already the monomorphized class by the time bound-checking
-		# runs (every real caller resolves `concrete` first), never the
-		# still-abstract template, so there is no second substitution to do
-		# here at all - just compare structurally.
+		# when `concrete` is a Specialization, `base` above is still the
+		# ABSTRACT class template (concrete.base) - its own .protocols are
+		# still unsubstituted (e.g. Sequence[set.T], not Sequence[i32]).
+		# Substitute each candidate entry's own args against concrete.args
+		# directly here, rather than going through monomorphize_class(concrete)
+		# first to get an already-substituted base (the old approach): that
+		# needed a _building reentrancy guard (concrete's own class building
+		# its own methods, one of which - e.g. a Sequence-conforming class's
+		# own __iter__ - reaches back here to check ITS OWN class's
+		# conformance, re-entering monomorphize_class for the same
+		# still-mid-construction spec), which fell back to comparing against
+		# the UNSUBSTITUTED abstract .protocols and silently failed the bound
+		# check for that one call (confirmed by a real repro: builtins.set/
+		# tuple's own __iter__ delegating to a shared, protocol-bound generic
+		# generator never got past this once reached from within its own
+		# class's build). A protocol entry's own .base is always the
+		# Protocol, never `concrete`'s class, so substituting just its args
+		# can't re-enter monomorphize_class for `concrete` at all - no guard
+		# needed, and no eager full build of `concrete` needed either.
 		for entry in base.protocols:
 			if not isinstance( entry, Specialization ) or entry.base is not concrete_bound.base:
 				continue
-			if len( entry.args ) == len( concrete_bound.args ) and all(
-				resolver._same_type( a, b ) for a, b in zip( entry.args, concrete_bound.args )
+			entry_args = entry.args
+			if isinstance( concrete, Specialization ) and resolver is not None:
+				entry_args = [
+					resolver.monomorphizer.substitute_type_params( a, base.type_params or [], concrete.args )
+					for a in entry_args
+				]
+			if len( entry_args ) == len( concrete_bound.args ) and all(
+				resolver._same_type( a, b ) for a, b in zip( entry_args, concrete_bound.args )
 			):
 				return True
 		return False

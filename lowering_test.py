@@ -4233,137 +4233,95 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( '1 or 2 arguments', self.discovery.errors.errors[0] )
 
-	def test_for_over_indexable_shape( self ) -> None:
-		# for v in <obj>: where obj's type declares both __len__ and
-		# __getitem__ desugars to a counter-based while, reusing
-		# _expr_Subscript's own __getitem__ resolution for the per-iteration
-		# bind - tagged is_for_loop_element_read so it keeps auto-consuming
-		# a fallible Result there specifically (see test below), even though
-		# ordinary user-written `x[i]` no longer does
+	def test_for_over_iterable_conformer_calls_iter_once( self ) -> None:
+		# for v in <obj>: now strictly requires Iterator[T]/Iterable[T]
+		# conformance (no more __len__/__getitem__ duck-typing) - an
+		# Iterable[T] conformer's own __iter__() is called exactly once, up
+		# front, and the resulting generator's __next__() drives the loop -
+		# not a direct __getitem__(index) walk any more (that whole
+		# mechanism, _lower_for_over_indexable, is gone - the per-iteration
+		# bounds-checked-index bind it used to build, and the Unwrap-panic
+		# consumption on it, both moved into _sequence_iter's own real
+		# generator body, lib/builtins/__init__.py - shared by every
+		# Sequence[T] conformer, not reimplemented per for-loop any more)
 		code = '\n'.join([
-			'@cstruct',
-			'class Box:',
+			'class Box( Sequence[i32], Iterable[i32] ):',
 			'	_len: usize',
+			'',
+			'	def __init__( self, n: usize ) -> None:',
+			'		self._len = n',
 			'',
 			'	def __len__( self ) -> usize:',
 			'		return self._len',
 			'',
-			'	def __getitem__( self, i: usize ) -> i32:',
-			'		return 1',
+			'	def __getitem__( self, i: usize ) -> Result[i32, IndexError]:',
+			'		return Result.Ok( 1 )',
+			'',
+			'	def __iter__( self ) -> Generator[i32, StopIteration]:',
+			'		return _sequence_iter( self )',
 			'',
 			'def main( b: Box ) -> None:',
 			'	for v in b:',
 			'		x: i32 = v',
 			'	return',
 		])
-		self.discovery.import_name( 'builtins' ) # the desugared while's own hidden bound check is now an ordinary usize.__lt__ dunder call
+		self.discovery.import_name( 'builtins' )
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertEqual( kinds.count( 'Call' ), 2 ) # __len__() once, __getitem__(i) once per compiled iteration-body
-		self.assertEqual( kinds.count( 'Label' ), 2 ) # start, end - continue_label omitted, the body never uses `continue`
-		self.assertEqual( kinds.count( 'AddWrap' ), 1 )
-		# Result.or_return-flavored auto-unwrap only fires when __getitem__
-		# actually returns a Result - this Box's __getitem__ returns plain
-		# i32, so no OrReturn/OrJump should appear
-		self.assertNotIn( 'OrReturn', kinds )
-		self.assertNotIn( 'OrJump', kinds )
+		# exactly 2 Call INSTRUCTIONS in main's own static IR - one to
+		# Box.__iter__() up front, one to the generator's own __next__()
+		# (executed repeatedly via the loop's back-edge goto, but still just
+		# ONE static Call instruction here - the generator's own internal
+		# state-machine logic for what __next__ actually DOES lives in a
+		# separate, synthesized function, not inlined into main)
+		call_targets = [ instr.target.stem for instr in fn.instructions if type( instr ).__name__ == 'Call' ]
+		self.assertEqual( call_targets, [ '__iter__', '__next__' ] )
 
-	def test_for_over_indexable_fallible_len_is_rejected( self ) -> None:
-		# __len__() is compiler-synthesized here (no source position to
-		# attach .unwrap()/.or_return() to) and expected to always be
-		# infallible in practice - a fallible one is a hard compile error,
-		# not an auto-propagate
+	def test_for_missing_iterator_or_iterable_conformance_is_rejected( self ) -> None:
+		# strict protocol dispatch (confirmed with the user) - a type with
+		# matching method NAMES but no DECLARED Iterator[T]/Iterable[T]
+		# conformance is rejected outright, not silently duck-typed
 		code = '\n'.join([
-			'class MyError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	x: T',
-			'',
-			'@cstruct',
 			'class Box:',
-			'	_len: usize',
-			'',
-			'	def __len__( self ) -> Result[usize,MyError]:',
-			'		return Result.__allocate__( x = self._len )',
-			'',
-			'	def __getitem__( self, i: usize ) -> i32:',
-			'		return 1',
+			'	pass',
 			'',
 			'def main( b: Box ) -> None:',
 			'	for v in b:',
 			'		pass',
 			'	return',
 		])
+		self.discovery.import_name( 'builtins' ) # Iterator/Iterable themselves live there - any for-loop needs to find them to even attempt the check
 		self._import( code )
 		self._lower_main()
-		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( 'infallible __len__', self.discovery.errors.errors[0] )
+		self.assertIn( 'for loop requires an IteratorProtocol[T] or Iterable[T] conformer', self.discovery.errors.errors[0] )
 
-	def test_for_over_indexable_fallible_getitem_still_auto_consumes( self ) -> None:
-		# unlike ordinary user-written x[i], the for-loop's own per-iteration
-		# bind keeps auto-consuming __getitem__'s Result - __getitem__ is
-		# expected to always be fallible in practice (IndexError/KeyError),
-		# and this read is compiler-synthesized with no source position for
-		# the user to attach .unwrap()/.or_return() to. Unlike a real
-		# .or_return(), this uses Unwrap-panic (not OrReturn) - the loop's own
-		# `index < len` bounds check already proves this Err arm unreachable,
-		# so it must NOT force the enclosing function to return
-		# Result[_,error] just to compile an ordinary for-loop (a real repro:
-		# `for arg in sys.argv[1:]: print(arg)` inside a plain `-> i32` main)
+	def test_for_over_iterable_conformer_fallible_getitem_does_not_require_result_return( self ) -> None:
+		# the actual bug this fixes (originally, before the strict-protocol
+		# redesign): a plain `-> i32` main (no Result in sight) iterating an
+		# ordinary Sequence[T] conformer used to fail to compile, demanding
+		# `main` return Result[_,IndexError] to propagate an error the
+		# loop's own bounds check already makes unreachable - that specific
+		# consumption now lives inside _sequence_iter's own generator body
+		# (a real .unwrap() call with a panic message, not or_return()), but
+		# the end-to-end behavior (no Result-returning main required) still
+		# needs guarding directly, real repro: `for arg in sys.argv[1:]:
+		# print(arg)` inside a plain `-> i32` main
 		code = '\n'.join([
-			'class MyError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	x: T',
-			'',
-			'@cstruct',
-			'class Box:',
+			'class Box( Sequence[i32], Iterable[i32] ):',
 			'	_len: usize',
+			'',
+			'	def __init__( self, n: usize ) -> None:',
+			'		self._len = n',
 			'',
 			'	def __len__( self ) -> usize:',
 			'		return self._len',
 			'',
-			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
-			'		return Result.__allocate__( x = 1 )',
+			'	def __getitem__( self, i: usize ) -> Result[i32, IndexError]:',
+			'		return Result.Ok( 1 )',
 			'',
-			'def main( b: Box ) -> Result[i32,MyError]:',
-			'	for v in b:',
-			'		x: i32 = v',
-			'	return Result( x = 0 )',
-		])
-		self.discovery.import_name( 'builtins' )
-		self._import( code )
-		fn = self._lower_main()
-		self.assertEqual( self.discovery.errors.errors, [] )
-		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'Unwrap', kinds )
-		self.assertNotIn( 'OrReturn', kinds )
-
-	def test_for_over_indexable_fallible_getitem_does_not_require_result_return( self ) -> None:
-		# the actual bug this fixes: a plain `-> i32` main (no Result in
-		# sight) iterating an ordinary indexable used to fail to compile,
-		# demanding `main` return Result[_,IndexError] to propagate an error
-		# the loop's own bounds check already makes unreachable
-		code = '\n'.join([
-			'class MyError: pass',
-			'',
-			'@cstruct',
-			'class Result[T,E]:',
-			'	x: T',
-			'',
-			'@cstruct',
-			'class Box:',
-			'	_len: usize',
-			'',
-			'	def __len__( self ) -> usize:',
-			'		return self._len',
-			'',
-			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
-			'		return Result.__allocate__( x = 1 )',
+			'	def __iter__( self ) -> Generator[i32, StopIteration]:',
+			'		return _sequence_iter( self )',
 			'',
 			'def main( b: Box ) -> i32:',
 			'	for v in b:',
@@ -4374,8 +4332,6 @@ class Tests( unittest.TestCase ):
 		self._import( code )
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
-		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'Unwrap', kinds )
 
 	def test_for_over_indexable_rc_element_decref_stays_inside_loop_body( self ) -> None:
 		# a real, confirmed bug found while fixing the two tests above: the
@@ -4448,21 +4404,6 @@ class Tests( unittest.TestCase ):
 			f'v_ok_decref_indices={v_ok_decref_indices} - this is the leaked-post-loop-flush bug: the '
 			f'element temp only gets decref\'d once (after the loop), not per iteration',
 		)
-
-	def test_for_over_indexable_missing_dunders_is_rejected( self ) -> None:
-		code = '\n'.join([
-			'class Box:',
-			'	pass',
-			'',
-			'def main( b: Box ) -> None:',
-			'	for v in b:',
-			'		pass',
-			'	return',
-		])
-		self._import( code )
-		self._lower_main()
-		self.assertIn( '__len__', self.discovery.errors.errors[0] )
-		self.assertIn( '__getitem__', self.discovery.errors.errors[0] )
 
 	def test_subscript_with_getitem_returning_result_is_not_auto_consumed( self ) -> None:
 		# obj[i] is plain sugar for obj.__getitem__(i), nothing more - when

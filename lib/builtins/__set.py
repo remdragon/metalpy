@@ -25,11 +25,13 @@
 # dispatching to __contains__ below). del my_set[x] does NOT - _stmt_Delete
 # only accepts a bare name - discard()/remove() must be called directly.
 #
-# __len__ + __getitem__(idx: usize) -> Result[T, IndexError] together are
-# exactly the "indexable" shape lowering.py's for-loop lowering
-# (lowering.py:3667-3731) looks for - `for x in my_set:` therefore works
-# with no compiler changes, same as list[T]/dict[K,V].key_at.
-class set[T]:
+# __len__ + __getitem__(idx: usize) -> Result[T, IndexError] together
+# already match Sequence[T]'s own shape - `for x in my_set:` needs a real,
+# declared Iterable[T] conformance (a for-loop's own subject must conform to
+# Iterator[T] or Iterable[T], no structural duck-typing - lowering.py's
+# _stmt_For), so __iter__ (below) delegates to _sequence_iter like list[T]'s
+# own does.
+class set[T]( Sequence[T], Iterable[T] ):
 	__inner: dict[T, bool]
 
 	def __init__( self ) -> None:
@@ -79,6 +81,9 @@ class set[T]:
 	# across a discard/remove, same as Python's own unordered set).
 	def __getitem__( self, index: usize ) -> Result[T, IndexError]:
 		return self.__inner.key_at( index )
+
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return _sequence_iter( self )
 
 	# --- set algebra ---------------------------------------------------
 	# union/intersection/difference/symmetric_difference each build and

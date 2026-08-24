@@ -35,6 +35,36 @@ class Iterable[T]:
 	# iterable, not just a random-access sequence.
 	def __iter__( self ) -> Generator[T, StopIteration]: ...
 
+@protocol
+class IteratorProtocol[T]:
+	# an ALREADY-in-progress iterator (a real generator object, or any
+	# hand-written class with its own __next__) - what for-loops (lowering.
+	# py's _stmt_For) actually drive once they have one, whether that came
+	# directly from a for-loop's own subject (IteratorProtocol[T]
+	# conformance) or via Iterable[T].__iter__() first. Named
+	# "IteratorProtocol", not the shorter "Iterator" its real Python
+	# namesake uses - "Iterator[...]" is already claimed, permanently, by
+	# an unrelated, pre-existing compiler special form (discovery.py's
+	# visit_Subscript textually recognizes `Iterator[Result[T,E]]` as
+	# sugar for a generator function's own return-type annotation - see
+	# Generator[T,E]'s identical treatment right below - long before this
+	# protocol existed), so `class Foo(Iterator[T]):` would silently
+	# misparse as THAT instead of a real protocol base. Declared
+	# conformance is a NAME-only check (discovery.py's _validate_protocol_
+	# conformance never inspects __next__'s own signature), so this stub's
+	# exact Result[T,StopIteration] shape below doesn't constrain a real
+	# generator's own wider error type in any way - __next__'s error type E
+	# may be anything AS LONG AS StopIteration is one of its leaves
+	# (PLAN_GENERATORS.md's StopIteration reversal - reaching the end is
+	# Err(StopIteration()), not a nullable None), which is what a for-
+	# loop's own consumption actually requires and already handles (E' = E
+	# minus StopIteration - see _lower_for_over_iterator_fallible_bind). A
+	# generator's own synthesized backing class (type_resolver.py's
+	# ensure_generator_synthesized) declares this conformance itself, the
+	# same way TupleStorage._declare_sequence_conformance already does for
+	# Sequence[T]/Iterable[T].
+	def __next__( self ) -> Result[T, StopIteration]: ...
+
 # the one place a Sequence[T]'s index-walk is written - every conformer's own
 # __iter__ just delegates here (a __iter__ method can never itself contain
 # yield - see type_resolver.py's ensure_generator_synthesized - so a
