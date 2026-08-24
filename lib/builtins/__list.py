@@ -409,6 +409,10 @@ class list[T]( Sequence[T], Iterable[T] ):
 	# primitive on UnsafeList[T] - one extra, balanced incref/decref pair,
 	# negligible next to the lock acquire/release this already pays for;
 	# revisit only if profiling ever says otherwise.
+	# 0 args (this one) vs 1 arg (the two below) is unambiguous by arity
+	# alone - no @overload needed here, only between the two 1-arg forms
+	# below (same arity, T vs T|None - genuinely needs @overload's own
+	# stub/priority split, see their own comment)
 	def pop( self ) -> Result[T, IndexError]:
 		with self.__lock:
 			n: usize = self.__inner.__len__()
@@ -419,6 +423,21 @@ class list[T]( Sequence[T], Iterable[T] ):
 			val: T = self.__inner.__getitem__( last ).unwrap( 'list.pop: index in bounds by construction' )
 			self.__inner.erase_at( last ).unwrap( 'list.pop: index in bounds by construction' )
 			return Result.Ok( val )
+
+	# an empty-list default, infallible sibling - `while x := xs.pop(default):`/
+	# similar "drain until empty, no separate is_ok() check" idioms are common
+	# enough to earn their own overload rather than forcing every caller to
+	# spell .pop().unwrap_or(default) by hand. Mirrors Result.unwrap_or's own
+	# stub+impl split just above: a concrete, non-None default narrows the
+	# return type to plain T (this stub, bound to the real T|None impl right
+	# below); default=None itself, or an already-nullable default, still
+	# needs to come back out possibly-None.
+	@overload
+	def pop( self, default: T ) -> T:
+		...
+
+	def pop( self, default: T|None ) -> T|None:
+		return self.pop().unwrap_or( default )
 
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
