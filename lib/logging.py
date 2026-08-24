@@ -69,7 +69,7 @@ def _level_name( level: i32 ) -> str:
 		return 'CRITICAL'
 	if level == NOTSET:
 		return 'NOTSET'
-	return f'Level {int( level )}' # i32 itself has no __str__ - only the boxed int does
+	return f'Level {level}'
 
 
 # ---------------------------------------------------------------------------

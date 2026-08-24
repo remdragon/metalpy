@@ -869,3 +869,9 @@ u128.__str__ = i_str_unsigned[u128]
 u128.__repr__ = i_str_unsigned[u128]
 usize.__str__ = i_str_unsigned[usize]
 usize.__repr__ = i_str_unsigned[usize]
+
+def bool_str( value: bool ) -> str:
+	return 'True' if value else 'False'
+
+bool.__str__ = bool_str
+bool.__repr__ = bool_str

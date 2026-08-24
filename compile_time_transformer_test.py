@@ -130,10 +130,27 @@ class JoinedStrFoldingTests( unittest.TestCase ):
 		# the outer JoinedStr itself ends up foldable
 		self.assertEqual( _fold( 'x = f"n={1+1}{y}"', {} ), "x = f'n={2}{y}'" )
 
-	def test_bool_value_left_unfolded( self ) -> None:
-		# no metalpy bool.__str__() exists to fold against - see
-		# visit_JoinedStr's own comment
-		self.assertEqual( _fold( 'x = f"{True}"', {} ), "x = f'{True}'" )
+	def test_bool_value_folds( self ) -> None:
+		# PLAN_STR_FORMAT.md item 6: bool now has a real __str__/__repr__
+		# ('True'/'False', matching Python's own str(True)/str(False)) - see
+		# _try_fold_formatted_value's own bool branch
+		self.assertEqual( _fold( 'x = f"{True}"', {} ), "x = 'True'" )
+		self.assertEqual( _fold( 'x = f"{False}"', {} ), "x = 'False'" )
+
+	def test_bool_repr_conversion_folds( self ) -> None:
+		self.assertEqual( _fold( 'x = f"{True!r}"', {} ), "x = 'True'" )
+
+	def test_bool_with_format_spec_left_unfolded( self ) -> None:
+		# no explicit !s/!r conversion + an explicit format spec on a bare
+		# bool - metalpy's bool has no numeric-format-spec dispatch the way
+		# Python's own int-subclassing gives it (format(True, 'd') == '1'),
+		# so this stays unfoldable rather than guessing
+		self.assertEqual( _fold( 'x = f"{True:>10}"', {} ), "x = f'{True:>10}'" )
+
+	def test_bool_with_conversion_and_format_spec_folds( self ) -> None:
+		# !s/!r + a spec applies to the already-converted str text, which is
+		# safe for bool same as any other type
+		self.assertEqual( _fold( 'x = f"{True!s:>6}"', {} ), "x = '  True'" )
 
 	def test_float_value_left_unfolded( self ) -> None:
 		self.assertEqual( _fold( 'x = f"{1.5}"', {} ), "x = f'{1.5}'" )
