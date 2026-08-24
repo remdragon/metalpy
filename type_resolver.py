@@ -5846,6 +5846,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._pop_narrowed_with_prefix( node.target.id )
 		else:
 			self._unnarrow_attr_target( node.target )
+			self._track_attr_target_type( node.target, self.discovery.visit( node.annotation ))
 		return node
 
 	def visit_Assign( self, node: ast.Assign ) -> ast.Assign:
@@ -5857,7 +5858,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._pop_narrowed_with_prefix( node.targets[0].id )
 		elif len( node.targets ) == 1:
 			self._unnarrow_attr_target( node.targets[0] )
+			self._track_attr_target_type( node.targets[0], self._type_of_expr( node.value ))
 		return node
+
+	def _track_attr_target_type( self, target: ast.expr, value_type: Type|None ) -> None:
+		''' the field-target counterpart of self.locals[name.id] = ... above -
+		visit_If's own "did the OTHER, non-comparison-proven branch reassign
+		the subject to exactly the narrowed type" check (below) reads
+		self.locals under the SAME '::'-joined key _narrow_subject_key uses
+		for a field subject, so a plain-Name reassignment being tracked there
+		but a field reassignment never being tracked at all meant that check
+		could never fire for `if self.g is None: self.g = Owned(...)` - only
+		ever for the equivalent bare-Name/global pattern. Reuses self.locals
+		rather than a parallel dict: '::' can never collide with a real
+		identifier, and every other reader of self.locals only ever looks up
+		plain Name keys. '''
+		key = self._attribute_chain_key( target )
+		if key is not None:
+			self.locals[key] = value_type
 
 	def visit_NamedExpr( self, node: ast.NamedExpr ) -> ast.NamedExpr:
 		# walrus (`x := expr`) - same local-type-tracking bookkeeping as
@@ -6645,7 +6663,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# detection (which keys off the branch's LAST statement).
 		other_terminates = bool( other_body ) and isinstance( other_body[-1], ( ast.Return, ast.Break, ast.Continue, ast.Raise ))
 		if not other_terminates and self.locals.get( subject_name ) is narrow_member.type:
-			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_member, node ) ]
+			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_member, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ) ]
 		if other_terminates:
 			# the un-narrowed branch never reaches the join - every path that
 			# DOES (whatever follows this if-statement in the same enclosing

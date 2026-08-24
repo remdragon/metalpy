@@ -16891,6 +16891,35 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_field_lazy_init_narrows_past_if( self ) -> None:
+		# regression: `if self.g is None: self.g = Owned(...)` never narrowed
+		# self.g on the path after the if, even though every reaching path
+		# provably reassigns it - the identical `if _g is None: _g = ...`
+		# shape already narrowed fine for a module global. Root cause:
+		# visit_If's "did the other branch reassign the subject to the
+		# narrowed type" check reads type_resolver.py's own self.locals,
+		# which visit_Assign only ever populated for a bare Name target,
+		# never for an Attribute (field) target.
+		self._run( '''
+class Box:
+	x: i32
+
+class Holder:
+	g: Box|None = None
+
+def main() -> i32:
+	h: Holder = Holder()
+	if h.g is None:
+		h.g = Box( x = 42 )
+	b: Box = h.g
+	with compiler.wrap_arithmetic:
+		diff: i32 = b.x - 42
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
 
 class NestedFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' non-capturing nested function defs - see PLAN_LAMBDA.md. Never
