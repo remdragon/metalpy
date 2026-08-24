@@ -2668,13 +2668,19 @@ class FunctionLowering:
 		self.lowering.schedule( base_init.return_type )
 		for param in base_init.parameters or []:
 			self.lowering.schedule( param.type )
+		# see the .or_return() recognizer's own identical snapshot/comment
+		# (_expr_Call) - args/kwargs below can themselves retain a Part B
+		# field receiver (e.g. `super().__init__(self.some_field)`) that's
+		# fully consumed by the call and must be released regardless of
+		# which leg fires, same reasoning as any other or_return() receiver
+		receiver_pending_start = len( self._pending_temps )
 		args, kwargs = self._lower_call_args( base_init, init_call )
 		dest = self._new_temp( base_init.return_type ) if is_fallible else None
 		call = ir.Call( dest = dest, target = base_init, receiver = self_param, args = args, kwargs = kwargs, is_super_init_call = True )
 		self._emit( call )
 		if or_return_call is not None:
 			assert dest is not None
-			self._lower_or_return( or_return_call, dest, want_result = False )
+			self._lower_or_return( or_return_call, dest, want_result = False, receiver_pending_start = receiver_pending_start )
 		self._cfg.complete_base_construction( self_cls.base.flattened_attributes() )
 		return fn.node.body[1:]
 
@@ -2852,6 +2858,56 @@ class FunctionLowering:
 				self._emit( instr )
 			self._emit( ir.DeleteTemp( temp = t ))
 		self._pending_temps = []
+
+	def _flush_new_pending_temps( self, start_index: int, *keep: ir.Operand ) -> None:
+		''' shared by _consume_checked_result/_emit_or_throw: flushes every
+		pending temp added SINCE `start_index` (an index into
+		self._pending_temps, snapshotted by the caller right before
+		lowering the checked receiver expression - see _lower_or_return/
+		_lower_or_throw's own `receiver_pending_start`), except those in
+		`keep` (the checked receiver/result value itself, still needed by
+		the OrReturn/OrJump/OrThrow/Unwrap instruction about to be
+		emitted). Restores `keep`'s own still-pending entries afterward so
+		their normal, later lifecycle (the natural end-of-statement flush,
+		same as always) is completely unaffected.
+
+		Deliberately scoped to start_index onward, NOT "everything
+		currently pending": an OUTER, still-in-progress expression this
+		checked value is only PART of (e.g. the first half of a chained
+		`k + str(':') + v.or_return()` concatenation) can have its OWN
+		still-needed pending temp sitting BEFORE start_index - flushing
+		that too corrupts it out from under the rest of the expression,
+		confirmed as a real bug (not hypothetical): an earlier version of
+		this fix flushed unconditionally and caused exactly that shape to
+        read a freed string's length as its concatenation grew, aborting
+		with "out of memory" on the very first nested json.dumps() call in
+		the test suite - lib/json.py's own `_json_escape_string(k) + ':' +
+		_dump_value(v).or_return()` in its Object dump arm.
+
+		What's actually left to flush after start_index, once `keep` is
+		excluded, is exactly the receiver's OWN sub-expression temps -
+		most commonly Part B's own retain-on-read for a chained field
+		receiver used only to build the checked value, e.g. `self.a.b.
+		method(...).or_return()` - which must be released regardless of
+		which leg (Ok/Err) actually fires, since neither leg needs it
+		afterward. Without this it's dead code exactly like _stmt_If's own
+		sibling bug: the checked call's Err leg is a real early exit (a
+		genuine `return`/`goto` under the hood, same as or_return()'s own
+		declared spec says), so it skips right past the ordinary once-per-
+		statement flush that would otherwise release it - confirmed via a
+		real compiler.refcount()/AddressSanitizer repro (`self.__raw.
+		_ptr_at(idx).or_return()` permanently over-retained self.__raw, a
+		leak found only once _stmt_If's own sibling bug was fixed and
+		stopped masking it). `keep` uses Temp.id, not Python identity -
+		operands round-trip through dataclasses that don't override
+		__eq__/__hash__ for this purpose. '''
+		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
+		older = self._pending_temps[:start_index]
+		newer = self._pending_temps[start_index:]
+		kept = [ t for t in newer if t.id in keep_ids ]
+		self._pending_temps = [ t for t in newer if t.id not in keep_ids ]
+		self._flush_pending_temps()
+		self._pending_temps = older + kept
 
 	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False ) -> None:
 		''' shared by _stmt_Return and @inline splicing (_lower_inline_call/
@@ -7521,8 +7577,14 @@ class FunctionLowering:
 		ast.copy_location( is_err_test, node )
 		is_err_cond = self._lower_expr( is_err_test, bool_cls )
 
+		# only set (and only reachable) in the remaining_error_type is None
+		# branch below - see its own comment at the bottom of this method
+		# for why this exit needs its own dedicated label rather than
+		# jumping straight to end_label the way it used to
+		stop_label: str|None = None
 		if remaining_error_type is None:
-			self._emit( ir.JumpIfTrue( cond = is_err_cond, target = end_label ))
+			stop_label = self._new_label( 'for_stop' )
+			self._emit( ir.JumpIfTrue( cond = is_err_cond, target = stop_label ))
 			self._cfg.narrow( next_var.stem, ok_member )
 			bind = ast.Assign( targets = [ node.target ], value = self.lowering._synth_name( next_var.stem, node ))
 			ast.copy_location( bind, node )
@@ -7548,10 +7610,63 @@ class FunctionLowering:
 		if continue_captured:
 			self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
+		if stop_label is not None:
+			self._emit( ir.Label( name = stop_label ))
+			# next_var holds the Err/StopIteration payload __next__() just
+			# returned - unlike `break` (which already releases next_var's
+			# CURRENT payload itself, via its own existing branch-confined-
+			# binding cleanup - see _stmt_Break) this JumpIfTrue above is a
+			# bare, hand-emitted jump with none of that machinery behind it,
+			# so nothing else ever releases it. The ORDINARY per-iteration
+			# release (right before looping back to start_label, paired with
+			# next_var's own assignment above) only runs on the NORMAL
+			# continuation path - this exit skips straight past it. next_var's
+			# own cfg-tracked binding (from cfg.assign() above) is no help
+			# either: restore(loop_snapshot) below already drops it back to
+			# its pre-loop (nonexistent) state, same as any other loop-
+			# confined binding - so this can't reuse that tracking, it has to
+			# be a bare, tag-dispatched release keyed on next_var's OWN
+			# declared type, exactly like compiler.decref(x)'s own "bare
+			# Name" path. A dedicated label (not just falling into end_label,
+			# which break ALSO targets) is required specifically so this
+			# release never runs on break's own path too - it already has
+			# its own, and this would double-release the SAME payload
+			# otherwise (confirmed via a real repro: an RC-typed element
+			# still `for`-in-progress when `break` fires came back under-
+			# counted, not over, until this was scoped to just this label).
+			# Confirmed as a real leak via AddressSanitizer for the
+			# StopIteration case: a fresh StopIteration object allocated
+			# every time a for-loop's iterator is exhausted, permanently
+			# unreachable afterward - found only once the pending-temp
+			# fixes elsewhere in this method stopped masking it.
+			#
+			# A NARROWED extraction (GetAttr(data)+GetAttr(v_<Err member>)),
+			# not a general cfg.decref(result_type, next_var) - stop_label is
+			# ONLY reached via is_err_cond being true, so the tag is
+			# statically known Err here; a general tag-dispatched decref
+			# would still emit a genuinely dead v_Ok GetAttr+Decref pair
+			# alongside the real v_Err one (unreachable at runtime, since
+			# this label's only predecessor already proved the tag isn't Ok -
+			# but still emitted, unconditionally, as part of decref()'s own
+			# generic per-leaf dispatch). That dead pair collided with
+			# lowering_test.py's own test_for_over_indexable_rc_element_
+			# decref_stays_inside_loop_body, which (rightly) asserts every
+			# v_Ok Decref appears before the loop's back-edge Jump, to guard
+			# against a DIFFERENT, previously-fixed bug (the per-iteration
+			# element decref only firing once, after the whole loop, instead
+			# of every iteration) - this narrowed version simply never emits
+			# a v_Ok arm at all, so there's nothing to collide with, and it's
+			# less code besides.
+			data_dest = self._new_temp( _payload_cls )
+			self._emit( ir.GetAttr( dest = data_dest, obj = next_var, attr = _data_attr.stem ))
+			err_dest = self._new_temp( err_member.type )
+			self._emit( ir.GetAttr( dest = err_dest, obj = data_dest, attr = f'v_{err_member.stem}' ))
+			for instr in self._cfg.decref( err_member.type, err_dest ):
+				self._emit( instr )
 		self._emit( ir.Label( name = end_label ))
 		if obj_needs_release:
 			# every non-early-return exit converges here (normal exhaustion
-			# via JumpIfTrue above, and break via break_label=end_label) -
+			# via stop_label above, and break via break_label=end_label) -
 			# obj_var's own lexical extent ends exactly at this label, so
 			# disarm the registered defer and release it directly, right
 			# here, matching _lower_with_context_manager's own identical
@@ -11075,7 +11190,9 @@ class FunctionLowering:
 			self._instructions = outer_instructions
 		return captured
 
-	def _consume_checked_result( self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
+	def _consume_checked_result(
+		self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None, *, receiver_pending_start: int|None = None,
+	) -> ir.Temp:
 		# shared by both binop (AddCheck/.../Div/Mod) and unary (NegCheck)
 		# Check-mode ops, _maybe_consume_result's __len__/__getitem__ auto-
 		# unwrap, and _lower_or_return's own <result_expr>.or_return() - see
@@ -11115,6 +11232,23 @@ class FunctionLowering:
 				node,
 			)
 		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
+		# see _flush_new_pending_temps's own docstring: check_dest/extra are
+		# the only operands still needed below (by OrReturn/OrJump/Unwrap
+		# themselves) - anything else pending SINCE receiver_pending_start
+		# (i.e. only from building up check_dest's own receiver expression,
+		# e.g. a chained field receiver's own Part B retain - NOT from
+		# whatever outer expression check_dest itself is only part of) must
+		# be released now, before the Err leg's own early exit can skip
+		# right past it. Only the explicit .or_return() syntax currently
+		# passes a real receiver_pending_start (see _lower_or_return) -
+		# every other caller (checked arithmetic, __len__/__getitem__'s
+		# auto-unwrap) leaves it None, unaffected, since their own operands
+		# don't go through Part B's field-receiver retain shape in the same
+		# way and haven't been confirmed to need this. Placed before
+		# unwrapped's own creation so this never touches unwrapped itself
+		# (nothing is written into it yet).
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, check_dest, extra )
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
@@ -14457,7 +14591,9 @@ class FunctionLowering:
 
 		return self._emit_call_indirect( fn_cast, [ self_operand, *args ], closure_type.return_type, expected_type )
 
-	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
+	def _lower_or_return(
+		self, node: ast.Call, receiver: ir.Operand, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
 		# <result_expr>.or_return() is recognized textually here rather than
 		# ever actually calling Result.or_return's own declared body
 		# (`if self.is_err(): compiler.early_return(self.data.v_Err)` /
@@ -14487,7 +14623,7 @@ class FunctionLowering:
 		# live in _consume_checked_result itself, shared with checked-
 		# arithmetic's own identical OrReturn/OrJump early-exit - see its
 		# own comment
-		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None )
+		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None, receiver_pending_start = receiver_pending_start )
 		if not want_result:
 			# unwrapped's own extraction is bundled into OrReturn/OrJump's IR
 			# shape (see _consume_checked_result) - can't be skipped even
@@ -14501,7 +14637,9 @@ class FunctionLowering:
 			return None
 		return unwrapped
 
-	def _lower_or_throw( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
+	def _lower_or_throw(
+		self, node: ast.Call, receiver: ir.Operand, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
 		''' <result_expr>.or_throw() - like or_return() above (same "no real
 		method, recognized by AST shape alone" story - see _lower_or_return's
 		own comment). The real per-leaf dispatch/emission logic is shared
@@ -14528,7 +14666,9 @@ class FunctionLowering:
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		if shape is None:
 			self.lowering.discovery.fail( f'or_throw() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
-		return self._emit_or_throw( node, receiver, want_result, alternatives = self.lowering._OR_THROW_ALTERNATIVES )
+		return self._emit_or_throw(
+			node, receiver, want_result, alternatives = self.lowering._OR_THROW_ALTERNATIVES, receiver_pending_start = receiver_pending_start,
+		)
 
 	def _dispatch_leaves_against_try_stack( self, all_leaves: list[Type] ) -> tuple[list[ir.ThrowLeaf],list[Type]]:
 		''' matches each of `all_leaves` against every enclosing try's own
@@ -14558,7 +14698,10 @@ class FunctionLowering:
 				covered_leaves.append( leaf )
 		return dispatch, covered_leaves
 
-	def _emit_or_throw( self, node: ast.AST, receiver: ir.Operand, want_result: bool, *, alternatives: str, pre_checked: bool = False ) -> ir.Operand|None:
+	def _emit_or_throw(
+		self, node: ast.AST, receiver: ir.Operand, want_result: bool, *,
+		alternatives: str, pre_checked: bool = False, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
 		''' The real body of .or_throw() (explicit or auto-inserted alike) -
 		extracted from _lower_or_throw so every auto-insertion site (see its
 		own docstring) can reuse the exact same per-leaf dispatch/emission,
@@ -14607,6 +14750,13 @@ class FunctionLowering:
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
 
+		# see _consume_checked_result's own identical call/comment - same
+		# construct (a checked-Result value with an early-exit Err leg),
+		# just a different emission path (ir.OrThrow instead of OrReturn/
+		# OrJump, since or_throw() needs a per-leaf dispatch table
+		# _consume_checked_result has no way to thread through)
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, receiver )
 		unwrapped = self._new_temp( result_type )
 		all_covered = len( covered_leaves ) == len( all_leaves )
 		if all_covered:
@@ -16068,16 +16218,26 @@ class FunctionLowering:
 			# receiver is actually Result[_,_]-shaped (and that no
 			# arguments were given) - a non-Result receiver correctly still
 			# fails there, with the same message as before.
+			# snapshotted BEFORE lowering the receiver expression, not after -
+			# _flush_new_pending_temps needs to know exactly which pending
+			# temps belong to the RECEIVER's own build-up (from here onward)
+			# versus an OUTER, still-in-progress expression this whole
+			# `.or_return()` call is only PART of (e.g. the first half of a
+			# chained `k + str(':') + v.or_return()` concatenation, whose own
+			# still-needed pending temp must never be touched - see that
+			# helper's own docstring for the real bug this guards against)
+			receiver_pending_start = len( self._pending_temps )
 			receiver = self._lower_expr( node.func.value, None )
-			return self._lower_or_return( node, receiver, want_result )
+			return self._lower_or_return( node, receiver, want_result, receiver_pending_start = receiver_pending_start )
 
 		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_throw':
 			# <result_expr>.or_throw() - same recognition shape as or_return()
 			# just above (see its own comment) - discovery.py rejects a
 			# user-written `def or_throw(...)` outright, on any class, the
 			# same way
+			receiver_pending_start = len( self._pending_temps )
 			receiver = self._lower_expr( node.func.value, None )
-			return self._lower_or_throw( node, receiver, want_result )
+			return self._lower_or_throw( node, receiver, want_result, receiver_pending_start = receiver_pending_start )
 
 		# each recognizer returns None (not an error) when this call doesn't
 		# match its own construction-sugar shape at all, falling through to
