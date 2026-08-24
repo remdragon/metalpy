@@ -2454,6 +2454,23 @@ class UnsafeDict[K, V]:
 	__raw: RawDict
 
 	def __init__( self ) -> None:
+		# V=NoneType is caught HERE, once, rather than in every method below
+		# that casts a borrowed Ptr[None] through Ptr[V] (_owned_value,
+		# _store_value, _release_value) - a dict/set can't be used at all
+		# without going through this constructor first, so a single guard
+		# here covers every one of those call sites for free. See
+		# PLAN_NONETYPE_GENERIC_VALUE.md: Ptr[None] is ALSO this codebase's
+		# own opaque/type-erased pointer spelling (RawDict's own key_ptr/
+		# value_ptr fields, right below), so Ptr[V] with V=NoneType collides
+		# with that meaning and compiles to real C void* - dereferencing it
+		# (every one of those three methods' non-RC branch) is a genuine C
+		# type error, not just a wrong answer. `if type(V) is None:` folds
+		# away entirely (dead branch never lowered - see _try_fold_type_is_if,
+		# type_resolver.py) for every OTHER V, so this costs nothing and
+		# changes nothing for dict[K, str]/dict[K, i32]/etc.
+		if type( V ) is None:
+			compiler.error( 'dict[K, None] (and set[None]) are not supported - None cannot be a '
+				'generic value-storage type (see PLAN_NONETYPE_GENERIC_VALUE.md); use dict[K, bool] instead' )
 		self.__raw = RawDict()
 
 	def __len__( self ) -> usize:

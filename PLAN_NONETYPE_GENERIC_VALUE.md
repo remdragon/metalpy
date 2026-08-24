@@ -143,18 +143,67 @@ they collide through the exact same `NoneType` Scalar and the exact same
   the same way) - keep `bool`/a dedicated 1-byte marker as the standing
   workaround, same as `set[T]` already does.
 
-## Recommendation
+## Resolution (2026-08-24): a (c)-shaped fix, with a real diagnostic
 
-Leave `set[T]` on `bool` (already shipped, works, costs one byte). The
-three isolated fixes above are worth keeping regardless (real bugs,
-zero-regression, no reason to revert), but none of them alone unblocks
-`dict[K, None]` - that needs a real design decision on (a) vs (b) vs (c)
-above, which is bigger than an implementation task and shouldn't be decided
-unilaterally mid-fix. This document exists so a future session doesn't have
-to re-derive the same three-layers-deep investigation from scratch - pick
-up directly at "The blocker" section above.
+Decided with the user, after walking through concrete before/after code for
+all three candidates: **(c)**, but done properly - `dict[K, None]` is
+rejected with a clean, purpose-authored `compiler.error(...)` message
+instead of the raw C `void*`-deref type error, rather than silently left as
+"whatever error the C compiler happens to produce". (a)/(b) were explicitly
+rejected: (a)'s blast radius (auditing every `Ptr[None]` use across the
+erasure-heavy `lib/` tree, ~46 files) was judged not worth it for a need
+nobody actually has (nobody wants a dict that stores `None` - `bool`/a
+dedicated marker is already a complete substitute); (b) (real per-container
+storage support) was judged unnecessary complexity for the same reason -
+solving `_release_value`'s ownership semantics for a value nobody ever reads
+back has no payoff.
 
-## Verification plan for any future attempt
+**What shipped** (commit history in this worktree):
+1. **`compiler.error(msg)`** - a new compile-time-only intrinsic
+   (`lowering.py`'s `_lower_compiler_error`) letting library code raise a
+   real, custom compile error via `discovery.fail(...)`, reachability-gated
+   like `@requires_crt`/`sys.panic`. Fills the exact gap `lib/ssl.py`'s own
+   `_MACOS_SSL_NOT_YET_IMPLEMENTED` comment already documented ("MetalPy has
+   no compiler.error(...)... intrinsic").
+2. **`type(V) is None` now works and FOLDS** for V a generic class/function's
+   own bare type parameter (not just an ordinary value) -
+   `type_resolver.py`'s `_rewrite_type_is_comparison` now tries a namespace
+   (type-reference) resolution before falling back to value-expression
+   resolution, mirroring `compiler.is_rc(T)`'s existing dual-path pattern.
+   Found and fixed a companion pre-existing bug along the way: `type(x) is
+   None` failed for EVERY subject, generic or not, because
+   `_ReferenceResolver`'s own `_try_resolve_namespace` never special-cased a
+   literal `None` RHS (its sibling in the `TypeResolver` class already did).
+3. **Real compile-time branch elimination**: `_try_fold_type_is_if` (new,
+   mirrors the existing `_try_fold_is_rc_if`) drops the untaken branch of
+   `if type(V) is T: ... else: ...` from the AST entirely, before lowering
+   ever sees it. This turned out to be REQUIRED, not just an optimization -
+   confirmed via a real repro that `lowering.py`'s `_stmt_If` lowers BOTH
+   branches of every `if` unconditionally, with no existing dead-branch
+   elimination keyed on a folded-constant condition; without this fold, a
+   `compiler.error(...)` guarded by `if type(V) is None:` fired for EVERY
+   V, not just `None` - would have broken every existing `dict[K,V]`/
+   `set[T]` instantiation in the whole test suite.
+4. **`UnsafeDict.__init__`** (`lib/builtins/__init__.py`) now guards with
+   `if type(V) is None: compiler.error(...)` - one chokepoint (a dict can't
+   be used without going through its constructor) instead of duplicating
+   the guard in `_owned_value`/`_store_value`/`_release_value` separately.
+
+**Verified**: real compile+run repros for both directions (untaken branch
+never fires for `V=i32`; taken branch fires correctly for `V=None`), plus
+9 new tests (`type_resolver_test.py`'s AST-level fold/defer tests,
+`emitter_c_test.py`'s `CompilerErrorIntrinsicTests`/
+`TypeIsGenericParamRealCompileTests`/`DictNoneValueTypeRealCompileTests`).
+Full suite clean on clang, MSVC, and gcc(WSL) (1761/1763 - the only 2
+failures are pre-existing, confirmed unrelated: independently reproduced
+against clean, unmodified master with zero of this work's changes applied -
+see `rc_element_refcount_correct_across_construct_and_teardown`/
+`generator_for_loop_over_rc_typed_list_element` in `emitter_c_test.py`, not
+yet fixed, flagged separately).
+
+`set[T]` stays on `bool` (unaffected, unchanged).
+
+## Historical verification plan (superseded by the resolution above)
 
 1. Work in a fresh `EnterWorktree` worktree (never reuse this one or any
    other named one - see this repo's `CLAUDE.md`).

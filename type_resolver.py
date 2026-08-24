@@ -5155,6 +5155,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 	# --- since rewrites 1/2 never need it ---
 
 	def _try_resolve_namespace( self, node: ast.expr ) -> Name|None:
+		if isinstance( node, ast.Constant ) and node.value is None:
+			# a bare `None` used as a TYPE reference (type(x) is None) - same
+			# NoneType-literal special case TypeResolver's own identically-
+			# named method (this file, ~line 3895) already applies; missing
+			# here meant `type(x) is None` failed outright ("None does not
+			# name a type") for EVERY subject, generic or not - confirmed via
+			# a real repro before this fix (an ordinary i32|None union's own
+			# type(x) is None check)
+			return self.discovery.get_none_type()
 		if isinstance( node, ast.Name ):
 			return self.discovery.find_name( node.id, node )
 		if isinstance( node, ast.Attribute ):
@@ -6150,7 +6159,20 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					result = ast.Constant( value = matches != is_not )
 					ast.copy_location( result, node )
 					return result
-		subj_type = self._type_of_expr( subject_expr )
+		# subject_expr may itself be a bare TYPE reference - a generic
+		# class/function's own type parameter used directly as a value
+		# (e.g. `type(V) is None` inside a method body generic over V) -
+		# rather than an ordinary value expression whose type must be
+		# inferred. Same dual-path resolution compiler.is_rc(T)/compiler.
+		# sizeof(T) already use (lowering.py's _lower_compiler_is_rc):
+		# try a namespace lookup first, fall back to the value-expression
+		# lookup only if that names something other than a Type. Probed
+		# SILENTLY (_try_resolve_callable_namespace, not the raising
+		# _try_resolve_namespace) since this pass also runs pre-lowering,
+		# before an ordinary local variable is registered - see that
+		# method's own docstring for why raising resolution is unsafe here.
+		subj_ref = self._try_resolve_callable_namespace( subject_expr )
+		subj_type = subj_ref if isinstance( subj_ref, Type ) else self._type_of_expr( subject_expr )
 		if subj_type is None:
 			self.discovery.fail( f'type(...) is ...: cannot determine the type of {ast.unparse(subject_expr)}: {ast.unparse(node)}', node )
 		if isinstance( subj_type, TypeVar ):
@@ -6348,6 +6370,76 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				folded.append( result )
 		return folded
 
+	def _try_fold_type_is_if( self, node: ast.If ) -> list[ast.stmt]|None:
+		''' rewrite 4b: `if type(V) is T: A else: B`, where V is a generic
+		class/function's own type parameter used BARE, as a type reference
+		(not `if type(x) is T:` against an ordinary VALUE x - see
+		_try_desugar_type_is_if/_type_is_shape for that, union-typed-value-
+		specific shape). Folds to just A's or B's statements, the OTHER
+		branch dropped entirely before it's ever type-checked - the exact
+		same compile-time-branch-elimination shape _try_fold_is_rc_if already
+		has for `if compiler.is_rc(T): ...`, just keyed on _same_type(T, V)
+		instead of _is_RC(T).
+
+		Why this fold has to exist, not just the plain boolean fold
+		_rewrite_type_is_comparison's own subj_ref resolution already gives
+		`type(V) is T` as an expression: lowering.py's _stmt_If lowers BOTH
+		branches of every `if`, unconditionally - there is no general dead-
+		branch elimination anywhere below this pass keyed on a folded-
+		constant condition (confirmed via a real repro: a `compiler.error(...)`
+		guarded by `if type(V) is None:` fired for EVERY V, not just V=None,
+		because the branch was still fully lowered even though the condition
+		folds to a compile-time False). Motivating case: UnsafeDict's own
+		type(V) is None guard (PLAN_NONETYPE_GENERIC_VALUE.md) needs the
+		untaken branch to never be visited at all for V != NoneType, not
+		merely to be dead code at the C level.
+
+		Only ever fires once the subject genuinely resolves to a CONCRETE
+		type (declines - returns None - while it's still an unbound TypeVar,
+		same two-pass discipline _try_fold_is_rc_if's own docstring documents
+		at length: this pass also runs against the shared, abstract body
+		first, where V is still its own TypeVar). Deliberately does NOT
+		recognize instanceof(V, T) sugar (unlike _type_is_shape, which does
+		for its own, unrelated union-value shape) - no real caller needs it
+		yet; `type(V) is T` alone covers PLAN_NONETYPE_GENERIC_VALUE.md's own
+		motivating case. instanceof(V, T) as a plain (non-eliminating)
+		boolean expression still works via visit_Compare's ordinary rewrite,
+		just without this fold's dead-branch-elimination benefit.
+
+		Never authoritative about failure, matching every other rewrite in
+		this class: any doubt at all (not this exact shape, subject not a
+		bare type reference, RHS not a real type) returns None and leaves
+		the if statement untouched for visit_Compare's own existing
+		recognition to handle as an ordinary boolean condition. '''
+		test = node.test
+		if not ( isinstance( test, ast.Compare ) and len( test.ops ) == 1 and isinstance( test.ops[0], ( ast.Is, ast.IsNot )) ):
+			return None
+		left_subject = self._type_call_subject( test.left )
+		right_subject = self._type_call_subject( test.comparators[0] )
+		if left_subject is None and right_subject is None:
+			return None
+		if left_subject is not None and right_subject is not None:
+			return None # type(...) is type(...): let visit_Compare's own rewrite report this
+		subject_expr = left_subject if left_subject is not None else right_subject
+		type_expr = test.comparators[0] if left_subject is not None else test.left
+		is_not = isinstance( test.ops[0], ast.IsNot )
+		subj_ref = self._try_resolve_callable_namespace( subject_expr )
+		if not isinstance( subj_ref, Type ) or isinstance( subj_ref, TypeVar ):
+			return None # not a bare type-parameter reference, or still unbound - defer
+		leaf_type = self._try_resolve_namespace( type_expr )
+		if leaf_type is None:
+			return None
+		condition_true = self.resolver._same_type( leaf_type, subj_ref ) != is_not
+		winning_body = node.body if condition_true else node.orelse
+		folded: list[ast.stmt] = []
+		for stmt in winning_body:
+			result = self.visit( stmt )
+			if isinstance( result, list ):
+				folded.extend( result )
+			elif result is not None:
+				folded.append( result )
+		return folded
+
 	def _type_is_shape( self, test: ast.expr ) -> tuple[ast.expr,ast.expr,TaggedUnion,Variable,bool]|None:
 		''' recognizes type(x) is T / type(x) is not T / instanceof(x, T)
 		against a union-typed x, resolving all the way through to the real
@@ -6481,6 +6573,9 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		per-statement loops document: a synthesized narrow-marker Assign
 		must never be re-visited through the ordinary visit_Assign path. '''
 		folded = self._try_fold_is_rc_if( node )
+		if folded is not None:
+			return folded
+		folded = self._try_fold_type_is_if( node )
 		if folded is not None:
 			return folded
 		desugared = self._try_desugar_type_is_if( node )

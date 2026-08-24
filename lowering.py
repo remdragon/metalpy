@@ -5,7 +5,7 @@ import itertools
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable
+from typing import Callable, Iterable, NoReturn
 
 # local imports:
 import arithmetic_mode
@@ -5056,6 +5056,27 @@ class FunctionLowering:
 			)
 		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
 		return ir.Const( type = expected_type or bool_cls, value = self.lowering._type_resolver._is_RC( target_type ))
+
+	def _lower_compiler_error( self, node: ast.Call, expected_type: Type|None ) -> NoReturn:
+		# compiler.error(msg) - a real compile-time diagnostic library code
+		# can raise itself, e.g. a generic container guarding against a type
+		# parameter binding it deliberately doesn't support (see
+		# PLAN_NONETYPE_GENERIC_VALUE.md - UnsafeDict's own type(V) is None
+		# guard is the motivating case). Before this, library code wanting a
+		# custom compile-time message had no real mechanism - lib/ssl.py's
+		# own comment on _MACOS_SSL_NOT_YET_IMPLEMENTED documents the
+		# workaround (an intentionally undefined name, relying on the
+		# generic "name is not defined" error) this replaces with a real,
+		# purpose-written message. msg must be a literal string constant -
+		# same "no runtime computation, compile-time only" posture every
+		# other compiler.* intrinsic already has; a non-constant argument
+		# would need actual VALUE evaluation to read a message that then
+		# only matters if this call is even reachable, which is needlessly
+		# more machinery than any real caller needs (every call site wants
+		# a fixed, authored message, not a computed one).
+		if len( node.args ) != 1 or node.keywords or not isinstance( node.args[0], ast.Constant ) or not isinstance( node.args[0].value, str ):
+			self.lowering.discovery.fail( f'compiler.error(...) takes exactly one string-literal argument: {ast.unparse(node)}', node )
+		self.lowering.discovery.fail( node.args[0].value, node )
 
 	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
@@ -15103,6 +15124,9 @@ class FunctionLowering:
 			case 'refcount':
 				result = self._lower_compiler_refcount( node, expected_type )
 				return result if want_result else None
+
+			case 'error':
+				self._lower_compiler_error( node, expected_type )
 
 			case 'checked_add' | 'wrapped_add' | 'saturated_add' | 'checked_sub' | 'wrapped_sub' | 'saturated_sub' | \
 				'checked_mul' | 'wrapped_mul' | 'saturated_mul' | 'checked_floordiv' | 'wrapped_floordiv' | 'saturated_floordiv' | \
