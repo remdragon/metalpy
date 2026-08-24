@@ -8563,6 +8563,22 @@ class FunctionLowering:
 		if type( node.value ) is int:
 			int_type = self.lowering.discovery.find_name_or_none( 'int' )
 			if int_type is not None and expected_type is int_type:
+				# int.__init__ only takes an i32 (no arbitrary-precision
+				# literal constructor exists) - checked HERE, with a message
+				# naming the real cause and its real fix, rather than left to
+				# the desugared call below: that would otherwise surface as
+				# "... is out of range for intrinsics.i32 ...", technically
+				# correct (i32 IS what int(literal) narrows the literal into)
+				# but written as if the user had asked for an i32 themselves,
+				# when the annotation they actually wrote says int.
+				i32_type = self.lowering.discovery.get_intrinsics()['i32']
+				lo, hi = int_stem_range( i32_type )
+				if not ( lo <= node.value <= hi ):
+					self.lowering.discovery.fail(
+						f'{node.value} is too large to construct an int from a literal (int(x) only takes an i32-range '
+						f'literal, {lo}..{hi}) - use int.from_str({str(node.value)!r}) for a larger value: {ast.unparse(node)}',
+						node,
+					)
 				call_node = ast.Call( func = ast.Name( id = 'int', ctx = ast.Load() ), args = [ ast.Constant( value = node.value ) ], keywords = [] )
 				ast.copy_location( call_node, node )
 				ast.copy_location( call_node.func, node )
