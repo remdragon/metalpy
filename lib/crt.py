@@ -340,6 +340,19 @@ def rename(
 ) -> i32:
 	...
 
+# POSIX-only: os.rename()'s own fail-if-exists semantics (matching Windows)
+# are built on link()+unlink() rather than plain rename(2), which replaces
+# an existing destination - see lib/os.py's rename(). ConstPtr[None], not
+# ConstPtr[u8] - same char*/unsigned-char* mismatch as mkdir/rmdir/unlink's
+# own POSIX bindings above, once header= makes the real prototype visible.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'link', header = 'unistd.h' )
+def link(
+	oldpath: ConstPtr[None],
+	newpath: ConstPtr[None],
+) -> i32:
+	...
+
 @extern( 'c', 'getenv' )
 def getenv(
 	name: ConstPtr[u8],
