@@ -5271,6 +5271,21 @@ class FunctionLowering:
 			# compile+run repro (C4700 "uninitialized local variable 'w'
 			# used", then a heap-corruption crash at runtime).
 			self._cfg.restore( entry_snapshot )
+			# merge_if() below can mint fresh temps (a name dropped on only
+			# one side needs its own decref computed here - see its own
+			# "fresh on exactly one branch" case) - _new_temp()'s DeclareTemp
+			# side effect lands in whatever self._instructions currently is,
+			# which must be the real, live outer list (matching _stmt_If's
+			# own identical merge_if() call site), NOT handler_captured
+			# (still assigned from the just-lowered handler body above) -
+			# otherwise the DeclareTemp ends up spliced into the handler's
+			# own block while the matching compute/use instructions
+			# (returned as plain data, appended into combined_groups/
+			# handler_captured below) end up somewhere else entirely -
+			# confirmed by a real repro ("use of undeclared identifier
+			# '$tN'": a named Result local declared directly inside a try
+			# body, dropped by the handler-loop's own restore() above).
+			self._instructions = outer_instructions
 			try:
 				combined_extra, handler_extra, removed = self._cfg.merge_if(
 					entry_snapshot.bindings, combined_end.bindings, handler_end.bindings, self._current_fn.qualname,
