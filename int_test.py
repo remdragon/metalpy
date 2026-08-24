@@ -498,6 +498,55 @@ def main() -> i32:
 ''' )
 		self.assertNotEqual( result.returncode, 0, 'i32(x) overflow under panic_arithmetic should panic, not exit 0' )
 
+	def test_scalar_conversion_construct_cast_saturates( self ) -> None:
+		# i32(x) (x: int) under saturate_arithmetic redirects to
+		# __saturated_i32__ (infallible, clamps) instead of __i32__
+		# (@fallible_arithmetic, would otherwise require the enclosing
+		# function to return a Result to propagate into, same as .to_T()
+		# already does) - mirrors the compiler's own intrinsic Scalar-to-
+		# Scalar narrowing cast picking a different, infallible opcode
+		# under this exact mode.
+		checks = [
+			'in-range value passes through saturate_arithmetic unchanged',
+			'a value past i32::MAX clamps to i32::MAX, not an error/panic',
+			'a value past i32::MIN clamps to i32::MIN',
+			'a negative int clamps to 0 for an unsigned target',
+			'a value past u32::MAX clamps to u32::MAX',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.saturate_arithmetic:
+		small: int = int.from_i32(5).unwrap('a')
+		if i32(small) != 5:
+			return 1
+		big: int = int.from_str('99999999999999999999').unwrap('a')
+		if i32(big) != 2147483647:
+			return 2
+		neg_big: int = int.from_str('-99999999999999999999').unwrap('a')
+		if i32(neg_big) != -2147483648:
+			return 3
+		neg: int = int.from_str('-5').unwrap('a')
+		if u32(neg) != 0:
+			return 4
+		if u32(big) != 4294967295:
+			return 5
+	return 0
+''', checks )
+
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
+	def test_scalar_conversion_construct_cast_saturates_u128( self ) -> None:
+		checks = [
+			'u128(x) saturating cast round-trips a value that fits',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.saturate_arithmetic:
+		big: int = int.from_str('99999999999999999999').unwrap('a')
+		if u128(big) != 99999999999999999999:
+			return 1
+	return 0
+''', checks )
+
 	# --- __str__/__repr__ ---------------------------------------------------
 
 	def test_str_repr( self ) -> None:
