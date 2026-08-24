@@ -9609,6 +9609,73 @@ class FunctionLowering:
 		# comment for why this doesn't auto-consume a fallible result
 		return dest
 
+	def _lower_tuple_slice( self, node: ast.Subscript, obj: ir.Operand, tuple_type: TupleType ) -> ir.Operand:
+		''' t[a:b] on a homogeneous tuple[T,...] - unlike every other slice
+		target (_lower_slice_subscript's generic __getitem__(slice) dispatch
+		to a runtime method), a tuple's slice RESULT TYPE depends on the
+		slice's own bounds (a DIFFERENT fixed-arity tuple[T,...] per distinct
+		(start,stop) pair) - no ordinary method could express that with one
+		fixed return type, so this requires compile-time-constant bounds and
+		builds the result directly via field copies instead, the same "no
+		real __init__, just field=value sugar" construction _expr_Tuple's own
+		tuple-LITERAL handling already uses for its Allocate. Bounds are
+		clamped exactly like every other slice's own out-of-range tolerance
+		(_resolve_slice_bounds, lib/builtins/__init__.py) - never a compile
+		error, an out-of-range/inverted bound just yields a shorter (possibly
+		empty) result, same as real Python; negative literal bounds aren't
+		reachable here at all (`-1` parses as ast.UnaryOp(USub,...), not
+		ast.Constant, so it's rejected below as "not constant" - consistent
+		with usize-only slice.start/stop everywhere else in this codebase,
+		which has no negative-index support anywhere to match). '''
+		node_slice = node.slice
+		assert isinstance( node_slice, ast.Slice )
+		if node_slice.step is not None:
+			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
+		n = len( tuple_type.elem_types )
+		def const_bound( expr: ast.expr|None, default: int ) -> int:
+			if expr is None:
+				return default
+			if not ( isinstance( expr, ast.Constant ) and isinstance( expr.value, int ) and not isinstance( expr.value, bool )):
+				self.lowering.discovery.fail(
+					f'tuple slicing requires compile-time-constant integer bounds: {ast.unparse(node)}', node,
+				)
+				return default
+			return expr.value
+		start = max( 0, min( const_bound( node_slice.lower, 0 ), n ))
+		stop = max( 0, min( const_bound( node_slice.upper, n ), n ))
+		if start > stop:
+			stop = start
+		elem_types = tuple_type.elem_types[ start:stop ]
+		# arity 0/1 results are rejected outright, same deferral _expr_Tuple's
+		# own tuple-LITERAL construction already applies (PLAN_TUPLE.md) -
+		# not attempted here either, to avoid a fresh, untested 0/1-field
+		# RCClass edge case (an empty C struct in particular isn't legal in
+		# every one of this compiler's 3 target toolchains)
+		if len( elem_types ) < 2:
+			self.lowering.discovery.fail(
+				f'tuple slicing to {len(elem_types)} element(s) is not supported (need at least 2 - '
+				f'use t[{start}] directly for a single element): {ast.unparse(node)}',
+				node,
+			)
+		result_tt = self.lowering.discovery._get_or_create_tuple_type( elem_types )
+		backing_cls = self.lowering._ensure_resolved( result_tt )
+		self.lowering._schedule_rcclass_construction( backing_cls, backing_cls )
+		resolved_obj_type = self.lowering._ensure_resolved( obj.type )
+		fields: dict[str,ir.Operand] = {}
+		for i, elem_type in enumerate( elem_types ):
+			src_field = self.lowering._attr_lookup( resolved_obj_type, f'_{start + i}', node )
+			elem_dest = self._new_temp( src_field.type )
+			self._emit( ir.GetAttr( dest = elem_dest, obj = obj, attr = f'_{start + i}' ))
+			# a GetAttr borrow of the source tuple's own field - genuinely
+			# aliasing, same as _expr_Tuple's own per-element field_value call
+			# for an aliasing Name/Attribute element
+			for instr in self._cfg.field_value( src_field.type, elem_dest, is_alias = True ):
+				self._emit( instr )
+			fields[ f'_{i}' ] = elem_dest
+		dest = self._new_temp( backing_cls )
+		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
+		return dest
+
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
 		if isinstance( node.value, ast.Attribute ) and not isinstance( node.slice, ast.Slice ):
 			fixed = self._fixed_array_index_target( node.value, node.slice )
@@ -9619,6 +9686,16 @@ class FunctionLowering:
 				return self._maybe_castwrap_pointer( dest, expected_type )
 		obj = self._lower_expr( node.value, None )
 		if isinstance( node.slice, ast.Slice ):
+			# a tuple's own slice needs its OWN handling (_lower_tuple_slice),
+			# not the generic __getitem__(slice) dispatch below - the result
+			# type is a DIFFERENT fixed-arity tuple[...] depending on the
+			# slice's own compile-time bounds, which no ordinary runtime
+			# __getitem__(slice) method could express (its return type is
+			# fixed at declaration time) - see _lower_tuple_slice's own
+			# docstring
+			tuple_type = self.lowering._tuple_storage.tuple_type_for( self.lowering._ensure_resolved( obj.type ))
+			if tuple_type is not None:
+				return self._lower_tuple_slice( node, obj, tuple_type )
 			return self._lower_slice_subscript( node, obj )
 		# tuple_type_for checked BEFORE _find_indexlike_getitem, not after:
 		# a HOMOGENEOUS tuple's backing class now also declares a real,
