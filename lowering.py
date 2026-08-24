@@ -7683,6 +7683,19 @@ class FunctionLowering:
 
 	def _stmt_If( self, node: ast.If ) -> None:
 		test = self._lower_truth_test( node.test )
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: mirrors _stmt_While's own
+		# identical flush (see its comment for the full reasoning) - a temp
+		# retained while evaluating the condition (e.g. Part B's own retain-
+		# on-read for a chained field receiver, `self.a.b`) must be decref'd
+		# regardless of which branch runs. Without this, the ordinary once-
+		# per-statement flush _lower_stmt's wrapper provides only lands in
+		# the OUTER instruction stream after the whole if/else - dead code
+		# for any branch that terminates early (return/break/continue), so
+		# that branch's own copy of the retain never gets released. Flushed
+		# here, unconditionally, before JumpIfFalse even reads `test` - safe
+		# for the same reason _stmt_While's identical flush is (ir.DeleteTemp
+		# is a pure bookkeeping no-op at emission time).
+		self._flush_pending_temps()
 		else_label = self._new_label( 'if_else' )
 		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
 
