@@ -315,12 +315,23 @@ def DeleteFileA(
 ) -> bool:
 	...
 
-# MoveFileW, not MoveFileA - the *A entry points go through the process'
-# ANSI codepage (CP_ACP), not UTF-8, so they mangle any path outside it.
+# MoveFileW/MoveFileExW, not the *A entry points - *A goes through the
+# process' ANSI codepage (CP_ACP), not UTF-8, so it mangles any path
+# outside it.
 @extern( 'kernel32', 'MoveFileW' )
 def MoveFileW(
 	lpExistingFileName: ConstPtr[u16],
 	lpNewFileName: ConstPtr[u16],
+) -> bool:
+	...
+
+MOVEFILE_REPLACE_EXISTING: u32 = 0x1
+
+@extern( 'kernel32', 'MoveFileExW' )
+def MoveFileExW(
+	lpExistingFileName: ConstPtr[u16],
+	lpNewFileName: ConstPtr[u16],
+	dwFlags: u32,
 ) -> bool:
 	...
 

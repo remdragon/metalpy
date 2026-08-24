@@ -587,5 +587,129 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 
+class OsRenameReplaceTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' rename()/replace() - real filesystem I/O against a fresh temp
+	directory per test. rename() deliberately fails if dst exists on EVERY
+	platform (a metalpy-specific choice, unlike real Python's own os.rename,
+	which only fails on Windows and replaces on POSIX - see lib/os.py's own
+	rename() comment); replace() always replaces, also on every platform. '''
+
+	def setUp( self ) -> None:
+		from discovery import Discovery
+		from compiler import Compiler
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+		import tempfile
+		self._tmpdir_ctx = tempfile.TemporaryDirectory()
+		self.tmpdir = self._tmpdir_ctx.name
+
+	def tearDown( self ) -> None:
+		self._tmpdir_ctx.cleanup()
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_rename_and_replace( self ) -> None:
+		src_literal = repr( os.path.join( self.tmpdir, 'src.txt' ))
+		dst_literal = repr( os.path.join( self.tmpdir, 'dst.txt' ))
+		src_dir_literal = repr( os.path.join( self.tmpdir, 'src_dir' ))
+		dst_dir_literal = repr( os.path.join( self.tmpdir, 'dst_dir' ))
+		self.assert_programs_run([
+			( 'rename_fails_when_dst_file_exists', f'''
+from pathlib import Path
+import os
+
+def main() -> i32:
+	src: Path = Path( {src_literal} )
+	dst: Path = Path( {dst_literal} )
+	src.write_text( 'src' ).unwrap( 'write src' )
+	dst.write_text( 'dst' ).unwrap( 'write dst' )
+
+	match os.rename( {src_literal}, {dst_literal} ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			pass
+
+	if not src.exists():
+		return 2
+	if dst.read_text().unwrap( 'read dst' ) != 'dst':
+		return 3
+
+	src.unlink().unwrap( 'unlink src' )
+	dst.unlink().unwrap( 'unlink dst' )
+	return 0
+''' ),
+			( 'rename_succeeds_when_dst_absent', f'''
+from pathlib import Path
+import os
+
+def main() -> i32:
+	src: Path = Path( {src_literal} )
+	dst: Path = Path( {dst_literal} )
+	src.write_text( 'moved' ).unwrap( 'write src' )
+	os.rename( {src_literal}, {dst_literal} ).unwrap( 'rename failed' )
+	if src.exists():
+		return 1
+	if dst.read_text().unwrap( 'read dst' ) != 'moved':
+		return 2
+	dst.unlink().unwrap( 'unlink dst' )
+	return 0
+''' ),
+			( 'replace_always_replaces_an_existing_dst', f'''
+from pathlib import Path
+import os
+
+def main() -> i32:
+	src: Path = Path( {src_literal} )
+	dst: Path = Path( {dst_literal} )
+	src.write_text( 'src' ).unwrap( 'write src' )
+	dst.write_text( 'dst' ).unwrap( 'write dst' )
+
+	os.replace( {src_literal}, {dst_literal} ).unwrap( 'replace failed' )
+	if src.exists():
+		return 1
+	if dst.read_text().unwrap( 'read dst' ) != 'src':
+		return 2
+	dst.unlink().unwrap( 'unlink dst' )
+	return 0
+''' ),
+			( 'rename_dir_platform_behavior', f'''
+from pathlib import Path
+import os
+
+def main() -> i32:
+	src: Path = Path( {src_dir_literal} )
+	dst: Path = Path( {dst_dir_literal} )
+	src.mkdir().unwrap( 'mkdir src' )
+	dst.mkdir().unwrap( 'mkdir dst' )
+
+	# link()+unlink() (this module's own POSIX rename() implementation)
+	# can't target a directory, so a directory source falls back to plain
+	# rename(2) there - still replaces an EMPTY dst dir. Win32 MoveFileW
+	# never replaces an existing dst, directories included, no exception
+	# for an empty one - so this is a genuine, deliberate platform split
+	# (unlike a non-directory rename, which behaves identically
+	# everywhere - see the other cases in this test).
+	if compiler.target.os == 'windows':
+		match os.rename( {src_dir_literal}, {dst_dir_literal} ):
+			case Result.Ok( _ ):
+				return 1
+			case Result.Err( _ ):
+				pass
+		src.rmdir().unwrap( 'rmdir src' )
+		dst.rmdir().unwrap( 'rmdir dst' )
+		return 0
+
+	os.rename( {src_dir_literal}, {dst_dir_literal} ).unwrap( 'rename failed' )
+	if src.exists():
+		return 2
+	if not dst.exists():
+		return 3
+	dst.rmdir().unwrap( 'rmdir dst' )
+	return 0
+''' ),
+		])
+
+
 if __name__ == '__main__':
 	unittest.main()

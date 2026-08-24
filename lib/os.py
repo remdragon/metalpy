@@ -146,8 +146,10 @@ def _to_wide_cstr( s: str ) -> bytearray:
 
 @compiler.target( os = 'windows' )
 def rename( src: str, dst: str ) -> Result[None, OSError]:
-	# MoveFileW - matches Python's os.rename on Windows, which fails if dst
-	# exists (unlike POSIX rename(2), which replaces it)
+	# MoveFileW - fails if dst exists (this module's own deliberate choice:
+	# ONE fail-if-exists behavior on every platform, rather than mirroring
+	# Python's own Windows-only-fails/POSIX-replaces split - see replace()
+	# below for "always replace" instead)
 	from windows.kernel32 import MoveFileW, GetLastError
 	src_w: bytearray = _to_wide_cstr( src )
 	dst_w: bytearray = _to_wide_cstr( dst )
@@ -157,6 +159,42 @@ def rename( src: str, dst: str ) -> Result[None, OSError]:
 
 @compiler.target( os = not 'windows' )
 def rename( src: str, dst: str ) -> Result[None, OSError]:
+	# matches Windows: fails if dst exists, rather than POSIX rename(2)'s
+	# own replace-on-exists default (see replace() below for that instead).
+	# link()+unlink() gives atomic fail-if-exists semantics for files -
+	# link(2) can't target a directory though, so a directory source falls
+	# back to plain rename(2) (still replaces an EMPTY dst dir, and fails
+	# ENOTEMPTY on a non-empty one - a safe outcome either way).
+	from crt import link as _crt_link, unlink as _crt_unlink, rename as _crt_rename, get_errno
+	if path.isdir( src ):
+		if _crt_rename( src.get_cstr(), dst.get_cstr() ) < 0:
+			return Result.Err( OSError( get_errno() ))
+		return Result.Ok( None )
+	if _crt_link( compiler.cast( ConstPtr[None], src.get_cstr() ), compiler.cast( ConstPtr[None], dst.get_cstr() )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if _crt_unlink( compiler.cast( ConstPtr[None], src.get_cstr() )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def replace( src: str, dst: str ) -> Result[None, OSError]:
+	# always replaces an existing dst, on every platform - the counterpart
+	# to rename()'s own fail-if-exists behavior above.
+	from windows.kernel32 import MoveFileExW, GetLastError, MOVEFILE_REPLACE_EXISTING
+	src_w: bytearray = _to_wide_cstr( src )
+	dst_w: bytearray = _to_wide_cstr( dst )
+	if not MoveFileExW(
+		compiler.cast( ConstPtr[u16], src_w.get_const_ptr() ),
+		compiler.cast( ConstPtr[u16], dst_w.get_const_ptr() ),
+		MOVEFILE_REPLACE_EXISTING,
+	):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def replace( src: str, dst: str ) -> Result[None, OSError]:
+	# plain rename(2) already replaces an existing dst
 	from crt import rename as _crt_rename, get_errno
 	if _crt_rename( src.get_cstr(), dst.get_cstr() ) < 0:
 		return Result.Err( OSError( get_errno() ))
