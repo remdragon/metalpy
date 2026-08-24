@@ -9266,13 +9266,11 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
-			# for x in my_set: - proves the __len__ + __getitem__(usize)
-			# "indexable" for-loop protocol wiring (lowering.py's
-			# _lower_for_over_indexable) actually works for set[T], with no
-			# compiler changes of its own. The per-iteration bind desugars
-			# to obj[i].or_return() (since __getitem__ returns
-			# Result[T,IndexError]), which requires the ENCLOSING function
-			# to itself return a Result[_,IndexError]-shaped type - main()
+			# for x in my_set: - proves set[T]'s own Sequence[T]/Iterable[T]
+			# conformance (its __iter__ delegates to _sequence_iter) drives a
+			# real for-loop with no compiler changes of its own. The bound
+			# helper returns Result[_,IndexError] because _sequence_iter's
+			# own StopIteration-stripped remaining error is IndexError - main()
 			# returns plain i32 (needed for this test harness's own exit-
 			# code dispatch), so the loop lives in a small helper instead,
 			# unwrapped by main(). xor-checksum the visited elements
@@ -10426,17 +10424,15 @@ def main() -> i32:
 	return 0
 ''' ),
 			# for-loop iteration over an RC-element tuple[T,...] with ZERO
-			# elements - the exact shape of a real, confirmed bug
-			# (lowering.py's _lower_for_over_indexable, fixed separately -
-			# "Fix for-loop-over-indexable RC element temp leaking outside
-			# the loop"): the loop body never running at all used to leak a
-			# per-iteration temp's cleanup outside the loop, reading
-			# uninitialized stack memory as an ObjectHeader*. VariadicTuple
-			# has no direct __next__ (only __iter__, used by min/max/sum/
-			# etc., not by `for x in t:` itself - list[T] has the identical
-			# split), so `for x in some_tuple:` genuinely goes through
-			# _lower_for_over_indexable, not the generator path - this is a
-			# real regression guard, not a redundant check.
+			# elements - a real, previously-confirmed bug (a since-deleted
+			# indexable for-loop lowering: the loop body never running at all
+			# used to leak a per-iteration temp's cleanup outside the loop,
+			# reading uninitialized stack memory as an ObjectHeader*).
+			# VariadicTuple has no direct __next__, only Iterable[T]'s
+			# __iter__ (list[T] has the identical split), so `for x in
+			# some_tuple:` calls __iter__() once and drives the resulting
+			# generator - this is a real regression guard, not a redundant
+			# check.
 			( 'empty_and_single_element_iteration_no_crash', '''
 class Elem:
 	pass
@@ -13451,10 +13447,9 @@ class OverloadedGetitemDispatchTests( test_support.RealCompileMixin, CompilerTes
 	every one of __getitem__'s call sites the instant a type gains a second
 	__getitem__ overload) - found while adding slice-syntax support
 	(container[a:b] as a second __getitem__ overload alongside the existing
-	single-index one). Three call sites share this gap: plain `x[i]` reads
-	(_expr_Subscript), `x[i] += y` (_stmt_AugAssign's Subscript target), and
-	`for v in x:` over an indexable with no __iter__ (_lower_for_over_
-	indexable). Fixed via a new _find_indexlike_getitem helper (NOT
+	single-index one). Two call sites share this gap: plain `x[i]` reads
+	(_expr_Subscript) and `x[i] += y` (_stmt_AugAssign's Subscript target).
+	Fixed via a new _find_indexlike_getitem helper (NOT
 	_find_dunder_for_arg, which needs the caller to already know the exact
 	argument type to match against - an ordinary index's own type is instead
 	INFERRED FROM __getitem__'s declared parameter type, so there's no
@@ -13522,18 +13517,11 @@ def main() -> i32:
 		x[0] += 5
 	if x[0] != 15:
 		return 2
-	# for v in x: over an indexable with no __iter__ (_lower_for_over_indexable)
-	total: i32 = 0
-	with compiler.wrap_arithmetic:
-		for v in x:
-			total += v
-	if total != 15 + 20 + 30:
-		return 3
 	# the OTHER overload leaf (compound arg type) still resolves too, via
 	# ordinary method-call overload resolution - confirms the Overload
 	# group itself is intact, not just the index leaf
 	if x.__getitem__( RangeKey( lo = 99 )) != 99:
-		return 4
+		return 3
 	return 0
 ''' ),
 		] )
@@ -19580,13 +19568,97 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class ForLoopIteratorIterableProtocolTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `for x in y:` strictly requires y to conform to IteratorProtocol[T]
+	(a real __next__ - drives it directly) or Iterable[T] (a real __iter__ - called
+	once to get a real iterator, which is then driven the same way) - no
+	structural __len__/__getitem__(usize) duck-typing any more (confirmed
+	with the user; the old _lower_for_over_indexable mechanism is gone
+	entirely). This is a real, confirmed correctness fix, not just
+	stricter typing: dict[K,V] never declared __next__ directly and has no
+	usize-keyed __getitem__ at all - the old duck-typing fell through to
+	positionally indexing it with `__getitem__(key: K)`, which only even
+	type-checked when K happened to be usize-compatible, and would have
+	silently walked "positions" instead of real keys had anything ever
+	actually hit that combination (nothing did, until now). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the actual bug: dict[K,V] iterates real KEYS, not positions
+			( 'dict_iterates_real_keys_not_positions', '''
+def main() -> i32:
+	d: dict[i32, i32] = dict[i32, i32]()
+	d.__setitem__( 10, 100 )
+	d.__setitem__( 20, 200 )
+	d.__setitem__( 30, 300 )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for k in d:
+			total += k
+	if total != 60: # 10+20+30 - would be 0+1+2=3 if silently misused as positional indexing
+		return 1
+	return 0
+''' ),
+			# a hand-written IteratorProtocol[T] conformer (a real __next__,
+			# no __iter__ at all) drives directly - "iter() on an iterator
+			# returns itself" is subsumed by this taking priority over the
+			# Iterable[T] branch, not by every IteratorProtocol[T] also
+			# needing its own __iter__ returning self
+			( 'custom_iterator_conformer_drives_directly', '''
+class CountUpTo( IteratorProtocol[i32] ):
+	current: i32
+	limit: i32
+
+	def __init__( self, limit: i32 ) -> None:
+		self.current = 0
+		self.limit = limit
+
+	def __next__( self ) -> Result[i32, StopIteration]:
+		if self.current >= self.limit:
+			return Result.Err( StopIteration() )
+		v: i32 = self.current
+		with compiler.panic_arithmetic( 'bounded by limit' ):
+			self.current += 1
+		return Result.Ok( v )
+
+def main() -> i32:
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in CountUpTo( 4 ):
+			total += v
+	if total != 0 + 1 + 2 + 3:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_missing_iterator_or_iterable_conformance_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'class NotIterable:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	for x in NotIterable():',
+			'		pass',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'for loop requires an IteratorProtocol[T] or Iterable[T] conformer', errors[0] )
+
+
 class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' PLAN_GENERATORS.md - a plain function containing `yield`, where
 	every yield is a direct top-level statement (v1), the single yield
 	inside a direct top-level while loop (Phase 2 - PLAN_GENERATORS.md's
 	own motivating range()-style example), or the single yield inside a
-	direct top-level for loop - over range() (Phase 4), a list-like
-	__len__/__getitem__ indexable, or another generator's own __next__()
+	direct top-level for loop - over range() (Phase 4), an Iterable[T]
+	conformer like list[T], or another generator's own __next__()
 	(both Phase 5, matching the user-facing "remaining phases roadmap"'s
 	own Phase 1 - one generator consuming another this way is the
 	realistic way generators actually get exercised/tested). Real
@@ -21262,9 +21334,10 @@ def main() -> i32:
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
-		# PLAN_GENERATORS.md Phase 1 - a for loop over something with
-		# neither __len__/__getitem__ NOR __next__ must be a clear
-		# compile error, not a silently wrong state machine
+		# a for loop over something conforming to neither IteratorProtocol[T]
+		# nor Iterable[T] must be a clear compile error, not a silently
+		# wrong state machine - same strict-dispatch gate lowering.py's
+		# _stmt_For enforces for an ordinary (non-generator-body) for loop
 		self._run( '''
 class NotIterable:
 	pass
@@ -21277,16 +21350,22 @@ def main() -> None:
 	g = gen( NotIterable() )
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( '__len__', str( self.discovery.errors.errors[0] ))
+		self.assertIn( 'IteratorProtocol[T] or Iterable[T]', str( self.discovery.errors.errors[0] ))
 
 	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
 		# a __next__() that returns something other than Result[T,E] (E
 		# including StopIteration) - real, not a generator's own (compiler-
 		# synthesized __next__ always has the right shape) - must be a
 		# clear compile error, not a miscompile. Not generator-specific:
-		# any user class implementing __next__ by hand hits the same check.
+		# any user class implementing __next__ by hand hits the same check
+		# (declares Iterator[i32] conformance so it passes the strict
+		# Iterator[T]/Iterable[T] gate lowering.py's _stmt_For checks first
+		# - protocol conformance validation is NAME-only, see discovery.py's
+		# _validate_protocol_conformance, so this doesn't itself catch the
+		# bad shape; the deeper shape check inside _lower_for_over_iterator,
+		# reached only once a real __next__ exists, still does).
 		self._run( '''
-class NotReallyAnIterator:
+class NotReallyAnIterator( Iterator[i32] ):
 	def __next__( self ) -> i32:
 		return 1
 
@@ -22491,17 +22570,13 @@ def main() -> i32:
 				case Result.Ok( _ ):
 					pass
 			count += 1
-	# _desugar_indexable_for's own generated while-loop splices the
-	# original for-loop's body in verbatim, WITHOUT re-scanning it for a
-	# further nested for-loop-with-yield of its own - confirmed via a
-	# real repro to leave the inner one un-desugared, falling through to
-	# lowering.py's ordinary (non-generator-aware) for-loop lowering
-	# instead: compiled clean, but crashed at runtime under MSVC (debug:
-	# heap-corruption breakpoint; release: access violation) - clang/gcc's
-	# own codegen happened not to visibly corrupt anything for the same
-	# wrong IR, masking it completely. _recurse_desugar_for_loops now
-	# recurses into a for-loop-with-yield's own desugared output too, not
-	# just plain if/while/for/with bodies.
+	# a desugared for-loop's generated while-loop splices the original
+	# body in verbatim - a nested for-loop-with-yield inside that body
+	# must still get desugared too, not fall through to lowering.py's
+	# ordinary for-loop lowering (which crashed at runtime under MSVC,
+	# masked entirely under clang/gcc's codegen for the same wrong IR).
+	# _recurse_desugar_for_loops recurses into a for-loop-with-yield's own
+	# desugared output too, not just plain if/while/for/with bodies.
 	if count != 3:
 		return 1
 	return 0

@@ -784,40 +784,26 @@ class TypeResolver:
 			found = names.get( name ) if isinstance( names, dict ) else None
 		return found if isinstance( found, Function ) else None
 
-	def _probe_indexlike_getitem( self, owner_type: Type|None ) -> Function|None:
-		''' like _probe_method(owner_type, '__getitem__') above, but
-		Overload-aware for the "indexable" for-loop desugaring shape
-		(__len__()+__getitem__(), e.g. list[T]) - mirrors lowering.py's own
-		_find_indexlike_getitem exactly (same real gap, same fix: prefer
-		the Scalar-typed leaf over a compound one, e.g. slice, since an
-        ordinary index's own concrete type is normally INFERRED FROM
-		__getitem__'s declared parameter, not known up front here either -
-		see that method's own docstring for the full reasoning), deliberately
-		duplicated rather than reached across the TypeResolver/Lowering
-		boundary, same posture _probe_method itself already documents. '''
+	def _probe_conforms_to_protocol( self, owner_type: Type|None, protocol: ClassLike ) -> bool:
+		''' does the resolved concrete type declare conformance to
+		`protocol` (a bare Protocol/ClassLike, e.g. the real IteratorProtocol
+		or Iterable class object - not parametrized) - mirrors lowering.py's
+		own _type_conforms_to_protocol exactly, deliberately duplicated
+		rather than reached across the TypeResolver/Lowering boundary, same
+		posture _probe_method itself already documents. '''
 		if owner_type is None:
-			return None
-		owner_type = self.ensure_resolved( owner_type )
-		if isinstance( owner_type, ( CStruct, RCClass )):
-			found = owner_type.chain_lookup( '__getitem__' )
-		else:
-			names = getattr( owner_type, 'names', None )
-			found = names.get( '__getitem__' ) if isinstance( names, dict ) else None
-		if isinstance( found, Function ):
-			return found
-		if not isinstance( found, Overload ):
-			return None
-		for impl in found.implementations:
-			if impl.resolve is not None:
-				impl.resolve()
-			params = impl.parameters or []
-			arg_index = 1 if impl.cls is None else 0
-			if len( params ) != arg_index + 1:
-				continue
-			param_type = self.ensure_resolved( params[arg_index].type )
-			if isinstance( param_type, Scalar ):
-				return impl
-		return None
+			return False
+		resolved = self.ensure_resolved( owner_type )
+		base = resolved.base if isinstance( resolved, Specialization ) else resolved
+		if isinstance( base, TupleType ):
+			base = base.backing
+		if not isinstance( base, RCClass ):
+			return False
+		for p in base.protocols:
+			p_base = p.base if isinstance( p, Specialization ) else p
+			if p_base is protocol:
+				return True
+		return False
 
 	def _resolve_expr_type_for_desugar( self, fn: Function, expr: ast.expr ) -> Type|None:
 		''' PLAN_GENERATORS.md Phase 1 - best-effort "what type does this
@@ -1182,13 +1168,16 @@ class TypeResolver:
 	def _desugar_general_for( self, fn: Function, node: ast.For, extra_locals: dict[str,Type] ) -> list[ast.stmt]:
 		''' PLAN_GENERATORS.md Phase 1 - `for x in <expr>: BODY` where
 		<expr> isn't range() - resolves <expr>'s type (best-effort, AST-
-		only - see _resolve_expr_type_for_desugar) and dispatches to
-		whichever shape it has: __next__() -> T|None (another generator,
-		or any hand-written iterator - checked FIRST, matching lowering.
-		py's own _stmt_For priority for an ordinary for-loop) or
-		__len__()+__getitem__() (an indexable like list[T]). Neither
-		found, or the type can't be determined at all, is a clear compile
-		error - not a silent fallback to some other behavior. '''
+		only - see _resolve_expr_type_for_desugar) and dispatches strictly
+		by declared protocol conformance, mirroring lowering.py's own
+		_stmt_For exactly (same user directive: no __len__/__getitem__
+		duck typing, ever - a conformer must say so via its own base-class
+		list): IteratorProtocol[T] drives __next__() directly; Iterable[T]
+		calls __iter__() once (wrapped into a synthetic AST call node,
+		threaded through as _new_for_obj_field's iter_expr so the __for_obj
+		promoted local holds the ITERATOR, not the original Iterable) and
+		then drives the resulting generator the same way. Neither found,
+		or the type can't be determined at all, is a clear compile error. '''
 		if not isinstance( node.target, ast.Name ):
 			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node)}', node )
 		if node.orelse:
@@ -1202,23 +1191,45 @@ class TypeResolver:
 				f'- see PLAN_GENERATORS.md',
 				node,
 			)
-		next_fn = self._probe_method( obj_type, '__next__' )
-		if next_fn is not None:
+		iterator_protocol = self.discovery.find_name( 'IteratorProtocol', node )
+		iterable_protocol = self.discovery.find_name( 'Iterable', node )
+		if self._probe_conforms_to_protocol( obj_type, iterator_protocol ):
+			next_fn = self._probe_method( obj_type, '__next__' )
+			assert next_fn is not None, 'internal compiler error: IteratorProtocol[T] conformance declared without a real __next__'
 			return self._desugar_iterator_for( fn, node, obj_type, next_fn, extra_locals )
-		len_fn = self._probe_method( obj_type, '__len__' )
-		getitem_fn = self._probe_indexlike_getitem( obj_type )
-		if len_fn is not None and getitem_fn is not None:
-			return self._desugar_indexable_for( fn, node, obj_type, getitem_fn, extra_locals )
+		if self._probe_conforms_to_protocol( obj_type, iterable_protocol ):
+			iter_fn = self._probe_method( obj_type, '__iter__' )
+			assert iter_fn is not None, 'internal compiler error: Iterable[T] conformance declared without a real __iter__'
+			self.ensure_resolved( iter_fn )
+			self.ensure_generator_synthesized( iter_fn )
+			iterator_type = iter_fn.return_type
+			next_fn = self._probe_method( iterator_type, '__next__' )
+			if next_fn is None:
+				self.discovery.fail(
+					f'{fn.qualname}: {obj_type.qualname if obj_type else "?"}.__iter__() returned '
+					f'{iterator_type.qualname if iterator_type else "?"}, which does not conform to '
+					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node)}',
+					node,
+				)
+			iter_call = ast.Call(
+				func = ast.Attribute( value = node.iter, attr = '__iter__', ctx = ast.Load() ),
+				args = [], keywords = [],
+			)
+			ast.copy_location( iter_call, node )
+			return self._desugar_iterator_for( fn, node, iterator_type, next_fn, extra_locals, iter_call )
 		self.discovery.fail(
-			f'{fn.qualname}: a for loop containing yield needs __len__ and __getitem__ (or __next__ '
-			f'returning T|None) on {obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+			f'{fn.qualname}: for loop requires an IteratorProtocol[T] or Iterable[T] conformer, got '
+			f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
 			node,
 		)
 
-	def _new_for_obj_field( self, node: ast.For, obj_type: Type, extra_locals: dict[str,Type] ) -> tuple[str,ast.stmt]:
+	def _new_for_obj_field( self, node: ast.For, obj_type: Type, extra_locals: dict[str,Type], iter_expr: 'ast.expr|None' = None ) -> tuple[str,ast.stmt]:
 		''' registers a fresh __for_obj_N promoted local (type obj_type,
-		initial value node.iter) and returns (obj_name, obj_init) - shared
-		by _desugar_indexable_for/_desugar_iterator_for. The caller MUST
+		initial value node.iter, or `iter_expr` when given - an Iterable[T]
+		conformer's own for-loop desugars to iterating its __iter__() result
+		instead of the conformer itself, see _desugar_general_for's own
+		Iterable[T] branch) and returns (obj_name, obj_init) - shared
+		by _desugar_iterator_for. The caller MUST
 		place obj_init as the FIRST statement of its own returned list, so
 		it (re-)runs every time program execution reaches this desugared
 		for-loop, not just once - see below for why that matters.
@@ -1256,119 +1267,10 @@ class TypeResolver:
 		self._for_desugar_counter += 1
 		obj_name = f'__for_obj_{unique}'
 		extra_locals[ obj_name ] = obj_type
-		obj_init = ast.Assign( targets = [ ast.Name( id = obj_name, ctx = ast.Store() ) ], value = node.iter )
+		obj_init = ast.Assign( targets = [ ast.Name( id = obj_name, ctx = ast.Store() ) ], value = iter_expr if iter_expr is not None else node.iter )
 		ast.copy_location( obj_init, node )
 		obj_init.compiler_synthesized_for_loop_temp = True
 		return obj_name, obj_init
-
-	def _maybe_unwrap_call( self, call_expr: ast.expr, return_type: Type|None, node: ast.AST, msg: str ) -> tuple[ast.expr,Type|None]:
-		''' PLAN_GENERATORS.md Phase 1 - if return_type is Result[T,E]-
-		shaped, wraps call_expr in an explicit `.unwrap(msg)` (confirmed
-		via a real repro: list[T].__getitem__/__len__ are BOTH fallible,
-		Result[T,IndexError] - and unlike lowering.py's own _lower_for_
-		over_indexable, which auto-propagates via _maybe_consume_result
-		because IT'S lowering an ordinary for-loop where the enclosing
-		function might legitimately be Result-shaped, a generator's own
-		$$__next__ never is in v1 - propagation isn't an option here,
-		only a panic. Safe: every call site this is used for has a
-		structurally-guaranteed-safe precondition (an index strictly less
-		than a just-read length), matching the exact reasoning _lower_
-		for_range's own raw-AddWrap bypass already relies on for its
-		increment - this is that same guarantee, just for a fallible
-		METHOD instead of arithmetic) and returns (wrapped_expr, T);
-		otherwise returns (call_expr, return_type) unchanged - not every
-		indexable's own __len__/__getitem__ need be fallible, only
-		list[T]'s confirmed to be. '''
-		shape = self._result_shape( return_type )
-		if shape is None:
-			return call_expr, return_type
-		unwrap_call = ast.Call(
-			func = ast.Attribute( value = call_expr, attr = 'unwrap', ctx = ast.Load() ),
-			args = [ ast.Constant( value = msg ) ], keywords = [],
-		)
-		ast.copy_location( unwrap_call, node )
-		return unwrap_call, shape[0]
-
-	def _desugar_indexable_for( self, fn: Function, node: ast.For, obj_type: Type, getitem_fn: Function, extra_locals: dict[str,Type] ) -> list[ast.stmt]:
-		''' `for x in <expr>: BODY` (has __len__/__getitem__) desugars into
-		the exact while-loop equivalent lowering.py's own _lower_for_over_
-		indexable already builds at IR level - here as source AST feeding
-		the existing Phase 2 while-unit machinery unchanged. __for_obj
-		itself is the ONLY new promoted local (_new_for_obj_field);
-		__for_len/__for_index are ordinary scalar generator locals,
-		already covered by _collect_generator_locals with zero changes.
-		Both __len__() and __getitem__() are called explicitly (not via
-		`[]` subscript syntax, which hard-codes propagation) and passed
-		through _maybe_unwrap_call - see its own docstring for why panic,
-		not propagation, is the only option available to a generator's
-		own $$__next__. x's own element type is __getitem__'s UNWRAPPED
-		return type, spelled as a bare ast.Name(id=elem_type.stem) for its
-		own AnnAssign annotation - an ordinary promoted local like any
-		other since PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) lifted
-		_collect_generator_locals' former scalar-only restriction, RC-typed
-		elem_type included. '''
-		self.ensure_resolved( getitem_fn )
-		len_fn = self._probe_method( obj_type, '__len__' )
-		assert len_fn is not None # caller (_desugar_general_for) already confirmed this
-		self.ensure_resolved( len_fn )
-		obj_name, obj_init = self._new_for_obj_field( node, obj_type, extra_locals )
-		unique = self._for_desugar_counter
-		self._for_desugar_counter += 1
-		len_name = f'__for_len_{unique}'
-		index_name = f'__for_index_{unique}'
-
-		usize_name = ast.Name( id = 'usize', ctx = ast.Load() )
-		ast.copy_location( usize_name, node )
-		len_call = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__len__', ctx = ast.Load() ),
-			args = [], keywords = [],
-		)
-		ast.copy_location( len_call, node )
-		len_expr, _len_type = self._maybe_unwrap_call( len_call, len_fn.return_type, node, 'generator for-loop __len__() failed (unreachable)' )
-		len_init = ast.AnnAssign(
-			target = ast.Name( id = len_name, ctx = ast.Store() ), annotation = usize_name,
-			value = len_expr, simple = 1,
-		)
-		index_init = ast.AnnAssign(
-			target = ast.Name( id = index_name, ctx = ast.Store() ), annotation = usize_name,
-			value = ast.Constant( value = 0 ), simple = 1,
-		)
-		ast.copy_location( len_init, node ); ast.copy_location( index_init, node )
-
-		getitem_call = ast.Call(
-			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__getitem__', ctx = ast.Load() ),
-			args = [ ast.Name( id = index_name, ctx = ast.Load() ) ], keywords = [],
-		)
-		ast.copy_location( getitem_call, node )
-		getitem_expr, elem_type = self._maybe_unwrap_call( getitem_call, getitem_fn.return_type, node, 'generator for-loop index is structurally guaranteed in bounds (unreachable)' )
-
-		elem_type_name = ast.Name( id = elem_type.stem, ctx = ast.Load() ) if elem_type is not None else ast.Name( id = '?', ctx = ast.Load() )
-		ast.copy_location( elem_type_name, node )
-		target_bind = ast.AnnAssign(
-			target = ast.Name( id = node.target.id, ctx = ast.Store() ), annotation = elem_type_name,
-			value = getitem_expr, simple = 1,
-		)
-		ast.copy_location( target_bind, node )
-
-		increment = ast.AugAssign( target = ast.Name( id = index_name, ctx = ast.Store() ), op = ast.Add(), value = ast.Constant( value = 1 ) )
-		wrapped_increment = ast.With(
-			items = [ ast.withitem(
-				context_expr = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'wrap_arithmetic', ctx = ast.Load() ),
-				optional_vars = None,
-			) ],
-			body = [ increment ],
-		)
-		ast.copy_location( wrapped_increment, node )
-
-		while_node = ast.While(
-			test = ast.Compare( left = ast.Name( id = index_name, ctx = ast.Load() ), ops = [ ast.Lt() ], comparators = [ ast.Name( id = len_name, ctx = ast.Load() ) ] ),
-			body = [ target_bind ] + list( node.body ) + [ wrapped_increment ],
-			orelse = [],
-		)
-		ast.copy_location( while_node, node )
-		ast.fix_missing_locations( while_node )
-		ast.fix_missing_locations( len_init ); ast.fix_missing_locations( index_init )
-		return [ obj_init, len_init, index_init, while_node ]
 
 	def _type_annotation_ast( self, t: Type, node: ast.AST ) -> ast.expr:
 		''' builds a fresh annotation-position AST expression resolving
@@ -1402,7 +1304,7 @@ class TypeResolver:
 		ast.copy_location( result, node )
 		return result
 
-	def _desugar_iterator_for( self, fn: Function, node: ast.For, obj_type: Type, next_fn: Function, extra_locals: dict[str,Type] ) -> list[ast.stmt]:
+	def _desugar_iterator_for( self, fn: Function, node: ast.For, obj_type: Type, next_fn: Function, extra_locals: dict[str,Type], iter_expr: 'ast.expr|None' = None ) -> list[ast.stmt]:
 		''' `for x in <expr>: BODY` where <expr> has __next__() ->
 		Result[T,E] (E always includes StopIteration - PLAN_GENERATORS.md's
 		StopIteration reversal; most commonly: another generator).
@@ -1460,7 +1362,7 @@ class TypeResolver:
 		else:
 			remaining_error_type = self.discovery._get_or_create_union( remaining_leaves )
 
-		obj_name, obj_init = self._new_for_obj_field( node, obj_type, extra_locals )
+		obj_name, obj_init = self._new_for_obj_field( node, obj_type, extra_locals, iter_expr )
 		unique = self._for_desugar_counter
 		self._for_desugar_counter += 1
 		next_name = f'__for_next_{unique}'
@@ -3044,6 +2946,23 @@ class TypeResolver:
 			self.schedule( next_return_type )
 
 			backing_cls = self._build_generator_backing_class( fn, locals_decl, defer_sites, send_type )
+			# for-loop dispatch (lowering.py's _stmt_For) requires strict
+			# IteratorProtocol[T]/Iterable[T] protocol conformance, no duck-
+			# typing - every generator object IS an IteratorProtocol[T] (it
+			# has __next__, built just below), so it needs this declared the
+			# same way TupleStorage._declare_sequence_conformance already
+			# declares Sequence[T]/Iterable[T] for a homogeneous tuple's own
+			# backing class. Named "IteratorProtocol", not "Iterator" -
+			# "Iterator[...]" is already claimed by this file's OWN, unrelated
+			# GeneratorType-annotation special form (`Iterator[Result[T,E]]`
+			# as a generator function's own return type) - see lib/builtins/
+			# __init__.py's IteratorProtocol[T] docstring for the full "why".
+			# Conformance is a NAME-only check (discovery.py's _validate_
+			# protocol_conformance never inspects __next__'s own signature),
+			# so this is safe regardless of error_type's actual width
+			# (StopIteration | whatever else this generator declares)
+			iterator_protocol = self.discovery.find_name( 'IteratorProtocol', fn.node )
+			backing_cls.protocols.append( self.discovery._get_or_create_specialization( iterator_protocol, [ elem_type ] ))
 			resume_fn = self._build_generator_next_function( fn, backing_cls, locals_decl, next_return_type, pending_bare_return_assigns, defer_sites, send_type )
 			# PLAN_GENERATORS.md Phase C - __next__()/send(v) thin wrappers
 			# over $$__resume__ (built just above) - only when SendType is
@@ -5646,20 +5565,38 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				base = actual.base if isinstance( actual, Specialization ) else actual
 				if isinstance( base, TupleType ):
 					base = base.backing
-				skip_reentrant = isinstance( actual, Specialization ) and id( actual ) in self.resolver.monomorphizer._building
-				if isinstance( actual, Specialization ) and isinstance( base, RCClass ) and not skip_reentrant:
-					# _building guard - see mpy_types.py's identical guard on
-					# TypeVar.bound_satisfied_by for the full "why".
-					base = self.resolver.monomorphizer.monomorphize_class( actual )
-				if isinstance( base, RCClass ) and not skip_reentrant:
-					# skip_reentrant gates the whole lookup - see Lowering.
-					# _unify_type_param's identical, more-detailed comment on
-					# why a wrong bind is worse than none here.
+				if isinstance( base, RCClass ):
 					for entry in base.protocols:
-						if isinstance( entry, Specialization ) and entry.base is declared.bound.base:
-							for b_arg, e_arg in zip( declared.bound.args, entry.args ):
-								self._unify_type_param( type_params, b_arg, e_arg, bindings )
-							break
+						if not ( isinstance( entry, Specialization ) and entry.base is declared.bound.base ):
+							continue
+						entry_args = entry.args
+						if isinstance( actual, Specialization ):
+							# base here is still the ABSTRACT class template
+							# (actual.base) - substitute its declared protocol
+							# args against actual.args directly, rather than
+							# fully building actual via monomorphize_class
+							# first. That used to be needed to get a
+							# substituted base.protocols, but re-entered
+							# monomorphize_class whenever actual was its OWN
+							# still-in-progress build (e.g. set[T]'s __iter__
+							# body needing set[T]'s own Sequence[T] conformance
+							# to reverse-unify T) - the _building guard then
+							# skipped the whole lookup, silently leaving T
+							# unbound forever (confirmed by a real repro: the
+							# shared _sequence_iter's return type never
+							# resolved past its abstract T the first time any
+							# caller's __iter__ actually needed it). A
+							# protocol entry's own .base is always the
+							# Protocol, never `actual`'s class, so substituting
+							# just its args can't re-enter monomorphize_class
+							# for `actual` at all - no guard needed.
+							entry_args = [
+								self.resolver.monomorphizer.substitute_type_params( a, base.type_params or [], actual.args )
+								for a in entry_args
+							]
+						for b_arg, e_arg in zip( declared.bound.args, entry_args ):
+							self._unify_type_param( type_params, b_arg, e_arg, bindings )
+						break
 			return True
 		if isinstance( declared, Specialization ):
 			# _as_specialization, not a bare isinstance(actual, Specialization)
