@@ -16,11 +16,43 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 	if ptr is None:
 		panic( 'out of memory' )
 	if compiler.target.debug:
+		# debug-mode alloc-site tracking (dump_live_objects) - records this
+		# buffer in a SIDE-TABLE tracking node (compiler.__debug_raw_track__,
+		# emitter_c.py's __metalpy_debug_raw_track), not a header prefixed
+		# onto the real block: `ptr` itself is left completely unchanged
+		# (some existing code queries the OS allocator directly on a
+		# sys.alloc'd pointer - see free()'s own HeapSize/malloc_usable_size
+		# calls just below - so it has to stay the EXACT pointer the OS
+		# allocator returned). No per-call-site location is captured here
+		# (unlike RC objects - see ir.Allocate.loc/emitter_c.py's
+		# dump_live_objects support): this is a LIBRARY-INTERNAL call site
+		# (every list/dict/... backing buffer in the whole program funnels
+		# through this one alloc[T]), not the user's own call site, and
+		# there's no caller-location intrinsic in this codebase to reach
+		# past it - dump_live_objects reports these aggregated as one
+		# generic "raw sys.alloc buffers" group instead (count + total live
+		# bytes), not broken down further. Good enough for the leak-hunting
+		# this feature exists for; a real per-site breakdown is future work
+		# if it's ever needed.
+		compiler.__debug_raw_track__( ptr, byte_count )
 		# 0xCD ("uninitialized" - MSVC debug heap's own convention)
 		# this helps catch bugs like use-after-free
 		# we don't zero-fill because that can also hide bugs
 		mempoison( ptr, byte_count )
 	return ptr
+
+def dump_live_objects() -> None:
+	''' debug builds only: prints every still-live RC object and sys.alloc[T]
+	raw buffer, grouped by (class, allocation site) for RC objects (a single
+	aggregated group for raw buffers - see alloc[T]'s own comment on why),
+	with a count and total byte size per group. Call this near the end of
+	main() to check for leaks - there is no atexit/CRT-teardown hook (works
+	the same under --no-crt), so nothing calls it automatically. A no-op in
+	a release build: no allocation-site tracking exists there to dump (the
+	`if` below folds away entirely - compiler.dump_live_objects() itself is a
+	hard compile error if reached outside a debug build). '''
+	if compiler.target.debug:
+		compiler.dump_live_objects()
 
 # ---------------------------------------------------------------------------
 # stdout/stderr: minimal stream objects (see TODO.txt - full IO interfaces,
@@ -94,6 +126,10 @@ def free( ptr: Ptr[u8] ) -> None:
 	from windows.kernel32 import GetProcessHeap, HeapFree, HeapSize, HEAP_SIZE_FAILED
 	heap = GetProcessHeap()
 	if compiler.target.debug:
+		# drop alloc[T]'s own debug-mode side-table tracking entry (see its
+		# comment) - `ptr` itself is untouched, still the exact block
+		# HeapAlloc returned
+		compiler.__debug_raw_untrack__( ptr )
 		# same "0xCD before the real free" idea as alloc[T]'s own mempoison
 		# call above, just on the other end of the block's lifetime - this
 		# is what actually catches a use-after-free (reading/writing
@@ -110,9 +146,9 @@ def free( ptr: Ptr[u8] ) -> None:
 def free( ptr: Ptr[None] ) -> None:
 	from crt import free as _crt_free, malloc_usable_size as _crt_malloc_usable_size
 	if compiler.target.debug:
-		# see the Windows branch's own comment above - same mempoison-
-		# before-free, via glibc/macOS's own "how big was this block"
-		# query (crt.malloc_usable_size, os-split there)
+		# see the Windows branch's own comment above - same untrack-then-
+		# mempoison-before-free sequence
+		compiler.__debug_raw_untrack__( ptr )
 		size: usize = _crt_malloc_usable_size( ptr )
 		mempoison( ptr, size )
 	_crt_free(ptr)

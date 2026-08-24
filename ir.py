@@ -625,6 +625,7 @@ class Allocate( Instruction ): # Foo.__allocate__( field = value, ... )
 	dest: Temp
 	cls: ClassLike
 	fields: dict[str,Operand]
+	loc: str|None = None # 'file:line' of the allocating source, debug-mode object tracking only (see emitter_c.py's dump_live_objects support) - set centrally by Lowering._emit, not by individual construction sites
 
 	def test_repr( self ) -> str:
 		return f'Allocate( dest={self.dest!r}, cls={self.cls.qualname!r}, fields={self.fields!r} )'
@@ -882,6 +883,54 @@ class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no fi
 
 	def test_repr( self ) -> str:
 		return f'SizeOf( dest={self.dest!r}, type={self.type.qualname!r} )'
+
+# --- debug-mode alloc-site tracking (dump_live_objects, PLAN in
+# i-want-to-investigate-kind-garden.md) - raw sys.alloc[T] buffers have no
+# ObjectHeader of their own. Tracked via a SIDE TABLE (a small tracking node,
+# allocated straight from the OS allocator, holding just {link, ptr, size})
+# rather than a hidden prefix header in front of the real block: sys.alloc[T]
+# must keep returning the EXACT pointer the OS allocator gave it, unchanged -
+# confirmed necessary by a real regression, not just caution: an earlier
+# version of this feature offset the returned pointer past a prefix header,
+# which broke sys_free_mempoison_test.py's direct HeapSize(ptr) query (HeapSize
+# requires the literal block-start pointer HeapAlloc returned; any offset
+# pointer is a hard crash, not just a wrong answer) - some existing code
+# legitimately queries the OS allocator directly on a sys.alloc'd pointer, so
+# that pointer's identity has to stay exactly what the OS handed back.
+# Threaded into a SEPARATE global list from the RC one (not the RC objects'
+# list - the two header shapes differ, so keeping them apart avoids any
+# runtime type-tag/reinterpret-cast dance when dump_live_objects walks
+# either). debug-only; compile_time_transformer folds every call site of
+# these away entirely in a release build (same `if compiler.target.debug:`
+# guard mempoison already uses), so emitter_c.py only ever sees these when
+# _target_debug is True. ---
+
+@dataclass( kw_only = True )
+class DebugRawTrack( Instruction ): # compiler.__debug_raw_track__(ptr, size) -> None - records a freshly allocated raw sys.alloc[T] buffer in the side-table tracking list (best-effort: silently does nothing if the side allocation itself fails - never crashes the real allocation path)
+	ptr: Operand
+	size: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugRawTrack( ptr={self.ptr!r}, size={self.size!r} )'
+
+@dataclass( kw_only = True )
+class DebugRawUntrack( Instruction ): # compiler.__debug_raw_untrack__(ptr) -> None - removes ptr's side-table tracking entry (a no-op if ptr was never tracked, e.g. a release-mode-allocated pointer reaching a debug-mode free somehow - shouldn't happen, but this stays a safe no-op rather than a crash either way)
+	ptr: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugRawUntrack( ptr={self.ptr!r} )'
+
+@dataclass( kw_only = True )
+class DumpLiveObjects( Instruction ): # compiler.dump_live_objects() - walks both debug-tracking lists (RC objects + raw sys.alloc buffers), aggregates by (type_name, alloc_loc), prints counts/bytes via _Stdout.write - see emitter_c.py's __metalpy_dump_live_objects
+	def test_repr( self ) -> str:
+		return 'DumpLiveObjects()'
+
+@dataclass( kw_only = True )
+class DebugUntrackRC( Instruction ): # debug-mode alloc tracking only (see DumpLiveObjects) - untracks an RC object's own debug_link WITHOUT going through release_object's normal refcount-hits-zero path. Needed by compiler.__raw_free__'s own codegen (Lowering._lower_compiler_raw_free): a not-yet-fully-alive RCClass whose __init__ failed is freed DIRECTLY via sys.free(), bypassing release_object entirely - confirmed as a real bug otherwise (not just theoretical): the object's own ir.Allocate already tracked it into the global RC list, so skipping this leaves a dangling entry pointing at memory that's about to be freed, which corrupts the list the moment anything else touches it (a real MSVC-only crash this fixed, root-caused via bisection - clang/gcc happened not to reorder/reuse the freed block in a way that tripped it, in the same debug-mode test run)
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugUntrackRC( value={self.value!r} )'
 
 @dataclass( kw_only = True )
 class Return( Instruction ):
