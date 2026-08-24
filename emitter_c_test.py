@@ -9991,7 +9991,105 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# t[a:b] on a homogeneous tuple - compile-time-constant bounds
+			# build a fresh, DIFFERENT fixed-arity tuple[T,...] via field
+			# copies (_lower_tuple_slice), not a runtime __getitem__(slice)
+			# dispatch (no single return type could express "the arity
+			# depends on the caller's own literal bounds"). Covers a full
+			# slice, a middle slice, and both one-sided forms
+			( 'homogeneous_tuple_slice_various_bounds', '''
+def main() -> i32:
+	t: tuple[i32, i32, i32, i32] = ( 10, 20, 30, 40 )
+	mid = t[1:3]
+	if mid[0] != 20 or mid[1] != 30:
+		return 1
+	full = t[0:4]
+	if full[0] != 10 or full[1] != 20 or full[2] != 30 or full[3] != 40:
+		return 2
+	no_upper = t[2:]
+	if no_upper[0] != 30 or no_upper[1] != 40:
+		return 3
+	no_lower = t[:2]
+	if no_lower[0] != 10 or no_lower[1] != 20:
+		return 4
+	return 0
+''' ),
+			# out-of-range/inverted bounds clamp instead of erroring, same
+			# tolerance every other slice target already has
+			# (_resolve_slice_bounds, lib/builtins/__init__.py) - t[2:99]
+			# clamps stop to 4, still 2+ elements after clamping so it
+			# doesn't hit the arity<2 rejection
+			( 'homogeneous_tuple_slice_out_of_range_clamps', '''
+def main() -> i32:
+	t: tuple[i32, i32, i32, i32] = ( 10, 20, 30, 40 )
+	clamped = t[2:99]
+	if clamped[0] != 30 or clamped[1] != 40:
+		return 1
+	return 0
+''' ),
+			# RC-correctness: slicing must incref each copied element (a
+			# fresh, independent owner alongside the source tuple's own
+			# field), and release them again when the slice itself goes out
+			# of scope - checked via before/during/after compiler.refcount()
+			# rather than just "didn't crash"
+			( 'homogeneous_tuple_slice_rc_element_refcount_correct', '''
+class Elem:
+	pass
+
+def take_slice( t: tuple[Elem,Elem,Elem,Elem] ) -> usize:
+	s = t[1:3]
+	return compiler.refcount( s[0] )
+
+def main() -> i32:
+	t: tuple[Elem,Elem,Elem,Elem] = ( Elem(), Elem(), Elem(), Elem() )
+	with compiler.wrap_arithmetic:
+		before: usize = compiler.refcount( t[1] )
+		during: usize = take_slice( t )
+		if during != before + 1:
+			return 1
+		after: usize = compiler.refcount( t[1] )
+		if after != before:
+			return 2
+	return 0
+''' ),
 		] )
+
+	def test_homogeneous_tuple_slice_non_constant_bound_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	i: usize = 1',
+			'	s = t[i:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'tuple slicing requires compile-time-constant integer bounds', errors[0] )
+
+	def test_homogeneous_tuple_slice_to_single_element_is_rejected( self ) -> None:
+		# arity 0/1 tuple types are out of scope (same deferral _expr_Tuple's
+		# own tuple-LITERAL construction already applies) - not a silent
+		# clamp/coercion, a clear compile error pointing at the t[i] alternative
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	s = t[1:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'tuple slicing to 1 element(s) is not supported', errors[0] )
+
+	def test_homogeneous_tuple_slice_step_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	s = t[0:3:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
 
 	def test_tuple_unpack_arity_mismatch_is_rejected( self ) -> None:
 		self._run( '\n'.join([
