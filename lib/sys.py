@@ -305,7 +305,7 @@ def _build_argv() -> list[str]:
 				buf = bytearray( byte_len )
 				memcpy( buf.get_ptr(), compiler.cast( ConstPtr[u8], w ), byte_len )
 				s: str = utf16.decode( buf ).unwrap( 'sys.argv: invalid UTF-16 in argument' )
-				result.append( s ).unwrap( 'sys.argv: too many arguments' )
+				result.append( s )
 				i += 1
 	return result
 
