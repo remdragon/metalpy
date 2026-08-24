@@ -2348,7 +2348,23 @@ class FunctionLowering:
 				)
 				self._pending_temps = []
 				operand = self._lower_expr( var.init, var.type )
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: this global's own
+				# initializing write needs the SAME critical section an
+				# ordinary `global X; X = ...` reassignment gets, in case the
+				# initializer (or something it calls) spawns a thread that
+				# reassigns this global before this write itself runs - see
+				# cfg.py's assign_global_initializer's own docstring for the
+				# confirmed race this closes. The Assign has to stay INSIDE
+				# the same critical section as the Acquire/decref (not
+				# reconstructed after the fact) for the identical reason
+				# _cfg_assign's own write-side split already documents: it's
+				# its own separate textual read/write of `var` in the
+				# generated C, not covered by whatever the decref touched.
+				for instr in self._cfg.assign_global_initializer( var ):
+					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
+				if cfg.rc_leaves( var.type ):
+					self._emit( ir.ReleaseGlobalLock( var = var ))
 				for t in reversed( self._pending_temps ):
 					self._emit( ir.DeleteTemp( temp = t ))
 

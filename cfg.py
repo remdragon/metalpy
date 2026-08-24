@@ -1902,6 +1902,42 @@ class CFGState:
 			self._push( dest, dest.type, OwnState.OWNED )
 		return instructions
 
+	def assign_global_initializer( self, dest: Variable ) -> list[ir.Instruction]:
+		''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: the Acquire+decref-
+		current-value half of a global's OWN initializing write (lowering.py's
+		run_global emits the actual ir.Assign itself, then ir.ReleaseGlobalLock,
+		mirroring _cfg_assign's own write-side split for the identical "the
+		Assign is its own separate textual read/write in the generated C"
+		reason). Structurally IDENTICAL to assign()'s own `dest.is_global`
+		write branch above, with ONE deliberate difference: this does NOT
+		flip dest.reassigned_outside_init - a global written only by its own
+		initializer, never reassigned from a function body, is still provably
+		single-write and needs no lock at all (that flag's own comment); this
+		method's own Acquire/Release markers become no-ops for exactly that
+		case, gated at EMISSION time the same way every other marker already
+		is (see the is_alias branch above's identical "final value isn't
+		known yet here" reasoning).
+
+		Needed despite that "provably single-write" framing because it was
+		never quite true: a global's initializer can call an ordinary
+		function, and SYNTAX.md documents that as fully legal ("not
+		restricted to a compile-time constant... can call ordinary functions
+		at real program-startup time") - if that function spawns a thread
+		(joined or not), the spawned thread can reassign THIS global (or read
+		it) through the fully-locked ordinary `global X; X = ...` path WHILE
+		__metalpy_init() is still running, concurrently with this global's
+		own unlocked initializing write - confirmed as a real, reachable
+		race, not a theoretical one, once a global with a real initializer
+		exists alongside ANY reassignment of it from a thread-reachable
+		function. rc_leaves(dest.type) early-return matches assign()'s own -
+		Part A (and this fix) is scoped to RC-typed globals only, same as
+		everywhere else in this mechanism. '''
+		if not rc_leaves( dest.type ):
+			return []
+		instructions: list[ir.Instruction] = [ ir.AcquireGlobalLock( var = dest ) ]
+		instructions += self._decref_instructions( dest.type, dest ) # reads dest's CURRENT (zero-initialized, pre-first-write) value - release_object()'s own NULL check makes this a safe no-op the very first time
+		return instructions
+
 	def attr_assign( self, attr: Variable, src: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:
 		''' self.<attr> = value, inside __init__ specifically - mirrors
 		assign()'s own fresh/replace logic almost exactly, but deliberately

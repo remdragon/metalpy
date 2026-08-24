@@ -12,8 +12,27 @@ What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
 `ir.py`/`mpy_types.py`):
 - Detection: `Variable.reassigned_outside_init`, flipped by `cfg.py`'s
   `assign()` the moment a `global X; X = ...` reassignment is lowered
-  (never for a global's own module-level initializer - `lower_global()`
-  bypasses `cfg.assign()` entirely, confirmed directly).
+  (never for a global's own module-level initializer). A global's own
+  initializing write goes through a *separate* method,
+  `cfg.py`'s `assign_global_initializer()` (called from `lowering.py`'s
+  `run_global()`) - structurally identical to `assign()`'s own
+  `dest.is_global` write branch, but deliberately does NOT flip
+  `reassigned_outside_init` itself. **Status update:** this used to be a
+  real gap - a global's initializer can call an ordinary function
+  (SYNTAX.md: initializers aren't restricted to compile-time constants,
+  they run real code at program-startup time), and that function can spawn
+  a thread which concurrently reassigns the SAME global through the
+  fully-locked ordinary path *while* `__metalpy_init()` is still running
+  other initializers - a genuine, reachable torn-write-plus-leak race
+  (confirmed: 8/20 sabotaged runs leaked a `Box`, 0/25 with the fix -
+  `thread_safe_globals_test.py`'s `test_global_init_write_race_stress`).
+  Fixed by giving a global's own initializing write the same
+  Acquire/decref-current-value/Assign/Release critical section an ordinary
+  reassignment gets, gated at emission time the same way every other
+  marker already is - so a global that's genuinely never reassigned from a
+  function body still costs nothing (the markers become no-ops), while one
+  that is gets real protection for its own first write too, not just
+  later ones.
 - A per-global lock, synthesized only for globals that end up needing
   one - platform-shaped, not a single portable primitive (A.3's own
   documented asymmetry): on Windows, a bare `static void*` holding an
@@ -669,11 +688,18 @@ machinery:
   Instead, every protected global's `pthread_mutex_init()` call is emitted
   directly into the synthesized `__metalpy_init()` function body's own
   text, unconditionally ahead of the topologically-sorted global-init
-  calls - safe with no ordering analysis needed at all, since (as
-  `Variable.reassigned_outside_init`'s own comment establishes) a global's
-  OWN init instructions never contain an `ir.AcquireGlobalLock`/
-  `ReleaseGlobalLock` marker in the first place; only ordinary function
-  bodies do, and those only ever run after `__metalpy_init()` returns.
+  calls - safe with no ordering analysis needed at all. **Correction:** a
+  global's own init instructions CAN now contain
+  `ir.AcquireGlobalLock`/`ReleaseGlobalLock` markers too (see the Status
+  section's update above - a global's own initializing write needs the
+  same protection an ordinary reassignment does, since its own initializer
+  can spawn a thread that reassigns it concurrently). The ordering claim
+  here stays true regardless, for a different reason than originally
+  stated: every lock's `pthread_mutex_init()` runs first, unconditionally,
+  before *any* global initializer runs (this global's own included) - so
+  by the time a global's own init function can reach its
+  `AcquireGlobalLock`, the lock it acquires is already initialized, same
+  as for a later ordinary-function reassignment.
 
 ### A.4 Where to insert acquire/release (the A.3 lock case)
 

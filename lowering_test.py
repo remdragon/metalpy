@@ -10264,8 +10264,11 @@ class FetchUnicodeTableTests( unittest.TestCase ):
 		self.compiler.run()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		g = self.compiler.globals[0]
-		assign = g.instructions[0]
-		self.assertIsInstance( assign, ir.Assign )
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: an RC-typed global's own
+		# init now leads with AcquireGlobalLock/Decref before the Assign
+		assigns = [ i for i in g.instructions if isinstance( i, ir.Assign ) ]
+		self.assertEqual( len( assigns ), 1 )
+		assign = assigns[0]
 		const = assign.src
 		self.assertIsInstance( const, ir.Const )
 		self.assertIsInstance( const.value, bytes )

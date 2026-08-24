@@ -4383,8 +4383,14 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	# comment) a program using only one of the two directions. Only
 	# emitting what's actually referenced avoids that instead of
 	# suppressing the warning after the fact.
-	uses_incref = any( isinstance( instr, ir.Incref ) for lf in compiler.functions for instr in lf.instructions )
-	uses_decref = any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for lf in compiler.functions for instr in lf.instructions )
+	# a global's own init (PLAN_THREAD_SAFE_SHARED_STATE.md Part A: its own
+	# initializing write now decrefs its pre-init NULL value too) can be the
+	# ONLY source of a Decref/Incref in the whole program - compiler.globals
+	# has to be scanned alongside compiler.functions, not just the latter
+	uses_incref = any( isinstance( instr, ir.Incref ) for lf in compiler.functions for instr in lf.instructions ) \
+		or any( isinstance( instr, ir.Incref ) for g in compiler.globals for instr in g.instructions )
+	uses_decref = any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for lf in compiler.functions for instr in lf.instructions ) \
+		or any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for g in compiler.globals for instr in g.instructions )
 	parts: list[str] = [ _PROLOGUE_HEADER ]
 	if uses_incref:
 		parts.append( _PROLOGUE_RETAIN )
