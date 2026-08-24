@@ -259,15 +259,18 @@ def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
 # very first statements of main() - before __metalpy_init() (which is what
 # actually calls _build_argv() below, via this file's own `argv: list[str]
 # = _build_argv()` global) ever runs. Real argc/argv are only available at
-# a normal CRT-linked entry; a no_crt/freestanding build has no OS-provided
-# values to capture (mainCRTStartup calls main(0, NULL)), so argv is just
-# empty there - an accepted limitation, not a bug (GetCommandLineA()+manual
-# parsing would be the way to add it later if that's ever needed).
+# a normal CRT-linked entry - a no_crt/freestanding build's mainCRTStartup
+# calls main(0, NULL), so argv would silently be empty there regardless of
+# the real command line. @requires_crt on _build_argv forces the whole
+# build onto the real CRT-linked entry point the moment anything actually
+# reaches sys.argv, so this can't silently happen - see SYNTAX.md's own
+# "Forcing CRT Linking" section.
 # ---------------------------------------------------------------------------
 
 _raw_argc: i32 = 0
 _raw_argv: Ptr[Ptr[u8]] = None
 
+@requires_crt
 def _build_argv() -> list[str]:
 	result: list[str] = list[str]()
 	if _raw_argc <= 0:
