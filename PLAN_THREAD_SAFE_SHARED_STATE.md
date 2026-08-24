@@ -8,10 +8,10 @@ direct and narrowed reads/writes, on both Windows and Linux.** Part B's own
 below) is implemented and merged.
 
 **Part B itself (the actual per-object lock) - status update: implemented,
-all previously-blocking bugs fixed, full 3-compiler suite (clang/MSVC/
-WSL-gcc) clean.** Not yet merged to master as of this writing - see
-"Remaining before merge" below for what's still outstanding (real
-concurrent stress tests, matching Part A's own verification bar).
+all previously-blocking bugs fixed, verified under real concurrent stress
+(see below), full 3-compiler suite (clang/MSVC/WSL-gcc) clean.** Not yet
+merged to master as of this writing - implementation soundness and the
+merge decision are separate questions.
 
 What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
 mirroring Part A's global-lock markers, keyed on the receiver operand
@@ -91,11 +91,42 @@ a real compile-and-run repro (not just reasoning), worth recording:**
    directly inside `_object_header_prologue()` itself, ahead of the
    struct definition it protects.
 
-**Remaining before merge:** real concurrent stress tests for Part B
-(mirroring `thread_safe_globals_test.py`'s own multi-thread read/write
-races), matching the verification bar every other piece of this plan
-was held to before being called done - `thread_safe_fields_test.py`
-currently only covers single-threaded refcount accounting.
+**Real concurrent stress tests - status update: added, confirmed real.**
+`thread_safe_fields_test.py` now also covers, mirroring `thread_safe_
+globals_test.py`'s own three-way split for Part A:
+- **A direct read/write of a plain, non-Optional RC-typed field on a
+  shared object** (40 OS threads, 8 reassigning while 32 concurrently
+  read, 2000 iterations each - `test_concurrent_field_read_write_stress`).
+- **A narrowed read of a union-typed field** (`self.g: Box|None`, `if
+  self.g is not None: b: Box = self.g` read from 32 threads while 8
+  concurrently reassign it via a plain `self.g = Box(n)` SetAttr, 3000
+  iterations each, no manual lock at all -
+  `test_narrowed_field_read_concurrent_stress`). Deliberately built
+  around a pre-initialized field reassigned to a new value, not the
+  `if self.g is None: self.g = compute()` lazy-init shape Part A's own
+  equivalent global test uses - that specific "narrow after an in-branch
+  assignment" shape is NOT currently supported for a field at all
+  (confirmed via a real repro, `self.g: expected Box, got Box|NoneType`),
+  a genuine, separate, pre-existing compiler gap unrelated to Part B,
+  out of scope for this plan.
+- **A plain scalar field** (`test_scalar_field_unaffected` - functional
+  only, confirms Part B's own `cfg.rc_leaves`-gated early return still
+  correctly skips locking a field with no RC leaves at all, the field-
+  shaped counterpart of Part A's own `test_scalar_global_unaffected`).
+
+Both concurrency tests were confirmed to be REAL fixes, not no-ops that
+happen to pass: temporarily sabotaging `_is_real_field_receiver` to
+always return `False` (disabling Part B's locking entirely, the single
+chokepoint every read/write wrap site is gated on) reproduced a genuine
+crash (`STATUS_ILLEGAL_INSTRUCTION`, the same signature class this whole
+mechanism exists to close) in 15/15 runs of the read/write stress test
+and 5/5 of the narrowed-read one; 20/20 runs clean again once restored.
+Full 3-compiler suite (clang/MSVC/WSL-gcc, 1749 tests) clean.
+
+**Part B is now considered verified to the same bar Part A was** - no
+further blockers are tracked in this document. Whether/when to actually
+merge is a separate decision from whether the implementation itself is
+sound.
 
 **Field-visibility enforcement (the Prerequisite section below) - status
 update: implemented and merged**, not just designed. `Discovery.check_
