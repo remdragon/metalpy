@@ -3671,17 +3671,19 @@ def _emit_or_jump( instr: ir.OrJump ) -> list[str]:
 def _emit_leaf_dispatch_case(
 	dispatch: 'list[ir.ThrowLeaf]', leaf_type: Type, payload_expr: str,
 	epilogue: 'list[ir.Instruction]', target: str|None, return_slot: 'Variable|None',
-	function: Function, declared: set[str],
+	function: Function, declared: set[str], inline_exit: 'tuple[Variable,Variable,str]|None' = None,
 ) -> list[str]:
 	''' the body of ONE leaf's own `case`/single-leaf branch inside
 	_emit_or_throw/_emit_raise - either dispatches into an except handler
 	(a leaf covered by `dispatch`) or falls back to exactly OrReturn's/
-	OrJump's own propagate-to-caller shape (an uncovered leaf) - see
-	ir.OrThrow's and ir.Raise's own docstrings. Matched by qualname, same
-	convention _union_member/_atomic_leaves already use. Shared by both
+	OrJump's own propagate-to-caller shape (an uncovered leaf, target is
+	None/a real epilogue label respectively), or (inline_exit set) a multi-
+	statement @inline splice's own local result_var/exited_flag/merge_label
+	- see ir.OrThrow's and ir.Raise's own docstrings. Matched by qualname,
+	same convention _union_member/_atomic_leaves already use. Shared by both
 	instructions (extracted from the pre-ir.Raise, OrThrow-only version of
-	this function) - `dispatch`/`epilogue`/`target`/`return_slot` are
-	identically-shaped fields on both.
+	this function) - `dispatch`/`epilogue`/`target`/`return_slot`/
+	`inline_exit` are identically-shaped fields on both.
 
 	Every case body here lives inside its OWN switch-case `{ }` block (see
 	_emit_or_throw/_emit_raise) - an except-clause bind Variable is
@@ -3722,26 +3724,64 @@ def _emit_leaf_dispatch_case(
 	# than instr.value.type, which for ir.Raise isn't even a Result) is
 	# equally valid.
 	epilogue_lines = _emit_instructions( epilogue, function = function, declared = declared )
+	if inline_exit is not None:
+		# PLAN_INLINE.md early-return generalization, same shape as
+		# _emit_or_return's own inline_exit handling: `function` here is the
+		# CALLER's real, enclosing C function (splicing puts everything in
+		# ONE emitted function) - result_var's own type (the splice TARGET's
+		# real return type), not function.return_type, is what the widened
+		# __err must be built as. No real return/goto-to-a-real-epilogue-
+		# label here - stow into result_var, arm exited_flag, goto merge_label
+		result_var, exited_flag, merge_label = inline_exit
+		inline_ret_ctype = c_type( result_var.type )
+		inline_e_fn = _result_error_type( result_var.type )
+		tag_f, data_f, _ok_f, err_f = _result_tag_data_names( result_var.type )
+		result_c = _emit_operand( result_var )
+		flag_c = _emit_operand( exited_flag )
+		return [
+			'\t\t{',
+			f'\t\t{inline_ret_ctype} __err;',
+			f'\t\t__err.{tag_f} = 1;',
+			*_emit_widen_error( f'__err.{data_f}.{err_f}', inline_e_fn, payload_expr, leaf_type ),
+			*epilogue_lines,
+			f'\t\t{result_c} = __err;',
+			f'\t\t{flag_c} = true;',
+			f'\t\tgoto {_c_label(merge_label)};',
+			'\t\t}',
+		]
 	if target is None:
+		# own `{ }` block (not just the surrounding switch-case's, which
+		# _emit_raise's single-class/non-union caller doesn't even have -
+		# it emits this bare, with no enclosing `if`/`switch` at all): two
+		# separate uncovered `raise`s of the SAME single-class error type
+		# reaching the same C scope (e.g. two @inline splices of the same
+		# target, or two sibling top-level raises) would otherwise both
+		# declare `__err` in that one shared scope - a real "redefinition
+		# of '__err'" clang error, confirmed by a real repro (two @inline
+		# splice call sites of the same raise() target in one function)
 		ret_ctype = c_type( function.return_type )
 		tag_f, data_f, _ok_f, err_f = _result_tag_data_names( function.return_type )
 		e_fn = _result_error_type( function.return_type )
 		return [
+			'\t\t{',
 			f'\t\t{ret_ctype} __err;',
 			f'\t\t__err.{tag_f} = 1;',
 			*_emit_widen_error( f'__err.{data_f}.{err_f}', e_fn, payload_expr, leaf_type ),
 			*epilogue_lines,
 			'\t\treturn __err;',
+			'\t\t}',
 		]
 	assert return_slot is not None
 	slot = _emit_operand( return_slot )
 	tag_f, data_f, _ok_f, err_f = _result_tag_data_names( return_slot.type )
 	e_fn = _result_error_type( return_slot.type )
 	return [
+		'\t\t{',
 		f'\t\t{slot}.{tag_f} = 1;',
 		*_emit_widen_error( f'{slot}.{data_f}.{err_f}', e_fn, payload_expr, leaf_type ),
 		*epilogue_lines,
 		f'\t\tgoto {_c_label(target)};',
+		'\t\t}',
 	]
 
 def _declare_dispatch_binds( dispatch: 'list[ir.ThrowLeaf]', declared: set[str] ) -> list[str]:
@@ -3795,13 +3835,13 @@ def _emit_or_throw( instr: 'ir.OrThrow', function: Function, declared: set[str] 
 			payload_expr = f'({err_expr}).{op_data}.{_field_name(f"v_{op_attr.stem}")}'
 			lines.append( f'\t\t\tcase {i}: {{' )
 			lines.extend( '\t' + l for l in _emit_leaf_dispatch_case(
-				instr.dispatch, op_attr.type, payload_expr, instr.epilogue, instr.target, instr.return_slot, function, declared,
+				instr.dispatch, op_attr.type, payload_expr, instr.epilogue, instr.target, instr.return_slot, function, declared, instr.inline_exit,
 			))
 			lines.append( '\t\t\t}' ) # every case body above ends in goto/return - no break needed, never falls through
 		lines.append( '\t\t}' )
 	else:
 		lines.extend( _emit_leaf_dispatch_case(
-			instr.dispatch, e_op, err_expr, instr.epilogue, instr.target, instr.return_slot, function, declared,
+			instr.dispatch, e_op, err_expr, instr.epilogue, instr.target, instr.return_slot, function, declared, instr.inline_exit,
 		))
 	lines.append( '\t}' )
 	lines.append( f'\t{dest} = ({value}).{data_f}.{ok_f};' )
@@ -3825,13 +3865,13 @@ def _emit_raise( instr: 'ir.Raise', function: Function, declared: set[str] ) -> 
 			payload_expr = f'({value}).{op_data}.{_field_name(f"v_{op_attr.stem}")}'
 			lines.append( f'\t\tcase {i}: {{' )
 			lines.extend( _emit_leaf_dispatch_case(
-				instr.dispatch, op_attr.type, payload_expr, instr.epilogue, instr.target, instr.return_slot, function, declared,
+				instr.dispatch, op_attr.type, payload_expr, instr.epilogue, instr.target, instr.return_slot, function, declared, instr.inline_exit,
 			))
 			lines.append( '\t\t}' ) # every case body above ends in goto/return - no break needed, never falls through
 		lines.append( '\t}' )
 	else:
 		lines.extend( _emit_leaf_dispatch_case(
-			instr.dispatch, e_op, value, instr.epilogue, instr.target, instr.return_slot, function, declared,
+			instr.dispatch, e_op, value, instr.epilogue, instr.target, instr.return_slot, function, declared, instr.inline_exit,
 		))
 	return lines
 

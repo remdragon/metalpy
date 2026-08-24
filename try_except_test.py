@@ -778,6 +778,233 @@ def main() -> i32:
 '''
 
 
+# --- @inline multi-statement splice prelude - or_throw()/raise generalization
+# --- (PLAN_INLINE.md's own inline_exit shape, now also covering ir.OrThrow/
+# --- ir.Raise, not just OrReturn/OrJump) -------------------------------------
+
+_OR_THROW_INSIDE_INLINE_SPLICE_COVERED_BY_CALLER_TRY = '''
+class ErrorA:
+	pass
+
+def risky( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		return Result.Err( ErrorA() )
+	return Result.Ok( 7 )
+
+@cstruct
+class Adder:
+	base: i32
+
+	@inline
+	def add_checked( self, bad: bool ) -> i32:
+		v: i32 = risky( bad ).or_throw() # covered by the CALL SITE's own enclosing try below
+		result: i32 = 0
+		with compiler.wrap_arithmetic:
+			result = self.base + v
+		return result
+
+def main() -> i32:
+	a: Adder = Adder( base = 100 )
+	try:
+		if a.add_checked( False ) != 107:
+			return 1
+	except ErrorA:
+		return 2
+	try:
+		x: i32 = a.add_checked( True )
+		return 3
+	except ErrorA:
+		pass # dispatches straight to this handler - splicing must not corrupt main()'s own frame
+	return 0
+'''
+
+_OR_THROW_INSIDE_INLINE_SPLICE_UNCOVERED_PROPAGATES_TO_CALLER_RETURN = '''
+class ErrorA:
+	pass
+
+def risky( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		return Result.Err( ErrorA() )
+	return Result.Ok( 7 )
+
+@cstruct
+class Adder:
+	base: i32
+
+	@inline
+	def add_checked( self, bad: bool ) -> Result[i32, ErrorA]:
+		# no enclosing try at either call site below - ErrorA is uncovered,
+		# must propagate straight through the splice into add_checked's own
+		# Result[i32,ErrorA] value at the call site - the pre-fix latent bug
+		# (return_slot wired to the CALLER's own return_value_var) would
+		# have corrupted main()'s own i32 return slot instead
+		v: i32 = risky( bad ).or_throw()
+		result: i32 = 0
+		with compiler.wrap_arithmetic: # must be SKIPPED entirely on the error path
+			result = self.base + v
+		return Result.Ok( result )
+
+def main() -> i32:
+	a: Adder = Adder( base = 100 )
+	match a.add_checked( False ):
+		case Result.Ok( v ):
+			if v != 107:
+				return 1
+		case Result.Err( e ):
+			return 2
+	match a.add_checked( True ):
+		case Result.Ok( v ):
+			return 3
+		case Result.Err( e ):
+			pass
+	return 0
+'''
+
+_RAISE_INSIDE_INLINE_SPLICE_COVERED_BY_CALLER_TRY = '''
+class ErrorA:
+	pass
+
+@cstruct
+class Counter:
+	value: i32
+
+	@inline
+	def bumped( self, by: i32 ) -> i32:
+		if by < 0:
+			raise ErrorA()
+		result: i32 = 0
+		with compiler.wrap_arithmetic:
+			result = self.value + by
+		return result
+
+def main() -> i32:
+	c: Counter = Counter( value = 10 )
+	try:
+		if c.bumped( 5 ) != 15:
+			return 1
+	except ErrorA:
+		return 2
+	try:
+		x: i32 = c.bumped( -3 )
+		return 3
+	except ErrorA:
+		pass
+	return 0
+'''
+
+_RAISE_INSIDE_INLINE_SPLICE_UNCOVERED_PROPAGATES_TO_CALLER_RETURN = '''
+class ErrorA:
+	pass
+
+@cstruct
+class Counter:
+	value: i32
+
+	@inline
+	def bumped_raise( self, by: i32 ) -> Result[i32, ErrorA]:
+		if by < 0:
+			raise ErrorA() # uncovered at either call site below
+		result: i32 = 0
+		with compiler.wrap_arithmetic:
+			result = self.value + by
+		return Result.Ok( result )
+
+def main() -> i32:
+	c: Counter = Counter( value = 10 )
+	match c.bumped_raise( 5 ):
+		case Result.Ok( v ):
+			if v != 15:
+				return 1
+		case Result.Err( e ):
+			return 2
+	match c.bumped_raise( -3 ):
+		case Result.Ok( v ):
+			return 3
+		case Result.Err( e ):
+			pass
+	return 0
+'''
+
+# mixed union error type - some leaves covered by the call site's own
+# enclosing try, others not - proves the per-leaf split (already correct,
+# untouched) still composes correctly with the new inline_exit wiring on
+# just the uncovered side.
+#
+# NOTE: the covered-leaf call site below deliberately reads the Result via
+# a receiver-position method call (.is_err()) rather than binding it to a
+# name or `match`-ing it directly inside the try body - doing either of
+# those surfaced a SEPARATE, pre-existing cfg.py bug (a named/match-bound
+# Result-shaped local declared inside a try body's own top-level statements
+# loses its epilogue entry to the try's own branch-confinement restore,
+# leaving stray RC-cleanup temps referencing declarations that never make
+# it into the emitted C - confirmed with a minimal repro using no @inline/
+# or_throw/raise at all, so unrelated to this task's own change; flagged
+# separately, not fixed here per this task's own "don't touch cfg.py"
+# scope). A bare receiver expression never gets a NAMED epilogue entry (it's
+# cleaned up via the ordinary Temp/DeleteTemp path instead), sidestepping it.
+_MIXED_UNION_OR_THROW_INSIDE_INLINE_SPLICE_PARTIAL_COVERAGE = '''
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+def risky2( which: i32 ) -> Result[i32, ErrorA | ErrorB]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	if which == 2:
+		return Result.Err( ErrorB() )
+	return Result.Ok( which )
+
+@cstruct
+class Picker:
+	base: i32
+
+	@inline
+	def pick_checked( self, which: i32 ) -> Result[i32, ErrorA | ErrorB]:
+		v: i32 = risky2( which ).or_throw() # ErrorA covered only at the try-wrapped call site below; both leaves uncovered at the other two, needing this declared union
+		result: i32 = 0
+		with compiler.wrap_arithmetic:
+			result = self.base + v
+		return Result.Ok( result )
+
+def main() -> i32:
+	p: Picker = Picker( base = 100 )
+	code: i32 = 0
+	try:
+		# runtime: risky2(1) always hits ErrorA, dispatched straight to the
+		# handler below from INSIDE the splice - code stays 0, the is_err()
+		# check below never even runs
+		if p.pick_checked( 1 ).is_err():
+			code = 2
+		else:
+			code = 1
+	except ErrorA:
+		pass
+	if code != 0:
+		result: i32 = 0
+		with compiler.wrap_arithmetic:
+			result = 100 + code
+		return result # would only fire if ErrorA weren't actually dispatched above
+
+	# no enclosing try here - both leaves uncovered, must propagate through
+	# the splice into pick_checked's own declared Result[i32,ErrorA|ErrorB]
+	match p.pick_checked( 2 ): # runtime: hits ErrorB
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
+
+	match p.pick_checked( 0 ): # runtime: Ok
+		case Result.Ok( v ):
+			if v != 100:
+				return 2
+		case Result.Err( e ):
+			return 3
+	return 0
+'''
+
+
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile try/except tests' )
 class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 	def test_matched_leaf_binds_payload_and_fully_handled_needs_no_result_return( self ) -> None:
@@ -842,6 +1069,21 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_tuple_except_clause_one_leaf_never_thrown_still_not_dead( self ) -> None:
 		self.assert_programs_run([ ( 'tuple_except_one_leaf', _TUPLE_EXCEPT_CLAUSE_ONE_LEAF_NEVER_THROWN_STILL_NOT_DEAD ) ])
+
+	def test_or_throw_inside_inline_splice_covered_by_caller_try( self ) -> None:
+		self.assert_programs_run([ ( 'or_throw_inline_covered', _OR_THROW_INSIDE_INLINE_SPLICE_COVERED_BY_CALLER_TRY ) ])
+
+	def test_or_throw_inside_inline_splice_uncovered_propagates_to_caller_return( self ) -> None:
+		self.assert_programs_run([ ( 'or_throw_inline_uncovered', _OR_THROW_INSIDE_INLINE_SPLICE_UNCOVERED_PROPAGATES_TO_CALLER_RETURN ) ])
+
+	def test_raise_inside_inline_splice_covered_by_caller_try( self ) -> None:
+		self.assert_programs_run([ ( 'raise_inline_covered', _RAISE_INSIDE_INLINE_SPLICE_COVERED_BY_CALLER_TRY ) ])
+
+	def test_raise_inside_inline_splice_uncovered_propagates_to_caller_return( self ) -> None:
+		self.assert_programs_run([ ( 'raise_inline_uncovered', _RAISE_INSIDE_INLINE_SPLICE_UNCOVERED_PROPAGATES_TO_CALLER_RETURN ) ])
+
+	def test_mixed_union_or_throw_inside_inline_splice_partial_coverage( self ) -> None:
+		self.assert_programs_run([ ( 'or_throw_inline_mixed', _MIXED_UNION_OR_THROW_INSIDE_INLINE_SPLICE_PARTIAL_COVERAGE ) ])
 
 
 # --- compile-error coverage (no real C compiler needed) ---------------------
@@ -1149,7 +1391,14 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		errors = self.discovery.errors.errors
 		self.assertTrue( any( 'generator' in e for e in errors ), errors )
 
-	def test_raise_inside_inline_splice_prelude_is_rejected( self ) -> None:
+	def test_raise_inside_inline_splice_prelude_uncovered_still_requires_result_return( self ) -> None:
+		# @inline splice prelude no longer rejects raise/or_throw outright
+		# (see try_except_test.py's TryExceptRealCompileTests own real-
+		# compile coverage for the positive path) - but the ordinary
+		# or_throw()/raise coverage requirement still applies: an uncovered
+		# leaf still needs the INLINE TARGET's own declared return type to
+		# be a covering Result[_,_] (bumped here stays plain i32), same as
+		# it would for a non-spliced function
 		code = '\n'.join([
 			'class ErrorA: pass',
 			'',
@@ -1169,7 +1418,7 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 			'	return c.bumped( 5 )',
 		])
 		errors = self._lower_and_get_errors( code, 'main' )
-		self.assertTrue( any( '@inline' in e and 'raise' in e for e in errors ), errors )
+		self.assertTrue( any( 'ErrorA' in e and 'Result' in e for e in errors ), errors )
 
 	def test_raise_uncovered_leaf_with_insufficient_function_return_is_a_compile_error( self ) -> None:
 		code = '\n'.join([

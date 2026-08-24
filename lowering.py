@@ -5347,8 +5347,12 @@ class FunctionLowering:
 
 		No bare `raise` (Python's own re-raise - there is no ambient
 		current exception in this design) and no `raise ... from ...`
-		(exception chaining); same generator-body/@inline-splice-prelude
-		rejections as .or_throw() (_lower_or_throw) - mirrors its wording. '''
+		(exception chaining); same generator-body rejection as .or_throw()
+		(_lower_or_throw). The @inline-splice-prelude case is now
+		generalized (ir.Raise.inline_exit) rather than rejected - same
+		carve-out _emit_or_throw's own uncovered-leaf branch applies, and
+		same PLAN_RETURN_INFERENCE.md sentinel-state rejection as
+		_consume_checked_result/_emit_or_throw's own. '''
 		if node.exc is None:
 			self.lowering.discovery.fail(
 				f'bare raise (re-raise) is not supported - there is no ambient current exception in this design, '
@@ -5358,9 +5362,11 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'raise ... from ... (exception chaining) is not supported: {ast.unparse(node)}', node )
 		if self._current_fn is not None and self._current_fn.is_generator_next:
 			self.lowering.discovery.fail( f'raise is not supported inside a generator body yet: {ast.unparse(node)}', node )
-		if self._in_inline_splice_prelude:
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
 			self.lowering.discovery.fail(
-				f'@inline: raise is not supported before the final return of a multi-statement body: {ast.unparse(node)}', node,
+				f'@inline: or_throw()/raise that could propagate an error is not yet supported before the '
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
+				node,
 			)
 
 		value = self._lower_expr( node.exc, None )
@@ -5393,6 +5399,14 @@ class FunctionLowering:
 			return
 
 		tracked_operand = value if isinstance( value, Variable ) else None
+		# see _emit_or_throw's own identical inline_scope carve-out/comment
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
+		if inline_scope is not None:
+			replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+			self._flush_pending_temps()
+			self._cfg.mark_inline_scope_captured()
+			self._emit( ir.Raise( value = value, dispatch = dispatch, epilogue = replay, inline_exit = inline_scope ))
+			return
 		label = self._cfg.current_epilogue_label( tracked_operand )
 		if label is not None:
 			self._flush_pending_temps()
@@ -14668,21 +14682,14 @@ class FunctionLowering:
 		__setitem__/AugAssign, a discarded Result statement, a Result
 		flowing into a T-typed context) via _emit_or_throw - see its own
 		docstring. Only the checks specific to the explicit `.or_throw()`
-		SYNTAX (no-args, generator-body rejection, inline-splice rejection)
-		live here. '''
+		SYNTAX (no-args, generator-body rejection) live here - the @inline-
+		splice-prelude case is now generalized (ir.OrThrow.inline_exit),
+		same carve-out _emit_or_throw's own uncovered-leaf branch applies. '''
 		if node.args or node.keywords:
 			self.lowering.discovery.fail( f'or_throw() takes no arguments: {ast.unparse(node)}', node )
 		if self._current_fn is not None and self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
 				f'or_throw() is not supported inside a generator body yet: {ast.unparse(node)}', node,
-			)
-		if self._in_inline_splice_prelude:
-			# unlike or_return(), or_throw() has no inline_exit shape at all
-			# (ir.OrThrow's own docstring) - rejected outright rather than
-			# generalized, for now. The general auto-or_throw() rule has its
-			# own narrow carve-out for this same gap - see _auto_or_throw.
-			self.lowering.discovery.fail(
-				f'@inline: or_throw() is not supported before the final return of a multi-statement body: {ast.unparse(node)}', node,
 			)
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		if shape is None:
@@ -14748,7 +14755,18 @@ class FunctionLowering:
 		unconditional OrReturn/OrJump - there's no way to thread a per-leaf
 		dispatch table through it) - this replays its checked-result
 		bookkeeping (unchecked-result clearing, epilogue-label lookup) by
-		hand instead, then builds ir.OrThrow directly. '''
+		hand instead, then builds ir.OrThrow directly.
+
+		Uncovered-leaf propagation out of a multi-statement @inline splice's
+		pre-return statements mirrors _consume_checked_result's own
+		self._inline_scope_vars[-1] carve-out exactly (same PLAN_RETURN_
+		INFERENCE.md sentinel-state rejection too - see its own comment). '''
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
+			self.lowering.discovery.fail(
+				f'@inline: or_throw()/raise that could propagate an error is not yet supported before the '
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
+				node,
+			)
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		assert shape is not None
 		result_type, error_cls = shape
@@ -14789,14 +14807,29 @@ class FunctionLowering:
 			self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch ))
 		else:
 			tracked_operand = receiver if isinstance( receiver, Variable ) else None
-			label = self._cfg.current_epilogue_label( tracked_operand )
-			if label is not None:
-				self._emit( ir.OrThrow(
-					dest = unwrapped, value = receiver, dispatch = dispatch, target = label, return_slot = self._return_value_var,
-				))
-			else:
+			# see _consume_checked_result's own identical inline_scope carve-
+			# out/comment - reached from inside a multi-statement @inline
+			# splice's pre-return statements, the uncovered-leaf propagation
+			# must land in the SPLICE's own result_var/exited_flag/merge_label,
+			# never the caller's real return_slot/epilogue - always via the
+			# direct return_()-replay shape (mirrors OrReturn's own inline_exit,
+			# never OrJump's shared-scope-label optimization - simpler, and
+			# just as correct, at the cost of not sharing ladder code across
+			# multiple early-exit sites within the same splice)
+			inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
+			if inline_scope is not None:
 				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
-				self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch, epilogue = replay ))
+				self._cfg.mark_inline_scope_captured()
+				self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch, epilogue = replay, inline_exit = inline_scope ))
+			else:
+				label = self._cfg.current_epilogue_label( tracked_operand )
+				if label is not None:
+					self._emit( ir.OrThrow(
+						dest = unwrapped, value = receiver, dispatch = dispatch, target = label, return_slot = self._return_value_var,
+					))
+				else:
+					replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+					self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch, epilogue = replay ))
 
 		# same borrow-then-incref rationale as _consume_checked_result's own
 		# identical tail (see its own comment) - a no-op for a non-RC
@@ -14828,27 +14861,14 @@ class FunctionLowering:
 		caller's value is necessarily fallible (mirrors _maybe_consume_
 		result's own identical "pass through, don't reject" contract).
 
-		The @inline multi-statement splice prelude is a narrow, deliberate
-		carve-out: ir.OrThrow has no inline_exit shape (see its own
-		docstring / _lower_or_throw's own outright rejection of the real
-		`.or_throw()` syntax there) - falls back to the EXISTING OrReturn/
-		OrJump+inline_exit path (_consume_checked_result) unchanged instead
-		of a redesign. Arithmetic already relied on this fallback before
-		this change; every other newly-auto-consuming site now gets it too,
-		for free, the moment it's reached from inside a splice prelude. '''
+		Reached from inside a multi-statement @inline splice's pre-return
+		statements exactly like any other call site now (ir.OrThrow.
+		inline_exit) - no separate carve-out needed any more; _emit_or_throw
+		itself routes the uncovered-leaf fallback into the splice's own
+		result_var/exited_flag/merge_label. '''
 		shape = self.lowering._type_resolver._result_shape( value.type )
 		if shape is None:
 			return value if want_result else None
-		result_type, error_cls = shape
-		if self._in_inline_splice_prelude:
-			if not pre_checked:
-				result_cls = self.lowering.discovery.find_name( 'Result', node )
-				self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
-			unwrapped = self._consume_checked_result( node, value, result_type, extra = None )
-			if not want_result:
-				self._emit( ir.MarkUsed( operand = unwrapped ))
-				return None
-			return unwrapped
 		return self._emit_or_throw( node, value, want_result, alternatives = alternatives, pre_checked = pre_checked )
 
 	def _maybe_auto_consume_result( self, node: ast.AST, operand: ir.Operand, expected_type: Type|None, alternatives: str, *, context: str|None = None ) -> ir.Operand|None:
