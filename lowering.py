@@ -6744,6 +6744,30 @@ class FunctionLowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
+	def _lower_branch_condition( self, test: ast.expr ) -> ir.Operand:
+		''' shared by _stmt_If/_stmt_While: lowers a statement-level branch
+		condition, then immediately flushes any temps retained while
+		evaluating it (PLAN_THREAD_SAFE_SHARED_STATE.md Part B - e.g. a
+		chained field receiver, `self.a.b`) - BEFORE the caller emits its
+		own JumpIfFalse/branches, not after. Both callers' own branches can
+		diverge early (a while loop's body re-enters this same test every
+		iteration; an if's own branch can return/break/continue, skipping
+		the enclosing statement's normal once-per-statement flush entirely
+		for that path) - either way, deferring the flush past the branch
+		point leaves it as dead code on any path that doesn't fall through
+		to the shared join point, permanently over-retaining whatever the
+		condition retained. Safe to flush even though `test` itself is one
+		of the flushed temps: ir.DeleteTemp is a pure bookkeeping no-op at
+		emission time ("C block scoping already handles temp lifetime" -
+		emitter_c.py's own comment), so `test`'s C variable stays perfectly
+		readable immediately after. Not used by _expr_IfExp - a ternary's
+		own condition can never contain a return/break/continue (it's an
+		expression, not a statement), so its already-existing once-per-
+		statement flush never has an early-exit path to go missing on. '''
+		cond = self._lower_truth_test( test )
+		self._flush_pending_temps()
+		return cond
+
 	def _stmt_While( self, node: ast.While ) -> None:
 		if node.orelse:
 			self.lowering.discovery.fail( 'while/else is not supported', node )
@@ -6754,28 +6778,7 @@ class FunctionLowering:
 		# repeated block, same as _stmt_If's test) so it's genuinely
 		# re-evaluated every time the bottom Jump loops back
 		self._emit( ir.Label( name = start_label ))
-		test = self._lower_truth_test( node.test )
-		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: the condition is lowered
-		# ONCE here (Python-level), but the resulting C instructions sit
-		# physically between start_label and the back-edge Jump below, so
-		# they RE-EXECUTE every real iteration. Any RC temp retained while
-		# evaluating it (e.g. Part B's own retain-on-read for a chained
-		# field receiver, `self.a.b`) needs a decref EVERY iteration too -
-		# the ordinary once-per-statement flush _lower_stmt's own wrapper
-		# provides only fires once, AFTER this whole method returns,
-		# confirmed as a real per-iteration leak (compiler.refcount()
-		# regression: a generator's own `while i < b.v:`, b a captured
-		# field, leaked one reference per resumption). Flushed here,
-		# unconditionally, before JumpIfFalse even reads `test` - safe
-		# even though `test` itself is one of the flushed temps:
-		# ir.DeleteTemp is a pure bookkeeping no-op at emission time ("C
-		# block scoping already handles temp lifetime" - emitter_c.py's own
-		# comment), so `test`'s C variable stays perfectly readable
-		# immediately after. Every OTHER temp the condition created (in
-		# particular any Part-B-retained receiver) gets its real decref
-		# here instead, every single iteration, exactly matching how many
-		# times the matching Incref actually ran.
-		self._flush_pending_temps()
+		test = self._lower_branch_condition( node.test )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
 		# continue_captured unused here - start_label (this loop's own
@@ -7029,6 +7032,23 @@ class FunctionLowering:
 			self.lowering.schedule( iter_fn.return_type )
 			iterator_dest = self._new_temp( iter_fn.return_type )
 			self._emit( ir.Call( dest = iterator_dest, target = iter_fn, receiver = obj, args = [], kwargs = {} ))
+			# obj's own receiver use ends right here - __iter__() built its
+			# own independently-retained iterator (e.g. Part B's own retain-
+			# on-read for a chained field receiver, `self.a.b`, or a fresh
+			# Call/Allocate result), so if obj was itself a genuinely fresh/
+			# owned temp, it needs releasing NOW, not deferred to the natural
+			# end of this statement (see _lower_for_over_iterator's own
+			# identical reasoning for iterator_dest below) - the loop body
+			# below can return/break early, well before this statement's own
+			# generic end-of-statement flush would ever run. A bare aliasing
+			# read (obj already borrowed from an existing binding, e.g. `for
+			# x in some_local_iterable:`) is unaffected: is_fresh_temp is
+			# False there, so this is a no-op, matching its existing (already
+			# correct) behavior of never releasing a borrowed reference.
+			if self._cfg.is_fresh_temp( obj ):
+				for instr in self._cfg.delete_temp( obj ):
+					self._emit( instr )
+				self._emit( ir.DeleteTemp( temp = obj ))
 			next_fn = self.lowering._find_iterator_next_method( iterator_dest.type )
 			if next_fn is None:
 				self.lowering.discovery.fail(
@@ -7295,6 +7315,47 @@ class FunctionLowering:
 		unique = self._label_id
 		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
 		self._emit( ir.Assign( dest = obj_var, src = obj ))
+		# obj_var holds the iterator this loop drives via __next__() for its
+		# ENTIRE body, unlike _stmt_If/_stmt_While's own condition temps
+		# (needed only up to the branch point) - it can't be released the
+		# instant it's bound, only once the loop truly ends, on EVERY exit
+		# path: normal exhaustion, break (both converge at end_label below),
+		# and an early return/continue-out-of-an-enclosing-construct reached
+		# from inside the loop body, which skips end_label entirely. Only a
+		# genuinely fresh/owned obj (a real Call/Allocate result, or Part B's
+		# own retain-on-read for a chained field receiver, `self.a.b`) needs
+		# this at all - a bare aliasing read (`for x in some_local_iterator:`)
+		# never took an extra reference in the first place, so obj_var stays
+		# a plain, unreleased borrow, matching this function's existing
+		# (correct) behavior for that case. untrack_temp here hands the
+		# release responsibility to the registered defer below instead of
+		# leaving it as an ordinary pending temp - this statement's own
+		# generic end-of-statement flush would otherwise still try to
+		# release it too, once the defer already has (a double-free) or,
+		# worse, only ever release it there at all, which is unreachable
+		# dead code on any early-return exit (the exact bug this mirrors
+		# from _stmt_If's own identical fix).
+		def _make_obj_decref_stmt() -> ast.stmt:
+			# a FRESH node every call, never reused across the two sites this
+			# is called from (defer registration below, and the disarm-and-
+			# call-directly site right after end_label) - mirrors
+			# _lower_with_context_manager's own identical _make_exit_stmt()
+			# and its own comment on why
+			call = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+				args = [ self.lowering._synth_name( obj_var.stem, node ) ], keywords = [],
+			)
+			ast.fix_missing_locations( ast.copy_location( call, node ))
+			stmt = ast.Expr( value = call )
+			ast.fix_missing_locations( ast.copy_location( stmt, node ))
+			return stmt
+
+		obj_needs_release = self._cfg.is_fresh_temp( obj )
+		obj_release_flag: Variable|None = None
+		if obj_needs_release:
+			self._cfg.untrack_temp( obj )
+			self._register_defer_block( is_err_only = False, body = [ _make_obj_decref_stmt() ], node = node, allow_inside_loop = True )
+			obj_release_flag = self._defer_flags[-1] # the one push_defer above just armed
 		next_var = self._declare_hidden_local( f'__for_next_{unique}', result_type, node )
 
 		if remaining_error_type is not None:
@@ -7383,6 +7444,22 @@ class FunctionLowering:
 			self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
+		if obj_needs_release:
+			# every non-early-return exit converges here (normal exhaustion
+			# via JumpIfTrue above, and break via break_label=end_label) -
+			# obj_var's own lexical extent ends exactly at this label, so
+			# disarm the registered defer and release it directly, right
+			# here, matching _lower_with_context_manager's own identical
+			# "disarm + direct call" pattern (see its own comment for why:
+			# without this, obj_var would leak past the for-statement's own
+			# end and only ever get released later, at the function's own
+			# eventual return/epilogue - too broad, not "when this loop
+			# ends"). An early return reached from inside the loop body
+			# never reaches this point at all - that path is exactly what
+			# the still-armed defer itself covers, replayed by _stmt_Return.
+			assert obj_release_flag is not None
+			self._emit( ir.Assign( dest = obj_release_flag, src = ir.Const( type = bool_cls, value = False )))
+			self._lower_stmt( _make_obj_decref_stmt() )
 
 	def _lower_for_over_iterator_fallible_bind(
 		self, node: ast.For, next_var: Variable, err_member: Variable, ok_member: Variable, is_err_cond: ir.Operand,
@@ -7682,20 +7759,7 @@ class FunctionLowering:
 		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
 
 	def _stmt_If( self, node: ast.If ) -> None:
-		test = self._lower_truth_test( node.test )
-		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: mirrors _stmt_While's own
-		# identical flush (see its comment for the full reasoning) - a temp
-		# retained while evaluating the condition (e.g. Part B's own retain-
-		# on-read for a chained field receiver, `self.a.b`) must be decref'd
-		# regardless of which branch runs. Without this, the ordinary once-
-		# per-statement flush _lower_stmt's wrapper provides only lands in
-		# the OUTER instruction stream after the whole if/else - dead code
-		# for any branch that terminates early (return/break/continue), so
-		# that branch's own copy of the retain never gets released. Flushed
-		# here, unconditionally, before JumpIfFalse even reads `test` - safe
-		# for the same reason _stmt_While's identical flush is (ir.DeleteTemp
-		# is a pure bookkeeping no-op at emission time).
-		self._flush_pending_temps()
+		test = self._lower_branch_condition( node.test )
 		else_label = self._new_label( 'if_else' )
 		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
 
