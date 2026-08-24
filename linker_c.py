@@ -271,6 +271,14 @@ class CcTool:
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
 		if self.name == 'cl':
+			if no_crt:
+				# a freestanding MSVC build has no CRT to supply __chkstk (the
+				# stack-probe routine cl.exe's own backend silently calls from
+				# any function prologue whose frame exceeds one page) - see
+				# _build_chkstk_obj's own docstring
+				chkstk_obj = _build_chkstk_obj( verbose = verbose )
+				if chkstk_obj is not None:
+					obj_args = obj_args + [ str( chkstk_obj ) ]
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 			if no_crt:
 				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
@@ -734,6 +742,117 @@ def find_dll( name: str ) -> Path|None:
 		if candidate.is_file():
 			return candidate
 	return None
+
+
+_CHKSTK_ASM = '''\
+; __chkstk - x64 stack-probe support routine, normally supplied by the CRT.
+; A freestanding (no_crt) MSVC build has no CRT to provide it, but cl.exe's
+; own backend still silently emits a `call __chkstk` in the prologue of any
+; function whose local frame exceeds one page (4KB) - see
+; msvc_no_crt_missing_chkstk memory. Contract (cl.exe's own, undocumented but
+; stable ABI): RAX = requested frame size in bytes; does NOT adjust RSP
+; itself (unlike the x86 32-bit _chkstk) - only touches each page from the
+; current RSP downward, in descending order, so the OS's guard-page
+; mechanism commits/traps in the same order the prologue's own subsequent
+; `sub rsp, rax` will actually access them. Skipping pages (e.g. touching
+; only the final page) can hit the WRONG guard page and crash with an
+; unrecoverable access violation instead of an ordinary, catchable stack
+; overflow.
+;
+; This is the same body (translated to MASM/Intel syntax) as LLVM
+; compiler-rt's ___chkstk_ms (x86_64/chkstk.S) - an independently-shipped,
+; long-established reimplementation of the same undocumented MSVC ABI, used
+; by GCC/Clang's own -mstack-probe. Only preserves RAX/RCX/flags, matching
+; what a compiler-inserted call site actually expects to survive.
+_TEXT SEGMENT
+
+PUBLIC __chkstk
+
+__chkstk PROC
+        push    rcx
+        push    rax
+        cmp     rax, 1000h
+        lea     rcx, [rsp+18h]
+        jb      SHORT lastpage
+probeloop:
+        sub     rcx, 1000h
+        test    qword ptr [rcx], rcx
+        sub     rax, 1000h
+        cmp     rax, 1000h
+        ja      probeloop
+lastpage:
+        sub     rcx, rax
+        test    qword ptr [rcx], rcx
+        pop     rax
+        pop     rcx
+        ret
+__chkstk ENDP
+
+_TEXT ENDS
+
+END
+'''
+
+
+def _build_chkstk_obj( verbose: bool = False ) -> Path|None:
+	'''
+	Builds (and disk-caches) __chkstk.obj, assembled from _CHKSTK_ASM via
+	ml64.exe - see _CHKSTK_ASM's own comment for why a freestanding MSVC
+	build needs this at all. Only ever called for a `cl` build (see link()'s
+	own call site) - ml64.exe lives right alongside cl.exe in VC's Hostx64\\x64
+	toolchain directory, so it's guaranteed to already be on PATH by the same
+	vcvars64 import that put cl.exe there (detect_cc's own MSVC branch).
+
+	Cannot be written as ordinary C: x64 MSVC has neither inline asm nor
+	__declspec(naked), and __chkstk's calling convention (RAX in, no
+	parameter-register/stack-frame setup, RSP left untouched) isn't
+	expressible as a callable C function signature regardless - it has to be
+	hand-assembled.
+
+	Returns None (best-effort, never fails the build) if ml64.exe can't be
+	found - the resulting build fails exactly as it did before this function
+	existed (a LNK2019 for __chkstk, but only for a program whose no_crt
+	build actually needs it).
+
+	The assembly source is fixed/constant, so the cache key is just its own
+	content hash (changes only if _CHKSTK_ASM itself is ever edited) - same
+	spirit as build_ntdll_import_lib's own cache, but with nothing per-build
+	to vary on.
+	'''
+	import hashlib
+	import tempfile
+
+	ml64 = shutil.which( 'ml64' )
+	if ml64 is None:
+		return None
+
+	key = hashlib.sha256( _CHKSTK_ASM.encode() ).hexdigest()[:16]
+	cache_dir = Path( tempfile.gettempdir() ) / 'metalpy' / 'chkstk_obj'
+	obj_path = cache_dir / f'{key}.obj'
+	if ensure_cache_dir( cache_dir ) and obj_path.is_file():
+		return obj_path
+
+	with tempfile.TemporaryDirectory() as tmp:
+		asm_path = Path( tmp ) / 'chkstk.asm'
+		out_path = Path( tmp ) / 'chkstk.obj'
+		asm_path.write_text( _CHKSTK_ASM, encoding = 'utf-8' )
+		cmd = [ ml64, '/nologo', '/c', f'/Fo{out_path}', str( asm_path ) ]
+		if verbose:
+			print( ' '.join( cmd ), file = sys.stderr )
+		result = subprocess.run( cmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True )
+		if result.returncode != 0 or not out_path.is_file():
+			print( f'WARNING - failed to assemble __chkstk.obj via ml64:\n{result.stdout}', file = sys.stderr )
+			return None
+		data = out_path.read_bytes()
+		if atomic_write_cache( obj_path, data ):
+			return obj_path
+		# shared cache dir unavailable this run - fall back to a private,
+		# uncached copy rather than a path just confirmed not to exist (same
+		# fallback shape as build_ntdll_import_lib's own)
+		fallback_fd, fallback_name = tempfile.mkstemp( suffix = '.obj', prefix = 'metalpy_chkstk_' )
+		with os.fdopen( fallback_fd, 'wb' ) as f:
+			f.write( data )
+		return Path( fallback_name )
 
 
 def _find_wide_int_runtime_lib( cc: CcTool ) -> str|None:
