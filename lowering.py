@@ -600,16 +600,21 @@ class Lowering:
 		# Ptr[T] (not ConstPtr[T]: every op here either writes through the
 		# pointer, or (atomic_load) is only meaningful on a location another
 		# thread can concurrently write - a genuinely immutable location
-		# needs no atomic access at all) with T a plain scalar. RC types are
-		# rejected deliberately: atomically swapping an RC pointer without
-		# incref/decref bookkeeping is exactly the lock-free-RC rabbit hole
-		# this intentionally stays out of (see the plan's own Context).
+		# needs no atomic access at all) with T a plain scalar OR a raw
+		# Ptr[U]/ConstPtr[U] (same single-machine-word representation as a
+		# scalar - e.g. a lock-free lazily-published cache pointer, see
+		# str.to_utf16()). Bare RC types are still rejected deliberately:
+		# atomically swapping an RC pointer without incref/decref
+		# bookkeeping is exactly the lock-free-RC rabbit hole this
+		# intentionally stays out of (see the plan's own Context) - a raw
+		# Ptr[U]/ConstPtr[U] carries no refcount, so that concern doesn't
+		# apply to it.
 		if not ( isinstance( ptr_type, Specialization ) and isinstance( ptr_type.base, Scalar ) and ptr_type.base.stem == 'Ptr' ):
 			self.discovery.fail( f'compiler.atomic_*(...) argument must be Ptr[T]: {ast.unparse(node)}', node )
 		pointee = ptr_type.args[0]
-		if not isinstance( pointee, Scalar ):
+		if not ( isinstance( pointee, Scalar ) or self._type_resolver._is_ptr_specialization( pointee )):
 			self.discovery.fail(
-				f'compiler.atomic_*(...) argument must point to a plain scalar, not '
+				f'compiler.atomic_*(...) argument must point to a plain scalar or raw pointer, not '
 				f'{pointee.qualname if pointee else "?"}: {ast.unparse(node)}',
 				node,
 			)
