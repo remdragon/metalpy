@@ -2536,6 +2536,107 @@ class ModuleVisibilityEnforcementTests( unittest.TestCase ):
 		self.assertEqual( disco.errors.errors, [] )
 
 
+class FieldVisibilityEnforcementTests( unittest.TestCase ):
+	''' the class-level `_`/`__` field-privacy counterpart to
+	ModuleVisibilityEnforcementTests above - PLAN_THREAD_SAFE_SHARED_
+	STATE.md's own "field-visibility enforcement doesn't exist today"
+	prerequisite. `__field` (not a real dunder) is accessible only from a
+	method textually inside its own defining class; `_field` is accessible
+	from that class or any (possibly indirect) subclass - see
+	Discovery.check_field_visibility's own docstring. '''
+
+	def _compile( self, files: dict[str,str], entry_source: str ) -> tuple['compiler.Compiler', discovery.Discovery]:
+		import compiler as compiler_module
+		root = Path( self._tmp )
+		for name, text in files.items():
+			path = root / name
+			path.parent.mkdir( parents = True, exist_ok = True )
+			path.write_text( text )
+		disco = discovery.Discovery( paths = [ root, Path( discovery.__file__ ).parent / 'lib' ], import_builtins = True )
+		comp = compiler_module.Compiler( disco )
+		comp.import_code( entry_source, root / '__main__.py', scope = None )
+		comp.run()
+		return comp, disco
+
+	def setUp( self ) -> None:
+		self._tmpdir = tempfile.TemporaryDirectory()
+		self._tmp = self._tmpdir.name
+		self.addCleanup( self._tmpdir.cleanup )
+
+	def test_private_field_write_rejected_from_outside_its_class( self ) -> None:
+		_comp, disco = self._compile( {}, (
+			'class Box:\n'
+			'\t__secret: i32\n'
+			'\tdef __init__( self ) -> None:\n\t\tself.__secret = 42\n'
+			'def main() -> i32:\n'
+			'\tb: Box = Box()\n'
+			'\tb.__secret = 99\n'
+			'\treturn b.__secret\n'
+		))
+		errors = [ e for e in disco.errors.errors if 'is private' in e ]
+		self.assertEqual( len( errors ), 2, disco.errors.errors ) # the write AND the read
+		self.assertTrue( all( '__main__.Box.__secret' in e for e in errors ), disco.errors.errors )
+
+	def test_private_field_allowed_within_its_own_class( self ) -> None:
+		_comp, disco = self._compile( {}, (
+			'class Box:\n'
+			'\t__secret: i32\n'
+			'\tdef __init__( self ) -> None:\n\t\tself.__secret = 42\n'
+			'\tdef get( self ) -> i32:\n\t\treturn self.__secret\n'
+			'def main() -> i32:\n'
+			'\treturn Box().get()\n'
+		))
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_protected_field_allowed_from_subclass( self ) -> None:
+		_comp, disco = self._compile( {}, (
+			'class Box:\n'
+			'\t_shared: i32\n'
+			'\tdef __init__( self ) -> None:\n\t\tself._shared = 1\n'
+			'class SubBox( Box ):\n'
+			'\tdef bump( self ) -> i32:\n\t\treturn self._shared\n'
+			'def main() -> i32:\n'
+			'\treturn SubBox().bump()\n'
+		))
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_protected_field_rejected_from_unrelated_class( self ) -> None:
+		_comp, disco = self._compile( {}, (
+			'class Box:\n'
+			'\t_shared: i32\n'
+			'\tdef __init__( self ) -> None:\n\t\tself._shared = 1\n'
+			'def main() -> i32:\n'
+			'\tb: Box = Box()\n'
+			'\treturn b._shared\n'
+		))
+		errors = [ e for e in disco.errors.errors if 'is protected' in e ]
+		self.assertEqual( len( errors ), 1, disco.errors.errors )
+		self.assertIn( '__main__.Box._shared', errors[0] )
+
+	def test_public_field_unrestricted( self ) -> None:
+		_comp, disco = self._compile( {}, (
+			'class Box:\n'
+			'\tvalue: i32\n'
+			'\tdef __init__( self ) -> None:\n\t\tself.value = 1\n'
+			'def main() -> i32:\n'
+			'\tb: Box = Box()\n'
+			'\tb.value = 2\n'
+			'\treturn b.value\n'
+		))
+		self.assertEqual( disco.errors.errors, [] )
+
+	def test_dunder_field_is_never_private( self ) -> None:
+		_comp, disco = self._compile( {}, (
+			'class Box:\n'
+			'\t__init_dummy__: i32\n'
+			'\tdef __init__( self ) -> None:\n\t\tself.__init_dummy__ = 1\n'
+			'def main() -> i32:\n'
+			'\tb: Box = Box()\n'
+			'\treturn b.__init_dummy__\n'
+		))
+		self.assertEqual( disco.errors.errors, [] )
+
+
 class OverloadTests( unittest.TestCase ):
 	def setUp( self ) -> None:
 		self.discovery = discovery.Discovery( import_builtins = False )

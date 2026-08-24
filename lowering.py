@@ -17,7 +17,7 @@ from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
-	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range, GeneratorType, Protocol,
+	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range, GeneratorType, Protocol, InheritanceChainMixin,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -3839,6 +3839,7 @@ class FunctionLowering:
 				self._cfg.unnarrow( target_key )
 			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, target.attr, target )
+			self._check_field_visibility( obj.type, attr_var, target.attr, target )
 			if isinstance( attr_var.type, FixedArrayType ):
 				# same restriction as the GetAttr (read) side - a bare C array
 				# member is never assignable via `=` (only a whole containing
@@ -4080,6 +4081,7 @@ class FunctionLowering:
 		elif isinstance( node.target, ast.Attribute ):
 			obj, writeback = self._lower_attr_target_obj( node.target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, node.target.attr, node.target )
+			self._check_field_visibility( obj.type, attr_var, node.target.attr, node.target )
 			old = self._new_temp( attr_var.type )
 			self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
 			field_is_rc = self.lowering._ensure_resolved( attr_var.type ).is_rc_pointer()
@@ -5314,6 +5316,7 @@ class FunctionLowering:
 				)
 			root = self._lower_expr( arg_node.value, None )
 			attr_var = self.lowering._attr_lookup( root.type, arg_node.attr, arg_node )
+			self._check_field_visibility( root.type, attr_var, arg_node.attr, arg_node )
 			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
 			if isinstance( attr_var.type, FixedArrayType ):
 				# compiler.addrof(x.field) where field is ElemType[N] ->
@@ -9237,6 +9240,7 @@ class FunctionLowering:
 				return self._lower_method_call( obj, node.attr, [], expected_type or method.return_type, node )
 			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
+		self._check_field_visibility( obj.type, attr_var, node.attr, node )
 		if isinstance( attr_var.type, FixedArrayType ):
 			# a bare C array member isn't assignable via `=` at all (only a
 			# whole containing struct/union is, or an explicit memcpy) - see
@@ -12892,6 +12896,56 @@ class FunctionLowering:
 		if target_cls is None:
 			return None
 		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+
+	def _check_field_visibility( self, owner_type: Type|None, attr_var: Variable, attr_name: str, ctx: ast.AST ) -> None:
+		''' PLAN_THREAD_SAFE_SHARED_STATE.md's field-visibility-enforcement
+		prerequisite: called from every genuine user-facing `obj.field`
+		read/write chokepoint (never from an internal synthesized-name
+		lookup like a tuple element's `_N` field or a narrowing probe -
+		those go through _attr_lookup directly, bypassing this). Resolves
+		which class actually DECLARES attr_name (InheritanceChainMixin.
+		field_owner - not necessarily owner_type itself, which may be a
+		subclass reached through the concrete receiver) and defers the
+		actual `_`/`__` check to discovery.check_field_visibility, the same
+		accessing-class source of truth (_current_fn.cls) _try_lower_
+		allocate_call's own private-access check just below already uses.
+		A safe no-op for anything that isn't an RCClass/CStruct field at all
+		(CUnion/TaggedUnion/CEnum members, Ptr pointees, ...) - none of
+		those have SYNTAX.md's field-privacy concept in the first place. '''
+		# unwrap to the abstract TEMPLATE, not _ensure_resolved's monomorphized
+		# concrete instantiation - field_owner/in_private_scope/in_protected_
+		# scope all compare by object IDENTITY, and _ensure_resolved hands
+		# back a fresh, per-instantiation RCClass object for a generic class
+		# (confirmed via a real false positive: monomorphized `builtins.
+		# list[i32]` methods rejected as unable to access their OWN class's
+		# `__inner`/`__lock` fields, because the receiver's and the accessing
+		# method's own .cls each independently monomorphized to a
+		# DIFFERENT-but-equal-looking object) - the abstract template is the
+		# one stable object every instantiation shares, exactly the
+		# "whichever template self/scope are each an instance of" contract
+		# in_private_scope's own docstring already documents for its `scope`
+		# side (see _try_lower_allocate_call's identical target_cls unwrap
+		# just below, which resolves this the same way for __allocate__).
+		resolved = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
+		if not isinstance( resolved, InheritanceChainMixin ):
+			return
+		defining_cls = resolved.field_owner( attr_name )
+		if defining_cls is None:
+			return
+		if self._current_fn is not None and self._current_fn.is_destructor:
+			# $$__destructor__ (type_resolver.py's _synthesize_rcclass_
+			# destructor) is built with cls=None (confirmed directly: its own
+			# Function(...) construction passes cls=None explicitly) even
+			# though it's logically "inside" its own class - its whole job is
+			# decref'ing every field, public or private, so it's exempt by
+			# construction rather than something accessing_cls=None should
+			# reject. Every other compiler-synthesized field toucher
+			# (construction/$$__new__) goes through ir.Allocate, never
+			# GetAttr/SetAttr, so this is the only synthesized-function case
+			# that reaches this check at all.
+			return
+		accessing_cls = self._current_fn.cls if self._current_fn is not None else None
+		self.lowering.discovery.check_field_visibility( attr_var, defining_cls, ctx, accessing_cls )
 
 	def _try_lower_allocate_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
 		# Class.__allocate__(field=value, ...) - a compiler-synthesized

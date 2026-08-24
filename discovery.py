@@ -805,6 +805,47 @@ class Discovery( ast.NodeVisitor ):
 			ctx,
 		)
 
+	def check_field_visibility( self, field_var: 'Variable', defining_cls: 'InheritanceChainMixin', ctx: ast.AST, accessing_cls: 'Type|None' ) -> None:
+		''' SYNTAX.md's class-level field-privacy tier, the class-scoped
+		counterpart to check_module_visibility above -
+		PLAN_THREAD_SAFE_SHARED_STATE.md's own "field-visibility enforcement
+		doesn't exist today" prerequisite (required before Part B's
+		write-once-after-__init__ exemption can be sound). `__field` (not
+		also ending `__`) is accessible only from a method textually inside
+		its own DEFINING class (mpy_types.py's Type.in_private_scope - the
+		same check Class.__allocate__() already enforces); `_field` is
+		accessible from that class or any (possibly indirect) subclass
+		(Type.in_protected_scope). `defining_cls` must be the class whose
+		OWN .names actually declares field_var (InheritanceChainMixin.
+		field_owner) - NOT necessarily the concrete receiver's type, since a
+		field can be read/written through a subclass instance.
+		`accessing_cls` is the currently-lowering method's own class
+		(FunctionLowering._current_fn.cls) - the same source of truth
+		_try_lower_allocate_call's identical private-access check already
+		uses; None (module-level code, no enclosing method) is never in
+		scope for any `_`/`__` field. A safe no-op for a public field (no
+		leading underscore) or a real dunder (`__init__`-shaped, leading AND
+		trailing `__`). '''
+		stem = field_var.stem
+		if stem.startswith( '__' ):
+			if stem.endswith( '__' ):
+				return
+			if accessing_cls is not None and defining_cls.in_private_scope( accessing_cls ):
+				return
+			self.fail(
+				f'{defining_cls.qualname}.{stem} is private - only accessible from a method of {defining_cls.qualname} itself\n'
+				f'\tnote: a field starting with \'__\' (and not also ending with \'__\') is class-private',
+				ctx,
+			)
+		elif stem.startswith( '_' ):
+			if accessing_cls is not None and defining_cls.in_protected_scope( accessing_cls ):
+				return
+			self.fail(
+				f'{defining_cls.qualname}.{stem} is protected - only accessible from {defining_cls.qualname} or a subclass\n'
+				f'\tnote: a field starting with a single \'_\' is protected',
+				ctx,
+			)
+
 	def visit( self, node: ast.AST ) -> Any:
 		method = f'visit_{node.__class__.__name__}'
 		handler = getattr( self, method, None )
