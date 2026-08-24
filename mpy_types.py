@@ -217,6 +217,24 @@ class ScopeMixin:
 		base = scope.base if isinstance( scope, Specialization ) else scope
 		return base is self # type: ignore
 
+	def in_protected_scope( self, scope: 'Type|None' ) -> bool:
+		''' the `_protected` counterpart of in_private_scope: true if `scope`
+		IS this class, or a (possibly indirect) subclass of it -
+		SYNTAX.md's single-underscore field/method tier, visible to the
+		defining class and every subclass (any depth). Only RCClass/CStruct
+		(InheritanceChainMixin) have a real base chain to walk; every other
+		ScopeMixin kind (TaggedUnion, Protocol, CUnion, CEnum - none support
+		inheritance) degrades to the identical identity check in_private_
+		scope already does, via the loop simply never starting and falling
+		through to the plain `base is self` check below. '''
+		base = scope.base if isinstance( scope, Specialization ) else scope
+		node: 'InheritanceChainMixin|None' = base if isinstance( base, InheritanceChainMixin ) else None
+		while node is not None:
+			if node is self:
+				return True
+			node = _next_chain_node( node.base )
+		return base is self # type: ignore
+
 @dataclass( kw_only = True, repr = False )
 class Scalar( Type, ScopeMixin ):
 	'''
@@ -885,6 +903,23 @@ class InheritanceChainMixin( ScopeMixin ):
 			found = node.get_local_or_raise( name ) # every real InheritanceChainMixin (RCClass/CStruct) is also a ScopeMixin
 			if found is not None:
 				return found
+			node = _next_chain_node( node.base )
+		return None
+
+	def field_owner( self, name: str ) -> 'InheritanceChainMixin|None':
+		''' the class in this chain whose OWN .names directly declares
+		`name` (not merely inherits it) - the "defining class" field-
+		visibility enforcement (Discovery.check_field_visibility) checks
+		against, since chain_lookup finds a field for any receiver in the
+		chain but a `_`/`__` field's privacy is scoped to where it was
+		actually DECLARED, not the concrete receiver type it's read
+		through. Same walk as chain_lookup, minus the resolved Variable. '''
+		node: 'InheritanceChainMixin|None' = self
+		while node is not None:
+			if node.resolve is not None:
+				node.resolve()
+			if node.get_local( name ) is not None:
+				return node
 			node = _next_chain_node( node.base )
 		return None
 

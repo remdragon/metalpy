@@ -3,10 +3,42 @@
 ## Status
 
 **Part A (module globals) implemented and confirmed correct for both
-direct and narrowed reads/writes, on both Windows and Linux.** Part B
-(instance fields, `ObjectHeader` growth) is still fully unimplemented - do
-not attempt without its own dedicated worktree/session, for the reasons
-this document's Part B section already gives.
+direct and narrowed reads/writes, on both Windows and Linux.** Part B's own
+**prerequisite** (class-level `_`/`__` field-visibility enforcement, see
+below) is now implemented and merged; Part B itself (the actual per-object
+lock, `ObjectHeader` growth, `GetAttr`/`SetAttr` acquire/release) is still
+fully unimplemented - do not attempt without its own dedicated worktree/
+session, for the reasons this document's Part B section already gives, and
+without first resolving the "Open questions" below (especially #1, the
+POSIX per-object lock primitive, and #2, confirming the reentrancy hazard
+against real generated code).
+
+**Field-visibility enforcement (the Prerequisite section below) - status
+update: implemented and merged**, not just designed. `Discovery.check_
+field_visibility` (discovery.py, mirroring `check_module_visibility`'s own
+shape) + `Type.in_protected_scope`/`InheritanceChainMixin.field_owner`
+(mpy_types.py, siblings of `in_private_scope`/`chain_lookup`) +
+`FunctionLowering._check_field_visibility` (lowering.py, wired into the 4
+genuine user-facing `obj.field` chokepoints: ordinary read, plain-assign
+write, augmented-assign, `compiler.addrof(x.field)` - deliberately NOT
+inside `_attr_lookup` itself, which is also reached by internal synthesized
+lookups like a tuple element's `_N` field that must stay unchecked).
+Confirmed via the exact repro this section's own text below gives (`b.
+__secret = 99` now a compile error) and via a real `lib/` audit: one
+genuine violation found and fixed (`datetime.timedelta`'s own `_total_us`
+field, read directly by `Date`/`Datetime` arithmetic in the same module but
+a different, non-subclass class - renamed to a public `total_us`, the
+"legitimately needs cross-class access" resolution this document's own
+Cost-mitigation-#2 discussion anticipated for the public/protected tiers).
+One real false positive found and fixed along the way, worth recording:
+the compiler-synthesized `$$__destructor__` (type_resolver.py's
+`_synthesize_rcclass_destructor`) is built with `cls=None` even though its
+whole job is decref'ing every field of its own class, public or private -
+now explicitly exempted (`Function.is_destructor`) rather than made to
+carry a real `.cls` neither its own synthesis nor anything else needed
+before now. See `discovery_test.py`'s new `FieldVisibilityEnforcementTests`
+for the regression suite. Full 3-compiler test suite (clang/MSVC/WSL-gcc)
+verified clean.
 
 What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
 `ir.py`/`mpy_types.py`):
