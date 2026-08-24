@@ -9277,13 +9277,13 @@ class FunctionLowering:
 		# class that doesn't declare one, and the same direct-Allocate shape
 		# _lower_bound_method_closure already uses to build a ClosureType
 		# value with no __init__ of its own either.
-		if len( node.elts ) < 2:
-			# arity 0/1 is a real Python ast.Tuple parsing ambiguity (a
-			# 1-tuple LITERAL needs a trailing comma to disambiguate from a
-			# plain parenthesized expression) - deferred rather than
-			# guessed at, see PLAN_TUPLE.md's own "Deferred" list. An empty
-			# `()` reaches here too (len 0) - same deferral.
-			self.lowering.discovery.fail( f'tuple literals need at least 2 elements: {ast.unparse(node)}', node )
+		# arity 0 (`()`) and arity 1 (`(x,)`) are both unambiguous at the AST
+		# level - Python's own parser never confuses either with a plain
+		# parenthesized expression (`(x)` never becomes an ast.Tuple at all;
+		# only a genuine trailing comma or empty parens do) - so both are
+		# handled the same way as any other arity here, no special-casing
+		# needed past this point.
+		#
 		# per-element expected types, threaded down the same way
 		# _lower_allocate_fields threads field.type into each field's own
 		# _lower_expr call - without this, a leaf value destined for a
@@ -9646,17 +9646,9 @@ class FunctionLowering:
 		if start > stop:
 			stop = start
 		elem_types = tuple_type.elem_types[ start:stop ]
-		# arity 0/1 results are rejected outright, same deferral _expr_Tuple's
-		# own tuple-LITERAL construction already applies (PLAN_TUPLE.md) -
-		# not attempted here either, to avoid a fresh, untested 0/1-field
-		# RCClass edge case (an empty C struct in particular isn't legal in
-		# every one of this compiler's 3 target toolchains)
-		if len( elem_types ) < 2:
-			self.lowering.discovery.fail(
-				f'tuple slicing to {len(elem_types)} element(s) is not supported (need at least 2 - '
-				f'use t[{start}] directly for a single element): {ast.unparse(node)}',
-				node,
-			)
+		# arity 0/1 results are real, valid tuple types now (0/1-arity
+		# tuple[...] annotations and literals both exist - see discovery.py's
+		# visit_Subscript/_expr_Tuple) - no special-casing needed here either
 		result_tt = self.lowering.discovery._get_or_create_tuple_type( elem_types )
 		backing_cls = self.lowering._ensure_resolved( result_tt )
 		self.lowering._schedule_rcclass_construction( backing_cls, backing_cls )

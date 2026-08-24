@@ -10052,6 +10052,21 @@ def main() -> i32:
 			return 2
 	return 0
 ''' ),
+			# arity 0/1 slice RESULTS - once 0/1-arity tuple[...] became a
+			# real, first-class type (annotation + literal, discovery.py's
+			# visit_Subscript/_expr_Tuple), _lower_tuple_slice's own earlier
+			# arity<2 rejection was lifted too - t[i:i] (empty range) and
+			# t[i:i+1] (single element) both now just build the matching
+			# tuple[] / tuple[T] result, no different from any other arity
+			( 'homogeneous_tuple_slice_arity_zero_and_one_results', '''
+def main() -> i32:
+	t: tuple[i32, i32, i32, i32] = ( 10, 20, 30, 40 )
+	one = t[1:2]
+	if one[0] != 20:
+		return 1
+	empty: tuple[()] = t[2:2]
+	return 0
+''' ),
 		] )
 
 	def test_homogeneous_tuple_slice_non_constant_bound_is_rejected( self ) -> None:
@@ -10065,20 +10080,6 @@ def main() -> i32:
 		errors = self.discovery.errors.errors
 		self.assertEqual( len( errors ), 1 )
 		self.assertIn( 'tuple slicing requires compile-time-constant integer bounds', errors[0] )
-
-	def test_homogeneous_tuple_slice_to_single_element_is_rejected( self ) -> None:
-		# arity 0/1 tuple types are out of scope (same deferral _expr_Tuple's
-		# own tuple-LITERAL construction already applies) - not a silent
-		# clamp/coercion, a clear compile error pointing at the t[i] alternative
-		self._run( '\n'.join([
-			'def main() -> i32:',
-			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
-			'	s = t[1:2]',
-			'	return 0',
-		]))
-		errors = self.discovery.errors.errors
-		self.assertEqual( len( errors ), 1 )
-		self.assertIn( 'tuple slicing to 1 element(s) is not supported', errors[0] )
 
 	def test_homogeneous_tuple_slice_step_is_rejected( self ) -> None:
 		self._run( '\n'.join([

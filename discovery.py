@@ -1111,15 +1111,21 @@ class Discovery( ast.NodeVisitor ):
 		# established casing - from a user's perspective this reads as an
 		# ordinary builtin, not compiler magic the way Callable/Closure are.
 		if isinstance( node.value, ast.Name ) and node.value.id == 'tuple':
-			arity_ok = isinstance( node.slice, ast.Tuple ) and len( node.slice.elts ) >= 2
-			if not arity_ok:
-				# arity 0/1 (bare `tuple[T]`, or no elements at all) is a
-				# real Python ast.Tuple parsing ambiguity (a 1-tuple LITERAL
-				# needs a trailing comma to disambiguate from a plain
-				# parenthesized expression) - deferred rather than guessed
-				# at, see PLAN_TUPLE.md's own "Deferred" list
-				self.fail( f'tuple[...] needs at least 2 type arguments: {ast.unparse(node)}', node )
-			elem_types = [ self.visit( elt ) for elt in node.slice.elts ] # type: ignore
+			# arity >= 2 always parses as ast.Tuple(elts=[...]) (real commas
+			# in the subscript); arity 0 (`tuple[()]`, an empty tuple LITERAL
+			# as the single slice element) parses the SAME way, with elts=[]
+			# - both handled identically here. Arity 1 (`tuple[T]`, no comma
+			# at all) is the one genuinely different shape: Python's own ast
+			# never wraps a LONE subscript index in ast.Tuple, so node.slice
+			# there is just T itself - the only way to tell "one type
+			# argument" apart from "the tuple type is itself the single
+			# argument" (e.g. `tuple[tuple[i32,i32]]`, a tuple holding one
+			# nested tuple - node.slice is an ast.Subscript there, still not
+			# an ast.Tuple) is exactly this shape check.
+			if isinstance( node.slice, ast.Tuple ):
+				elem_types = [ self.visit( elt ) for elt in node.slice.elts ]
+			else:
+				elem_types = [ self.visit( node.slice ) ]
 			return self._get_or_create_tuple_type( elem_types )
 
 		# Iterator[T] - PLAN_GENERATORS.md. Recognized textually, same

@@ -6803,29 +6803,36 @@ class Tests( unittest.TestCase ):
 		# fields' own "no __init__" path)
 		self.assertFalse( any( isinstance( instr, ir.Call ) for instr in fn.instructions ))
 
-	def test_tuple_literal_needs_at_least_two_elements( self ) -> None:
-		# a 1-element/empty tuple literal is a real Python ast.Tuple parsing
-		# ambiguity (a 1-tuple needs a trailing comma to disambiguate from a
-		# plain parenthesized expression) - deferred, see PLAN_TUPLE.md's
-		# own "Deferred" list. `(1,)` is arity 1 - still rejected here.
+	def test_tuple_literal_arity_zero_and_one_are_valid( self ) -> None:
+		# `()`/`(1,)` are both unambiguous at the AST level - Python's own
+		# parser never confuses either with a plain parenthesized expression
+		# (only a genuine trailing comma or empty parens produce a real
+		# ast.Tuple node at all) - previously rejected outright, now first-
+		# class tuple types like any other arity
 		code = '\n'.join([
 			'def main() -> None:',
-			'	t = ( 1, )',
+			'	e = ()',
+			'	one = ( 1, )',
 			'	return',
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertIn( 'at least 2 elements', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
-	def test_tuple_annotation_needs_at_least_two_type_arguments( self ) -> None:
+	def test_tuple_annotation_arity_zero_and_one_are_valid( self ) -> None:
+		# `tuple[()]` (empty parens as the single slice element - still an
+		# ast.Tuple(elts=[])) and `tuple[i32]` (no comma at all - node.slice
+		# is bare i32 itself, never wrapped in ast.Tuple) are the two
+		# distinct AST shapes discovery.py's visit_Subscript now recognizes
 		code = '\n'.join([
 			'def main() -> None:',
-			'	t: tuple[i32] = ( 1, 2 )',
+			'	e: tuple[()] = ()',
+			'	one: tuple[i32] = ( 1, )',
 			'	return',
 		])
 		self._import( code )
 		self._lower_main()
-		self.assertIn( 'at least 2 type arguments', self.discovery.errors.errors[0] )
+		self.assertEqual( self.discovery.errors.errors, [] )
 
 	def test_constant_index_lowers_to_getattr( self ) -> None:
 		code = '\n'.join([
