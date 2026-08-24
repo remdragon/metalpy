@@ -3852,6 +3852,7 @@ class FunctionLowering:
 					target,
 				)
 			operand = self._lower_expr( node.value, attr_var.type )
+			needs_field_lock = False
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> = value, inside __init__ construction itself -
 				# tracked for definite-assignment/self-escape purposes (see
@@ -3909,12 +3910,25 @@ class FunctionLowering:
 				# cfg.py doesn't track arbitrary struct instances' field
 				# CONTENTS across statements (v1 scope cut - see cfg.py's
 				# module docstring), so the current value is always read
-				# fresh here rather than consulted from any tracked state
+				# fresh here rather than consulted from any tracked state.
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: this whole
+				# sequence (read-old, decref-old/incref-new, the SetAttr
+				# below) is ONE critical section, the field-locking
+				# counterpart of Part A's identical "the Assign has to stay
+				# INSIDE the same critical section as the Acquire/decref"
+				# rule - a concurrent reader/writer on the SAME object's
+				# SAME field must never observe a state between the decref
+				# of the old value and the store of the new one.
+				needs_field_lock = self._is_real_field_receiver( obj.type )
+				if needs_field_lock:
+					self._emit( ir.AcquireFieldLock( obj = obj ))
 				old = self._new_temp( attr_var.type )
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = target.attr ))
 				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand )):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
+			if needs_field_lock:
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
@@ -4083,7 +4097,33 @@ class FunctionLowering:
 			attr_var = self.lowering._attr_lookup( obj.type, node.target.attr, node.target )
 			self._check_field_visibility( obj.type, attr_var, node.target.attr, node.target )
 			old = self._new_temp( attr_var.type )
-			self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
+			old_is_rc = bool( cfg.rc_leaves( attr_var.type )) and self._is_real_field_receiver( obj.type )
+			if old_is_rc:
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: `old` stays alive
+				# (as the iplace-dunder receiver, or as an attr_replace/
+				# _lower_binop_values operand) across evaluating node.value
+				# below, which can run arbitrary code - a bare, unretained
+				# GetAttr here would leave the exact "reader loads a pointer,
+				# gets preempted before its own incref, writer frees it"
+				# window A.3 describes, just for a field instead of a global.
+				# Retained here, under its own critical section (never held
+				# across node.value's own lowering - "lock the access, not
+				# the statement"), and registered fresh_temp so it's treated
+				# as an already-owned value the rest of this function - NOT
+				# double-counted against attr_replace's own unconditional
+				# decref of `old` below: that decref balances the FIELD's
+				# original ownership, this incref adds a SEPARATE, temp-
+				# owned reference that this statement's own pending_temps
+				# cleanup balances at the end (see _new_temp/fresh_temp) -
+				# two owners in, two decrefs out, whichever branch below runs.
+				self._emit( ir.AcquireFieldLock( obj = obj ))
+				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
+				for instr in self._cfg.incref( attr_var.type, old ):
+					self._emit( instr )
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._cfg.fresh_temp( old, attr_var.type )
+			else:
+				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
 			field_is_rc = self.lowering._ensure_resolved( attr_var.type ).is_rc_pointer()
 			if field_is_rc:
 				# no hint - see the Name branch's identical comment: a field's
@@ -4099,15 +4139,20 @@ class FunctionLowering:
 			iplace_method = self._find_iplace_dunder( attr_var.type, type( node.op ), right.type ) if field_is_rc else None
 			if iplace_method is not None:
 				# old aliases the SAME heap object attr_var's own field
-				# already points to (a plain GetAttr read, no incref of its
-				# own) - mutating it in place via __iadd__ already mutates
-				# the field's pointee; the field's own pointer value never
-				# changes, so SetAttr/writeback would be redundant (and, for
-				# writeback in particular, actively pointless - only the
-				# field's pointee changed, not the struct holding the field)
+				# already points to (Part B's own temp-owned reference on
+				# top, if old_is_rc - see its own comment above; the field's
+				# own pointer value never changes) - mutating it in place via
+				# __iadd__ already mutates the field's pointee, so SetAttr/
+				# writeback would be redundant (and, for writeback in
+				# particular, actively pointless - only the field's pointee
+				# changed, not the struct holding the field). old's own
+				# pending_temps cleanup (if old_is_rc) balances the extra
+				# temp-owned reference automatically on this early return,
+				# same as any other fresh_temp-registered value.
 				self._emit_iplace_dunder_call( node, iplace_method, old, right )
 				return
 			result = self._lower_binop_values( node, old, right, attr_var.type )
+			needs_field_lock = False
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> += value, inside __init__ construction itself -
 				# same definite-assignment/self-escape tracking an ordinary
@@ -4118,10 +4163,21 @@ class FunctionLowering:
 				# ordinary SetAttr on an already-constructed instance - `old`
 				# is exactly the CURRENT value _stmt_Assign's own Attribute
 				# branch would otherwise re-read via its own fresh GetAttr;
-				# reusing it here avoids a redundant third read
+				# reusing it here avoids a redundant third read. Its own
+				# SEPARATE critical section, same reasoning _stmt_Assign's
+				# identical branch already documents - not merged with the
+				# read-side lock above (node.value's own lowering ran in
+				# between, and could itself touch this SAME object's OTHER
+				# fields - B.4's reentrancy hazard, avoided by never holding
+				# the lock across anything but one field access).
+				needs_field_lock = self._is_real_field_receiver( obj.type )
+				if needs_field_lock:
+					self._emit( ir.AcquireFieldLock( obj = obj ))
 				for instr in self._cfg.attr_replace( attr_var.type, old, result, is_alias = False ):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = node.target.attr, value = result ))
+			if needs_field_lock:
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( node.target, ast.Subscript ):
@@ -5907,7 +5963,60 @@ class FunctionLowering:
 		# rather than an unconditional failure.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
-		operand = self._lower_expr( node.args[0], None )
+		arg_node = node.args[0]
+		if isinstance( arg_node, ast.Attribute ):
+			# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: compiler.decref(obj.
+			# field) - the synthesized destructor's own field-teardown shape
+			# (type_resolver.py's _build_field_teardown_ast, RCClass branch) -
+			# means to transfer the FIELD's own single reference directly
+			# into this decref. Lowering obj.field through the ordinary
+			# _expr_Attribute path (this function's normal `operand =
+			# self._lower_expr(...)` below) would go through Part B's own
+			# retain-on-read (B.3) first, creating a SEPARATE, independently-
+			# owned COPY - decref'ing that copy right back only cancels the
+			# extra retain, leaving the field's TRUE original reference
+			# permanently unreleased. Confirmed as a real leak, not a
+			# theoretical one: compiler.refcount() showed a Box captured by
+			# a closure environment gaining one extra reference after the
+			# closure's own teardown ran, every single time. A single
+			# atomic critical section here instead - acquire, a BARE
+			# (unretained) read, decref, release - both fixes the leak and
+			# is cheaper than the generic retain-then-immediately-undo
+			# roundtrip would have been. Only short-circuits the exact
+			# `compiler.decref(<attribute>)` shape - the OTHER established
+			# idiom this intrinsic also serves (`val: T = <read>;
+			# compiler.decref(val)`, list/dict's own element teardown,
+			# manually_decreffed's own docstring) passes an ast.Name, never
+			# reaches here, and is unaffected.
+			field_obj = self._lower_expr( arg_node.value, None )
+			field_var = self.lowering._attr_lookup( field_obj.type, arg_node.attr, arg_node )
+			is_real_field = self._is_real_field_receiver( field_obj.type )
+			if is_real_field:
+				self._check_field_visibility( field_obj.type, field_var, arg_node.attr, arg_node )
+			if is_real_field and cfg.rc_leaves( field_var.type ):
+				self._emit( ir.AcquireFieldLock( obj = field_obj ))
+				raw = self._new_temp( field_var.type )
+				self._emit( ir.GetAttr( dest = raw, obj = field_obj, attr = arg_node.attr ))
+				for instr in self._cfg.decref( field_var.type, raw ):
+					self._emit( instr )
+				self._emit( ir.ReleaseFieldLock( obj = field_obj ))
+				self._cfg.untrack_temp( raw )
+				return
+			# either a non-RC field (nothing to decref - falls into the
+			# generic-method/fail handling below unchanged) or not a real
+			# user field at all (e.g. field_obj.type is a TaggedUnion's own
+			# .tag/.data, no locking concept applies there either) - a bare,
+			# unretained read straight off the ALREADY-LOWERED field_obj,
+			# matching this function's own pre-Part-B behavior exactly,
+			# rather than re-lowering arg_node.value a second time (which
+			# would double any side effects a non-trivial receiver
+			# expression has - confirmed as the right call by _lower_expr's
+			# own general "never re-evaluate an already-lowered operand"
+			# discipline used throughout this file).
+			operand = self._new_temp( field_var.type )
+			self._emit( ir.GetAttr( dest = operand, obj = field_obj, attr = arg_node.attr ))
+		else:
+			operand = self._lower_expr( arg_node, None )
 		if operand.type is not None and cfg.rc_leaves( operand.type ):
 			for instr in self._cfg.decref( operand.type, operand ):
 				self._emit( instr )
@@ -9257,30 +9366,47 @@ class FunctionLowering:
 				node,
 			)
 		dest = self._new_temp( attr_var.type )
-		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
+		# mirrors _expr_Name's own narrowed-read rewrite exactly (see its
+		# comment for the full reasoning) - checks THIS node's own full
+		# chain key (any depth, `self.a.b.c`), not just a single hop; a
+		# chain that ISN'T itself narrowed but rests on a narrowed PREFIX
+		# (`self.a` narrowed, `.b.c` chained on top) was already resolved
+		# correctly by the recursive `obj = self._lower_expr(node.value,
+		# ...)` call above, which narrows at whatever shallower level
+		# actually matched.
 		chain_key = self._attribute_chain_key( node )
-		if chain_key is not None:
-			# mirrors _expr_Name's own narrowed-read rewrite exactly (see its
-			# comment for the full reasoning), just sourced from this field's
-			# freshly-read union VALUE (`dest`, a Temp) instead of a Variable
-			# binding directly - a struct-by-value Temp is an equally valid
-			# ir.GetAttr `obj` source. Checks THIS node's own full chain key
-			# (any depth, `self.a.b.c`), not just a single hop - a chain
-			# narrowed as its own subject is found directly here; a chain
-			# that ISN'T itself narrowed but rests on a narrowed PREFIX
-			# (`self.a` narrowed, `.b.c` chained on top) was already
-			# resolved correctly by the recursive `obj = self._lower_expr(
-			# node.value, ...)` call above, which narrows at whatever
-			# shallower level actually matched.
-			member = self._cfg.narrowed_member( chain_key )
-			if member is not None and not self.lowering._type_resolver._same_type( expected_type, attr_var.type ):
-				base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
-				_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
-				payload_dest = self._new_temp( payload_cls )
-				self._emit( ir.GetAttr( dest = payload_dest, obj = dest, attr = data_attr.stem ))
-				leaf_dest = self._new_temp( member.type )
-				self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
-				return leaf_dest
+		member = self._cfg.narrowed_member( chain_key ) if chain_key is not None else None
+		is_narrowed = member is not None and not self.lowering._type_resolver._same_type( expected_type, attr_var.type )
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: an RC-typed field read
+		# (narrowed or not) needs the SAME "acquire / read+retain / release"
+		# protection Part A already gives a global - a bare, unretained
+		# GetAttr here is the exact "reader loads a pointer, gets preempted
+		# before its own incref, a concurrent writer frees it" race A.3
+		# describes, just for a field's OWN storage (obj->field) instead of
+		# a global's. `obj` itself is never at risk (this thread already
+		# holds its own live reference to obj, unlike a global's slot, which
+		# nothing here owns) - only obj's FIELD needs protecting.
+		attr_is_rc = bool( cfg.rc_leaves( attr_var.type )) and self._is_real_field_receiver( obj.type )
+		if attr_is_rc:
+			self._emit( ir.AcquireFieldLock( obj = obj ))
+		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
+		if is_narrowed:
+			base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
+			_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
+			payload_dest = self._new_temp( payload_cls )
+			self._emit( ir.GetAttr( dest = payload_dest, obj = dest, attr = data_attr.stem ))
+			leaf_dest = self._new_temp( member.type )
+			self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+			if attr_is_rc:
+				self._emit( ir.Incref( value = leaf_dest ))
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._cfg.fresh_temp( leaf_dest, member.type )
+			return leaf_dest
+		if attr_is_rc:
+			for instr in self._cfg.incref( attr_var.type, dest ):
+				self._emit( instr )
+			self._emit( ir.ReleaseFieldLock( obj = obj ))
+			self._cfg.fresh_temp( dest, attr_var.type )
 		# a pointer-typed field passed into a differently-typed pointer parameter
 		# (e.g. sys.memcpy( ..., self.__metadata, ... ) where src is ConstPtr[u8])
 		# needs the same CastWrap coercion _expr_Name does for bare locals.
@@ -12896,6 +13022,30 @@ class FunctionLowering:
 		if target_cls is None:
 			return None
 		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
+
+	def _is_real_field_receiver( self, owner_type: Type|None ) -> bool:
+		''' PLAN_THREAD_SAFE_SHARED_STATE.md Part B locking gate: true only
+		when owner_type is a genuine, heap-allocated RCClass instance - the
+		only kind of receiver that HAS a $header (and therefore a lock) at
+		all. Deliberately narrower than _check_field_visibility's own
+		InheritanceChainMixin check (RCClass OR CStruct): a CStruct is
+		always either embedded BY VALUE inside its own containing object (no
+		separate identity/pointer of its own - protected by the CONTAINING
+		RCClass's lock, not one of its own) or, for an @interface CStruct,
+		heap-allocated WITHOUT an ObjectHeader at all (see emit_c's own
+		ir.Allocate codegen: "NO ObjectHeader/refcount init" for that case) -
+		neither shape has a $header.lock to acquire. Confirmed as a real bug,
+		not a theoretical one: a nested CStruct field's own teardown
+		(compiler.decref recursing into a by-value-embedded CStruct's own
+		attributes, type_resolver.py's _build_field_teardown_ast) tried to
+		reinterpret-cast a whole `struct Wrapper` VALUE (not a pointer) to
+		ObjectHeader*, rejected outright by clang. `.tag`/`.data`/
+		`.v_<member>` (TaggedUnion's own compiler-SYNTHESIZED storage-view
+		accessors - UnionStorage.get()) are excluded for the same underlying
+		reason (no ObjectHeader of their own either) and were the first
+		confirmed instance of this class of bug. '''
+		resolved = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
+		return isinstance( resolved, RCClass )
 
 	def _check_field_visibility( self, owner_type: Type|None, attr_var: Variable, attr_name: str, ctx: ast.AST ) -> None:
 		''' PLAN_THREAD_SAFE_SHARED_STATE.md's field-visibility-enforcement

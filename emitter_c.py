@@ -31,7 +31,7 @@ from mpy_types import (
 # (i.e. most trivial programs). PROLOGUE itself (the full concatenation)
 # stays around unchanged for callers that want the whole thing regardless
 # (see emitter_c_test.py's own release_object test).
-_PROLOGUE_HEADER = '''\
+_PROLOGUE_HEADER_FIXED = '''\
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -85,8 +85,35 @@ typedef struct {
 	// case) costs nothing extra for this - it gets a plain
 	// __metalpy_ObjectVtbl instance, no synthesized type of its own.
 	const __metalpy_ObjectVtbl* vtable;
-} ObjectHeader;
 '''
+
+# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: one lock per object (B.1 - not
+# one per field), embedded directly in ObjectHeader so every RCClass's own
+# leading $header member carries it for free, no per-class opt-in needed.
+# Shipped unconditionally (no whole-program "does this program spawn a
+# Thread" gate, unlike the Cost-mitigations section's own aspirational #1 -
+# Part A itself was ALSO shipped without that switch, scoped down instead
+# by only ever protecting a global that's genuinely reassigned; Part B has
+# no equivalent narrower target - every RC object gets one). Same platform
+# asymmetry as A.3's per-global lock: a bare `void*` on Windows (SRWLOCK's
+# own all-zero state is a valid unlocked lock, so sys.alloc's own
+# poison-in-debug/uninitialized-in-release memory just needs an explicit
+# zero write at construction, not a real init call - see ir.Allocate's own
+# codegen); a real `pthread_mutex_t` on POSIX, needing a genuine
+# pthread_mutex_init() call at EVERY construction site (a real per-object
+# cost the "revisit the lighter primitive later" decision accepts for now).
+_PROLOGUE_HEADER_FIELD_WINDOWS = '\tvoid* lock;\n'
+_PROLOGUE_HEADER_FIELD_PTHREAD = '\tpthread_mutex_t lock;\n'
+
+def _object_header_prologue() -> str:
+	''' ObjectHeader's own full text, including Part B's per-object lock
+	field - a FUNCTION (not the plain string constant this used to be),
+	since the field's own C type depends on _target_os, which is only known
+	once emit_c() itself has set it (module-level constants can't see that -
+	see _target_os's own docstring on why it's set inside emit_c(), not at
+	import time). '''
+	field = _PROLOGUE_HEADER_FIELD_PTHREAD if _target_uses_pthread_lock() else _PROLOGUE_HEADER_FIELD_WINDOWS
+	return _PROLOGUE_HEADER_FIXED + field + '} ObjectHeader;\n'
 
 # only needed where an ir.Incref is actually emitted (see emit_c) - a
 # program that only ever gives up references (or never touches an RCClass
@@ -574,11 +601,6 @@ static inline double __metalpy_parse_f64( const char* text ) {
 #endif
 '''
 
-# the full, unconditional concatenation - kept for callers that want every
-# PROLOGUE helper regardless of whether a specific program needs it (e.g.
-# emitter_c_test.py's own release_object test). emit_c() itself assembles
-# the pieces above selectively instead of using this directly.
-PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE
 
 
 
@@ -752,6 +774,49 @@ def _global_lock_release( lock_name: str ) -> str:
 		return f'\tpthread_mutex_unlock( &{lock_name} );'
 	return f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
+def _field_lock_prologue() -> str:
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part B: acquire_field_lock/
+	release_field_lock wrap the per-object $header.lock the same way
+	retain_object/release_object wrap $header.ref_count - real, one-place
+	FUNCTIONS (not inline call text at every ir.AcquireFieldLock/
+	ReleaseFieldLock site) specifically so the immortal-object skip below
+	lives in exactly one place. Required, not just tidy: a compile-time-
+	baked static const instance (a string literal, a static vtable
+	instance - emit_str_literal and friends) sets $header.ref_count =
+	METALPY_IMMORTAL_REFCOUNT directly in a designated-initializer list
+	that never mentions .lock at all - C zero-fills that (a real guarantee
+	for a static aggregate initializer, unlike sys.alloc's own unions-
+	initialized heap memory), which is a valid unlocked SRWLOCK but NOT a
+	valid pthread_mutex_t (POSIX gives zero-init-safety to neither by
+	contract - A.3's own point, reused here) - locking it directly would be
+	real undefined behavior the first time ANY of its fields is ever read
+	through an ordinary GetAttr. Skipping locking entirely for an immortal
+	object is also simply correct on its own terms, the same reason
+	retain_object/release_object already skip refcount work for one: an
+	object nothing ever frees needs no exclusion for field access to be
+	safe UNLESS something actually reassigns that field concurrently -
+	immortal objects in this codebase are exactly the ones nothing does
+	that to (compile-time constants), so this stays sound, not just
+	convenient. '''
+	if _target_uses_pthread_lock():
+		lock_expr = 'pthread_mutex_lock( &obj->lock )'
+		unlock_expr = 'pthread_mutex_unlock( &obj->lock )'
+	else:
+		lock_expr = f'AcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
+		unlock_expr = f'ReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
+	return (
+		f'static inline void acquire_field_lock( ObjectHeader* obj ) {{\n'
+		f'\tif ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {{\n'
+		f'\t\t{lock_expr};\n'
+		f'\t}}\n'
+		f'}}\n'
+		f'static inline void release_field_lock( ObjectHeader* obj ) {{\n'
+		f'\tif ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {{\n'
+		f'\t\t{unlock_expr};\n'
+		f'\t}}\n'
+		f'}}\n'
+	)
+
 # set once, at the very top of emit_c() (which has `compiler` in scope) -
 # read from _emit_instruction/_emit_instructions, which do not. This is
 # genuinely whole-compilation-unit ambient state (every line emit_c() ever
@@ -780,6 +845,19 @@ def _target_uses_pthread_lock() -> bool:
 	# macOS and deletes the poison pill below, there's exactly one already-
 	# correct code path waiting, not four to individually double-check.
 	return _target_os in ( 'linux', 'macos' )
+
+# the full, unconditional concatenation - kept for callers that want every
+# PROLOGUE helper regardless of whether a specific program needs it (e.g.
+# emitter_c_test.py's own release_object test). emit_c() itself assembles
+# the pieces above selectively instead of using this directly. Placed here
+# (not right after _PROLOGUE_FLOAT_PARSE, where it lived before Part B),
+# not earlier: _object_header_prologue() needs _target_uses_pthread_lock()
+# defined first, since this executes at IMPORT time, in top-to-bottom
+# module-body order - _target_os is still None at this point (only ever set
+# inside emit_c() itself, per that global's own docstring), so this always
+# reflects the Windows-shaped ObjectHeader (a `void* lock`) regardless of
+# whatever target a later real emit_c() call actually targets.
+PROLOGUE = _object_header_prologue() + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE
 
 def _global_lock_supported() -> bool:
 	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: Windows (SRWLOCK) and Linux
@@ -3115,6 +3193,14 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		if not ( instr.var.reassigned_outside_init and _global_lock_supported() ):
 			return []
 		return [ _global_lock_release( _global_lock_name( instr.var ))]
+	if isinstance( instr, ir.AcquireFieldLock ):
+		if not _global_lock_supported():
+			return [] # unsupported target - see _global_lock_supported's own docstring
+		return [ f'\tacquire_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
+	if isinstance( instr, ir.ReleaseFieldLock ):
+		if not _global_lock_supported():
+			return []
+		return [ f'\trelease_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
 	if isinstance( instr, ir.DecrefDynamic ):
 		# instr.value is Ptr[None] (type-erased) - $header is always the
 		# FIRST member of every RCClass struct (emit_rcclass's own field-
@@ -3227,6 +3313,22 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			if concrete_cls.virtual_slots():
 				vtable_ref = f'(const __metalpy_ObjectVtbl*){vtable_ref}'
 			lines.append( f'\t({dest})->$header.vtable = {vtable_ref};' )
+			# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: sys.alloc's own
+			# allocation is never zero-initialized (mempoison in debug,
+			# raw malloc in release - same reason $header.ref_count/.vtable
+			# above are explicit writes, not relied-on zero-init) - the new
+			# per-object lock field needs the identical explicit
+			# construction-time init every other ObjectHeader field gets.
+			# Windows: an all-zero SRWLOCK IS a valid unlocked lock (A.3's
+			# own established fact, reused verbatim here) - a plain zero
+			# write suffices, no real init call. POSIX: pthread_mutex_t has
+			# no such zero-init guarantee - a genuine pthread_mutex_init()
+			# call is required at every single construction site.
+			if _global_lock_supported():
+				if _target_uses_pthread_lock():
+					lines.append( f'\tpthread_mutex_init( &(({dest})->$header.lock), ((void*)0) );' )
+				else:
+					lines.append( f'\t({dest})->$header.lock = ((void*)0);' )
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
 			return lines
@@ -4303,7 +4405,19 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	global _target_os
 	_target_os = compiler.disco.active_target['os']
 	locked_globals = [ g for g in compiler.globals if _needs_global_lock( g.variable ) ]
-	if locked_globals and _global_lock_supported() and _target_os == 'windows':
+	# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: every constructed RC object
+	# now carries its own lock (ObjectHeader's own new field,
+	# _object_header_prologue) - the SRWLock exports/pthread.h registration
+	# below is needed whenever ANY ir.Allocate constructs one anywhere in
+	# the whole program, not just when a global happens to need locking
+	# (locked_globals alone). No narrower per-class "does THIS class need
+	# it" test worth building - Part B applies uniformly to every RC field.
+	has_object_header_alloc = (
+		any( isinstance( instr, ir.Allocate ) and instr.cls is not None and instr.cls.has_object_header() for lf in compiler.functions for instr in lf.instructions )
+		or any( isinstance( instr, ir.Allocate ) and instr.cls is not None and instr.cls.has_object_header() for g in compiler.globals for instr in g.instructions )
+	)
+	locks_needed = locked_globals or has_object_header_alloc
+	if locks_needed and _global_lock_supported() and _target_os == 'windows':
 		# real kernel32.dll exports (SRWLOCK is a genuine Win32 primitive,
 		# not something this codebase invents) - registered the same way
 		# __metalpy_format_f64's own GetProcAddress dependency is, just
@@ -4315,7 +4429,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		compiler.extern_libs.setdefault( 'kernel32', set() ).update((
 			'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive',
 		))
-	if locked_globals and _global_lock_supported() and _target_uses_pthread_lock():
+	if locks_needed and _global_lock_supported() and _target_uses_pthread_lock():
 		# pthread_mutex_t's real definition (needed below, where this
 		# module's own storage declaration is a genuine `pthread_mutex_t`,
 		# not an opaque void* the way SRWLOCK gets away with - see
@@ -4391,17 +4505,31 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		or any( isinstance( instr, ir.Incref ) for g in compiler.globals for instr in g.instructions )
 	uses_decref = any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for lf in compiler.functions for instr in lf.instructions ) \
 		or any( isinstance( instr, ( ir.Decref, ir.DecrefDynamic )) for g in compiler.globals for instr in g.instructions )
-	parts: list[str] = [ _PROLOGUE_HEADER ]
+	# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: same -Wunused-function
+	# avoidance as uses_incref/uses_decref above, for acquire_field_lock/
+	# release_field_lock - a program with no RC field access at all
+	# (scalars only, or no RCClass traffic) never gets an AcquireFieldLock/
+	# ReleaseFieldLock marker emitted anywhere.
+	uses_field_lock = any( isinstance( instr, ( ir.AcquireFieldLock, ir.ReleaseFieldLock )) for lf in compiler.functions for instr in lf.instructions ) \
+		or any( isinstance( instr, ( ir.AcquireFieldLock, ir.ReleaseFieldLock )) for g in compiler.globals for instr in g.instructions )
+	parts: list[str] = [ _object_header_prologue() ]
 	if uses_incref:
 		parts.append( _PROLOGUE_RETAIN )
 	if uses_decref:
 		parts.append( _PROLOGUE_RELEASE )
-	parts.append( _PROLOGUE_ARITH )
-	if uses_format_conv:
-		parts.append( _PROLOGUE_FLOAT_FORMAT )
-	if uses_parse_conv:
-		parts.append( _PROLOGUE_FLOAT_PARSE )
-	if locked_globals and _global_lock_supported() and _target_os == 'windows':
+	if ( locked_globals or uses_field_lock ) and _global_lock_supported() and _target_os == 'windows':
+		# needed for Part A's own per-global lock storage (locked_globals)
+		# AND Part B's per-object $header.lock (uses_field_lock) - both use
+		# the identical SRWLOCK forward declarations/AcquireSRWLockExclusive/
+		# ReleaseSRWLockExclusive prototypes, so one shared, unconditionally-
+		# repeatable declaration covers whichever (or both) actually apply.
+		# Emitted BEFORE _field_lock_prologue() below - acquire_field_lock/
+		# release_field_lock's own bodies call AcquireSRWLockExclusive/
+		# ReleaseSRWLockExclusive directly, so the forward declaration has
+		# to land first in the translation unit (confirmed by a real
+		# "conflicting types" error when this was the other way around -
+		# clang's own implicit-declaration inference from the CALL SITE
+		# disagreed with the real prototype declared afterward).
 		parts.append( _PROLOGUE_GLOBAL_LOCK_WINDOWS )
 		# Neither Linux nor macOS needs an analogous hand-declared prologue
 		# (_target_uses_pthread_lock covers both): pthread_mutex_t's real
@@ -4410,6 +4538,13 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		# function's own required_headers.add('pthread.h')), which carries
 		# none of SRWLOCK's "don't want to drag in all of windows.h just
 		# for one struct" cost - see _global_lock_acquire's own comment.
+	if uses_field_lock and _global_lock_supported():
+		parts.append( _field_lock_prologue() )
+	parts.append( _PROLOGUE_ARITH )
+	if uses_format_conv:
+		parts.append( _PROLOGUE_FLOAT_FORMAT )
+	if uses_parse_conv:
+		parts.append( _PROLOGUE_FLOAT_PARSE )
 
 	# collect #include requirements from all modules whose symbols are
 	# compiled into this translation unit

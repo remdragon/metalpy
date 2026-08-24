@@ -5,13 +5,65 @@
 **Part A (module globals) implemented and confirmed correct for both
 direct and narrowed reads/writes, on both Windows and Linux.** Part B's own
 **prerequisite** (class-level `_`/`__` field-visibility enforcement, see
-below) is now implemented and merged; Part B itself (the actual per-object
-lock, `ObjectHeader` growth, `GetAttr`/`SetAttr` acquire/release) is still
-fully unimplemented - do not attempt without its own dedicated worktree/
-session, for the reasons this document's Part B section already gives, and
-without first resolving the "Open questions" below (especially #1, the
-POSIX per-object lock primitive, and #2, confirming the reentrancy hazard
-against real generated code).
+below) is implemented and merged.
+
+**Part B itself (the actual per-object lock) - status update: a real,
+substantial implementation attempt exists (worktree `part-b-instance-
+field-locking`, NOT merged - a genuine, confirmed correctness bug blocks
+it, see below), not the "fully unimplemented" this section used to say.**
+What's built and confirmed working: `ir.AcquireFieldLock`/`ReleaseFieldLock`
+markers (ir.py, mirroring Part A's global-lock markers, keyed on the
+receiver operand instead of a Variable); `ObjectHeader` growth
+(`emitter_c.py`'s `_object_header_prologue()`, a `void*`/`pthread_mutex_t`
+lock field picked at emission time, same A.3 platform asymmetry as Part A -
+POSIX needs a real `pthread_mutex_init()` at every construction site, no
+zero-init guarantee); `acquire_field_lock`/`release_field_lock` helper
+functions that skip locking entirely for an IMMORTAL object (required, not
+optional - a compile-time-baked static instance's `.lock` field is never
+initialized, so locking it would be real UB); `GetAttr`/`SetAttr` wrapping
+at every genuine field chokepoint (`lowering.py`'s `_expr_Attribute`,
+`_stmt_Assign`'s plain-write and augmented-assign branches), gated on a new
+`_is_real_field_receiver` check (RCClass only - NOT CStruct, which has no
+`$header` of its own, embedded by value or, for `@interface`, heap-
+allocated without a header at all; NOT a TaggedUnion's own `.tag`/`.data`
+storage-view accessors either) after two real false-positive bugs were
+found and fixed this way (locking a union's internal payload, locking a
+by-value-embedded CStruct); a matching fix to `compiler.decref(obj.field)`
+(used by the synthesized destructor's own field teardown,
+`_build_field_teardown_ast`) to consume the field's own reference directly
+under one critical section rather than retain-then-immediately-undo, after
+the naive version was confirmed to leak exactly one reference per torn-
+down RC field (a real `compiler.refcount()` regression, not a hypothetical
+one). The whole-program on/off switch (Cost mitigations #1) was
+deliberately NOT built for this pass - Part A itself never had one either
+(see A.1's own scoping), and the memory-cost tradeoff didn't seem worth
+gating on an as-yet-unbuilt Thread-reachability analysis before landing
+correctness.
+
+**The blocking bug, not yet fixed: a field read inside a LOOP CONDITION
+leaks one reference per iteration.** `_stmt_While`'s own condition
+expression (`_lower_truth_test(node.test)`, `lowering.py`) is lowered
+exactly ONCE at compile time, but the resulting C sits physically inside
+the loop and re-executes once per real iteration - so a read-side
+`AcquireFieldLock`/incref emitted there fires N times at runtime, while the
+matching decref (driven by `_new_temp`/`fresh_temp`'s ordinary pending-
+temps flush, which only runs once per STATEMENT-level lowering pass, not
+once per loop iteration) fires exactly once. Confirmed via a real
+`compiler.refcount()` regression test: a generator's own `while i < b.v:`
+condition (`b` a captured `Box` parameter) leaked 2 references after 2
+iterations before the generator was dropped mid-consumption. Not specific
+to generators - any ordinary while/for loop whose condition reads an
+RC-typed field through this mechanism has the same exposure; loop BODY
+statements are unaffected (each gets its own per-iteration flush via the
+ordinary `_lower_stmt` statement boundary - only the CONDITION expression,
+lowered once but executed repeatedly, is exempt from that). Needs an
+explicit per-iteration cleanup point for the condition's own temps on
+BOTH exits from each iteration (the back-edge jump to the loop start AND
+the `JumpIfFalse` exit) before this is safe to land - real design work
+against `_stmt_While`/`_stmt_For`'s own back-edge machinery, not a
+one-line fix. **Do not merge this worktree's branch, and do not build on
+top of it, until this is resolved and re-verified under real concurrent
+stress the same way every other piece of this plan was.**
 
 **Field-visibility enforcement (the Prerequisite section below) - status
 update: implemented and merged**, not just designed. `Discovery.check_
