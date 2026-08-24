@@ -14,7 +14,8 @@ class Utf16( Codec ):
 		s_ptr: ConstPtr[u8] = s.get_const_ptr()
 
 		# Worst-case: every input byte is ASCII -> 2 bytes per byte.
-		out = bytearray(s_len * 2)
+		with compiler.panic_arithmetic('a real string can never be within 2x of usize::MAX bytes'):
+			out = bytearray(s_len * 2)
 		# Cast to u16 pointer – writes are native endianness.
 		out_u16: Ptr[u16] = compiler.cast(Ptr[u16], out.get_ptr())
 
@@ -73,7 +74,8 @@ class Utf16( Codec ):
 				in_idx += bytes_read
 
 		# Shrink to exact byte length.
-		byte_len: usize = out_idx * 2
+		with compiler.panic_arithmetic('out_idx counts u16 units of out, which is already 2x-sized'):
+			byte_len: usize = out_idx * 2
 		final = bytearray(byte_len)
 		sys.memcpy(final.get_ptr(), out.get_ptr(), byte_len)
 		return Result.Ok(bytes.from_bytearray(move(final)))
@@ -81,13 +83,16 @@ class Utf16( Codec ):
 	@virtual
 	def decode(self, b: bytes | bytearray) -> Result[str, CodecError]:
 		b_len: usize = len(b)
-		if b_len % 2 != 0:
+		with compiler.panic_arithmetic('divisor is the literal 2, never zero'):
+			is_odd: usize = b_len % 2
+		if is_odd != 0:
 			return Result.Err(CodecError('utf-16le',
 				'UTF-16 data must have even length'))
 		b_ptr: ConstPtr[u8] = b.get_const_ptr()
 		# Cast input to u16* – reads are native endianness.
 		in_u16: ConstPtr[u16] = compiler.cast(ConstPtr[u16], b_ptr)
-		num_units: usize = b_len // 2
+		with compiler.panic_arithmetic('divisor is the literal 2, never zero'):
+			num_units: usize = b_len // 2
 
 		# Worst-case: each u16 unit may become up to 3 UTF-8 bytes.
 		with compiler.panic_arithmetic('irrational byte length'):
@@ -103,17 +108,17 @@ class Utf16( Codec ):
 				i += 1
 
 				# Surrogate pair detection (native endianness).
-				if 0xD800 <= cp <= 0xDBFF:   # High surrogate
+				if cp >= 0xD800 and cp <= 0xDBFF:   # High surrogate
 					if i >= num_units:
 						return Result.Err(CodecError('utf-16le',
 							'Incomplete surrogate pair'))
 					low_surr: u32 = in_u16[i]
 					i += 1
-					if not (0xDC00 <= low_surr <= 0xDFFF):
+					if not ( low_surr >= 0xDC00 and low_surr <= 0xDFFF ):
 						return Result.Err(CodecError('utf-16le',
 							'Invalid low surrogate'))
 					cp = 0x10000 + ((cp - 0xD800) << 10) + (low_surr - 0xDC00)
-				elif 0xDC00 <= cp <= 0xDFFF:   # Low surrogate without high
+				elif cp >= 0xDC00 and cp <= 0xDFFF:   # Low surrogate without high
 					return Result.Err(CodecError('utf-16le',
 						'Unexpected low surrogate'))
 

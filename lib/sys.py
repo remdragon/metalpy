@@ -254,23 +254,62 @@ def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
 # ---------------------------------------------------------------------------
 # argv: command-line arguments (argv[0] included, matching real Python)
 #
-# _raw_argc/_raw_argv are written DIRECTLY (raw C assignment, not through
-# any metalpy-level Assign) by emit_c()'s own entry-point prelude, as the
-# very first statements of main() - before __metalpy_init() (which is what
-# actually calls _build_argv() below, via this file's own `argv: list[str]
-# = _build_argv()` global) ever runs. Real argc/argv are only available at
-# a normal CRT-linked entry - a no_crt/freestanding build's mainCRTStartup
-# calls main(0, NULL), so argv would silently be empty there regardless of
-# the real command line. @requires_crt on _build_argv forces the whole
-# build onto the real CRT-linked entry point the moment anything actually
-# reaches sys.argv, so this can't silently happen - see SYNTAX.md's own
-# "Forcing CRT Linking" section.
+# Windows: GetCommandLineW()+CommandLineToArgvW() (kernel32/shell32) read the
+# process' own command line directly, independent of main(argc,argv) - a
+# no_crt/freestanding build's mainCRTStartup calls main(0, NULL) (see
+# emitter_c.py's own comment there), so relying on the C-level argc/argv
+# there would leave sys.argv silently empty regardless of the real command
+# line. This works identically whether or not the CRT is linked.
+#
+# Everywhere else: _raw_argc/_raw_argv are written DIRECTLY (raw C
+# assignment, not through any metalpy-level Assign) by emit_c()'s own
+# entry-point prelude, as the very first statements of main() - before
+# __metalpy_init() (which is what actually calls _build_argv() below, via
+# this file's own `argv: list[str] = _build_argv()` global) ever runs. POSIX
+# targets always link a real, CRT-provided main() in this codebase (no
+# freestanding entry point exists there), so this is safe unconditionally.
 # ---------------------------------------------------------------------------
 
 _raw_argc: i32 = 0
 _raw_argv: Ptr[Ptr[u8]] = None
 
-@requires_crt
+@compiler.target( os = 'windows' )
+def _wcslen( ptr: ConstPtr[u16], max_len: usize ) -> usize:
+	n: usize = 0
+	with compiler.wrap_arithmetic:
+		while n < max_len and ptr[n] != 0:
+			n += 1
+	return n
+
+@compiler.target( os = 'windows' )
+def _build_argv() -> list[str]:
+	from windows.kernel32 import GetCommandLineW, LocalFree
+	from windows.shell32 import CommandLineToArgvW
+	from codecs.utf16 import utf16
+
+	result: list[str] = list[str]()
+	argc: i32 = 0
+	argv_w: Ptr[Ptr[u16]] = CommandLineToArgvW( GetCommandLineW(), compiler.addrof( argc ))
+	if argv_w is None:
+		return result
+	if argc > 0:
+		with compiler.panic_arithmetic( 'argc is never negative once positive-checked above' ):
+			count: usize = usize( argc )
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by count/wcslen, cannot overflow' ):
+			while i < count:
+				w: ConstPtr[u16] = argv_w[i]
+				n: usize = _wcslen( w, 1_000_000 )
+				byte_len: usize = n * 2
+				buf = bytearray( byte_len )
+				memcpy( buf.get_ptr(), compiler.cast( ConstPtr[u8], w ), byte_len )
+				s: str = utf16.decode( buf ).unwrap( 'sys.argv: invalid UTF-16 in argument' )
+				result.append( s ).unwrap( 'sys.argv: too many arguments' )
+				i += 1
+	LocalFree( compiler.cast( Ptr[None], argv_w ))
+	return result
+
+@compiler.target( os = not 'windows' )
 def _build_argv() -> list[str]:
 	result: list[str] = list[str]()
 	if _raw_argc <= 0:

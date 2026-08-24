@@ -134,6 +134,26 @@ def ExitProcess(
 def GetLastError() -> u32:
 	...
 
+# LPWSTR GetCommandLineW(void) - the process' own command line, as the OS
+# loader set it (Unicode, unlike the CRT's own possibly-mangled main(argc,
+# argv)). Available regardless of whether the CRT is linked - see sys.py's
+# own _build_argv comment on why that matters for a freestanding build.
+# Process-owned memory, never freed by the caller.
+@extern( 'kernel32', 'GetCommandLineW' )
+def GetCommandLineW() -> ConstPtr[u16]:
+	...
+
+# HLOCAL LocalFree(HLOCAL hMem) - frees a block the LocalAlloc family (or,
+# per its own docs, shell32's CommandLineToArgvW) returned. Returns NULL on
+# success, the same handle back on failure - callers here treat it as
+# best-effort and don't check it, matching every other cleanup-only call in
+# this file (e.g. CloseHandle's own callers).
+@extern( 'kernel32', 'LocalFree' )
+def LocalFree(
+	hMem: Ptr[None],
+) -> Ptr[None]:
+	...
+
 # void GetSystemTime(LPSYSTEMTIME lpSystemTime) - current UTC time; used by
 # windows/zoneinfo_rules.py purely to read off the current YEAR (a rough
 # "now" for choosing which years to build DST transitions for) - no
