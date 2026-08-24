@@ -1111,6 +1111,22 @@ class Discovery( ast.NodeVisitor ):
 		# established casing - from a user's perspective this reads as an
 		# ordinary builtin, not compiler magic the way Callable/Closure are.
 		if isinstance( node.value, ast.Name ) and node.value.id == 'tuple':
+			# tuple[T, ...] - Python's own spelling for a VARIABLE-length,
+			# homogeneous tuple (unlike every arity below, this ISN'T a
+			# TupleStorage-synthesized fixed layout at all - it resolves to
+			# a Specialization of the real VariadicTuple[T] class, lib/
+			# builtins/__vartuple.py, built on the same UnsafeList[T]
+			# storage list[T] itself uses). Checked first and specifically:
+			# `tuple[T1, T2]` also parses as a 2-element ast.Tuple slice, so
+			# only the exact "second element is the literal Ellipsis
+			# constant" shape means variadic, not merely length == 2.
+			if (
+				isinstance( node.slice, ast.Tuple ) and len( node.slice.elts ) == 2
+				and isinstance( node.slice.elts[1], ast.Constant ) and node.slice.elts[1].value is Ellipsis
+			):
+				elem_type = self.visit( node.slice.elts[0] )
+				variadic_cls = self.find_name( 'VariadicTuple', node )
+				return self._get_or_create_specialization( variadic_cls, [ elem_type ] )
 			# arity >= 2 always parses as ast.Tuple(elts=[...]) (real commas
 			# in the subscript); arity 0 (`tuple[()]`, an empty tuple LITERAL
 			# as the single slice element) parses the SAME way, with elts=[]
