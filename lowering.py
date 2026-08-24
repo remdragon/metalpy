@@ -13432,6 +13432,24 @@ class FunctionLowering:
 		# narrowing Scalar-to-Scalar T(x) already gets via _lower_scalar_
 		# cast above, so `i32(some_int)` behaves identically regardless of
 		# whether the narrowing is a compiler intrinsic or library-authored
+		# one - EXCEPT under saturate_arithmetic specifically: __i32__'s
+		# own value-range check is genuinely mode-INDEPENDENT (SYNTAX.md's
+		# .to_T() contract - "no meaningful wrapped/saturated value-range
+		# check"), so it can only ever propagate or panic, never clamp.
+		# Mirrors the compiler's OWN intrinsic cast instead, which picks a
+		# DIFFERENT, infallible opcode (CastSaturate) under this mode
+		# rather than reusing the checked opcode's Result - a library-
+		# authored source does the equivalent by dunder NAME instead of
+		# opcode: __saturated_i32__ (infallible, clamps rather than
+		# erring), if the class declares one, wins under this mode alone.
+		if isinstance( self._arithmetic_mode[-1], arithmetic_mode.ArithmeticSaturate ):
+			saturated = self.lowering._find_method( operand.type, f'__saturated_{target_cls.stem}__' )
+			if saturated is not None:
+				self.lowering._ensure_resolved( saturated )
+				self.lowering.schedule( saturated.return_type )
+				dest = self._new_temp( expected_type or saturated.return_type )
+				self._emit( ir.Call( dest = dest, target = saturated, receiver = operand, args = [], kwargs = {} ))
+				return dest
 		dunder = self.lowering._find_method( operand.type, f'__{target_cls.stem}__' )
 		if dunder is None:
 			self.lowering.discovery.fail(

@@ -101,16 +101,21 @@ _I16_MIN: i64 = -32768
 _I16_MAX: i64 = 32767
 _I32_MIN: i64 = -2147483648
 _I32_MAX: i64 = 2147483647
+_I64_MIN: i64 = -9223372036854775808
+_I64_MAX: i64 = 9223372036854775807
 _U8_MAX: i64 = 255
 _U16_MAX: i64 = 65535
 _U32_MAX: i64 = 4294967295
+_U64_MAX: u64 = 18446744073709551615
+_I128_MIN: i128 = -170141183460469231731687303715884105728
+_I128_MAX: i128 = 170141183460469231731687303715884105727
+_U128_MAX: u128 = 340282366920938463463374607431768211455
 
-# decimal spellings of i64::MIN's own magnitude, i64::MAX, u64::MAX,
-# i128::MIN's own magnitude, i128::MAX, and u128::MAX - used only to bound-
-# check an int's own magnitude BEFORE accumulating into the correspondingly-
-# wide scalar (see _to_i64/_to_u64/_to_i128/_to_u128's own comments for why
-# digit COUNT alone isn't a tight enough bound: an N-digit value can still
-# exceed an N-digit MAX).
+# decimal spellings of the same bounds - used only to bound-check an int's
+# own magnitude BEFORE accumulating into the correspondingly-wide scalar
+# (see _to_i64/_to_u64/_to_i128/_to_u128's own comments for why digit COUNT
+# alone isn't a tight enough bound: an N-digit value can still exceed an
+# N-digit MAX).
 _I64_MIN_MAGNITUDE_STR: str = '9223372036854775808'
 _I64_MAX_STR: str = '9223372036854775807'
 _U64_MAX_STR: str = '18446744073709551615'
@@ -791,6 +796,85 @@ class int:
 
 	def to_u128( self ) -> Result[u128, OverflowError]:
 		return self._to_u128()
+
+	# --- saturating construct-cast siblings ------------------------------
+	# `int(x)` (x: int) under `with compiler.saturate_arithmetic:` doesn't
+	# route through __i32__/etc (@fallible_arithmetic, Result-based,
+	# genuinely mode-INDEPENDENT per to_T()'s own contract above) - it
+	# looks up this __saturated_iN__/__saturated_uN__ sibling instead (see
+	# lowering.py's _try_lower_scalar_construct_call), mirroring how the
+	# compiler's OWN intrinsic Scalar-to-Scalar narrowing cast picks an
+	# entirely different, infallible opcode under saturate mode
+	# (CastSaturate) rather than reusing the checked-mode Result opcode.
+	# Infallible by construction: clamps rather than erring, so there's
+	# nothing for an enclosing Result-returning function to propagate.
+
+	def _saturate_i64_range( self, min_val: i64, max_val: i64 ) -> i64:
+		# shared by every signed/unsigned __saturated_*__ up to u32 (see
+		# _to_i64's own comment for why this stays on the i64 accumulator
+		# rather than i128 - same MSVC-fallback reasoning applies here).
+		wide = self._to_i64()
+		if wide.is_err():
+			return max_val if not self.__is_negative else min_val
+		v = wide.unwrap( 'just checked is_err() above' )
+		if v < min_val:
+			return min_val
+		if v > max_val:
+			return max_val
+		return v
+
+	def _saturate_u64_range( self, max_val: u64 ) -> u64:
+		if self.__is_negative and not self.is_zero():
+			return 0
+		wide = self._to_u64()
+		if wide.is_err():
+			return max_val
+		v = wide.unwrap( 'just checked is_err() above' )
+		return max_val if v > max_val else v
+
+	def __saturated_i8__( self ) -> i8:
+		with compiler.wrap_arithmetic: # already clamped into i8's own range
+			return i8( self._saturate_i64_range( _I8_MIN, _I8_MAX ))
+
+	def __saturated_i16__( self ) -> i16:
+		with compiler.wrap_arithmetic:
+			return i16( self._saturate_i64_range( _I16_MIN, _I16_MAX ))
+
+	def __saturated_i32__( self ) -> i32:
+		with compiler.wrap_arithmetic:
+			return i32( self._saturate_i64_range( _I32_MIN, _I32_MAX ))
+
+	def __saturated_i64__( self ) -> i64:
+		return self._saturate_i64_range( _I64_MIN, _I64_MAX )
+
+	def __saturated_i128__( self ) -> i128:
+		if self.__is_negative and self._magnitude_exceeds( _I128_MIN_MAGNITUDE_STR ):
+			return _I128_MIN
+		if not self.__is_negative and self._magnitude_exceeds( _I128_MAX_STR ):
+			return _I128_MAX
+		return self._to_i128().unwrap( 'just range-checked above' )
+
+	def __saturated_u8__( self ) -> u8:
+		with compiler.wrap_arithmetic:
+			return u8( self._saturate_i64_range( 0, _U8_MAX ))
+
+	def __saturated_u16__( self ) -> u16:
+		with compiler.wrap_arithmetic:
+			return u16( self._saturate_i64_range( 0, _U16_MAX ))
+
+	def __saturated_u32__( self ) -> u32:
+		with compiler.wrap_arithmetic:
+			return u32( self._saturate_i64_range( 0, _U32_MAX ))
+
+	def __saturated_u64__( self ) -> u64:
+		return self._saturate_u64_range( _U64_MAX )
+
+	def __saturated_u128__( self ) -> u128:
+		if self.__is_negative and not self.is_zero():
+			return 0
+		if self._magnitude_exceeds( _U128_MAX_STR ):
+			return _U128_MAX
+		return self._to_u128().unwrap( 'just range-checked above' )
 
 	@fallible_arithmetic
 	def __i8__( self ) -> Result[i8, OverflowError]:
