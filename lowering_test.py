@@ -4307,7 +4307,12 @@ class Tests( unittest.TestCase ):
 		# bind keeps auto-consuming __getitem__'s Result - __getitem__ is
 		# expected to always be fallible in practice (IndexError/KeyError),
 		# and this read is compiler-synthesized with no source position for
-		# the user to attach .unwrap()/.or_return() to
+		# the user to attach .unwrap()/.or_return() to. Unlike a real
+		# .or_return(), this uses Unwrap-panic (not OrReturn) - the loop's own
+		# `index < len` bounds check already proves this Err arm unreachable,
+		# so it must NOT force the enclosing function to return
+		# Result[_,error] just to compile an ordinary for-loop (a real repro:
+		# `for arg in sys.argv[1:]: print(arg)` inside a plain `-> i32` main)
 		code = '\n'.join([
 			'class MyError: pass',
 			'',
@@ -4335,7 +4340,42 @@ class Tests( unittest.TestCase ):
 		fn = self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
-		self.assertIn( 'OrReturn', kinds )
+		self.assertIn( 'Unwrap', kinds )
+		self.assertNotIn( 'OrReturn', kinds )
+
+	def test_for_over_indexable_fallible_getitem_does_not_require_result_return( self ) -> None:
+		# the actual bug this fixes: a plain `-> i32` main (no Result in
+		# sight) iterating an ordinary indexable used to fail to compile,
+		# demanding `main` return Result[_,IndexError] to propagate an error
+		# the loop's own bounds check already makes unreachable
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'@cstruct',
+			'class Result[T,E]:',
+			'	x: T',
+			'',
+			'@cstruct',
+			'class Box:',
+			'	_len: usize',
+			'',
+			'	def __len__( self ) -> usize:',
+			'		return self._len',
+			'',
+			'	def __getitem__( self, i: usize ) -> Result[i32,MyError]:',
+			'		return Result.__allocate__( x = 1 )',
+			'',
+			'def main( b: Box ) -> i32:',
+			'	for v in b:',
+			'		x: i32 = v',
+			'	return 0',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		kinds = [ type( instr ).__name__ for instr in fn.instructions ]
+		self.assertIn( 'Unwrap', kinds )
 
 	def test_for_over_indexable_missing_dunders_is_rejected( self ) -> None:
 		code = '\n'.join([

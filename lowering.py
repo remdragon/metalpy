@@ -6366,7 +6366,7 @@ class FunctionLowering:
 		self.lowering.schedule( type )
 		return var
 
-	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str ) -> ir.Operand:
+	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str, panic_errmsg: str|None = None ) -> ir.Operand:
 		# if `value` is itself a Result[T,E], auto-consume it via the same
 		# OrReturn/OrJump propagation or_return()/checked arithmetic use -
 		# unlike _lower_or_return, a non-Result value is passed through
@@ -6388,6 +6388,17 @@ class FunctionLowering:
 		# lookup here (unlike _result_shape's own find_name_or_none) since
 		# shape being non-None already proves Result is defined
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		if panic_errmsg is not None:
+			# caller has already proven this Err arm unreachable (e.g. a
+			# for-loop's own bounds-checked index) - Unwrap-panic instead of
+			# OrReturn/OrJump, same as `with compiler.panic_arithmetic(...):`,
+			# so this doesn't force the enclosing function to return
+			# Result[_,error_cls] just to propagate an error that can't happen
+			str_cls = self.lowering.discovery.find_name( 'str', node )
+			errmsg_node = ast.Constant( value = panic_errmsg )
+			ast.copy_location( errmsg_node, node )
+			extra = self._lower_expr( errmsg_node, str_cls )
+			return self._consume_checked_result( node, value, result_type, extra = extra )
 		self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
 		return self._consume_checked_result( node, value, result_type, extra = None )
 
@@ -9734,8 +9745,15 @@ class FunctionLowering:
 			# a for-loop's own per-iteration bind (_lower_for_over_indexable) -
 			# compiler-synthesized, no source position to attach .unwrap()/
 			# .or_return() to, and __getitem__ is expected to always be
-			# fallible in practice - keep auto-consuming here specifically
-			return self._maybe_consume_result( node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
+			# fallible in practice - keep auto-consuming here specifically.
+			# panic_errmsg (not None/or_return-propagation): the loop's own
+			# `index < len` test already proves this Err arm unreachable, so
+			# requiring the enclosing function to return Result[_,IndexError]
+			# just to compile an ordinary `for x in some_list:` would be wrong
+			return self._maybe_consume_result(
+				node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES,
+				panic_errmsg = 'for-loop: element index out of range (internal - should be unreachable)',
+			)
 		return call_dest
 
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
