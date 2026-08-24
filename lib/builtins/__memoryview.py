@@ -20,7 +20,7 @@ analogous thing via its exporter's buffer-refcount protocol.
 import compiler
 from mmap import mmap
 
-class memoryview:
+class memoryview( Sequence[u8], Iterable[u8] ):
 	__ptr: Ptr[u8]
 	__len: usize
 	__source: bytearray|mmap
@@ -60,6 +60,9 @@ class memoryview:
 		for the actual (non-copying) view construction. '''
 		( start, stop ) = _resolve_slice_bounds( s, self.__len )
 		return self._byte_slice( start, stop )
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	def get_ptr( self ) -> Ptr[u8]:
 		return self.__ptr

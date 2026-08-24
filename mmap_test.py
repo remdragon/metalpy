@@ -66,6 +66,32 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_for_loop_iterates_bytes( self ) -> None:
+		''' mmap conforms to Sequence[u8]/Iterable[u8] - a plain for loop
+		over it (not just index access) must work. '''
+		import emitter_c
+		path_literal = repr( self.fixture_path )
+		self._run( f'''
+import compiler
+import mmap
+
+def main() -> i32:
+	r = File.binary_reader( {path_literal} )
+	f = r.unwrap( 'open failed' )
+	defer( f.close() )
+	mm: mmap.mmap = mmap.mmap( f.fd(), 0, access = mmap.ACCESS_READ ).unwrap( 'mmap failed' )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for b in mm:
+			total += i32( b )
+	if total != 1620: # sum of 'Hello, mmap world!'s byte values
+		return 1
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_explicit_length_maps_a_prefix( self ) -> None:
 		import emitter_c
 		path_literal = repr( self.fixture_path )
