@@ -81,19 +81,6 @@ class IntBehaviorTests( unittest.TestCase ):
 
 			return subprocess.run( [ str( exe_path ) ], capture_output = True )
 
-	def _assert_compile_error( self, code: str, expected_substring: str ) -> None:
-		''' compiles `code` against the real builtins and asserts it fails
-		with a message containing expected_substring - for asserting the
-		exact WORDING of a diagnostic (message-clarity fixes), unlike
-		_run_program (which asserts a clean compile and then runs the
-		result). '''
-		discovery = Discovery( import_builtins = True )
-		compiler = Compiler( discovery )
-		compiler.import_code( code, Path( '__main__.py' ), scope = None )
-		compiler.run()
-		self.assertTrue( discovery.errors.errors, 'expected a compile error, got none' )
-		self.assertIn( expected_substring, str( discovery.errors.errors[0] ) )
-
 	def _assert_program_succeeds( self, code: str, check_names: list[str] ) -> None:
 		''' runs `code` and asserts it exited 0. check_names[i] (0-indexed)
 		names whatever assertion inside the program returns i+1 on failure,
@@ -395,23 +382,39 @@ def main() -> i32:
 	return 0
 ''', checks )
 
-	def test_out_of_range_literal_into_int_names_int_not_i32( self ) -> None:
-		# a bare literal too large for builtins.int's own literal
-		# constructor (int(x) only takes an i32) desugars into int(literal)
-		# - see _expr_Constant's own comment. Without the dedicated check
-		# this used to surface as "... is out of range for intrinsics.i32
-		# ...", confusing since the user wrote `int`, never asked for an
-		# i32 anywhere - asserts the clearer, int-specific wording instead,
-		# naming both the real cause and int.from_str as the real fix.
-		self._assert_compile_error(
-			'''
+	def test_arbitrary_size_literal_into_int( self ) -> None:
+		# a bare literal too large for builtins.int's own single-i32-
+		# parameter __init__ must still just work - this IS arbitrary-
+		# precision int, not a fixed-width scalar with a real range limit,
+		# so a literal's own size should never be a compile error here.
+		# _expr_Constant routes a too-big-for-i32 literal through
+		# int.from_str(...) on the literal's own decimal text instead of
+		# int(literal) - covers a value past i64::MAX and past even
+		# i128/u128::MAX (this compiler's own widest native scalars),
+		# where from_str's bignum parsing is the only way to represent it
+		# at all, plus a large NEGATIVE literal (sign handling).
+		checks = [
+			'a literal past i32::MAX but within i64 range',
+			'a literal past i128/u128::MAX (wider than any native scalar this compiler has)',
+			'a large negative literal',
+			'arithmetic on two arbitrary-size literals still round-trips correctly',
+		]
+		self._assert_program_succeeds( '''
 def main() -> i32:
-	x: int = 99999999999999999999
+	a: int = 999999999999999999
+	if a.to_i64().unwrap('x') != 999999999999999999:
+		return 1
+	b: int = 99999999999999999999999999999999999999999999999999
+	if b.to_i64().is_err() != True:
+		return 2
+	c: int = -99999999999999999999999999999999999999999999999999
+	if not c.is_negative():
+		return 3
+	total = ( b + c ).unwrap('y')
+	if total != int(0):
+		return 4
 	return 0
-''',
-			"99999999999999999999 is too large to construct an int from a literal (int(x) only takes an i32-range "
-			"literal, -2147483648..2147483647) - use int.from_str('99999999999999999999') for a larger value",
-		)
+''', checks )
 
 	def test_from_str( self ) -> None:
 		checks = [
