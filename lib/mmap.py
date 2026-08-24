@@ -28,7 +28,7 @@ ACCESS_WRITE: i32 = 2
 ACCESS_COPY:  i32 = 3
 
 
-class mmap:
+class mmap( Sequence[u8], Iterable[u8] ):
 	__ptr: Ptr[u8]
 	__len: usize
 
@@ -133,6 +133,14 @@ class mmap:
 
 	def __len__( self ) -> usize:
 		return self.__len
+
+	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
+		if index >= self.__len:
+			return Result.Err( IndexError() )
+		return Result.Ok( self.__ptr[index] )
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	def get_ptr( self ) -> Ptr[u8]:
 		return self.__ptr

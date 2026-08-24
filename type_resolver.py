@@ -1033,7 +1033,7 @@ class TypeResolver:
 		IS the entire mechanism Phase 4 needed (see
 		_desugar_generator_for_loops, this method's only caller). '''
 		if not isinstance( node.target, ast.Name ):
-			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node)}', node )
+			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node.target)}', node )
 		if node.orelse:
 			self.discovery.fail( f'{fn.qualname}: for/else is not supported', node )
 		call = node.iter
@@ -1179,7 +1179,7 @@ class TypeResolver:
 		then drives the resulting generator the same way. Neither found,
 		or the type can't be determined at all, is a clear compile error. '''
 		if not isinstance( node.target, ast.Name ):
-			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node)}', node )
+			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node.target)}', node )
 		if node.orelse:
 			self.discovery.fail( f'{fn.qualname}: for/else is not supported', node )
 		obj_type = self._resolve_expr_type_for_desugar( fn, node.iter )
@@ -1208,7 +1208,7 @@ class TypeResolver:
 				self.discovery.fail(
 					f'{fn.qualname}: {obj_type.qualname if obj_type else "?"}.__iter__() returned '
 					f'{iterator_type.qualname if iterator_type else "?"}, which does not conform to '
-					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node)}',
+					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node.iter)}',
 					node,
 				)
 			iter_call = ast.Call(
@@ -1219,7 +1219,7 @@ class TypeResolver:
 			return self._desugar_iterator_for( fn, node, iterator_type, next_fn, extra_locals, iter_call )
 		self.discovery.fail(
 			f'{fn.qualname}: for loop requires an IteratorProtocol[T] or Iterable[T] conformer, got '
-			f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+			f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node.iter)}',
 			node,
 		)
 
@@ -1343,7 +1343,7 @@ class TypeResolver:
 		if shape is None:
 			self.discovery.fail(
 				f'{fn.qualname}: for loop needs __next__() to return Result[T,E] on '
-				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node.iter)}',
 				node,
 			)
 		elem_type, full_error_type = shape
@@ -1351,7 +1351,7 @@ class TypeResolver:
 		if stop_iteration_cls is None or stop_iteration_cls not in self._atomic_leaves( full_error_type ):
 			self.discovery.fail(
 				f'{fn.qualname}: for loop needs __next__()\'s own error type to include StopIteration on '
-				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node)}',
+				f'{obj_type.qualname if obj_type else "?"}: {ast.unparse(node.iter)}',
 				node,
 			)
 		remaining_leaves = [ leaf for leaf in self._atomic_leaves( full_error_type ) if leaf is not stop_iteration_cls ]

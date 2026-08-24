@@ -359,7 +359,7 @@ def _bytes_endswith( haystack: bytes|bytearray, suffix: bytes|bytearray ) -> boo
 	return sys.memcmp( candidate, suffix.get_const_ptr(), suffix_len ) == 0
 
 
-class bytes:
+class bytes( Sequence[u8], Iterable[u8] ):
 	__data: ConstPtr[u8]
 
 	__len: usize
@@ -369,7 +369,7 @@ class bytes:
 		data = sys.alloc[u8]( self.__len )
 		sys.memcpy( data, copy_from.get_const_ptr(), self.__len )
 		self.__data = data
-	
+
 	@staticmethod
 	def from_bytearray( src: move[bytearray] ) -> bytes:
 		length: usize = len( src )
@@ -381,13 +381,13 @@ class bytes:
 				)
 			case Result.Err( sys.OwnershipError.SharedReference( src2 )):
 				return bytes( src2 )
-	
+
 	def __len__( self ) -> usize:
 		return self.__len
-	
+
 	def __del__( self ) -> None:
 		sys.free( self.__data )
-	
+
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
 
@@ -403,16 +403,23 @@ class bytes:
 	def endswith( self, suffix: bytes|bytearray ) -> bool:
 		return _bytes_endswith( self, suffix )
 
+	@overload
+	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
+		if index >= self.__len:
+			return Result.Err( IndexError() )
+		return Result.Ok( self.__data[index] )
+
 	# s[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a new,
 	# independently-owned bytes, matching real Python's own slice semantics
 	# exactly (out-of-range bounds silently clamp - see
-	# _resolve_slice_bounds). bytes has no scalar __getitem__(idx)
-	# overload to share this name with (immutable, and nothing here needs
-	# single-byte access by index yet), so this is a plain method, not an
-	# @overload group.
+	# _resolve_slice_bounds).
+	@overload
 	def __getitem__( self, s: slice ) -> bytes:
 		( start, stop ) = _resolve_slice_bounds( s, self.__len )
 		return self._byte_slice( start, stop )
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	@private
 	def _byte_slice( self, start: usize, end: usize ) -> bytes:
@@ -453,7 +460,7 @@ class bytes:
 
 BYTEARRAY_INVALID: Ptr[u8] = 0 # this is a sentinel to indicate a bytearray was released - matches lib/windows/kernel32.py's own INVALID_HANDLE_VALUE convention (a literal assigned directly to its real pointer type, not a same-width integer alias needing its own cast at every comparison site)
 
-class bytearray:
+class bytearray( Sequence[u8], Iterable[u8] ):
 	__data: Ptr[u8]
 	__len: usize
 	__cap: usize
@@ -519,6 +526,9 @@ class bytearray:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__setitem__() called after release()'
 			assert index < self.__len, 'bytearray.__setitem__() index out of range'
 		self.__data[index] = value
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	def resize( self, new_size: usize ) -> None:
 		''' grows or shrinks self to new_size bytes, zero-filling any newly
@@ -616,7 +626,7 @@ class bytearray:
 				start = match_start + sep_len
 		return result
 
-class str:
+class str( Sequence[str], Iterable[str] ):
 	__data: ConstPtr[u8]
 
 	__byte_size: usize # the number of bytes (code units) include the zero-terminater
@@ -821,6 +831,9 @@ class str:
 		# precomputed once by _from_owned_cstr during its mandatory UTF-8
 		# validation scan (see __char_count's own field comment).
 		return self.__char_count
+
+	def __iter__( self ) -> Generator[str, StopIteration]:
+		return _sequence_iter( self )
 
 	@overload
 	def __getitem__( self, idx: usize ) -> Result[str, IndexError]:

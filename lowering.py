@@ -7265,14 +7265,14 @@ class FunctionLowering:
 				self.lowering.discovery.fail(
 					f'{obj.type.qualname if obj.type else "?"}.__iter__() returned '
 					f'{iterator_dest.type.qualname if iterator_dest.type else "?"}, which does not conform to '
-					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node)}',
+					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node.iter)}',
 					node,
 				)
 			self._lower_for_over_iterator( node, iterator_dest, next_fn )
 		else:
 			self.lowering.discovery.fail(
 				f'for loop requires an IteratorProtocol[T] or Iterable[T] conformer, got '
-				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node.iter)}',
 				node,
 			)
 

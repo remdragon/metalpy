@@ -154,6 +154,63 @@ def main() -> i32:
 	return 0
 '''
 
+_STR_ITERABLE_CONFORMANCE = '''
+def main() -> i32:
+	s: str = 'abc'
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		for ch in s:
+			if ch == 'a':
+				count += 1
+			elif ch == 'b':
+				count += 2
+			elif ch == 'c':
+				count += 4
+	if count != 7:
+		return 1
+	if min( 'bca' ) != 'a':
+		return 2
+	if max( 'bca' ) != 'c':
+		return 3
+	return 0
+'''
+
+_BYTES_BYTEARRAY_MEMORYVIEW_ITERABLE_CONFORMANCE = '''
+def main() -> i32:
+	ba: bytearray = bytearray( 3 )
+	ba[0] = 1
+	ba[1] = 2
+	ba[2] = 3
+
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for x in ba:
+			total += i32( x )
+	if total != 6:
+		return 1
+
+	mv: memoryview = memoryview( ba )
+	total = 0
+	with compiler.wrap_arithmetic:
+		for x in mv:
+			total += i32( x )
+	if total != 6:
+		return 2
+
+	b: bytes = bytes.from_bytearray( move( bytearray( 3 )))
+	count: isize = 0
+	with compiler.wrap_arithmetic:
+		for x in b:
+			count += 1
+	if count != 3:
+		return 3
+
+	if b[0].unwrap( 'in bounds' ) != 0:
+		return 4
+
+	return 0
+'''
+
 _GENERIC_TUPLE_TYPED_PARAMETER_INFERENCE = '''
 def first_of[T]( t: tuple[T, T] ) -> T:
 	a, b = t
@@ -204,6 +261,22 @@ class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
 		usize index. '''
 		self.assert_programs_run([
 			( 'dict_iterable_conformance', _DICT_ITERABLE_CONFORMANCE ),
+		])
+
+	def test_str_iterable_conformance( self ) -> None:
+		''' str conforms to Sequence[str]/Iterable[str] via its existing
+		codepoint-indexed __getitem__(usize) - a plain for loop (not just
+		s[i] access) and min/max(str) now work. '''
+		self.assert_programs_run([
+			( 'str_iterable_conformance', _STR_ITERABLE_CONFORMANCE ),
+		])
+
+	def test_bytes_bytearray_memoryview_iterable_conformance( self ) -> None:
+		''' bytes/bytearray/memoryview all conform to Sequence[u8]/
+		Iterable[u8] - bytes needed a new scalar __getitem__(usize)
+		overload added alongside its pre-existing slice-only one. '''
+		self.assert_programs_run([
+			( 'bytes_bytearray_memoryview_iterable_conformance', _BYTES_BYTEARRAY_MEMORYVIEW_ITERABLE_CONFORMANCE ),
 		])
 
 	def test_generic_tuple_typed_parameter_inference( self ) -> None:
