@@ -4065,6 +4065,19 @@ class TypeResolver:
 			return self.discovery.visit_Subscript( node )
 		if isinstance( node, ast.Subscript ):
 			base = self._try_resolve_namespace( node.value )
+			if isinstance( base, Overload ):
+				# min[int](...) - Overload itself has no .type_params (see
+				# its own docstring: several members, each with its OWN
+				# type_params) - pick whichever member's type_params count
+				# matches the subscript's own arg count, same as ordinary
+				# overload dispatch picks a member by argument SHAPE. None
+				# on no match or on a genuine tie (two members with the
+				# same type_params count) - falls through to the plain
+				# isinstance check below, same 'not this pass's job, defer
+				# to lowering.py's own diagnostic' discipline as everywhere
+				# else in this method.
+				arg_count = len( node.slice.elts ) if isinstance( node.slice, ast.Tuple ) else 1
+				base = self._match_overload_type_param_candidate( base, arg_count )
 			# Name[T] - a generic FUNCTION (mylen[i32]), a generic CLASS
 			# construction (list[i32]()), or an intrinsic generic pointer
 			# scalar (Ptr[u8]/ConstPtr[u8], as a type reference - e.g.
@@ -4091,6 +4104,22 @@ class TypeResolver:
 				args.append( resolved )
 			return self.discovery._get_or_create_specialization( base, args )
 		return None
+
+	def _match_overload_type_param_candidate( self, base: Overload, arg_count: int ) -> Function|None:
+		''' `name[T0,T1,...](...)` explicit instantiation against an
+		OVERLOADED name - Overload has no .type_params of its own (each
+		member has its own, see Overload's own docstring), so the subscript's
+		arg count is used to pick which member it's meant to bind, the same
+		way ordinary overload dispatch picks a member by argument SHAPE.
+		Candidates are stubs+implementations combined (mirrors overload_
+		resolution.resolve_call's own "@overload members are stubs +
+		implementations" framing). None on no match, or on a genuine tie
+		(two members sharing the same type_params count) - not this method's
+		job to disambiguate further, same "any doubt, decline" discipline
+		every other _try_resolve_namespace/_try_resolve_callable_namespace
+		branch already follows. '''
+		candidates = [ fn for fn in ( *base.stubs, *base.implementations ) if len( fn.type_params or [] ) == arg_count ]
+		return candidates[0] if len( candidates ) == 1 else None
 
 	def _attr_lookup_callable( self, owner_type: Type|None, attr: str, ctx: ast.AST ) -> Function|Overload:
 		owner_type = self.ensure_resolved( owner_type )
@@ -5293,6 +5322,12 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# docstring already flagged ("explicit-subscript construction
 			# isn't even resolvable by name lookup today").
 			base = self._try_resolve_callable_namespace( node.value )
+			if isinstance( base, Overload ):
+				# min[int](...) - see _try_resolve_namespace's identical
+				# Subscript-branch comment on _match_overload_type_param_
+				# candidate for why Overload needs picking-by-arg-count here.
+				arg_count = len( node.slice.elts ) if isinstance( node.slice, ast.Tuple ) else 1
+				base = self.resolver._match_overload_type_param_candidate( base, arg_count )
 			if not isinstance( base, ( Function, RCClass, CStruct, CUnion, TaggedUnion, CEnum, Scalar )) or not getattr( base, 'type_params', None ):
 				return None
 			resolve = getattr( base, 'resolve', None )
@@ -5329,6 +5364,12 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# Name[T](...)/Attribute[T](...) - mirrors Lowering.
 			# _try_resolve_namespace's identical Subscript branch
 			base = self._try_resolve_callable_namespace( func.value )
+			if isinstance( base, Overload ):
+				# min[int](...) - see _try_resolve_namespace's identical
+				# Subscript-branch comment on _match_overload_type_param_
+				# candidate for why Overload needs picking-by-arg-count here.
+				arg_count = len( func.slice.elts ) if isinstance( func.slice, ast.Tuple ) else 1
+				base = self.resolver._match_overload_type_param_candidate( base, arg_count )
 			if not isinstance( base, Function ) or not base.type_params:
 				return None
 			if base.resolve is not None:
