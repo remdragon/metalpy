@@ -2410,6 +2410,27 @@ class ModuleVisibilityEnforcementTests( unittest.TestCase ):
 		self.assertEqual( len( errors ), 1, disco.errors.errors )
 		self.assertIn( 'pkg.a._internal', errors[0] )
 
+	def test_default_parameter_value_referencing_a_private_name_resolves_in_the_defining_module( self ) -> None:
+		# a default argument value is filled in at the CALL site but must
+		# still be checked as if accessed from the DEFINING function's own
+		# module, not the caller's - lowering.py's _lower_parameter_default
+		# already establishes the right module_context/scope_context for
+		# NAME RESOLUTION; this confirms the privacy check actually listens
+		# to that (self._owning_module), not just the ambient stack top.
+		# Confirmed as a real false positive: lib/pathlib.py's own `flavor:
+		# PathFlavor = _NATIVE_FLAVOR` parameter default, omitted at a call
+		# site living in an unrelated module, got flagged as THAT module
+		# illegally reaching pathlib's own package-private constant.
+		_comp, disco = self._compile(
+			{ 'pkg/__init__.py': '', 'pkg/a.py': (
+				'_default_value: i32 = 5\n'
+				'def use_default( x: i32 = _default_value ) -> i32:\n\treturn x\n'
+			)},
+			'from pkg.a import use_default\n'
+			'def main() -> i32:\n\treturn use_default()\n',
+		)
+		self.assertEqual( disco.errors.errors, [] )
+
 	def test_class_method_underscore_names_are_unaffected( self ) -> None:
 		# scope check: a class METHOD (fn.cls is not None) is a separate,
 		# still-unenforced convention (SYNTAX.md's own protected/private

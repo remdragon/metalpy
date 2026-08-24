@@ -13558,6 +13558,43 @@ class FunctionLowering:
 			return None
 		return unwrapped
 
+	def _lower_parameter_default( self, target: Function, param: Parameter ) -> ir.Operand:
+		''' an omitted argument's default VALUE, lowered in the DEFINING
+		function/class's own module/scope - not the caller's: a default
+		expression can reference names visible where the function was
+		DEFINED (matching _lower_allocate_fields's identical field-default
+		pattern), and errors inside it should be located there too. Shared
+		by every "fill in an omitted argument" call site (_lower_call_args,
+		_fill_generic_call_defaults, the resolved-Overload-candidate tail)
+		so they can't drift out of sync on this - confirmed as a real,
+		pre-existing gap before this helper existed: the Overload-candidate
+		tail was missing the module_context/scope_context switch entirely
+		(only the other two had it), silently resolving a default value
+		against the CALLER's own scope instead.
+
+		Also updates self._owning_module for the duration - module_context
+		is a genuine, correct switch to the callee's own module, but
+		self._owning_module (what check_module_visibility's callers pass as
+		the "who's really accessing this" module - see its own comment) is
+		otherwise fixed for this WHOLE FunctionLowering pass and would
+		still read as the CALLER's module here without this override.
+		Confirmed as a real false positive: lib/pathlib.py's own `flavor:
+		PathFlavor = _NATIVE_FLAVOR` parameter default, filled in at a
+		call site living in a completely different module, got flagged as
+		that OTHER module illegally reaching pathlib's own package-private
+		constant - same bug shape as _lower_inline_call's own identical
+		fix, just for default-argument filling instead of @inline
+		splicing. '''
+		self.lowering._type_resolver.resolve_parameter_default( target, param )
+		saved_owning_module = self._owning_module
+		self._owning_module = self.lowering._find_module_for( target )
+		try:
+			with self.lowering.discovery.module_context( self._owning_module ):
+				with self.lowering.discovery.scope_context( target ):
+					return self._lower_expr( param.default, param.type )
+		finally:
+			self._owning_module = saved_owning_module
+
 	def _lower_call_args( self, target: Function, node: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
 		# shared by the plain call path (_lower_call's own else branch) and
 		# _lower_generic_function_call: lowers positional/keyword args
@@ -13595,17 +13632,8 @@ class FunctionLowering:
 				# defaults live on fn.node.args, never walked by resolve_
 				# function_body's fn.node.body loop, and are lowered here,
 				# often before target's own turn on the compile queue ever
-				# comes up - see resolve_parameter_default's own docstring
-				self.lowering._type_resolver.resolve_parameter_default( target, param )
-				# lowered in the CALLEE's own module/scope, not the
-				# caller's (matching the identical field-default pattern
-				# above in _lower_allocate_fields) - a default expression
-				# can reference names visible where the function/class was
-				# DEFINED, and errors inside it should be located there too
-				with self.lowering.discovery.module_context( self.lowering._find_module_for( target )):
-					with self.lowering.discovery.scope_context( target ):
-						default_operand = self._lower_expr( param.default, param.type )
-				kwargs[param.stem] = default_operand
+				# comes up - see _lower_parameter_default's own docstring
+				kwargs[param.stem] = self._lower_parameter_default( target, param )
 		return args, kwargs
 
 	def _lower_inline_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -14200,14 +14228,10 @@ class FunctionLowering:
 		given.update( kwargs.keys() )
 		for param in monomorphized.parameters or []:
 			if param.stem not in given and param.default is not None:
-				# see resolve_parameter_default's own docstring for why this
+				# see _lower_parameter_default's own docstring for why this
 				# is needed - a construction call embedded in the default
 				# otherwise never gets its __init__ eagerly pre-resolved
-				self.lowering._type_resolver.resolve_parameter_default( monomorphized, param )
-				with self.lowering.discovery.module_context( self.lowering._find_module_for( monomorphized )):
-					with self.lowering.discovery.scope_context( monomorphized ):
-						default_operand = self._lower_expr( param.default, param.type )
-				kwargs[param.stem] = default_operand
+				kwargs[param.stem] = self._lower_parameter_default( monomorphized, param )
 
 	def _finish_generic_call( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# shared tail of _lower_inferred_generic_call (extracted verbatim,
@@ -15380,12 +15404,17 @@ class FunctionLowering:
 			given.update( kwargs.keys() )
 			for param in target.parameters or []:
 				if param.stem not in given and param.default is not None:
-					# see _lower_call_args's identical call for why this is
-					# needed - a construction call embedded in this default
-					# otherwise never gets its __init__ eagerly pre-resolved
-					self.lowering._type_resolver.resolve_parameter_default( target, param )
-					default_operand = self._lower_expr( param.default, param.type )
-					kwargs[param.stem] = default_operand
+					# see _lower_parameter_default's own docstring for why
+					# this is needed - a construction call embedded in this
+					# default otherwise never gets its __init__ eagerly
+					# pre-resolved. This call site used to lower the default
+					# expression directly, with no module_context/scope_
+					# context switch at all (unlike its own "mirrors _lower_
+					# call_args's identical tail" comment claimed) - a real,
+					# pre-existing bug, not just missing the later privacy-
+					# check fix: it silently resolved a default value against
+					# the CALLER's own scope instead of the callee's.
+					kwargs[param.stem] = self._lower_parameter_default( target, param )
 		else:
 			self.lowering._resolve_call_target( target )
 			# a Scalar-registered method's receiver isn't threaded through
