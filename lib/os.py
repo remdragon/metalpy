@@ -111,7 +111,7 @@ def rmdir( dirpath: str ) -> Result[None, OSError]:
 @compiler.target( os = not 'windows' )
 def rmdir( dirpath: str ) -> Result[None, OSError]:
 	from crt import rmdir as _crt_rmdir, get_errno
-	if _crt_rmdir( dirpath.get_cstr() ) < 0:
+	if _crt_rmdir( compiler.cast( ConstPtr[None], dirpath.get_cstr() )) < 0:
 		return Result.Err( OSError( get_errno() ))
 	return Result.Ok( None )
 
@@ -126,7 +126,7 @@ def unlink( filepath: str ) -> Result[None, OSError]:
 @compiler.target( os = not 'windows' )
 def unlink( filepath: str ) -> Result[None, OSError]:
 	from crt import unlink as _crt_unlink, get_errno
-	if _crt_unlink( filepath.get_cstr() ) < 0:
+	if _crt_unlink( compiler.cast( ConstPtr[None], filepath.get_cstr() )) < 0:
 		return Result.Err( OSError( get_errno() ))
 	return Result.Ok( None )
 
@@ -223,7 +223,7 @@ def _getcwd() -> Result[str, OSError]:
 	buf_size: usize = 4096
 	buf: Ptr[u8] = sys.alloc[u8]( buf_size )
 	defer( sys.free( buf ))
-	result: Ptr[u8] = getcwd( buf, buf_size )
+	result: Ptr[None] = getcwd( compiler.cast( Ptr[None], buf ), buf_size )
 	if result is None:
 		return Result.Err( OSError( get_errno() ))
 	n: usize = sys.cstrlen( buf, buf_size )

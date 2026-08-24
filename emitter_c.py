@@ -574,11 +574,150 @@ static inline double __metalpy_parse_f64( const char* text ) {
 #endif
 '''
 
+# always emitted (unconditionally, like _PROLOGUE_ARITH) - every compiled
+# program should report a fault instead of silently vanishing, not just ones
+# that happen to reference some other PROLOGUE helper. __metalpy_init()
+# installs this before anything else runs (see emit_c's own call to
+# __metalpy_install_crash_handler()), so it's in place before global
+# initializers, let alone main(), get a chance to run.
+#
+# Hand-rolled, not routed through sys.panic/_write_stderr_cstr (lib/sys.py):
+# a fault handler has to assume the process is in an arbitrary broken state
+# (corrupted heap, exhausted stack) - reusing machinery that itself expects a
+# healthy runtime isn't trustworthy. Same reasoning as sys.panic's own
+# comment on why IT avoids allocation, taken one step further here (avoids
+# calling into any metalpy-level code at all).
+_PROLOGUE_CRASH_HANDLER = '''\
+#ifdef _WIN32
+// hand-declared rather than routed through windows.kernel32's own @extern
+// bindings (SetUnhandledExceptionFilter/EXCEPTION_POINTERS have no other user
+// in this codebase). GetStdHandle/WriteFile/ExitProcess mirror
+// windows.kernel32's own @extern-generated signatures exactly (see
+// _function_prototype) - a repeated, compatible extern declaration of the
+// same symbol is legal C, so this coexists fine whether or not a given
+// program separately imports windows.kernel32 for its own reasons.
+void* GetStdHandle( uint32_t nStdHandle );
+bool WriteFile( void* hFile, const uint8_t* lpBuffer, uint32_t nNumberOfBytesToWrite, uint32_t* lpNumberOfBytesWritten, void* lpOverlapped );
+_Noreturn void ExitProcess( uint32_t uExitCode );
+// only the fields this handler actually reads - trailing real fields
+// (ExceptionInformation[15]) are omitted; safe, since nothing here takes
+// sizeof() or reads past NumberParameters, and the OS-owned struct these
+// pointers reference is always at least this big.
+typedef struct __metalpy_EXCEPTION_RECORD {
+	uint32_t ExceptionCode;
+	uint32_t ExceptionFlags;
+	struct __metalpy_EXCEPTION_RECORD* ExceptionRecord;
+	void* ExceptionAddress;
+	uint32_t NumberParameters;
+} __metalpy_EXCEPTION_RECORD;
+typedef struct {
+	__metalpy_EXCEPTION_RECORD* ExceptionRecord;
+	void* ContextRecord;
+} __metalpy_EXCEPTION_POINTERS;
+void* SetUnhandledExceptionFilter( int32_t (*lpTopLevelExceptionFilter)( __metalpy_EXCEPTION_POINTERS* ));
+
+// re-entrancy guard - the handler firing again (e.g. a stack-overflow fault
+// re-faulting while this handler itself runs on the little extra stack
+// Windows grants for exactly that case) exits immediately instead of
+// recursing back into WriteFile.
+static volatile long __metalpy_in_crash_handler = 0;
+
+static void __metalpy_crash_write( const char* msg ) {
+	uint32_t len = 0;
+	while ( msg[len] ) len++;
+	void* h = GetStdHandle( (uint32_t)-12 ); // STD_ERROR_HANDLE
+	if ( h != (void*)(intptr_t)-1 ) {
+		uint32_t written = 0;
+		WriteFile( h, (const uint8_t*)msg, len, &written, 0 );
+	}
+}
+
+static void __metalpy_crash_write_hex( uint64_t v ) {
+	char buf[] = "0x0000000000000000";
+	for ( int i = 17; i >= 2 && v; i-- ) {
+		uint32_t nib = (uint32_t)( v & 0xF );
+		buf[i] = (char)( nib < 10 ? '0' + nib : 'a' + nib - 10 );
+		v >>= 4;
+	}
+	__metalpy_crash_write( buf );
+}
+
+static int32_t __metalpy_crash_filter( __metalpy_EXCEPTION_POINTERS* info ) {
+	if ( __metalpy_in_crash_handler ) ExitProcess( 1 );
+	__metalpy_in_crash_handler = 1;
+	uint32_t code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+	__metalpy_crash_write( "\\nFatal error: unhandled exception " );
+	__metalpy_crash_write_hex( code );
+	__metalpy_crash_write( " at address " );
+	__metalpy_crash_write_hex( (uint64_t)(uintptr_t)( info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : 0 ));
+	__metalpy_crash_write( "\\n" );
+	ExitProcess( code ? code : 1 );
+}
+
+static void __metalpy_install_crash_handler( void ) {
+	SetUnhandledExceptionFilter( __metalpy_crash_filter );
+}
+#else
+// <unistd.h> for the REAL write()/_exit() declarations - safe now that
+// lib/crt.py's own write/_exit are split into os='windows'/os=not'windows'
+// overloads, with header='unistd.h' only on the POSIX one (see that split's
+// own comment in crt.py, and every other unistd.h-shaped extern there,
+// for the two real problems this used to hit before the whole file's
+// POSIX-facing externs were audited: a single ungated header= reaching a
+// Windows build, and this header conflicting with a sibling extern's own
+// separately-guessed, incompatible pointee type). Both this file and
+// crt.py's own POSIX-branch prototype (skipped whenever unistd.h is
+// already required - see emit_c's pass-1 loop) now defer to the one real
+// header instead of each hand-declaring their own guess at it.
+#include <signal.h>
+#include <unistd.h>
+static void __metalpy_crash_write( const char* msg ) {
+	size_t len = 0;
+	while ( msg[len] ) len++;
+	ssize_t __metalpy_unused = write( 2, msg, len );
+	(void)__metalpy_unused;
+}
+
+static const char* __metalpy_signal_name( int sig ) {
+	switch ( sig ) {
+		case SIGSEGV: return "SIGSEGV (segmentation fault)";
+		case SIGABRT: return "SIGABRT (aborted)";
+		case SIGFPE:  return "SIGFPE (arithmetic exception)";
+		case SIGILL:  return "SIGILL (illegal instruction)";
+		case SIGBUS:  return "SIGBUS (bus error)";
+		default:      return "unknown signal";
+	}
+}
+
+// see the Windows branch's own comment on why this needs its own re-entrancy
+// guard - sig_atomic_t (not a plain int/bool) is the one type C guarantees
+// is safe to read/write from inside a signal handler
+static volatile sig_atomic_t __metalpy_in_crash_handler = 0;
+
+static void __metalpy_crash_handler( int sig ) {
+	if ( __metalpy_in_crash_handler ) _exit( 128 + sig );
+	__metalpy_in_crash_handler = 1;
+	__metalpy_crash_write( "\\nFatal error: " );
+	__metalpy_crash_write( __metalpy_signal_name( sig ));
+	__metalpy_crash_write( "\\n" );
+	_exit( 128 + sig );
+}
+
+static void __metalpy_install_crash_handler( void ) {
+	signal( SIGSEGV, __metalpy_crash_handler );
+	signal( SIGABRT, __metalpy_crash_handler );
+	signal( SIGFPE, __metalpy_crash_handler );
+	signal( SIGILL, __metalpy_crash_handler );
+	signal( SIGBUS, __metalpy_crash_handler );
+}
+#endif
+'''
+
 # the full, unconditional concatenation - kept for callers that want every
 # PROLOGUE helper regardless of whether a specific program needs it (e.g.
 # emitter_c_test.py's own release_object test). emit_c() itself assembles
 # the pieces above selectively instead of using this directly.
-PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE
+PROLOGUE = _PROLOGUE_HEADER + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE + _PROLOGUE_CRASH_HANDLER
 
 
 
@@ -4401,6 +4540,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 		parts.append( _PROLOGUE_FLOAT_FORMAT )
 	if uses_parse_conv:
 		parts.append( _PROLOGUE_FLOAT_PARSE )
+	parts.append( _PROLOGUE_CRASH_HANDLER )
 	if locked_globals and _global_lock_supported() and _target_os == 'windows':
 		parts.append( _PROLOGUE_GLOBAL_LOCK_WINDOWS )
 		# Neither Linux nor macOS needs an analogous hand-declared prologue
@@ -4660,6 +4800,10 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	)
 	parts.append(
 		'static void __metalpy_init( void ) {\n'
+		# first thing any compiled program does, on every target/entry-point
+		# shape (see _PROLOGUE_CRASH_HANDLER's own comment) - before global
+		# initializers, let alone main(), get a chance to fault.
+		+ '\t__metalpy_install_crash_handler();\n'
 		+ ( '\n'.join( lock_init_calls ) + '\n' if lock_init_calls else '' )
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
