@@ -1597,11 +1597,100 @@ def main() -> i32:
 	return 0
 '''
 
+# regression for a real cfg.py bug: a NAMED Result[T,E]-shaped local (or a
+# compiler-synthesized match-subject) declared as a top-level statement
+# directly inside a try body lost its epilogue bookkeeping when the try's
+# own per-handler restore() truncated the epilogue stack back to the try's
+# entry snapshot - even after a `return`/match arm inside the try body had
+# already committed a goto into that entry's own shared label ("use of
+# undeclared label"). Fixed by having restore() keep a CAPTURED entry alive
+# across the truncation, same as an already-armed defer/errdefer entry.
+_NAMED_RESULT_LOCAL_MATCH_RETURN_INSIDE_TRY_BODY = '''
+class ErrorA:
+	pass
+
+def indicator( which: i32 ) -> Result[i32, ErrorA]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	return Result.Ok( which )
+
+def other() -> Result[i32, ErrorA]:
+	return Result.Ok( 9 )
+
+def run( which: i32 ) -> i32:
+	try:
+		x: i32 = other().or_throw()
+		match indicator( which ):
+			case Result.Ok( v ):
+				return 0
+			case Result.Err( e ):
+				return -1
+	except ErrorA:
+		return -2
+	return -3
+
+def main() -> i32:
+	if run( 1 ) != -1:
+		return 1
+	if run( 0 ) != 0:
+		return 2
+	return 0
+'''
+
+# regression for a second, related cfg.py bug: even with no `return`/match at
+# all, simply declaring a named Result[T,E] local inside a try body and
+# is_err()-checking it produced references to fresh $tN temps whose
+# DeclareTemp never made it into the emitted C. Root cause: _stmt_Try's own
+# per-handler merge_if() call minted those temps while self._instructions
+# still pointed at the just-lowered HANDLER's own instruction list (never
+# reset back to the real outer list first, unlike every other merge_if()
+# call site) - the DeclareTemp landed in the handler's own (unrelated, often
+# dead) block while the matching compute/use instructions landed on the try
+# body's own fallthrough path instead ("use of undeclared identifier").
+_NAMED_RESULT_LOCAL_IS_ERR_CHECK_INSIDE_TRY_BODY = '''
+class ErrorA:
+	pass
+
+def indicator( which: i32 ) -> Result[i32, ErrorA]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	return Result.Ok( which )
+
+def other() -> Result[i32, ErrorA]:
+	return Result.Ok( 9 )
+
+def run( which: i32 ) -> i32:
+	result: i32 = -3
+	try:
+		r1: Result[i32, ErrorA] = indicator( which )
+		if r1.is_err():
+			result = -1
+		else:
+			result = 0
+		x: i32 = other().or_throw()
+	except ErrorA:
+		result = -2
+	return result
+
+def main() -> i32:
+	if run( 1 ) != -1:
+		return 1
+	if run( 0 ) != 0:
+		return 2
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile try/except RC stress test' )
 class TryExceptRCStressTests( RealCompileMixin, unittest.TestCase ):
 	def test_fresh_construction_across_handlers_repeated_no_leak_or_double_free( self ) -> None:
 		self.assert_programs_run([ ( 'try_except_rc_stress', _RC_STRESS_ACROSS_HANDLERS ) ])
+
+	def test_named_result_local_match_return_inside_try_body( self ) -> None:
+		self.assert_programs_run([ ( 'try_except_named_result_match_return', _NAMED_RESULT_LOCAL_MATCH_RETURN_INSIDE_TRY_BODY ) ])
+
+	def test_named_result_local_is_err_check_inside_try_body( self ) -> None:
+		self.assert_programs_run([ ( 'try_except_named_result_is_err', _NAMED_RESULT_LOCAL_IS_ERR_CHECK_INSIDE_TRY_BODY ) ])
 
 
 if __name__ == '__main__':

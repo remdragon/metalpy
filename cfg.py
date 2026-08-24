@@ -386,12 +386,33 @@ class CFGState:
 		assumed definitely-assigned once back outside it - merge_if()/
 		merge_loop_exits() are what let a name's liveness survive past the
 		construct, via their own explicit reconciliation, same split of
-		responsibility as bindings/narrowed above. '''
+		responsibility as bindings/narrowed above.
+
+		A CAPTURED plain entry also survives, same as a flag-guarded one -
+		current_epilogue_label() already handed its .name out as a live goto
+		target (this can happen even for a genuinely branch-scoped entry
+		when the pushing code itself is UNCONFINED at push time - e.g.
+		_stmt_Try's own try body, which never wraps itself in enter_branch()
+		since it always runs exactly once when reached, unlike a handler -
+		see its own docstring). Dropping it here would leave that goto
+		dangling once build_epilogue_ladder() never emits the matching
+		Label - confirmed by a real repro (a named Result local, or a
+		compiler-synthesized match subject, declared directly inside a
+		try body, with a `return`/match arm reachable from inside that same
+		body). Safe to keep unconditionally: an entry that's NOT captured
+		here is confined-and-never-jumped-to, so its teardown is already
+		fully handled by whichever reconciliation call (merge_if()/
+		merge_loop_exits()) is about to run instead - and an entry that's
+		genuinely confined (pushed at or after a live enter_branch()/
+		enter_loop() depth) never reaches captured=True in the first place,
+		since current_epilogue_label() refuses to hand out a label for one
+		(see its own docstring) - so this can never resurrect an entry that
+		was truly meant to be block-scoped. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
-		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
+		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.captured ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
 
