@@ -454,20 +454,28 @@ class OrThrow( Instruction ):
 	payload if the clause names one), NEVER touching the enclosing
 	function's own return type at all. Only a leaf with NO entry in
 	dispatch falls back to exactly OrReturn's (target is None) or OrJump's
-	(target is a real epilogue label) own propagate-to-caller behavior -
-	`epilogue`/`target`/`return_slot` mirror those two instructions
-	exactly, and are only ever consulted along that uncovered-leaf path
-	(built and legality-checked by lowering.py only when at least one leaf
-	is actually uncovered - see _lower_or_throw). No inline_exit field:
-	.or_throw() inside an @inline splice's pre-return statements is
-	rejected outright (see discovery.py/_lower_or_throw), unlike
-	.or_return(), which supports it. '''
+	(target is a real epilogue label) own propagate-to-caller behavior, OR
+	(inside a multi-statement @inline splice's pre-return statements) the
+	splice-local inline_exit shape below - `epilogue`/`target`/
+	`return_slot` mirror OrReturn/OrJump exactly, and are only ever
+	consulted along that uncovered-leaf path (built and legality-checked
+	by lowering.py only when at least one leaf is actually uncovered - see
+	_lower_or_throw). '''
 	dest: Temp
 	value: Operand # a Result[T,E]
 	dispatch: list[ThrowLeaf]
 	epilogue: list['Instruction'] = field( default_factory = list )
 	target: str|None = None # None -> real C `return`, matching OrReturn; a real label -> `goto`, matching OrJump
 	return_slot: 'Variable|None' = None # only meaningful when target is not None
+	# PLAN_INLINE.md early-return generalization, same shape as OrReturn's own
+	# inline_exit field - set only for the uncovered-leaf fallback, reached
+	# from inside a multi-statement @inline splice's pre-return statements:
+	# widens into result_var (the SPLICE TARGET's own return type, not
+	# target/return_slot's enclosing-function one), arms exited_flag, and
+	# `goto`s merge_label instead of returning/jumping to a real epilogue.
+	# Mutually exclusive with target/return_slot being meaningfully set - see
+	# lowering.py's _emit_or_throw.
+	inline_exit: 'tuple[Variable,Variable,str]|None' = None
 
 	def test_repr( self ) -> str:
 		return f'OrThrow( dest={self.dest!r}, value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
@@ -486,13 +494,14 @@ class Raise( Instruction ):
 	real epilogue label) - emitter_c.py reuses the exact same
 	_emit_widen_error-based machinery ir.OrThrow's own uncovered-leaf arm
 	already uses, just seeded from `value` directly instead of `(receiver).
-	data.err`. `dispatch`/`epilogue`/`target`/`return_slot` mirror
-	ir.OrThrow's own identical fields. '''
+	data.err`. `dispatch`/`epilogue`/`target`/`return_slot`/`inline_exit`
+	mirror ir.OrThrow's own identical fields. '''
 	value: Operand # the raised error value itself - NOT a Result
 	dispatch: list[ThrowLeaf]
 	epilogue: list['Instruction'] = field( default_factory = list )
 	target: str|None = None # None -> real C `return`; a real label -> `goto`
 	return_slot: 'Variable|None' = None # only meaningful when target is not None
+	inline_exit: 'tuple[Variable,Variable,str]|None' = None # see ir.OrThrow's own identical field
 
 	def test_repr( self ) -> str:
 		return f'Raise( value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
