@@ -38,6 +38,7 @@ from compiler import Compiler
 from discovery import Discovery
 
 _CC = linker_c.detect_cc()
+_HAS_I128 = linker_c.has_i128( _CC )
 
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping real-compile int tests' )
@@ -419,6 +420,83 @@ def main() -> i32:
 		return 8
 	return 0
 ''', checks )
+
+	def test_scalar_conversions( self ) -> None:
+		checks = [
+			'to_i8/to_u8 round-trip MIN/MAX, overflow one past either end',
+			'to_i64 correctly overflows a 19-digit value that exceeds i64::MAX (pre-existing accumulator-overflow bug fixed here)',
+			'a negative int overflows any unsigned target',
+			'i32(some_int) construct-cast syntax dispatches through __i32__ and yields a plain i32 (not a Result) under panic_arithmetic on success',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	if int.from_str('-128').unwrap('a').to_i8().unwrap('b') != -128:
+		return 1
+	if int.from_str('127').unwrap('a').to_i8().unwrap('b') != 127:
+		return 2
+	if not int.from_str('128').unwrap('a').to_i8().is_err():
+		return 3
+	if not int.from_str('-129').unwrap('a').to_i8().is_err():
+		return 4
+	if int.from_str('255').unwrap('a').to_u8().unwrap('b') != 255:
+		return 5
+	if not int.from_str('256').unwrap('a').to_u8().is_err():
+		return 6
+
+	# 19 digits, exceeds i64::MAX (9223372036854775807) - digit-count-only
+	# bounding used to accumulator-overflow (panic) here instead of
+	# cleanly returning Err
+	if not int.from_str('9999999999999999999').unwrap('a').to_i64().is_err():
+		return 7
+
+	if not int.from_str('-1').unwrap('a').to_u32().is_err():
+		return 8
+
+	small: int = int.from_i32(42).unwrap('a')
+	with compiler.panic_arithmetic('should not overflow'):
+		if i32(small) != 42:
+			return 9
+
+	return 0
+''', checks )
+
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
+	def test_scalar_conversions_i128_u128( self ) -> None:
+		# separate from test_scalar_conversions above: i128/u128 themselves
+		# (unlike every narrower target, which _to_i64/_to_u64 deliberately
+		# avoid routing through i128/u128 for exactly this reason - see
+		# int._to_i64's own comment) inherit the same pre-existing MSVC-
+		# only 64-bit fallback every other i128/u128 feature in this
+		# compiler already has, so this needs the same skip every other
+		# real-i128-range test in this codebase already uses.
+		checks = [
+			'to_u128 round-trips u128::MAX, overflows one past it',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	u128_max: int = int.from_str('340282366920938463463374607431768211455').unwrap('a')
+	if u128_max.to_u128().unwrap('b') != 340282366920938463463374607431768211455:
+		return 1
+	one_past: int = int.from_str('340282366920938463463374607431768211456').unwrap('a')
+	if not one_past.to_u128().is_err():
+		return 2
+	return 0
+''', checks )
+
+	def test_scalar_conversion_construct_cast_panics_on_overflow( self ) -> None:
+		# i32(x) (x: int) dispatches through __i32__ (@fallible_arithmetic),
+		# so a real overflow under panic_arithmetic auto-panics - a nonzero,
+		# crashed exit, not a returned Err the caller could inspect. Checked
+		# via the raw process exit code (like _run_program), not _assert_
+		# program_succeeds, since the whole point here is that it does NOT
+		# exit cleanly.
+		result = self._run_program( '''
+def main() -> i32:
+	big: int = int.from_str('99999999999999999999').unwrap('a')
+	with compiler.panic_arithmetic('deliberate overflow'):
+		return i32(big)
+''' )
+		self.assertNotEqual( result.returncode, 0, 'i32(x) overflow under panic_arithmetic should panic, not exit 0' )
 
 	# --- __str__/__repr__ ---------------------------------------------------
 

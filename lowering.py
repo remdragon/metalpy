@@ -13370,15 +13370,22 @@ class FunctionLowering:
 			return self._lower_scalar_cast( target_cls, operand, node )
 		# a non-Scalar source (e.g. an RCClass) - this is where library-
 		# authored extensibility (Scalar.names, see discovery.py's
-		# visit_Assign) actually earns its keep: a future
-		# `SomeClass.__u32__(self) -> u32: ...` is dispatched here exactly
-		# like any other method call
+		# visit_Assign) actually earns its keep: a `SomeClass.__u32__(self)
+		# -> u32: ...` is dispatched here exactly like any other method
+		# call - or, if declared @fallible_arithmetic (e.g. int.__i32__,
+		# a genuine value-range check with no bit-width concept to fall
+		# back on), through the SAME ambient-mode auto-consumption a
+		# narrowing Scalar-to-Scalar T(x) already gets via _lower_scalar_
+		# cast above, so `i32(some_int)` behaves identically regardless of
+		# whether the narrowing is a compiler intrinsic or library-authored
 		dunder = self.lowering._find_method( operand.type, f'__{target_cls.stem}__' )
 		if dunder is None:
 			self.lowering.discovery.fail(
 				f'{operand.type.qualname if operand.type else "?"} has no __{target_cls.stem}__ method - cannot convert to {target_cls.qualname}: {ast.unparse(node)}',
 				node,
 			)
+		if dunder.is_fallible_arithmetic:
+			return self._emit_fallible_method_call( node, dunder, operand, [], expected_type )
 		self.lowering._ensure_resolved( dunder )
 		self.lowering.schedule( dunder.return_type )
 		dest = self._new_temp( expected_type or dunder.return_type )

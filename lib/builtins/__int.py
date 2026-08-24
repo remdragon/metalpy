@@ -90,12 +90,33 @@ _ASCII_NINE: u8 = 0x39 # '9'
 _HEX_DIGITS_LOWER: str = '0123456789abcdef'
 _HEX_DIGITS_UPPER: str = '0123456789ABCDEF'
 
-# i32.min/i32.max are not real expressions in this language (scalars have no
-# such members - confirmed by direct inspection); to_i32()'s own bounds
-# check spells the literal range out instead, widened to i64 to match
-# value's own type there.
+# iN.min/iN.max are not real expressions in this language (scalars have no
+# such members - confirmed by direct inspection); every to_iN/to_uN below
+# spells its own target range out instead, widened to i64 (the shared
+# _to_i64 accumulator's own type - see its own comment) to compare
+# directly against a widened value with no further casting.
+_I8_MIN: i64 = -128
+_I8_MAX: i64 = 127
+_I16_MIN: i64 = -32768
+_I16_MAX: i64 = 32767
 _I32_MIN: i64 = -2147483648
 _I32_MAX: i64 = 2147483647
+_U8_MAX: i64 = 255
+_U16_MAX: i64 = 65535
+_U32_MAX: i64 = 4294967295
+
+# decimal spellings of i64::MIN's own magnitude, i64::MAX, u64::MAX,
+# i128::MIN's own magnitude, i128::MAX, and u128::MAX - used only to bound-
+# check an int's own magnitude BEFORE accumulating into the correspondingly-
+# wide scalar (see _to_i64/_to_u64/_to_i128/_to_u128's own comments for why
+# digit COUNT alone isn't a tight enough bound: an N-digit value can still
+# exceed an N-digit MAX).
+_I64_MIN_MAGNITUDE_STR: str = '9223372036854775808'
+_I64_MAX_STR: str = '9223372036854775807'
+_U64_MAX_STR: str = '18446744073709551615'
+_I128_MIN_MAGNITUDE_STR: str = '170141183460469231731687303715884105728'
+_I128_MAX_STR: str = '170141183460469231731687303715884105727'
+_U128_MAX_STR: str = '340282366920938463463374607431768211455'
 
 class int:
 	__digits: Ptr[u8]
@@ -601,21 +622,63 @@ class int:
 	# --- narrowing / widening conversions ------------------------------
 	# int never implicitly converts to/from fixed-width types (SYNTAX.md
 	# Section 2), so both directions are explicit, fallible calls.
-	
+	#
+	# `to_T()` mirrors what `.to_T()` already means for Scalar-to-Scalar
+	# pairs (SYNTAX.md "Scalar Conversions"): Result[T,OverflowError],
+	# succeeds iff the value fits T's own [MIN,MAX]. Deliberately plain
+	# (not @fallible_arithmetic), matching __add__/__sub__/__mul__'s own
+	# "not mode-aware" precedent above - existing callers (int_test.py,
+	# _to_radix_digits below) already consume the raw Result manually via
+	# .unwrap()/.is_err(), and @fallible_arithmetic's ambient-mode auto-
+	# consumption would silently break every one of them.
+	#
+	# `__T__()` is the T(x) construct-cast sibling lowering.py's
+	# _try_lower_scalar_construct_call dunder-dispatch tail looks up by
+	# name - @fallible_arithmetic (unlike to_T() above) so `i32(some_int)`
+	# participates in ambient arithmetic mode (auto-propagate/panic) the
+	# same way a narrowing Scalar-to-Scalar T(x) already does, since
+	# participating in ambient mode is the entire point of T(x) syntax.
+
 	@staticmethod
 	def from_i32( value: i32 ) -> Result[int, IntError]:
 		return Result.Ok( int( value ))
-	
-	def to_i32( self ) -> Result[i32, IntError]:
-		# A 19-digit number is the most that can possibly fit in an i64
-		# accumulator (i64::MAX has 19 digits), so bailing out above that
-		# threshold up front means the accumulation loop itself can never
-		# overflow -- no need for BigInt_to_int's per-digit
-		# check_mul_int_int/check_add_int_int guards.
-		if self.__num_digits > 19:
-			return Result.Err( IntError.Overflow( None ))
-		
-		with compiler.panic_arithmetic( 'accumulating at most 19 decimal digits into an i64 cannot overflow, guaranteed by the digit-count check above' ):
+
+	def _magnitude_exceeds( self, limit_str: str ) -> bool:
+		# true if self's absolute value is strictly greater than the
+		# decimal magnitude limit_str spells - shared bound check for
+		# _to_i128/_to_u128 below, both of which need to know their own
+		# accumulator (i128/u128 respectively) can safely hold self's
+		# value BEFORE accumulating into it. Digit COUNT alone (as this
+		# method's own predecessor used to bound an i64 accumulator by
+		# "at most 19 digits") is NOT a tight enough bound - a 19-digit
+		# value can still exceed i64::MAX (also 19 digits: 19-digit
+		# 9999999999999999999 > i64::MAX's 9223372036854775807) - a real,
+		# pre-existing bug confirmed here (that accumulation's own
+		# `panic_arithmetic` claimed "cannot overflow" when it demonstrably
+		# could, for exactly this input), fixed by comparing against the
+		# exact magnitude instead of trusting a digit-count threshold.
+		limit = int.from_str( limit_str ).unwrap( 'internal magnitude literal is always well-formed' )
+		return int._compare_magnitude( self, limit ) > 0
+
+	def _to_i64( self ) -> Result[i64, OverflowError]:
+		# widens self into i64, the accumulator every to_iN/to_uN target
+		# up to u32 (whose own range fits safely inside i64's) narrows
+		# FROM, rather than re-deriving its own bounded accumulation loop.
+		# Deliberately NOT i128 here even though i128 could represent a
+		# wider range in principle: i128/u128 have a documented MSVC-only
+		# fallback to plain 64-bit (cl.exe has no native 128-bit integer
+		# type - see emitter_c.py's __metalpy_wideint comment), so routing
+		# every narrow target through an i128 accumulator would silently
+		# inherit that fallback's real 64-bit ceiling under MSVC even
+		# though nothing about i8..u32 needs more than 64 bits - confirmed
+		# via a real repro (to_i64 on a genuinely-in-i128-range but
+		# out-of-i64-range 19-digit value panicked under MSVC, despite
+		# this method's own bound check having already proven it fits
+		# real, non-emulated i128). i64 has no such platform gap.
+		limit_str = _I64_MIN_MAGNITUDE_STR if self.__is_negative else _I64_MAX_STR
+		if self._magnitude_exceeds( limit_str ):
+			return Result.Err( OverflowError() )
+		with compiler.panic_arithmetic( 'magnitude already bounded to i64 range by the check above - every partial sum during MSD-first accumulation is itself a numeric prefix of the final, in-range value, so it can never exceed it' ):
 			value: i64 = 0
 			i: usize = self.__num_digits
 			while i > 0:
@@ -623,12 +686,152 @@ class int:
 				value = value * 10 + i64( self.__digits[i] )
 			if self.__is_negative:
 				value = -value
-		
-		if value < _I32_MIN or value > _I32_MAX:
-			return Result.Err( IntError.Overflow( None ))
+		return Result.Ok( value )
+
+	def _to_u64( self ) -> Result[u64, OverflowError]:
+		# u64's positive range exceeds i64::MAX, so it needs its own
+		# accumulator - same bound-then-accumulate structure as _to_i64,
+		# just unsigned throughout (see that method's own comment; u64
+		# itself has no MSVC-fallback gap - only i128/u128 do).
+		if self.__is_negative and not self.is_zero():
+			return Result.Err( OverflowError() )
+		if self._magnitude_exceeds( _U64_MAX_STR ):
+			return Result.Err( OverflowError() )
+		with compiler.panic_arithmetic( 'magnitude already bounded to u64::MAX by the check above - see _to_i64\'s identical reasoning' ):
+			value: u64 = 0
+			i: usize = self.__num_digits
+			while i > 0:
+				i -= 1
+				value = value * 10 + u64( self.__digits[i] )
+		return Result.Ok( value )
+
+	def _to_i128( self ) -> Result[i128, OverflowError]:
+		# only for the to_i128 target itself - see _to_i64's own comment
+		# for why every NARROWER target deliberately avoids this
+		# accumulator despite i128 being wide enough in principle.
+		limit_str = _I128_MIN_MAGNITUDE_STR if self.__is_negative else _I128_MAX_STR
+		if self._magnitude_exceeds( limit_str ):
+			return Result.Err( OverflowError() )
+		with compiler.panic_arithmetic( 'magnitude already bounded to i128 range by the check above - see _to_i64\'s identical reasoning' ):
+			value: i128 = 0
+			i: usize = self.__num_digits
+			while i > 0:
+				i -= 1
+				value = value * 10 + i128( self.__digits[i] )
+			if self.__is_negative:
+				value = -value
+		return Result.Ok( value )
+
+	def _to_u128( self ) -> Result[u128, OverflowError]:
+		# u128's positive range exceeds i128::MAX, so it needs its own
+		# accumulator - same bound-then-accumulate structure as _to_i128,
+		# just unsigned throughout (see that method's own comment).
+		if self.__is_negative and not self.is_zero():
+			return Result.Err( OverflowError() )
+		if self._magnitude_exceeds( _U128_MAX_STR ):
+			return Result.Err( OverflowError() )
+		with compiler.panic_arithmetic( 'magnitude already bounded to u128::MAX by the check above - see _to_i128\'s identical reasoning' ):
+			value: u128 = 0
+			i: usize = self.__num_digits
+			while i > 0:
+				i -= 1
+				value = value * 10 + u128( self.__digits[i] )
+		return Result.Ok( value )
+
+	def to_i8( self ) -> Result[i8, OverflowError]:
+		wide = self._to_i64().or_return()
+		if wide < _I8_MIN or wide > _I8_MAX:
+			return Result.Err( OverflowError() )
 		with compiler.wrap_arithmetic: # already range-checked above; this narrows, never truncates
-			return Result.Ok( i32( value ) )
-	
+			return Result.Ok( i8( wide ))
+
+	def to_i16( self ) -> Result[i16, OverflowError]:
+		wide = self._to_i64().or_return()
+		if wide < _I16_MIN or wide > _I16_MAX:
+			return Result.Err( OverflowError() )
+		with compiler.wrap_arithmetic:
+			return Result.Ok( i16( wide ))
+
+	def to_i32( self ) -> Result[i32, OverflowError]:
+		wide = self._to_i64().or_return()
+		if wide < _I32_MIN or wide > _I32_MAX:
+			return Result.Err( OverflowError() )
+		with compiler.wrap_arithmetic:
+			return Result.Ok( i32( wide ))
+
+	def to_i64( self ) -> Result[i64, OverflowError]:
+		return self._to_i64()
+
+	def to_i128( self ) -> Result[i128, OverflowError]:
+		return self._to_i128()
+
+	def to_u8( self ) -> Result[u8, OverflowError]:
+		wide = self._to_i64().or_return()
+		if wide < 0 or wide > _U8_MAX:
+			return Result.Err( OverflowError() )
+		with compiler.wrap_arithmetic:
+			return Result.Ok( u8( wide ))
+
+	def to_u16( self ) -> Result[u16, OverflowError]:
+		wide = self._to_i64().or_return()
+		if wide < 0 or wide > _U16_MAX:
+			return Result.Err( OverflowError() )
+		with compiler.wrap_arithmetic:
+			return Result.Ok( u16( wide ))
+
+	def to_u32( self ) -> Result[u32, OverflowError]:
+		wide = self._to_i64().or_return()
+		if wide < 0 or wide > _U32_MAX:
+			return Result.Err( OverflowError() )
+		with compiler.wrap_arithmetic:
+			return Result.Ok( u32( wide ))
+
+	def to_u64( self ) -> Result[u64, OverflowError]:
+		return self._to_u64()
+
+	def to_u128( self ) -> Result[u128, OverflowError]:
+		return self._to_u128()
+
+	@fallible_arithmetic
+	def __i8__( self ) -> Result[i8, OverflowError]:
+		return self.to_i8()
+
+	@fallible_arithmetic
+	def __i16__( self ) -> Result[i16, OverflowError]:
+		return self.to_i16()
+
+	@fallible_arithmetic
+	def __i32__( self ) -> Result[i32, OverflowError]:
+		return self.to_i32()
+
+	@fallible_arithmetic
+	def __i64__( self ) -> Result[i64, OverflowError]:
+		return self.to_i64()
+
+	@fallible_arithmetic
+	def __i128__( self ) -> Result[i128, OverflowError]:
+		return self.to_i128()
+
+	@fallible_arithmetic
+	def __u8__( self ) -> Result[u8, OverflowError]:
+		return self.to_u8()
+
+	@fallible_arithmetic
+	def __u16__( self ) -> Result[u16, OverflowError]:
+		return self.to_u16()
+
+	@fallible_arithmetic
+	def __u32__( self ) -> Result[u32, OverflowError]:
+		return self.to_u32()
+
+	@fallible_arithmetic
+	def __u64__( self ) -> Result[u64, OverflowError]:
+		return self.to_u64()
+
+	@fallible_arithmetic
+	def __u128__( self ) -> Result[u128, OverflowError]:
+		return self.to_u128()
+
 	# --- string conversion ----------------------------------------------
 	#
 	# Builds the digits (most-significant digit first, i.e. reversed from
