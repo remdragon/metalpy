@@ -4614,19 +4614,21 @@ class MacosGlobalLockPoisonPillTests( unittest.TestCase ):
 
 	_MACOS_TARGET = ActiveTarget( os = 'macos', arch = 'x86_64', family = 'unix', bits = 64, debug = True, posix = True )
 
+	# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: unlike Part A (only a
+	# genuinely reassigned global reaches _global_lock_supported() at all),
+	# Part B's own per-object lock is needed for ANY constructed RC object,
+	# not just a reassigned global - so this fixture, to stay a genuine
+	# "nothing needs ANY locking machinery" case, must construct no RC
+	# object at all (a scalar-only global, previously it built a real Foo
+	# instance - confirmed as a real regression once Part B's has_object_
+	# header_alloc scan started reaching _global_lock_supported() too).
 	_NO_REASSIGNMENT_FIXTURE = '\n'.join([
 		'import compiler',
-		'class Foo:',
-		'	x: i32',
-		'	@staticmethod',
-		'	def make( v: i32 ) -> Foo:',
-		'		return Foo.__allocate__( x = v )',
-		'',
-		'g1: Foo = Foo.make( 1 )',
+		'g1: i32 = 1',
 		'',
 		'def main() -> i32:',
 		'	with compiler.wrap_arithmetic:',
-		'		return g1.x - 1',
+		'		return g1 - 1',
 	])
 
 	# the exact "genuinely reassigned from inside a function body" shape
@@ -4673,6 +4675,30 @@ class MacosGlobalLockPoisonPillTests( unittest.TestCase ):
 
 	def test_protected_global_on_macos_raises_the_poison_pill( self ) -> None:
 		compiler = self._compile( self._REASSIGNED_GLOBAL_FIXTURE )
+		with self.assertRaises( AssertionError ) as ctx:
+			emitter_c.emit_c( compiler )
+		self.assertIn( 'completely untested', str( ctx.exception ))
+
+	def test_constructed_rc_object_on_macos_raises_the_poison_pill( self ) -> None:
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: every constructed RC
+		# object now needs its own per-object lock, unverified on macOS the
+		# same way Part A's per-global lock always was - this is the Part B
+		# counterpart of test_protected_global_on_macos_raises_the_poison_
+		# pill above, confirming the SAME poison pill now also fires for
+		# ordinary RC construction, not just a reassigned global.
+		source = '\n'.join([
+			'import compiler',
+			'class Foo:',
+			'	x: i32',
+			'	def __init__( self, v: i32 ) -> None:',
+			'		self.x = v',
+			'',
+			'def main() -> i32:',
+			'	f: Foo = Foo( 1 )',
+			'	with compiler.wrap_arithmetic:',
+			'		return f.x - 1',
+		])
+		compiler = self._compile( source )
 		with self.assertRaises( AssertionError ) as ctx:
 			emitter_c.emit_c( compiler )
 		self.assertIn( 'completely untested', str( ctx.exception ))
