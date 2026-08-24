@@ -3934,6 +3934,12 @@ class FunctionLowering:
 		if isinstance( target, ast.Name ):
 			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 			if existing is not None:
+				# a module-level global's own Variable may not have had its
+				# OWN .resolve run yet (its .type is None until then) if this
+				# reassignment is the FIRST thing to touch it - see AugAssign's
+				# identical _ensure_resolved(existing) call above for the full
+				# reasoning
+				self.lowering._ensure_resolved( existing )
 				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
 				# every local (including a `case T(name):` match-arm binding -
 				# see is_match_binding below) is function-scoped, no per-arm/
@@ -4187,6 +4193,7 @@ class FunctionLowering:
 					self._emit( ir.GetAttr( dest = elem, obj = value, attr = f'_{i}' ))
 					existing = self._existing_local_or_none( elt.id, node, 'cannot assign to it' )
 					if existing is not None:
+						self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 						self._cfg.unnarrow( elt.id )
 						final = self._coerce_or_check_operand( elem, existing.type, node )
 						is_alias = not getattr( final, 'is_union_coerce_result', False )
@@ -7249,6 +7256,7 @@ class FunctionLowering:
 		# (range()'s implicit start=0) with no type of its own to infer from
 		existing = self._existing_local_or_none( target.id, node, 'cannot use it as a for loop target' )
 		if existing is not None:
+			self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 			operand = self._lower_expr( value_expr, existing.type )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 			self._cfg.mark_live( existing.stem ) # this bypasses _cfg_assign like the rest of this function does (pre-existing, not touched here) - liveness alone still needs marking, since it's unconditionally assigned right here regardless
@@ -8871,6 +8879,7 @@ class FunctionLowering:
 		assert isinstance( target, ast.Name )
 		existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 		if existing is not None:
+			self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 			self._cfg.unnarrow( target.id )
 			operand = self._lower_expr( node.value, existing.type )
 			self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node )

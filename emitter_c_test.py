@@ -4641,6 +4641,51 @@ class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClass
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
+	def test_global_reassigned_inside_main_before_any_other_use( self ) -> None:
+		# real, reachable crash: a RC-typed global reassigned via `global g;
+		# g = ...` directly inside main() - not a helper function main()
+		# calls, and with no PRIOR read of g anywhere earlier in main()'s
+		# own body - used to crash lowering itself (AttributeError:
+		# 'NoneType' object has no attribute 'rc_leaves', cfg.py's
+		# rc_leaves()) rather than failing to compile cleanly or misbehaving
+		# at runtime.
+		#
+		# Root cause: compiler.run() enqueues main() first, so main() is
+		# lowered before g's own compile unit is ever dequeued (Variable.
+		# resolve(), which populates .type, only runs when the Variable's
+		# OWN turn on the work queue arrives - see Compiler._lower's
+		# Variable branch). An ordinary READ of a global (_expr_Name) always
+		# calls lowering._ensure_resolved(name) first, forcing .type to be
+		# populated on demand - but the REASSIGNMENT path (_stmt_Assign's
+		# existing-binding branch, shared by AnnAssign/tuple-unpack/for-loop/
+		# walrus via _existing_local_or_none) read existing.type directly,
+		# with no such call. This was invisible whenever some OTHER
+		# reference to the global (a read, or the reassignment living in a
+		# function other than main()) happened to resolve it first - e.g.
+		# this file's own test_global_initializer_reading_another_globals_
+		# value_runs_in_dependency_order and thread_safe_globals_test.py's
+		# _REASSIGNED_GLOBAL_FIXTURE both reassign from a HELPER function,
+		# never main() itself, so they never hit this. Fixed by giving the
+		# reassignment path the same _ensure_resolved(existing) call
+		# AugAssign's own Name-target branch already had.
+		self._run( '\n'.join([
+			'class Foo:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'g: Foo = Foo( 10 )',
+			'',
+			'def main() -> i32:',
+			'	global g',
+			'	g = Foo( 20 )',
+			'	if g.x != 20:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
 class GlobalInitCycleDetectionTests( RCClassTestCase ):
 	def test_circular_global_value_dependency_is_a_clean_compile_error( self ) -> None:
 		# the one shape _topologically_sort_globals can never satisfy: two
