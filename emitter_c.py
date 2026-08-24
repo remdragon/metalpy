@@ -56,19 +56,31 @@ _PROLOGUE_HEADER_FIXED = '''\
 #else
 #define __metalpy_maybe_unused __attribute__((unused))
 #endif
+'''
 
-// the one universal, ALWAYS-leading member of every RCClass's own vtable
-// type, whatever else that type goes on to add for its own @virtual
-// methods (see emit_rcclass_vtbl_struct's own "destroy-prefixed" comment) -
-// this is what lets ObjectHeader's own $vtable field stay typed to this one
-// shared, minimal shape and still safely read through ANY concrete class's
-// own (possibly larger) real vtable, the same "shared leading layout,
-// narrower read through a base-typed lens" trick CStruct's own per-level
-// Vtbl types already rely on (see _interface_vtbl_name)
-typedef struct {
-	void (*destroy)( void* );
-} __metalpy_ObjectVtbl;
+# the one universal, ALWAYS-leading member of every RCClass's own vtable
+# type, whatever else that type goes on to add for its own @virtual
+# methods (see emit_rcclass_vtbl_struct's own "destroy-prefixed" comment) -
+# this is what lets ObjectHeader's own $vtable field stay typed to this one
+# shared, minimal shape and still safely read through ANY concrete class's
+# own (possibly larger) real vtable, the same "shared leading layout,
+# narrower read through a base-typed lens" trick CStruct's own per-level
+# Vtbl types already rely on (see _interface_vtbl_name). slot 0 MUST stay
+# `destroy` - every concrete-class vtable-struct generator depends on that
+# (emit_rcclass_vtbl_struct, the interface equivalent). debug builds append
+# `type_name` AFTER destroy (one pointer per CLASS, not per object - each
+# concrete class already gets its own vtable instance) so dump_live_objects
+# can label a live object's group without needing a per-object copy.
+def _object_vtbl_prologue() -> str:
+	type_name_field = '\tconst char* type_name; // debug builds only - see dump_live_objects\n' if _target_debug else ''
+	return (
+		'typedef struct {\n'
+		'\tvoid (*destroy)( void* );\n'
+		+ type_name_field +
+		'} __metalpy_ObjectVtbl;\n'
+	)
 
+_PROLOGUE_HEADER_TAIL = '''\
 typedef struct {
 	_Atomic int32_t ref_count;
 	// set once at construction (see emit_c's ir.Allocate codegen), read
@@ -105,6 +117,114 @@ typedef struct {
 _PROLOGUE_HEADER_FIELD_WINDOWS = '\tvoid* lock;\n'
 _PROLOGUE_HEADER_FIELD_PTHREAD = '\tpthread_mutex_t lock;\n'
 
+# debug-only alloc-site tracking (dump_live_objects, lib/sys.py): a single
+# global intrusive doubly-linked list threaded through every live RC object
+# (and, separately, every live sys.alloc[T] raw buffer - see _alloc's own
+# debug-mode header in lib/sys.py) so a program can walk everything still
+# live without any OS heap-walk API (none is portable across MSVC/clang/gcc).
+# No CRT calls (insert-at-head/unlink only) - safe under --no-crt. Debug-only:
+# costs nothing in a release build, which never emits this block at all.
+#
+# Both lists are process-global, mutated from whatever thread happens to
+# construct/release an RC object or alloc[T]/free a raw buffer - genuinely
+# concurrent in any multi-threaded program (lib/threading.py), so track/
+# untrack need a REAL lock around the list-splice, not just the "debug info,
+# doesn't need to be exact" posture the rest of this feature gets away with.
+# Confirmed necessary by a real regression, not just caution: an earlier,
+# unlocked version of this code caused emitter_c_test.py's own 8-thread
+# concurrent-dict-insert test to hang/timeout under --debug (multiple
+# threads splicing the SAME intrusive list at once corrupts it - a lost
+# update or a cycle - which then wedges __metalpy_debug_untrack's own
+# linear-scan free path, since a corrupted list can spin forever on a
+# pointer that never turns up, or an infinite loop through a self-
+# referential node). Reuses the exact same lock PRIMITIVE Part A's per-
+# global lock does (SRWLOCK on Windows, pthread_mutex_t on POSIX) - a
+# single dedicated lock shared by BOTH lists (RC + raw), not two separate
+# ones: this is diagnostic bookkeeping, not a hot path worth finer-grained
+# locking for.
+def _prologue_debug_list() -> str:
+	if _target_uses_pthread_lock():
+		# pthread_mutex_t is already in scope (pthread.h is force-included
+		# by _object_header_prologue() unconditionally on every POSIX
+		# target, regardless of debug mode - see its own comment).
+		# PTHREAD_MUTEX_INITIALIZER needs no separate init call, unlike
+		# ObjectHeader's own per-object lock field (which has no equivalent
+		# static-initializer-at-declaration option since it's a per-object,
+		# not per-program, storage location).
+		lock_decl = 'static pthread_mutex_t __metalpy_debug_lock = PTHREAD_MUTEX_INITIALIZER;\n'
+		lock_acquire = '\tpthread_mutex_lock( &__metalpy_debug_lock );\n'
+		lock_release = '\tpthread_mutex_unlock( &__metalpy_debug_lock );\n'
+	else:
+		# SRWLOCK's own all-zero state is already a valid unlocked lock (Part
+		# A/B's own established fact, reused verbatim here) - matches
+		# _global_lock_acquire/_global_lock_release's exact call shape and
+		# the exact same hand-declared struct tag/prototypes (repeated,
+		# COMPATIBLE declarations of the same two symbols are legal C - see
+		# _PROLOGUE_GLOBAL_LOCK_WINDOWS's own comment), so this coexists
+		# fine whether or not Part A/B's own lock machinery is ALSO active
+		# in this same translation unit.
+		lock_decl = (
+			f'struct {_SRWLOCK_STRUCT_NAME};\n'
+			f'void AcquireSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );\n'
+			f'void ReleaseSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );\n'
+			'static void* __metalpy_debug_lock = 0;\n'
+		)
+		lock_acquire = f'\tAcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&__metalpy_debug_lock );\n'
+		lock_release = f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&__metalpy_debug_lock );\n'
+	return f'''\
+typedef struct __metalpy_debug_link {{
+	struct __metalpy_debug_link* prev;
+	struct __metalpy_debug_link* next;
+}} __metalpy_debug_link;
+
+// two separate lists, not one shared list carrying a runtime type tag: RC
+// objects (ObjectHeader-prefixed) and raw sys.alloc[T] buffers (their own
+// side-table tracking node, see __metalpy_debug_raw_entry below) have
+// different header shapes, so keeping them apart avoids any reinterpret-
+// cast-by-tag dance when dump_live_objects walks either one.
+static __metalpy_maybe_unused __metalpy_debug_link __metalpy_debug_list_head = {{ &__metalpy_debug_list_head, &__metalpy_debug_list_head }};
+static __metalpy_maybe_unused __metalpy_debug_link __metalpy_debug_raw_list_head = {{ &__metalpy_debug_raw_list_head, &__metalpy_debug_raw_list_head }};
+
+{lock_decl}
+static inline __metalpy_maybe_unused void __metalpy_debug_lock_acquire( void ) {{
+{lock_acquire}}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_lock_release( void ) {{
+{lock_release}}}
+
+// _locked variants assume the caller already holds __metalpy_debug_lock -
+// needed by callers whose own critical section spans more than one list
+// operation (__metalpy_debug_raw_untrack's scan-then-splice,
+// __metalpy_dump_live_objects's whole walk) - taking the lock separately
+// for each individual splice there would leave a window between "found it"
+// and "removed it" (or between reading two list nodes while walking) for
+// another thread to mutate the list first. The plain (self-locking)
+// versions below are for the single-splice case (track/RC untrack).
+static inline __metalpy_maybe_unused void __metalpy_debug_track_locked( __metalpy_debug_link* head, __metalpy_debug_link* link ) {{
+	link->prev = head;
+	link->next = head->next;
+	head->next->prev = link;
+	head->next = link;
+}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_untrack_locked( __metalpy_debug_link* link ) {{
+	link->prev->next = link->next;
+	link->next->prev = link->prev;
+}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_track( __metalpy_debug_link* head, __metalpy_debug_link* link ) {{
+	__metalpy_debug_lock_acquire();
+	__metalpy_debug_track_locked( head, link );
+	__metalpy_debug_lock_release();
+}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_untrack( __metalpy_debug_link* link ) {{
+	__metalpy_debug_lock_acquire();
+	__metalpy_debug_untrack_locked( link );
+	__metalpy_debug_lock_release();
+}}
+'''
+
 def _object_header_prologue() -> str:
 	''' ObjectHeader's own full text, including Part B's per-object lock
 	field - a FUNCTION (not the plain string constant this used to be),
@@ -126,7 +246,208 @@ def _object_header_prologue() -> str:
 	system's problem to avoid, that's what include guards are for. '''
 	field = _PROLOGUE_HEADER_FIELD_PTHREAD if _target_uses_pthread_lock() else _PROLOGUE_HEADER_FIELD_WINDOWS
 	header_include = '#include <pthread.h>\n' if _target_uses_pthread_lock() else ''
-	return header_include + _PROLOGUE_HEADER_FIXED + field + '} ObjectHeader;\n'
+	debug_list = _prologue_debug_list() if _target_debug else ''
+	# alloc_loc/alloc_size/debug_link: debug-only alloc-site tracking
+	# (dump_live_objects) - alloc_loc points at a static string literal set
+	# once at construction (ir.Allocate codegen, emit_c), which also stamps
+	# alloc_size from a plain `sizeof(*dest)` at the call site (the concrete
+	# struct type is always known there - simplest available answer to "what
+	# does this live object cost", no separate per-class size table needed).
+	# debug_link threads this object into the global list _PROLOGUE_DEBUG_LIST
+	# declares.
+	debug_fields = '\tconst char* alloc_loc;\n\tsize_t alloc_size;\n\t__metalpy_debug_link debug_link;\n' if _target_debug else ''
+	return (
+		header_include + _PROLOGUE_HEADER_FIXED + debug_list + _object_vtbl_prologue() + _PROLOGUE_HEADER_TAIL
+		+ field + debug_fields + '} ObjectHeader;\n'
+	)
+
+# debug-only: raw sys.alloc[T] buffer tracking + dump_live_objects itself.
+# Comes AFTER _object_header_prologue()'s own text (ObjectHeader must already
+# be a complete type - dump_live_objects reads through it via offsetof), so
+# this is a separate function emit_c() appends right after that one, not
+# folded into _PROLOGUE_DEBUG_LIST above. No CRT calls anywhere in here
+# (manual decimal formatting, raw OS write) - safe under --no-crt, and
+# deliberately bypasses lib/sys.py's own _Stdout/write_all path (which is
+# itself just a thin wrapper over the exact same WriteFile/write(2) primitive
+# used here) rather than round-tripping through metalpy-level str/Result
+# machinery from inside a hand-written PROLOGUE C function.
+def _prologue_debug_ops() -> str:
+	if _target_os == 'windows':
+		write_decl = 'void* GetStdHandle( uint32_t nStdHandle ); bool WriteFile( void* hFile, const uint8_t* lpBuffer, uint32_t nNumberOfBytesToWrite, uint32_t* lpNumberOfBytesWritten, void* lpOverlapped );'
+		write_body = '''\
+	void* h = GetStdHandle( (uint32_t)-11 ); // STD_OUTPUT_HANDLE
+	if ( h == (void*)(intptr_t)-1 || h == 0 ) return;
+	uint32_t written = 0;
+	WriteFile( h, (const uint8_t*)s, len, &written, 0 );
+'''
+		# side-table tracking node allocation - hand-declared HeapAlloc/
+		# HeapFree/GetProcessHeap prototypes (same "repeated, compatible
+		# extern declaration is legal C" technique the crash handler already
+		# uses above), NOT lib/windows/kernel32.py's own @extern bindings:
+		# this runs from hand-written PROLOGUE C, which can't reach a
+		# metalpy-level import, and must work even in a program that never
+		# itself imports windows.kernel32 for anything else.
+		# matches windows.kernel32's own @extern-generated signatures
+		# EXACTLY (uint8_t*, not void*, for the buffer parameters/return) -
+		# a repeated, compatible extern declaration of the same symbol is
+		# legal C (same technique the crash handler above already uses),
+		# but only if the two declarations really do agree; a program that
+		# ALSO imports windows.kernel32 for its own reasons would otherwise
+		# see two INCOMPATIBLE declarations of the same symbol (confirmed:
+		# a real "conflicting types" error, not just theoretical risk).
+		raw_alloc_decl = 'void* GetProcessHeap( void ); void* HeapAlloc( void* hHeap, uint32_t dwFlags, uintptr_t dwBytes ); bool HeapFree( void* hHeap, uint32_t dwFlags, uint8_t* lpMem );'
+		raw_alloc_call = '(__metalpy_debug_raw_entry*)HeapAlloc( GetProcessHeap(), 0, sizeof( __metalpy_debug_raw_entry ))'
+		raw_free_call = 'HeapFree( GetProcessHeap(), 0, (uint8_t*)e )'
+	else:
+		write_decl = 'long write( int32_t fd, const void* buf, size_t count );'
+		write_body = '\twrite( 1, s, len );\n'
+		# POSIX targets always link a real CRT-provided main() in this
+		# codebase (see lib/sys.py's own argv comment) - a plain malloc/free
+		# call here is never a no-crt hazard the way it would be on Windows
+		# matches lib/crt.py's own @extern-generated malloc/free signatures
+		# EXACTLY (void* return, uintptr_t param for malloc - confirmed
+		# against the real generated C, not assumed: usize maps to
+		# uintptr_t, not size_t, in an extern's own parameter position; void*
+		# for free's argument, matching libc's real void*-typed signature
+		# per that file's own comment) - same "repeated but must stay
+		# COMPATIBLE" concern as the Windows branch's HeapAlloc/HeapFree
+		# above - confirmed as a REAL conflicting-types error under gcc
+		# otherwise (a mismatched hand-declared malloc here vs. crt.py's own
+		# extern-generated one, in the same translation unit).
+		raw_alloc_decl = 'void* malloc( uintptr_t size ); void free( void* ptr );'
+		raw_alloc_call = '(__metalpy_debug_raw_entry*)malloc( sizeof( __metalpy_debug_raw_entry ))'
+		raw_free_call = 'free( e )'
+	return f'''\
+{write_decl}
+
+static void __metalpy_debug_write( const char* s ) {{
+	size_t len = 0;
+	while ( s[len] ) len++;
+{write_body}}}
+
+static void __metalpy_debug_write_udec( size_t v ) {{
+	char buf[24];
+	int i = 24;
+	buf[--i] = 0;
+	if ( v == 0 ) buf[--i] = '0';
+	while ( v ) {{
+		buf[--i] = (char)( '0' + ( v % 10 ));
+		v /= 10;
+	}}
+	__metalpy_debug_write( &buf[i] );
+}}
+
+// side-table tracking node for a raw sys.alloc[T] buffer (debug builds only)
+// - see lib/sys.py's alloc[T]/free and ir.DebugRawTrack's own comment on why
+// this is a SEPARATE node (allocated straight from the OS allocator, never
+// through metalpy's own sys.alloc - that would recurse right back into this
+// same tracking code) rather than a header prefixed onto the real block:
+// sys.alloc[T] must keep returning the EXACT pointer the OS allocator gave
+// it, unchanged, since some existing code queries the OS allocator directly
+// on that pointer (confirmed by a real regression an earlier prefix-header
+// version of this caused - see ir.py's own comment).
+typedef struct {{
+	__metalpy_debug_link link;
+	void* ptr;
+	size_t size;
+}} __metalpy_debug_raw_entry;
+
+{raw_alloc_decl}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_raw_track( void* ptr, size_t size ) {{
+	if ( !ptr ) return;
+	__metalpy_debug_raw_entry* e = {raw_alloc_call};
+	if ( !e ) return; // tracking is best-effort - must never crash the real allocation path
+	e->ptr = ptr;
+	e->size = size;
+	__metalpy_debug_track( &__metalpy_debug_raw_list_head, &e->link );
+}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_raw_untrack( void* ptr ) {{
+	if ( !ptr ) return;
+	// the whole scan-then-splice is one critical section, not lock-per-step
+	// (see _prologue_debug_list's own comment on why) - find-then-remove
+	// under a SEPARATELY acquired lock would leave a window for another
+	// thread to mutate the list in between
+	__metalpy_debug_lock_acquire();
+	__metalpy_debug_link* l = __metalpy_debug_raw_list_head.next;
+	while ( l != &__metalpy_debug_raw_list_head ) {{
+		__metalpy_debug_raw_entry* e = (__metalpy_debug_raw_entry*)l; // link is this struct's own first member
+		if ( e->ptr == ptr ) {{
+			__metalpy_debug_untrack_locked( l );
+			__metalpy_debug_lock_release();
+			{raw_free_call};
+			return;
+		}}
+		l = l->next;
+	}}
+	__metalpy_debug_lock_release();
+}}
+
+// groups RC objects by (vtable, alloc_loc) - both are pointers to static
+// storage set once at construction (one literal per Allocate CALL SITE, one
+// vtable instance per CLASS), so pointer equality alone already means
+// "same class, same source line", no string comparison needed. O(n^2) over
+// the live set - a debug/diagnostic tool, not a hot path.
+static __metalpy_maybe_unused void __metalpy_dump_live_objects( void ) {{
+	// one lock for the WHOLE walk (both lists) - a concurrent track/untrack
+	// from another still-running thread must not be allowed to mutate
+	// either list mid-walk (see _prologue_debug_list's own comment)
+	__metalpy_debug_lock_acquire();
+	__metalpy_debug_write( "-- live RC objects --\\n" );
+	__metalpy_debug_link* l = __metalpy_debug_list_head.next;
+	while ( l != &__metalpy_debug_list_head ) {{
+		ObjectHeader* h = (ObjectHeader*)( (char*)l - offsetof( ObjectHeader, debug_link ));
+		__metalpy_debug_link* p = __metalpy_debug_list_head.next;
+		int already_reported = 0;
+		while ( p != l ) {{
+			ObjectHeader* ph = (ObjectHeader*)( (char*)p - offsetof( ObjectHeader, debug_link ));
+			if ( ph->vtable == h->vtable && ph->alloc_loc == h->alloc_loc ) {{ already_reported = 1; break; }}
+			p = p->next;
+		}}
+		if ( !already_reported ) {{
+			size_t count = 0, bytes = 0;
+			__metalpy_debug_link* q = l;
+			while ( q != &__metalpy_debug_list_head ) {{
+				ObjectHeader* qh = (ObjectHeader*)( (char*)q - offsetof( ObjectHeader, debug_link ));
+				if ( qh->vtable == h->vtable && qh->alloc_loc == h->alloc_loc ) {{ count++; bytes += qh->alloc_size; }}
+				q = q->next;
+			}}
+			__metalpy_debug_write( "  " );
+			__metalpy_debug_write( h->vtable && h->vtable->type_name ? h->vtable->type_name : "<unknown type>" );
+			__metalpy_debug_write( " @ " );
+			__metalpy_debug_write( h->alloc_loc ? h->alloc_loc : "<unknown location>" );
+			__metalpy_debug_write( ": count=" );
+			__metalpy_debug_write_udec( count );
+			__metalpy_debug_write( " bytes=" );
+			__metalpy_debug_write_udec( bytes );
+			__metalpy_debug_write( "\\n" );
+		}}
+		l = l->next;
+	}}
+	// raw sys.alloc[T] buffers: NOT split by (type,site) - see lib/sys.py's
+	// alloc[T]/free comment on why per-call-site attribution isn't plumbed
+	// through here; still gives a real live-byte total for anything sys.alloc
+	// itself allocates (list/dict backing storage, ...).
+	{{
+		size_t count = 0, bytes = 0;
+		__metalpy_debug_link* rl = __metalpy_debug_raw_list_head.next;
+		while ( rl != &__metalpy_debug_raw_list_head ) {{
+			__metalpy_debug_raw_entry* rh = (__metalpy_debug_raw_entry*)rl; // link is this struct's own first member
+			count++; bytes += rh->size;
+			rl = rl->next;
+		}}
+		if ( count ) {{
+			__metalpy_debug_write( "-- live raw sys.alloc buffers --\\n  count=" );
+			__metalpy_debug_write_udec( count );
+			__metalpy_debug_write( " bytes=" );
+			__metalpy_debug_write_udec( bytes );
+			__metalpy_debug_write( "\\n" );
+		}}
+	}}
+	__metalpy_debug_lock_release();
+}}
+'''
 
 # only needed where an ir.Incref is actually emitted (see emit_c) - a
 # program that only ever gives up references (or never touches an RCClass
@@ -140,8 +461,15 @@ static inline void retain_object( ObjectHeader* obj ) {
 '''
 
 # only needed where an ir.Decref/DecrefDynamic is actually emitted (see
-# emit_c)
-_PROLOGUE_RELEASE = '''\
+# emit_c). A FUNCTION (not a plain string constant), same reason as
+# _object_header_prologue: the debug-only untrack call below depends on
+# _target_debug, only known once emit_c() has set it.
+def _prologue_release() -> str:
+	# debug-mode alloc tracking: untrack right when the refcount hits zero,
+	# BEFORE vtable->destroy runs (destroy may free the object's own storage)
+	untrack = '\t\t\t__metalpy_debug_untrack( &obj->debug_link );\n' if _target_debug else ''
+	return (
+		'''\
 // the destructor was previously an explicit argument, passed as a compile-
 // time literal at every call site - redundant with the header's own
 // vtable field (set once at construction), which every caller can
@@ -157,6 +485,9 @@ _PROLOGUE_RELEASE = '''\
 static inline void release_object( ObjectHeader* obj ) {
 	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
 		if ( atomic_fetch_sub( &obj->ref_count, 1 ) == 1 ) {
+'''
+		+ untrack +
+		'''\
 			if ( obj->vtable && obj->vtable->destroy ) {
 				obj->vtable->destroy( obj );
 			}
@@ -164,6 +495,7 @@ static inline void release_object( ObjectHeader* obj ) {
 	}
 }
 '''
+	)
 
 _PROLOGUE_ARITH = '''\
 // metalpy arithmetic intrinsics — dispatch to compiler builtins (GCC/Clang)
@@ -984,6 +1316,12 @@ def _field_lock_prologue() -> str:
 # module state, and emit_c() calls never interleave within one process.
 _target_os: str|None = None
 
+# debug-only alloc-site tracking gate (dump_live_objects) - mirrors _target_os
+# above: set for real inside emit_c() (compiler.disco.active_target['debug']),
+# defaults False at import time so PROLOGUE (built at import time, below)
+# reflects a release-shaped ObjectHeader/vtable with no tracking overhead.
+_target_debug: bool = False
+
 def _target_uses_pthread_lock() -> bool:
 	# Linux AND macOS share the identical pthread_mutex_t codegen (same
 	# storage type, same pthread_mutex_init/lock/unlock calls, same
@@ -1009,7 +1347,7 @@ def _target_uses_pthread_lock() -> bool:
 # inside emit_c() itself, per that global's own docstring), so this always
 # reflects the Windows-shaped ObjectHeader (a `void* lock`) regardless of
 # whatever target a later real emit_c() call actually targets.
-PROLOGUE = _object_header_prologue() + _PROLOGUE_RETAIN + _PROLOGUE_RELEASE + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE + _PROLOGUE_CRASH_HANDLER
+PROLOGUE = _object_header_prologue() + _PROLOGUE_RETAIN + _prologue_release() + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE + _PROLOGUE_CRASH_HANDLER
 
 def _global_lock_supported() -> bool:
 	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: Windows (SRWLOCK) and Linux
@@ -3305,6 +3643,23 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# in this compiler, nor should one
 		return [ f'\t{_emit_operand(instr.dest)} = sizeof({_value_spelling(instr.type)});' ]
 
+	# debug-mode alloc-site tracking (dump_live_objects) - see
+	# _prologue_debug_ops. These are only ever lowered when compiler.target.
+	# debug folds true (lib/sys.py's own `if compiler.target.debug:` guards
+	# every call site - see compile_time_transformer), so _target_debug is
+	# always True here too; no separate release-mode branch needed.
+	if isinstance( instr, ir.DebugRawTrack ):
+		return [ f'\t__metalpy_debug_raw_track( (void*){_emit_operand(instr.ptr)}, (size_t){_emit_operand(instr.size)} );' ]
+	if isinstance( instr, ir.DebugRawUntrack ):
+		return [ f'\t__metalpy_debug_raw_untrack( (void*){_emit_operand(instr.ptr)} );' ]
+	if isinstance( instr, ir.DumpLiveObjects ):
+		return [ '\t__metalpy_dump_live_objects();' ]
+	if isinstance( instr, ir.DebugUntrackRC ):
+		# compiler.__raw_free__'s own debug-mode cleanup - see its own
+		# comment (Lowering._lower_compiler_raw_free) on why this can't just
+		# rely on release_object's normal untrack
+		return [ f'\t__metalpy_debug_untrack( &(({_emit_operand(instr.value)})->$header.debug_link) );' ]
+
 	if isinstance( instr, ir.Incref ):
 		# a plain cast, not &(value)->$header - $header is always the FIRST
 		# member of every RCClass struct (emit_rcclass's own field-flattening,
@@ -3482,6 +3837,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 					lines.append( f'\tpthread_mutex_init( &(({dest})->$header.lock), ((void*)0) );' )
 				else:
 					lines.append( f'\t({dest})->$header.lock = ((void*)0);' )
+			if _target_debug:
+				# debug-mode alloc-site tracking (dump_live_objects) -
+				# instr.loc is stamped centrally by Lowering._emit
+				loc = instr.loc or '<unknown>'
+				lines.append( f'\t({dest})->$header.alloc_loc = {_c_string_literal(loc.encode("utf-8"))};' )
+				lines.append( f'\t({dest})->$header.alloc_size = sizeof(*({dest}));' )
+				lines.append( f'\t__metalpy_debug_track( &__metalpy_debug_list_head, &(({dest})->$header.debug_link) );' )
 			for name, value in instr.fields.items():
 				lines.append( f'\t({dest})->{_field_name(name)} = {_emit_operand(value)};' )
 			return lines
@@ -4243,6 +4605,12 @@ def emit_rcclass_vtbl_struct( owner: RCClass ) -> str:
 	own "shared type" case for a class with none. '''
 	name = f'{mangle_type( owner )}Vtbl'
 	lines = [ f'typedef struct {name} {{', '\tvoid (*destroy)( void* );' ]
+	if _target_debug:
+		# must stay a literal PREFIX match with __metalpy_ObjectVtbl's own
+		# {destroy, type_name} layout (see that type's own comment) - every
+		# concrete class's real vtable is read through a base-typed
+		# __metalpy_ObjectVtbl* lens in release_object/dump_live_objects
+		lines.append( '\tconst char* type_name;' )
 	for slot in owner.virtual_slots():
 		ret, params = _vtable_slot_c_type( owner, slot )
 		lines.append( f'\t{ret} (*{_field_name(slot.stem)})( {", ".join(params)} );' )
@@ -4298,6 +4666,8 @@ def emit_rcclass_vtable_instance( cls: RCClass ) -> str|None:
 	vtbl_type = _rcclass_vtbl_type_name( cls )
 	instance_name = f'{mangle_type(cls)}$$vtable'
 	field_inits = [ f'.destroy = {_rcclass_destructor_name(cls)}' ]
+	if _target_debug:
+		field_inits.append( f'.type_name = {_c_string_literal(cls.qualname.encode("utf-8"))}' )
 	slots = cls.virtual_slots()
 	if slots:
 		owner = cls.vtbl_owner()
@@ -4728,8 +5098,9 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	order" decision. Linking is out of scope (C_EMITTER.md); the whole
 	program is already collected into one Compiler instance, so there's no
 	reason to split output across files. '''
-	global _target_os
+	global _target_os, _target_debug
 	_target_os = compiler.disco.active_target['os']
+	_target_debug = bool( compiler.disco.active_target['debug'] )
 	locked_globals = [ g for g in compiler.globals if _needs_global_lock( g.variable ) ]
 	# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: every constructed RC object
 	# now carries its own lock (ObjectHeader's own new field,
@@ -4839,10 +5210,12 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False ) -> str:
 	uses_field_lock = any( isinstance( instr, ( ir.AcquireFieldLock, ir.ReleaseFieldLock )) for lf in compiler.functions for instr in lf.instructions ) \
 		or any( isinstance( instr, ( ir.AcquireFieldLock, ir.ReleaseFieldLock )) for g in compiler.globals for instr in g.instructions )
 	parts: list[str] = [ _object_header_prologue() ]
+	if _target_debug:
+		parts.append( _prologue_debug_ops() )
 	if uses_incref:
 		parts.append( _PROLOGUE_RETAIN )
 	if uses_decref:
-		parts.append( _PROLOGUE_RELEASE )
+		parts.append( _prologue_release() )
 	if ( locked_globals or uses_field_lock ) and _global_lock_supported() and _target_os == 'windows':
 		# needed for Part A's own per-global lock storage (locked_globals)
 		# AND Part B's per-object $header.lock (uses_field_lock) - both use

@@ -1984,6 +1984,10 @@ class FunctionLowering:
 		# own Parameter exists (not yet constructed this early).
 		self._ever_declared_stems: set[str] = { p.stem for p in ( fn.parameters or [] )} if fn is not None else set()
 		self._current_fn = fn
+		# ambient "line we're currently lowering", refreshed at the top of
+		# _lower_stmt/_lower_expr - debug-info only (Allocate.loc, see _emit),
+		# never save/restored, doesn't need to be exact for nested sub-exprs
+		self._current_lineno = 0
 		# set for real in run()/run_global(), right before either enters its
 		# own module_context - see check_module_visibility's own comment on
 		# why this (not discovery.module_stack[-1]) is what every privacy
@@ -2732,6 +2736,8 @@ class FunctionLowering:
 		# just skipping it for globals
 		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
 			self._cfg.fresh_temp( instr.dest, instr.dest.type )
+		if self._current_fn is not None and isinstance( instr, ir.Allocate ):
+			instr.loc = f'{self._current_fn.file}:{self._current_lineno}'
 		if self._current_fn is not None:
 			self._check_self_escape_in( instr )
 		self._instructions.append( instr )
@@ -2802,6 +2808,7 @@ class FunctionLowering:
 	# --- statements ------------------------------------------------------------
 
 	def _lower_stmt( self, node: ast.stmt ) -> None:
+		self._current_lineno = getattr( node, 'lineno', self._current_lineno )
 		# _pending_temps is shared/mutable rather than passed explicitly, so a
 		# statement whose own handler recursively lowers nested statements
 		# (currently only _stmt_With) must not let those nested calls' own
@@ -4506,6 +4513,15 @@ class FunctionLowering:
 			return
 		if self.lowering._is_compiler_call( node.value ) == '__raw_free__':
 			self._lower_compiler_raw_free( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == 'dump_live_objects':
+			self._lower_compiler_dump_live_objects( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == '__debug_raw_track__':
+			self._lower_compiler_debug_raw_track( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == '__debug_raw_untrack__':
+			self._lower_compiler_debug_raw_untrack( node.value )
 			return
 		if isinstance( node.value, ast.Yield ):
 			# PLAN_GENERATORS.md Phase F - a bare (statement-position)
@@ -6214,6 +6230,53 @@ class FunctionLowering:
 		self._emit( ir.ParseFloat( dest = dest, buf = buf ))
 		return dest
 
+	# --- debug-mode alloc-site tracking (dump_live_objects) - see
+	# i-want-to-investigate-kind-garden.md. lib/sys.py's alloc[T]/free call
+	# these directly, always inside a `if compiler.target.debug:` guard (same
+	# dead-branch-elimination pattern mempoison already uses - see
+	# compile_time_transformer), so a release build's lowering never reaches
+	# any of these at all; emitter_c.py's own codegen for the matching ir
+	# instructions can assume _target_debug is always True there. ---
+
+	def _lower_compiler_debug_raw_track( self, node: ast.Call ) -> None:
+		# compiler.__debug_raw_track__(ptr, size) -> None - statement-only
+		# (mirrors compiler.incref/decref/atomic_store); see ir.DebugRawTrack.
+		# ptr's own declared type is whatever the caller already has (Ptr[u8]
+		# from sys.alloc[T]'s own _alloc call) - no fresh Ptr[u8] type object
+		# needed here, this never returns a value of its own.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__debug_raw_track__(...) takes exactly two arguments (ptr, size): {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		ptr = self._lower_expr( node.args[0], None )
+		size = self._lower_expr( node.args[1], intrinsics['usize'] )
+		self._emit( ir.DebugRawTrack( ptr = ptr, size = size ))
+
+	def _lower_compiler_debug_raw_untrack( self, node: ast.Call ) -> None:
+		# compiler.__debug_raw_untrack__(ptr) -> None - statement-only,
+		# inverse of __debug_raw_track__; see ir.DebugRawUntrack
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__debug_raw_untrack__(...) takes exactly one argument (ptr): {ast.unparse(node)}', node )
+		ptr = self._lower_expr( node.args[0], None )
+		self._emit( ir.DebugRawUntrack( ptr = ptr ))
+
+	def _lower_compiler_dump_live_objects( self, node: ast.Call ) -> None:
+		# compiler.dump_live_objects() - statement-only (mirrors compiler.
+		# incref/decref/atomic_store), see ir.DumpLiveObjects. A real compile
+		# error outside a debug build (matching the plan's own "compile error
+		# if called from a release build" note) - lib/sys.py's own
+		# dump_live_objects() is the intended entry point and always guards
+		# this behind `if compiler.target.debug:` itself, so reaching here in
+		# a release build means user code called the compiler.* intrinsic
+		# directly, bypassing that guard.
+		if node.args or node.keywords:
+			self.lowering.discovery.fail( f'compiler.dump_live_objects() takes no arguments: {ast.unparse(node)}', node )
+		if not self.lowering.discovery.active_target['debug']:
+			self.lowering.discovery.fail(
+				'compiler.dump_live_objects() is only available in a debug build (compiler.target.debug) - '
+				'no allocation-site tracking exists in a release build to dump', node,
+			)
+		self._emit( ir.DumpLiveObjects() )
+
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
 		# statement-only (see _stmt_Expr's own dispatch) - mirrors
 		# compiler.incref/decref: no return value, nothing to hand back to
@@ -6660,6 +6723,16 @@ class FunctionLowering:
 				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
 				node,
 			)
+		if self.lowering.discovery.active_target['debug']:
+			# debug-mode alloc-site tracking (dump_live_objects) - this
+			# object's own ir.Allocate already tracked it into the global RC
+			# list; sys.free() below frees its storage directly, WITHOUT
+			# going through release_object (that's the whole point - see
+			# this function's own comment on why the real destructor must
+			# never run here), so nothing else will ever untrack it. Must
+			# happen before sys.free() runs, not after - see ir.DebugUntrackRC's
+			# own comment (a real MSVC-only crash, root-caused via bisection).
+			self._emit( ir.DebugUntrackRC( value = operand ))
 		sys_module = self.lowering.discovery.modules['sys']
 		free_overload = sys_module.get_local( 'free' )
 		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
@@ -8144,6 +8217,7 @@ class FunctionLowering:
 		that needs it, to name the REAL cause (a reused binding name, not an
 		ordinary value mismatch) instead of a message that never explains
 		where the "expected" type even came from. '''
+		self._current_lineno = getattr( node, 'lineno', self._current_lineno )
 		method = getattr( self, f'_expr_{node.__class__.__name__}', None )
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
@@ -16224,6 +16298,7 @@ class FunctionLowering:
 			case 'parse_f64':
 				result = self._lower_compiler_parse_f64( node, expected_type )
 				return result if want_result else None
+
 
 		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':
 			# <result_expr>.or_return() - recognized by AST shape alone,
