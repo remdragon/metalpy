@@ -10221,6 +10221,144 @@ def main() -> i32:
 		] )
 
 
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile tests' )
+class VariadicTupleTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' tuple[T, ...] - Python's own spelling for a variable-length,
+	homogeneous tuple, distinct from the fixed-arity tuple[T0,T1,...] tested
+	above (TupleTests). Resolves to a Specialization of the real
+	VariadicTuple[T] class (lib/builtins/__vartuple.py, built on the same
+	UnsafeList[T] storage list[T] wraps) rather than a TupleStorage-
+	synthesized fixed layout - see discovery.py's visit_Subscript. The
+	public constructor is `tuple(some_list)`, an ordinary generic-function
+	call inferring T from its argument (confirmed already supported for a
+	bare, non-subscripted generic construction call - no new compiler
+	machinery needed for that part). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'construct_from_list_and_read_back', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	if len( t ) != 3:
+		return 1
+	if t.__getitem__( 0 ).unwrap( 'idx' ) != 1:
+		return 2
+	if t.__getitem__( 1 ).unwrap( 'idx' ) != 2:
+		return 3
+	if t.__getitem__( 2 ).unwrap( 'idx' ) != 3:
+		return 4
+	return 0
+''' ),
+			# an out-of-range constant/runtime index is a real Err, same as
+			# list[T] - unlike the FIXED-arity tuple's own t[0] sugar (a
+			# compile-time-checked direct field read), this is an ordinary
+			# fallible method call
+			( 'out_of_range_index_is_err', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	t: tuple[i32, ...] = tuple( xs )
+	if t.__getitem__( 1 ).is_ok():
+		return 1
+	return 0
+''' ),
+			( 'empty_tuple_from_empty_list', '''
+def main() -> i32:
+	t: tuple[i32, ...] = tuple( list[i32]() )
+	if len( t ) != 0:
+		return 1
+	if t:
+		return 2 # Python-style truthiness: empty is falsy
+	return 0
+''' ),
+			( 'slicing_returns_a_copy', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 10 )
+	xs.append( 20 )
+	xs.append( 30 )
+	xs.append( 40 )
+	t: tuple[i32, ...] = tuple( xs )
+	s = t[1:3]
+	if len( s ) != 2:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'idx' ) != 20:
+		return 2
+	if s.__getitem__( 1 ).unwrap( 'idx' ) != 30:
+		return 3
+	return 0
+''' ),
+			( 'iteration_via_for_loop', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	xs.append( 4 )
+	t: tuple[i32, ...] = tuple( xs )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t:
+			total += v
+	if total != 10:
+		return 1
+	return 0
+''' ),
+			# RC-correctness: constructing a tuple[T,...] from a list[T] must
+			# incref each copied element (independent ownership alongside the
+			# source list's own), and release them all again when the tuple
+			# itself goes out of scope - not a leak, not a premature free
+			( 'rc_element_refcount_correct_across_construct_and_teardown', '''
+class Elem:
+	pass
+
+def during_refcount( e: Elem ) -> usize:
+	xs: list[Elem] = list[Elem]()
+	xs.append( e )
+	t = tuple( xs )
+	return compiler.refcount( e )
+
+def main() -> i32:
+	e: Elem = Elem()
+	before: usize = compiler.refcount( e )
+	during: usize = during_refcount( e )
+	after: usize = compiler.refcount( e )
+	with compiler.wrap_arithmetic:
+		# +2: xs's own copy (from append) + tuple(xs)'s own copy
+		if during != before + 2:
+			return 1
+	if after != before:
+		return 2
+	return 0
+''' ),
+			# tuple[T,...] and the fixed-arity tuple[T0,T1,...] are genuinely
+			# different types that both happen to spell as `tuple[...]` -
+			# confirms they coexist without one shadowing/confusing the other
+			( 'variadic_and_fixed_arity_tuple_coexist', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	variadic: tuple[i32, ...] = tuple( xs )
+	fixed: tuple[i32, i32] = ( 1, 2 )
+	if len( variadic ) != 2:
+		return 1
+	if fixed[0] != 1 or fixed[1] != 2:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class UnionLeafCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' a plain leaf value (a literal, a variable, bare None) flowing into
 	a T|None (TaggedUnion)-typed slot - a call argument, a default value,

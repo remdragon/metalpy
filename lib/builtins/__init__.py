@@ -79,6 +79,7 @@ from .__int import int, IntError
 from .__scalar_dunders import i_add_checked
 from .__ptr_arith import ptr_add_checked
 from .__list import list, UnsafeList
+from .__vartuple import VariadicTuple, tuple
 from .__RawDict import RawDict, RawEntry
 from .__set import set
 from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one
