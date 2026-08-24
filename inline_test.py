@@ -82,9 +82,9 @@ class InlineLenBehaviorTests( unittest.TestCase ):
 		code = '\n'.join([
 			'def main() -> i32:',
 			'	x: list[i32] = list[i32]()',
-			"	x.append( 1 ).unwrap( 'append failed' )",
-			"	x.append( 2 ).unwrap( 'append failed' )",
-			"	x.append( 3 ).unwrap( 'append failed' )",
+			"	x.append( 1 )",
+			"	x.append( 2 )",
+			"	x.append( 3 )",
 			'	if len( x ) != 3:',
 			'		return 1',
 			'',
@@ -110,7 +110,7 @@ class InlineLenBehaviorTests( unittest.TestCase ):
 		code = '\n'.join([
 			'def main() -> i32:',
 			'	x: list[i32] = list[i32]()',
-			"	x.append( 1 ).unwrap( 'append failed' )",
+			"	x.append( 1 )",
 			"	n: usize = len( x )",
 			"	s: str = 'hi'",
 			'	m: usize = len( s )',

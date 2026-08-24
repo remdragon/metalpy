@@ -48,8 +48,8 @@ def sum_node( n: Node ) -> i32:
 
 def main() -> i32:
 	kids: list[Node] = list[Node]()
-	kids.append( Node.Leaf( 1 ) ).unwrap( 'spike: append failed' )
-	kids.append( Node.Leaf( 2 ) ).unwrap( 'spike: append failed' )
+	kids.append( Node.Leaf( 1 ) )
+	kids.append( Node.Leaf( 2 ) )
 	root: Node = Node.Branch( BranchData( 'root', kids ) )
 	if sum_node( root ) != 3:
 		return 1

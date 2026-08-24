@@ -95,8 +95,8 @@ def read_whole_file( path: str ) -> str:
 def main() -> i32:
 	path: str = 'csv_dict_case3.tmp'
 	fieldnames: list[str] = list[str]()
-	fieldnames.append( 'name' ).unwrap( 'x' )
-	fieldnames.append( 'age' ).unwrap( 'x' )
+	fieldnames.append( 'name' )
+	fieldnames.append( 'age' )
 
 	dw = csv.dict_writer( path, fieldnames ).unwrap( 'open for write' )
 	dw.writeheader().unwrap( 'header' )
@@ -129,8 +129,8 @@ def read_whole_file( path: str ) -> str:
 def main() -> i32:
 	path: str = 'csv_dict_case4.tmp'
 	fieldnames: list[str] = list[str]()
-	fieldnames.append( 'a' ).unwrap( 'x' )
-	fieldnames.append( 'b' ).unwrap( 'x' )
+	fieldnames.append( 'a' )
+	fieldnames.append( 'b' )
 
 	dw = csv.dict_writer( path, fieldnames ).unwrap( 'open for write' )
 	row1: dict[str,str] = dict[str,str]()
@@ -149,8 +149,8 @@ import csv
 def main() -> i32:
 	path: str = 'csv_dict_case5.tmp'
 	fieldnames: list[str] = list[str]()
-	fieldnames.append( 'id' ).unwrap( 'x' )
-	fieldnames.append( 'note' ).unwrap( 'x' )
+	fieldnames.append( 'id' )
+	fieldnames.append( 'note' )
 
 	dw = csv.dict_writer( path, fieldnames ).unwrap( 'open for write' )
 	dw.writeheader().unwrap( 'header' )

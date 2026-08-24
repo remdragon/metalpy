@@ -323,7 +323,7 @@ def _build_argv() -> list[str]:
 			n: usize = cstrlen( raw, 1_000_000 )
 			size: usize = n + 1
 			s: str = str.from_cstr( raw, size ).unwrap( 'sys.argv: invalid UTF-8 in argument' )
-			result.append( s ).unwrap( 'sys.argv: too many arguments' )
+			result.append( s )
 			i += 1
 	return result
 

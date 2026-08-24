@@ -83,7 +83,7 @@ class HTTPHeaders:
 		''' appends a new entry, keeping any existing entry with the same
 		(case-insensitive) name - matches HTTP's own "repeated headers are
 		combined, not overwritten" semantics for headers like Set-Cookie. '''
-		self.__entries.append( ( name, value )).unwrap( 'HTTPHeaders.add: append failed' )
+		self.__entries.append( ( name, value ))
 
 	def set( self, name: str, value: str ) -> None:
 		''' replaces every existing entry with a matching (case-insensitive)
@@ -100,12 +100,12 @@ class HTTPHeaders:
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( 'HTTPHeaders.set: index in bounds by construction' )
 			if _header_name_eq( entry[0], name ):
 				if not replaced:
-					rebuilt.append( ( name, value )).unwrap( 'HTTPHeaders.set: append failed' )
+					rebuilt.append( ( name, value ))
 					replaced = True
 			else:
-				rebuilt.append( entry ).unwrap( 'HTTPHeaders.set: append failed' )
+				rebuilt.append( entry )
 		if not replaced:
-			rebuilt.append( ( name, value )).unwrap( 'HTTPHeaders.set: append failed' )
+			rebuilt.append( ( name, value ))
 		self.__entries = rebuilt
 
 	def get( self, name: str ) -> str|None:
@@ -126,7 +126,7 @@ class HTTPHeaders:
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( 'HTTPHeaders.get_all: index in bounds by construction' )
 			if _header_name_eq( entry[0], name ):
-				result.append( entry[1] ).unwrap( 'HTTPHeaders.get_all: append failed' )
+				result.append( entry[1] )
 		return result
 
 	def name_at( self, index: usize ) -> Result[str, IndexError]:
@@ -877,7 +877,7 @@ def _dict_to_pairs( d: dict[str,str] ) -> list[tuple[str,str]]:
 	for i in range( n ):
 		key: str = d.key_at( i ).unwrap( '_dict_to_pairs: index in bounds by construction' )
 		value: str = d.value_at( i ).unwrap( '_dict_to_pairs: index in bounds by construction' )
-		pairs.append( ( key, value )).unwrap( '_dict_to_pairs: append failed' )
+		pairs.append( ( key, value ))
 	return pairs
 
 def _build_request_path( parsed: ParsedURL, params: dict[str,str]|None ) -> Result[str, HTTPError]:
@@ -897,7 +897,7 @@ def _build_request_path( parsed: ParsedURL, params: dict[str,str]|None ) -> Resu
 		en: usize = extra.__len__()
 		ei: usize = 0
 		for ei in range( en ):
-			pairs.append( extra.__getitem__( ei ).unwrap( '_build_request_path: index in bounds by construction' )).unwrap( '_build_request_path: append failed' )
+			pairs.append( extra.__getitem__( ei ).unwrap( '_build_request_path: index in bounds by construction' ))
 	if pairs.__len__() == 0:
 		return Result.Ok( parsed.path )
 	return Result.Ok( parsed.path + '?' + urlencode( pairs ))
@@ -1056,7 +1056,7 @@ def _redact( text: str, sensitive_values: list[str]|None ) -> str:
 	i: usize = 0
 	for i in range( n ):
 		v: str = source.__getitem__( i ).unwrap( '_redact: index in bounds by construction' )
-		values.append( v ).unwrap( '_redact: append failed' )
+		values.append( v )
 
 	with compiler.panic_arithmetic( 'n bounded by a real caller-supplied list, cannot overflow' ):
 		for i in range( n ):
@@ -1158,13 +1158,13 @@ class Session:
 		for i in range( n ):
 			name: str = self.__cookies.key_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
 			value: str = self.__cookies.value_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
-			parts.append( name + '=' + value ).unwrap( '_build_cookie_header: append failed' )
+			parts.append( name + '=' + value )
 		if extra is not None:
 			e2: dict[str,str] = extra
 			for i in range( extra_n ):
 				name = e2.key_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
 				value = e2.value_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
-				parts.append( name + '=' + value ).unwrap( '_build_cookie_header: append failed' )
+				parts.append( name + '=' + value )
 		return '; '.join( parts )
 
 	def request( self, method: str, url: str,

@@ -153,7 +153,7 @@ class Poller:
 			fd = fd,
 			readable = ( ev & ( EPOLLIN | EPOLLERR | EPOLLHUP )) != 0,
 			writable = ( ev & EPOLLOUT ) != 0,
-		)).unwrap( 'Poller.wait: result list overflow' )
+		))
 		return Result.Ok( out )
 
 
@@ -176,7 +176,7 @@ class Poller:
 			events = events | POLLRDNORM
 		if want_write:
 			events = events | POLLWRNORM
-		self.__fds.append( WSAPOLLFD( fd = fd, events = events )).unwrap( 'Poller.register: registered-fd list overflow' )
+		self.__fds.append( WSAPOLLFD( fd = fd, events = events ))
 		return Result.Ok( None )
 
 	def unregister( self, fd: SOCKET ) -> Result[None, OSError]:
@@ -186,7 +186,7 @@ class Poller:
 		while i < n:
 			entry: WSAPOLLFD = self.__fds.__getitem__( i ).unwrap( 'Poller.unregister: index in bounds by construction' )
 			if entry.fd != fd:
-				kept.append( entry ).unwrap( 'Poller.unregister: rebuild overflow' )
+				kept.append( entry )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 		self.__fds = kept
@@ -227,7 +227,7 @@ class Poller:
 						fd = ready_slot.fd,
 						readable = ( revents & ( POLLRDNORM | POLLERR | POLLHUP )) != 0,
 						writable = ( revents & POLLWRNORM ) != 0,
-					)).unwrap( 'Poller.wait: result list overflow' )
+					))
 				with compiler.wrap_arithmetic:
 					i = i + 1
 		sys.free( compiler.cast( Ptr[None], buf ))

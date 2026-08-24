@@ -140,7 +140,7 @@ class RowParser:
 		self.__current_field = ''
 
 	def _finish_field( self ) -> None:
-		self.__fields.append( self.__current_field ).unwrap( 'RowParser: field append failed' )
+		self.__fields.append( self.__current_field )
 		self.__current_field = ''
 
 	def feed_line( self, line: str ) -> Result[MaybeRow, CsvError]:
@@ -644,7 +644,7 @@ class DictWriter:
 					value = v
 				case Result.Err( e ):
 					pass # key missing from row - value stays ''
-			values.append( value ).unwrap( 'DictWriter: value append failed' )
+			values.append( value )
 			with compiler.wrap_arithmetic:
 				i += 1
 		return self.__rows.writerow( values )

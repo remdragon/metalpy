@@ -84,7 +84,7 @@ def _split_parts( rest: str, sep: str ) -> list[str]:
 			i += 1
 			if part == '' or part == '.':
 				continue
-			parts.append( part ).unwrap( 'pathlib: append failed' )
+			parts.append( part )
 	return parts
 
 
@@ -138,11 +138,11 @@ class Path:
 		segments: list[str] = _split_parts( rest, sep )
 		result: list[str] = list[str]()
 		if anchor != '':
-			result.append( anchor ).unwrap( 'pathlib: append failed' )
+			result.append( anchor )
 		i: usize = 0
 		with compiler.panic_arithmetic( 'bounded by len(segments), cannot overflow' ):
 			while i < len( segments ):
-				result.append( segments.__getitem__( i ).unwrap( 'pathlib: index in bounds by construction' )).unwrap( 'pathlib: append failed' )
+				result.append( segments.__getitem__( i ).unwrap( 'pathlib: index in bounds by construction' ))
 				i += 1
 		return result
 
@@ -202,7 +202,7 @@ class Path:
 			p: Path = current.parent
 			if p._raw == current._raw:
 				break
-			result.append( p ).unwrap( 'pathlib: append failed' )
+			result.append( p )
 			current = p
 		return result
 
@@ -333,7 +333,7 @@ class Path:
 		with compiler.panic_arithmetic( 'bounded by len(names), cannot overflow' ):
 			while i < len( names ):
 				name: str = names.__getitem__( i ).unwrap( 'pathlib: index in bounds by construction' )
-				result.append( self / name ).unwrap( 'pathlib: append failed' )
+				result.append( self / name )
 				i += 1
 		return Result.Ok( result )
 

@@ -6,16 +6,16 @@ import threading
 
 # Sequence[T]/Iterable[T]: the two protocols min(seq)/max(seq)/iter/any/all/
 # enumerate/map/reduce/sum are all built on (defined here, before ANY other
-# name in this module, since list[T]/slice[T] below need to declare
-# conformance in their own class header, e.g. `class list[T](Sequence[T],
-# Iterable[T]):` - a base-class list is resolved EAGERLY, at the base-class
-# expression's own parse time, unlike an ordinary annotation reference
-# (Result[T,IndexError] below is fine forward-referenced, lazily resolved -
-# only a TypeVar's own bound and a class's own base list are eager. list[T]
-# itself is defined in a separate file, __list.py, reached via this file's
-# own `from .__list import list` below - list[T]'s own class statement is
-# parsed as a side effect of THAT import line, so Sequence/Iterable must
-# already be registered before it, not merely appear earlier in THIS file).
+# name in this module, since list[T] below needs to declare conformance in
+# its own class header, e.g. `class list[T](Sequence[T], Iterable[T]):` - a
+# base-class list is resolved EAGERLY, at the base-class expression's own
+# parse time, unlike an ordinary annotation reference (Result[T,IndexError]
+# below is fine forward-referenced, lazily resolved - only a TypeVar's own
+# bound and a class's own base list are eager. list[T] itself is defined in
+# a separate file, __list.py, reached via this file's own `from .__list
+# import list` below - list[T]'s own class statement is parsed as a side
+# effect of THAT import line, so Sequence/Iterable must already be
+# registered before it, not merely appear earlier in THIS file).
 # Kept as two separate protocols, not one (matching real Python: dict
 # conforms to Iterable via key-iteration but isn't a Sequence - __getitem__
 # isn't usize-keyed) - see each's own docstring below.
@@ -23,9 +23,9 @@ import threading
 class Sequence[T]:
 	# only __getitem__ is required, not __len__ - reaching the end is
 	# signaled by Err(IndexError) itself, so a conformer never needs to
-	# separately answer "how many". list[T]/slice[T]'s existing scalar
-	# __getitem__ already has exactly this shape - conforming needed no
-	# method changes there, only the base-class declaration.
+	# separately answer "how many". list[T]'s existing scalar __getitem__
+	# already has exactly this shape - conforming needed no method changes
+	# there, only the base-class declaration.
 	def __getitem__( self, i: usize ) -> Result[T, IndexError]: ...
 
 @protocol
@@ -97,12 +97,6 @@ class ZeroDivisionError: pass
 class FloatingPointError: pass
 class IndexError: pass
 class KeyError: pass
-# list[T].append/insert/erase_at/pop refuse to mutate while a slice[T] view
-# (list[T][a:b], RAII-tracked) is outstanding (see __list.py's own
-# __getitem__(PySlice) comment) - the same "an outstanding export blocks a
-# resize" contract Python's own memoryview/buffer protocol enforces over
-# bytearray
-class BorrowError: pass
 # structural `==`/`!=` between two operands where at least one (left, right)
 # leaf-type pairing has no valid comparison (see lowering.py's
 # _lower_eq_dispatch/_classify_leaf_pair_eq) produces Result[bool,TypeError]
@@ -213,9 +207,9 @@ class Result[T,E]:
 
 
 @cstruct
-class PySlice:
+class slice:
 	# range descriptor for container[a:b] slice syntax (lowering.py's
-	# _lower_slice_subscript) - the __getitem__(PySlice) overload argument
+	# _lower_slice_subscript) - the __getitem__(slice) overload argument
 	# every slice-syntax-supporting type (str, bytearray, memoryview,
 	# UnsafeList[T], list[T]) shares, replacing the old hardcoded
 	# per-type _byte_slice(start,end)/_SLICE_LENGTH_METHOD dispatch. stop is
@@ -229,7 +223,7 @@ class PySlice:
 	stop: usize|None
 
 
-# Resolves a PySlice against a container's own real length, matching real
+# Resolves a slice against a container's own real length, matching real
 # Python's own slice semantics EXACTLY: container[a:b] never raises -
 # out-of-range bounds silently clamp into [0, real_len], and start > stop
 # (after clamping) yields an empty range - rather than the stricter
@@ -237,11 +231,11 @@ class PySlice:
 # uses for single-element access (container[i] DOES raise/Result::Err on an
 # out-of-range i). Slicing is a deliberately forgiving idiom in real Python,
 # worth preserving faithfully rather than picking the stricter convention.
-# Shared by every __getitem__(PySlice) overload (str, bytearray, memoryview,
+# Shared by every __getitem__(slice) overload (str, bytearray, memoryview,
 # UnsafeList[T], list[T]) so the clamping math itself lives in exactly one
 # place. No negative-index support (s[-1:] etc) - matches every existing
 # __getitem__ in this codebase, none of which support negative indices.
-def _resolve_pyslice_bounds( s: PySlice, real_len: usize ) -> tuple[usize,usize]:
+def _resolve_slice_bounds( s: slice, real_len: usize ) -> tuple[usize,usize]:
 	stop_field: usize|None = s.stop
 	real_stop: usize = real_len
 	if stop_field is not None:
@@ -256,117 +250,6 @@ def _resolve_pyslice_bounds( s: PySlice, real_len: usize ) -> tuple[usize,usize]
 		clamped_stop = clamped_start
 	return ( clamped_start, clamped_stop )
 
-
-# slice[T]'s own delegate for __iter__ below - see lib/builtins/__list.py's
-# _list_iter for why this is a dedicated, type-specific helper rather than
-# the shared _sequence_iter[T,S:Sequence[T]].
-def _slice_iter[T]( seq: slice[T] ) -> Generator[T, StopIteration]:
-	# __getitem__ called TWICE per element, no intermediate local - see
-	# _sequence_iter's identical comment for the two separate, real
-	# compiler issues this avoids.
-	i: usize = 0
-	while True:
-		if seq.__getitem__( i ).is_err():
-			return
-		yield seq.__getitem__( i ).unwrap( 'slice.__getitem__: was just checked is_ok() above' )
-		with compiler.wrap_arithmetic:
-			i += 1
-
-class slice[T]( Sequence[T], Iterable[T] ):
-	# _ptr is a raw, untyped view into the backing buffer - NOT
-	# ConstPtr[T]. Ptr[Foo]/ConstPtr[Foo] for an RC class Foo compiles to
-	# the exact same C type as a bare Foo handle (struct Foo*, one star -
-	# see emitter_c.py's own _value_spelling comment: "Ptr[T]'s inner T
-	# must stay a single pointer even when T is an RCClass - sys.alloc
-	# [Foo]'s own real return type"), by design, for the "pointer to ONE
-	# freshly allocated object" use case - genuinely correct there, but
-	# incompatible with "pointer to an ARRAY of handles" (needs struct
-	# Foo**, two stars), which is what a slice over RC elements actually
-	# is. This is the exact same "an RC element's own slot holds its
-	# HANDLE, not its struct body" distinction UnsafeList's own RawList/
-	# _read_element/_write_element (lib/builtins/__list.py) already keep
-	# straight via an explicit compiler.is_rc(T) branch + Ptr[None] casts,
-	# rather than naive Ptr[T] array indexing - slice[T] mirrors that
-	# same pattern here (found + fixed together with str.concat/
-	# UnsafeList, its only real caller - PLAN_FSTRINGS.md).
-	#
-	# A plain (non-@cstruct) RCClass, not a value type, specifically so it
-	# gets a real __init__/__del__: __borrow_addr, when set, points at a
-	# source list[T]'s own atomic borrow counter (see list[T].__getitem__
-	# (PySlice)/UnsafeList[T]._slice_view, lib/builtins/__list.py) -
-	# __init__ atomically increments it, __del__ atomically decrements it,
-	# tying the borrow's lifetime to this object's own RC lifetime (RAII)
-	# instead of the old manual, unpaired-call-prone list[T].borrow_slice()/
-	# release_borrow(). None (UnsafeList[T]-sourced slices, which have no
-	# backing counter at all - UnsafeList stays unguarded, single-owner by
-	# construction) skips the atomic ops entirely. The VIEW itself (_ptr/
-	# __len) is still just a non-owning borrow over the backing buffer -
-	# only the borrow-COUNT bookkeeping is now automatic; a list[T] being
-	# destructed out from under a live borrow (as opposed to merely
-	# mutated) is still the caller's own responsibility to avoid, exactly
-	# as it always was.
-	_ptr: ConstPtr[None]
-	__len: usize
-	__borrow_addr: Ptr[usize]|None
-
-	def __init__( self, ptr: ConstPtr[None], length: usize, borrow_addr: Ptr[usize]|None ) -> None:
-		self._ptr = ptr
-		self.__len = length
-		self.__borrow_addr = borrow_addr
-		if borrow_addr is not None:
-			compiler.atomic_add( borrow_addr, 1 )
-
-	def __del__( self ) -> None:
-		# bound to a local first, not narrowed on a repeated self.__borrow_
-		# addr field read - re-reading a field twice (once for the `is not
-		# None` check, once inside the body) doesn't inherit the first
-		# read's own narrowing in this compiler; a local does
-		addr: Ptr[usize]|None = self.__borrow_addr
-		if addr is not None:
-			compiler.atomic_sub( addr, 1 )
-
-	def __len__( self ) -> usize:
-		return self.__len
-
-	def _element_size( self ) -> usize:
-		# same split RawList's own element_size computation uses (see
-		# UnsafeList.__init__'s own comment): an RC element's SLOT is
-		# always pointer-wide (it holds a handle, never the struct body),
-		# regardless of T's own real, possibly much larger, layout size
-		if compiler.is_rc( T ):
-			return compiler.sizeof( usize )
-		return compiler.sizeof( T )
-
-	def get_unchecked( self, index: usize ) -> T:
-		# Returns an owned value (incref'd if RC) - same "bare read +
-		# compiler.incref if RC" shape as UnsafeList.__getitem__. Callers
-		# never need their own compiler.incref/decref for the ELEMENT this
-		# returns; the view itself (_ptr/__len) stays a non-owning borrow
-		# over the backing buffer regardless (see the class comment above).
-		with compiler.panic_arithmetic( 'slice.get_unchecked: offset overflow' ):
-			slot: ConstPtr[None] = self._ptr + index * self._element_size()
-		if compiler.is_rc( T ):
-			handle_slot: ConstPtr[ConstPtr[None]] = compiler.cast( ConstPtr[ConstPtr[None]], slot )
-			val: T = compiler.cast( T, handle_slot[0] )
-			compiler.incref( val )
-			return val
-		else:
-			ptr: ConstPtr[T] = compiler.cast( ConstPtr[T], slot )
-			return ptr[0]
-
-	def __getitem__( self, index: usize ) -> Result[T,IndexError]:
-		if index >= self.__len:
-			return Result.Err( IndexError() )
-
-		return Result.Ok( self.get_unchecked( index ))
-
-	def __iter__( self ) -> Generator[T, StopIteration]:
-		return _slice_iter( self ) # not _sequence_iter - see lib/builtins/__list.py's _list_iter for why
-
-	def get_assert( self, index: usize ) -> T:
-		if index >= self.__len:
-			sys.panic( 'bad slice index' )
-		return self.get_unchecked( index )
 
 
 # shared byte-level helpers for bytes.find()/bytearray.find() (etc.) - pure
@@ -474,6 +357,17 @@ class bytes:
 	def endswith( self, suffix: bytes|bytearray ) -> bool:
 		return _bytes_endswith( self, suffix )
 
+	# s[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a new,
+	# independently-owned bytes, matching real Python's own slice semantics
+	# exactly (out-of-range bounds silently clamp - see
+	# _resolve_slice_bounds). bytes has no scalar __getitem__(idx)
+	# overload to share this name with (immutable, and nothing here needs
+	# single-byte access by index yet), so this is a plain method, not an
+	# @overload group.
+	def __getitem__( self, s: slice ) -> bytes:
+		( start, stop ) = _resolve_slice_bounds( s, self.__len )
+		return self._byte_slice( start, stop )
+
 	@private
 	def _byte_slice( self, start: usize, end: usize ) -> bytes:
 		''' bytes [start, end) of self, as a new, independently-owned bytes -
@@ -502,11 +396,11 @@ class bytes:
 		while True:
 			found: isize = self.find( sep, start )
 			if found == isize( -1 ):
-				result.append( self._byte_slice( start, self_len )).unwrap( 'bytes.split: append failed' )
+				result.append( self._byte_slice( start, self_len ))
 				break
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				match_start: usize = usize( found )
-			result.append( self._byte_slice( start, match_start )).unwrap( 'bytes.split: append failed' )
+			result.append( self._byte_slice( start, match_start ))
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
 		return result
@@ -563,15 +457,15 @@ class bytearray:
 		return Result.Ok( self.__data[index] )
 
 	@overload
-	def __getitem__( self, s: PySlice ) -> bytearray:
+	def __getitem__( self, s: slice ) -> bytearray:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
 		infallible, matching real Python's own slice semantics exactly -
 		out-of-range bounds silently clamp rather than raising (see
-		_resolve_pyslice_bounds), unlike single-element s[i] above, which
+		_resolve_slice_bounds), unlike single-element s[i] above, which
 		DOES error on an out-of-range index. '''
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__getitem__() called after release()'
-		( start, stop ) = _resolve_pyslice_bounds( s, self.__len )
+		( start, stop ) = _resolve_slice_bounds( s, self.__len )
 		return self._byte_slice( start, stop )
 
 	def __setitem__( self, index: usize, value: u8 ) -> None:
@@ -667,11 +561,11 @@ class bytearray:
 		while True:
 			found: isize = self.find( sep, start )
 			if found == isize( -1 ):
-				result.append( self._byte_slice( start, self_len )).unwrap( 'bytearray.split: append failed' )
+				result.append( self._byte_slice( start, self_len ))
 				break
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				match_start: usize = usize( found )
-			result.append( self._byte_slice( start, match_start )).unwrap( 'bytearray.split: append failed' )
+			result.append( self._byte_slice( start, match_start ))
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
 		return result
@@ -724,17 +618,19 @@ class str:
 		return str._from_owned_cstr( new_buf, new_byte_size ).unwrap( 'invalid UTF-8 in str.__add__' )
 	
 	@staticmethod
-	def concat( parts: slice[str] ) -> str:
-		# get_unchecked(i) already returns an owned str (incref'd if RC -
-		# see its own comment), so binding it into a named local and letting
+	def concat( parts: UnsafeList[str] ) -> str:
+		# __getitem__(i)'s own Incref (bounds-checked, but every i here is
+		# < count by construction) plus .unwrap()'s bare extraction already
+		# return an owned str, so binding it into a named local and letting
 		# that local's normal scope-exit decref fire is the correct release
-		# of exactly the reference get_unchecked just gave us - no manual
-		# incref needed here.
+		# of exactly the reference __getitem__ just gave us - no manual
+		# incref needed here (same "bound-local, incref cancels scope-exit
+		# decref" idiom list[T].pop() already uses).
 		new_size: usize = 1 # for the zero terminator
 		i: usize = 0
 		count: usize = parts.__len__()
 		for i in range( count ):
-			part: str = parts.get_unchecked( i )
+			part: str = parts.__getitem__( i ).unwrap( 'str.concat: index in bounds by construction' )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				new_size += part.__byte_size - 1
 
@@ -744,7 +640,7 @@ class str:
 		for i in range( count ):
 			# distinct name from the sizing loop's own `part` above - a
 			# variable's type is only ever declared once per function
-			copy_part: str = parts.get_unchecked( i )
+			copy_part: str = parts.__getitem__( i ).unwrap( 'str.concat: index in bounds by construction' )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				part_len: usize = copy_part.__byte_size - 1
 			with compiler.wrap_arithmetic:
@@ -840,7 +736,7 @@ class str:
 		return Result.Ok( self._byte_slice( i, end ))
 
 	@overload
-	def __getitem__( self, s: PySlice ) -> str:
+	def __getitem__( self, s: slice ) -> str:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
 		BYTE offsets, not this class's own __len__/codepoint-indexed s[i]
 		above (deliberate, pre-existing split - see _byte_slice's own
@@ -848,13 +744,13 @@ class str:
 		target_path[idx+9:], slices from str.find()'s own byte offset).
 		Infallible, matching real Python's own slice semantics exactly -
 		out-of-range bounds silently clamp rather than raising (see
-		_resolve_pyslice_bounds) - unlike single-element s[i] above, which
+		_resolve_slice_bounds) - unlike single-element s[i] above, which
 		DOES error on an out-of-range index. This also closes what the old
 		hardcoded slice-syntax path never checked at all (stop > len() was
 		a silent out-of-bounds C-level read) and used to panic on (usize
 		underflow on start > stop) - clamping makes both cases well-defined
 		instead, on top of matching Python's own behavior. '''
-		( start, stop ) = _resolve_pyslice_bounds( s, self.byte_len() )
+		( start, stop ) = _resolve_slice_bounds( s, self.byte_len() )
 		return self._byte_slice( start, stop )
 
 	def __bool__( self ) -> bool:
@@ -1017,11 +913,11 @@ class str:
 		while True:
 			found: isize = self.find( sep, start )
 			if found == isize( -1 ):
-				result.append( self._byte_slice( start, self_len )).unwrap( 'str.split: append failed' )
+				result.append( self._byte_slice( start, self_len ))
 				break
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				match_start: usize = usize( found )
-			result.append( self._byte_slice( start, match_start )).unwrap( 'str.split: append failed' )
+			result.append( self._byte_slice( start, match_start ))
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
 		return result
@@ -1183,14 +1079,13 @@ class str:
 	def join( self, parts: list[str] ) -> str:
 		''' self inserted between each element of parts - str.concat's own
 		two-pass shape, plus self's own bytes between consecutive parts.
-		Takes list[str] rather than slice[str] (str.concat's own parameter
-		type) - list[str] is the container every caller already has a
-		piece of text collection in (e.g. split()'s own return type), and
-		list[T] (unlike UnsafeList[T], see its own as_slice()) deliberately
-		has no slice[T] view to hand over (a raw buffer view isn't safe to
-		hold once the lock that made it valid has been released - see
+		Takes list[str] rather than UnsafeList[str] (str.concat's own
+		parameter type) - list[str] is the container every caller already
+		has a piece of text collection in (e.g. split()'s own return type),
+		and list[T]'s own methods are all lock-guarded per call (see
 		__list.py's own header comment), so bridging to str.concat would
-		still need an explicit copy either way. '''
+		still need an explicit copy into an UnsafeList[str] either way -
+		not worth it just to share concat's own loop body. '''
 		count: usize = parts.__len__()
 		if count == 0:
 			return ''
@@ -1420,16 +1315,16 @@ class str:
 			while end > 3:
 				with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
 					start: usize = end - 3
-				groups.append( self._byte_slice( start, end )).unwrap( '_insert_thousands_sep: append failed' )
+				groups.append( self._byte_slice( start, end ))
 				end = start
-			groups.append( self._byte_slice( 0, end )).unwrap( '_insert_thousands_sep: append failed' )
+			groups.append( self._byte_slice( 0, end ))
 			group_count: usize = groups.__len__()
 			ordered: list[str] = list[str]() # most-significant GROUP first
 			i: usize = group_count
 			with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
 				while i > 0:
 					i -= 1
-					ordered.append( groups.__getitem__( i ).unwrap( '_insert_thousands_sep: index in bounds by construction' )).unwrap( '_insert_thousands_sep: append failed' )
+					ordered.append( groups.__getitem__( i ).unwrap( '_insert_thousands_sep: index in bounds by construction' ))
 		return sep.join( ordered )
 
 	@private

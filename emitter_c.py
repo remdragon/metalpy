@@ -2998,8 +2998,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# Result[None,E].Ok(...) payload) - an uninitialized read there is
 			# real UB, not just a harmless value-doesn't-matter case: confirmed
 			# via MSVC's /RTC1 uninitialized-variable runtime check aborting
-			# (STATUS_BREAKPOINT) on exactly this shape (list.append() wrapped
-			# to return Result[None,BorrowError]).
+			# (STATUS_BREAKPOINT) on exactly this shape (a void-returning
+			# method wrapped to return Result[None,E]).
 			return [ f'\t{call_expr};', f'\t{_emit_operand(instr.dest)} = 0;' ]
 		return [ f'\t{call_expr};' ]
 

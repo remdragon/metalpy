@@ -196,9 +196,9 @@ import csv
 
 def main() -> i32:
 	row: list[str] = list[str]()
-	row.append( 'a' ).unwrap( 'x' )
-	row.append( 'b' ).unwrap( 'x' )
-	row.append( 'c' ).unwrap( 'x' )
+	row.append( 'a' )
+	row.append( 'b' )
+	row.append( 'c' )
 	line: str = csv.format_row( row )
 	if line != 'a,b,c':
 		return 1
@@ -209,9 +209,9 @@ import csv
 
 def main() -> i32:
 	row: list[str] = list[str]()
-	row.append( 'a,b' ).unwrap( 'x' )
-	row.append( 'has"quote' ).unwrap( 'x' )
-	row.append( 'plain' ).unwrap( 'x' )
+	row.append( 'a,b' )
+	row.append( 'has"quote' )
+	row.append( 'plain' )
 	line: str = csv.format_row( row )
 	if line != '"a,b","has""quote",plain':
 		return 1
@@ -222,10 +222,10 @@ import csv
 
 def main() -> i32:
 	row: list[str] = list[str]()
-	row.append( 'simple' ).unwrap( 'x' )
-	row.append( 'with,comma' ).unwrap( 'x' )
-	row.append( 'with"quote' ).unwrap( 'x' )
-	row.append( '' ).unwrap( 'x' )
+	row.append( 'simple' )
+	row.append( 'with,comma' )
+	row.append( 'with"quote' )
+	row.append( '' )
 	line: str = csv.format_row( row )
 	p = csv.RowParser()
 	match p.feed_line( line ):

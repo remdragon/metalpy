@@ -286,8 +286,8 @@ import os
 
 def main() -> i32:
 	paths: list[str] = list[str]()
-	paths.append( f'a{os.sep}b{os.sep}c' ).unwrap( 'append failed' )
-	paths.append( f'a{os.sep}b{os.sep}d' ).unwrap( 'append failed' )
+	paths.append( f'a{os.sep}b{os.sep}c' )
+	paths.append( f'a{os.sep}b{os.sep}d' )
 	result: str = os.path.commonpath( paths ).unwrap( 'commonpath failed' )
 	if result != f'a{os.sep}b':
 		return 1
@@ -298,8 +298,8 @@ import os
 
 def main() -> i32:
 	paths: list[str] = list[str]()
-	paths.append( '{abs_prefix}a{sep}b{sep}c' ).unwrap( 'append failed' )
-	paths.append( '{abs_prefix}a{sep}b{sep}d' ).unwrap( 'append failed' )
+	paths.append( '{abs_prefix}a{sep}b{sep}c' )
+	paths.append( '{abs_prefix}a{sep}b{sep}d' )
 	result: str = os.path.commonpath( paths ).unwrap( 'commonpath failed' )
 	if result != '{abs_prefix}a{sep}b':
 		return 1
@@ -310,8 +310,8 @@ import os
 
 def main() -> i32:
 	paths: list[str] = list[str]()
-	paths.append( 'a{sep}b' ).unwrap( 'append failed' )
-	paths.append( '{abs_prefix}a{sep}b' ).unwrap( 'append failed' )
+	paths.append( 'a{sep}b' )
+	paths.append( '{abs_prefix}a{sep}b' )
 	match os.path.commonpath( paths ):
 		case Result.Ok( _ ):
 			return 1
@@ -459,8 +459,8 @@ import os
 
 def main() -> i32:
 	paths: list[str] = list[str]()
-	paths.append( 'C:\\\\a' ).unwrap( 'append failed' )
-	paths.append( 'D:\\\\b' ).unwrap( 'append failed' )
+	paths.append( 'C:\\\\a' )
+	paths.append( 'D:\\\\b' )
 	match os.path.commonpath( paths ):
 		case Result.Ok( _ ):
 			return 1

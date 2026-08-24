@@ -94,14 +94,14 @@ from urllib.parse import urlencode, parse_qsl
 
 def main() -> i32:
 	pairs: list[tuple[str,str]] = list[tuple[str,str]]()
-	pairs.append( ( 'a', '1' )).unwrap( 'append' )
-	pairs.append( ( 'b', 'hello world' )).unwrap( 'append' )
+	pairs.append( ( 'a', '1' ))
+	pairs.append( ( 'b', 'hello world' ))
 	encoded: str = urlencode( pairs )
 	if encoded != 'a=1&b=hello+world':
 		return 1
 
 	special: list[tuple[str,str]] = list[tuple[str,str]]()
-	special.append( ( 'key', 'a&b=c' )).unwrap( 'append' )
+	special.append( ( 'key', 'a&b=c' ))
 	if urlencode( special ) != 'key=a%26b%3Dc':
 		return 2
 

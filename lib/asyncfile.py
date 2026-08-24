@@ -89,7 +89,7 @@ class _PoolWorker:
 		self.__wake_write = write_side
 
 	def submit( self, job: Job ) -> None:
-		self.__jobs.append( job ).unwrap( '_PoolWorker.submit: queue overflow' )
+		self.__jobs.append( job )
 		poke: bytes = b'x'
 		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.submit: wake failed' )
 
@@ -128,9 +128,9 @@ class _Pool:
 		i: usize = 0
 		while i < size:
 			w: _PoolWorker = _PoolWorker()
-			self.__workers.append( w ).unwrap( '_Pool.__init__: worker list overflow' )
+			self.__workers.append( w )
 			t: threading.Thread = threading.Thread( w.run_forever )
-			self.__threads.append( t ).unwrap( '_Pool.__init__: thread list overflow' )
+			self.__threads.append( t )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 

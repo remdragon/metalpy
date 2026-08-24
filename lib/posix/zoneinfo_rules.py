@@ -208,7 +208,7 @@ def _parse_data_block(
 		else:
 			with compiler.wrap_arithmetic:
 				t = i64( _read_i32_be( data, entry_off ))
-		transition_times.append( t ).unwrap( 'zoneinfo: append failed' )
+		transition_times.append( t )
 		with compiler.wrap_arithmetic:
 			i += 1
 	with compiler.wrap_arithmetic:
@@ -219,7 +219,7 @@ def _parse_data_block(
 	while i < timecnt:
 		with compiler.panic_arithmetic( 'zoneinfo: tzdata file truncated (transition types)' ):
 			idx_off: usize = pos + i
-		transition_type_idx.append( data[idx_off] ).unwrap( 'zoneinfo: append failed' )
+		transition_type_idx.append( data[idx_off] )
 		with compiler.wrap_arithmetic:
 			i += 1
 	with compiler.wrap_arithmetic:
@@ -249,7 +249,7 @@ def _parse_data_block(
 		with compiler.wrap_arithmetic:
 			desig_start: usize = pool_offset + usize( desigidx )
 		abbr: str = _read_cstr_at( data, pool_end, desig_start )
-		ttinfos.append( TTInfo( utcoffset = utoff, is_dst = isdst, abbr = abbr )).unwrap( 'zoneinfo: append failed' )
+		ttinfos.append( TTInfo( utcoffset = utoff, is_dst = isdst, abbr = abbr ))
 		with compiler.wrap_arithmetic:
 			i += 1
 	pos = pool_end
@@ -320,8 +320,8 @@ def _parse_tzif( zone: ZoneInfo, data: bytes ) -> None:
 		with compiler.wrap_arithmetic:
 			type_idx_usize: usize = usize( type_idx )
 		rule: TTInfo = block.ttinfos.__getitem__( type_idx_usize ).unwrap( 'zoneinfo: transition type index out of range (malformed tzdata)' )
-		transition_times.append( t ).unwrap( 'zoneinfo: append failed' )
-		transition_rules.append( rule ).unwrap( 'zoneinfo: append failed' )
+		transition_times.append( t )
+		transition_rules.append( rule )
 		with compiler.wrap_arithmetic:
 			i += 1
 

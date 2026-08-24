@@ -330,7 +330,7 @@ def main() -> i32:
 	threads: list[threading.Thread] = list[threading.Thread]()
 	i: usize = 0
 	while i < 16:
-		threads.append( threading.Thread( closure ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( closure ) )
 		with compiler.wrap_arithmetic:
 			i += 1
 	i = 0

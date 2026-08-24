@@ -31,7 +31,7 @@ def read_all_lines[T: io.Reader]( r: T ) -> Result[list[bytearray], OSError]:
 		line: bytearray = r.readline().or_return()
 		if len( line ) == 0:
 			return Result.Ok( lines )
-		lines.append( line ).unwrap( 'read_all_lines: append' )
+		lines.append( line )
 
 def run() -> Result[i32, OSError]:
 	path: str = 'io_test_tmp.bin'

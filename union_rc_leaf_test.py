@@ -60,7 +60,7 @@ def main() -> i32:
 		n: int = int.from_str( '42' ).unwrap( 'parse' )
 		before: usize = compiler.refcount( n )
 		items: list[Val] = list[Val]()
-		items.append( Val.Number( n )).unwrap( 'append' )
+		items.append( Val.Number( n ))
 		got: Val = items.__getitem__( 0 ).unwrap( 'get' )
 		match got:
 			case Val.Number( m ):
@@ -94,7 +94,7 @@ def main() -> i32:
 		b: Box = Box( v = 99 )
 		before: usize = compiler.refcount( b )
 		items: list[Val] = list[Val]()
-		items.append( Val.Boxed( b )).unwrap( 'append' )
+		items.append( Val.Boxed( b ))
 		got: Val = items.__getitem__( 0 ).unwrap( 'get' )
 		match got:
 			case Val.Boxed( boxed ):

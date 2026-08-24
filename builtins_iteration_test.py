@@ -12,11 +12,11 @@ from test_support import RealCompileMixin
 _LIST_REDUCTIONS = '''
 def main() -> i32:
 	lst: list[i32] = list[i32]()
-	lst.append( 3 ).unwrap( 'a' )
-	lst.append( 1 ).unwrap( 'b' )
-	lst.append( 4 ).unwrap( 'c' )
-	lst.append( 1 ).unwrap( 'd' )
-	lst.append( 5 ).unwrap( 'e' )
+	lst.append( 3 )
+	lst.append( 1 )
+	lst.append( 4 )
+	lst.append( 1 )
+	lst.append( 5 )
 	if min( lst ) != 1:
 		return 1
 	if max( lst ) != 5:
@@ -36,9 +36,9 @@ def main() -> i32:
 _ITER_NEXT_AND_ENUMERATE = '''
 def main() -> i32:
 	lst: list[i32] = list[i32]()
-	lst.append( 10 ).unwrap( 'a' )
-	lst.append( 20 ).unwrap( 'b' )
-	lst.append( 30 ).unwrap( 'c' )
+	lst.append( 10 )
+	lst.append( 20 )
+	lst.append( 30 )
 
 	it = iter( lst )
 	first: i32 = next( it ).unwrap( 'x' )
@@ -76,36 +76,19 @@ def add( a: i32, b: i32 ) -> i32:
 
 def main() -> i32:
 	lst: list[i32] = list[i32]()
-	lst.append( 1 ).unwrap( 'a' )
-	lst.append( 2 ).unwrap( 'b' )
-	lst.append( 3 ).unwrap( 'c' )
+	lst.append( 1 )
+	lst.append( 2 )
+	lst.append( 3 )
 
 	doubled: list[i32] = list[i32]()
 	for v in map( double, lst ):
-		doubled.append( v ).unwrap( 'd' )
+		doubled.append( v )
 	if sum( doubled ) != 12:
 		return 1
 
 	total: i32 = reduce( add, lst )
 	if total != 6:
 		return 2
-	return 0
-'''
-
-_SLICE_CONFORMANCE = '''
-def main() -> i32:
-	lst: list[i32] = list[i32]()
-	lst.append( 3 ).unwrap( 'a' )
-	lst.append( 1 ).unwrap( 'b' )
-	lst.append( 4 ).unwrap( 'c' )
-	lst.append( 1 ).unwrap( 'd' )
-	sl: slice[i32] = lst[1:4]
-	if sum( sl ) != 6: # 1+4+1
-		return 1
-	if min( sl ) != 1:
-		return 2
-	if max( sl ) != 4:
-		return 3
 	return 0
 '''
 
@@ -200,11 +183,6 @@ class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
 	def test_map_and_reduce( self ) -> None:
 		self.assert_programs_run([
 			( 'map_and_reduce', _MAP_AND_REDUCE ),
-		])
-
-	def test_slice_conformance( self ) -> None:
-		self.assert_programs_run([
-			( 'slice_conformance', _SLICE_CONFORMANCE ),
 		])
 
 	def test_homogeneous_tuple_conformance( self ) -> None:

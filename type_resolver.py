@@ -789,7 +789,7 @@ class TypeResolver:
 		Overload-aware for the "indexable" for-loop desugaring shape
 		(__len__()+__getitem__(), e.g. list[T]) - mirrors lowering.py's own
 		_find_indexlike_getitem exactly (same real gap, same fix: prefer
-		the Scalar-typed leaf over a compound one, e.g. PySlice, since an
+		the Scalar-typed leaf over a compound one, e.g. slice, since an
         ordinary index's own concrete type is normally INFERRED FROM
 		__getitem__'s declared parameter, not known up front here either -
 		see that method's own docstring for the full reasoning), deliberately

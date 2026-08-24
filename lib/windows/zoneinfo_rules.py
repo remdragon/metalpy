@@ -63,15 +63,15 @@ def load_zone( zone: ZoneInfo, key: str ) -> None:
 
 		if rules.has_dst:
 			if rules.to_dst_epoch < rules.to_std_epoch:
-				transition_times.append( rules.to_dst_epoch ).unwrap( 'zoneinfo: append failed' )
-				transition_rules.append( rules.dst_rule ).unwrap( 'zoneinfo: append failed' )
-				transition_times.append( rules.to_std_epoch ).unwrap( 'zoneinfo: append failed' )
-				transition_rules.append( rules.std_rule ).unwrap( 'zoneinfo: append failed' )
+				transition_times.append( rules.to_dst_epoch )
+				transition_rules.append( rules.dst_rule )
+				transition_times.append( rules.to_std_epoch )
+				transition_rules.append( rules.std_rule )
 			else:
-				transition_times.append( rules.to_std_epoch ).unwrap( 'zoneinfo: append failed' )
-				transition_rules.append( rules.std_rule ).unwrap( 'zoneinfo: append failed' )
-				transition_times.append( rules.to_dst_epoch ).unwrap( 'zoneinfo: append failed' )
-				transition_rules.append( rules.dst_rule ).unwrap( 'zoneinfo: append failed' )
+				transition_times.append( rules.to_std_epoch )
+				transition_rules.append( rules.std_rule )
+				transition_times.append( rules.to_dst_epoch )
+				transition_rules.append( rules.dst_rule )
 
 		with compiler.wrap_arithmetic:
 			year += 1
