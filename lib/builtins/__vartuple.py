@@ -27,13 +27,12 @@ import compiler
 class VariadicTuple[T]( Sequence[T], Iterable[T] ):
 	__inner: UnsafeList[T]
 
-	def __init__( self, src: list[T] ) -> None:
-		raw: UnsafeList[T] = UnsafeList[T]( len( src ))
-		i: usize = 0
-		while i < len( src ):
-			raw.append( src.__getitem__( i ).unwrap( 'VariadicTuple.__init__: index in bounds by construction' ))
-			with compiler.wrap_arithmetic:
-				i += 1
+	# takes ownership of an already-built UnsafeList[T] directly - the
+	# public, iterable-driven construction path lives in the top-level
+	# tuple(...) function below (built this way, not via __allocate__,
+	# specifically so a free function can call it - __allocate__ itself is
+	# restricted to a method of the class it constructs)
+	def __init__( self, raw: UnsafeList[T] ) -> None:
 		self.__inner = raw
 
 	def __len__( self ) -> usize:
@@ -62,14 +61,58 @@ class VariadicTuple[T]( Sequence[T], Iterable[T] ):
 			raw.append( self.__inner.__getitem__( i ).unwrap( 'VariadicTuple.__getitem__(slice): index in bounds by construction' ))
 			with compiler.wrap_arithmetic:
 				i += 1
-		return VariadicTuple[T].__allocate__( __inner = raw )
+		return VariadicTuple[T]( raw )
 
 	def __iter__( self ) -> Generator[T, StopIteration]:
 		return _sequence_iter( self )
 
-def tuple[T]( src: list[T] ) -> VariadicTuple[T]:
-	''' tuple(iterable) - real Python's own conversion constructor. list[T]
-	only for now (not a general Iterable[T]) - a real caller needing more
-	can widen this later; VariadicTuple.__init__'s own __len__()-driven
-	exact-capacity allocation already needs random access anyway. '''
-	return VariadicTuple[T]( src )
+	# positional comparison, real Python's own tuple equality contract
+	# (unlike set[T].__eq__ above - unordered, same length + containment)
+	def __eq__( self, other: VariadicTuple[T] ) -> bool:
+		if self.__len__() != other.__len__():
+			return False
+		i: usize = 0
+		with compiler.wrap_arithmetic:
+			while i < self.__len__():
+				a: T = self.__inner.__getitem__( i ).unwrap( 'VariadicTuple.__eq__: index in bounds by construction' )
+				b: T = other.__inner.__getitem__( i ).unwrap( 'VariadicTuple.__eq__: index in bounds by construction' )
+				if a != b:
+					return False
+				i += 1
+		return True
+
+	# _COMP_DUNDER (lowering.py) dispatches != to __ne__ directly - it never
+	# auto-derives one from __eq__ - see set[T].__ne__'s own identical note
+	def __ne__( self, other: VariadicTuple[T] ) -> bool:
+		return not ( self == other )
+
+	def __repr__( self ) -> str:
+		# real Python's own trailing-comma convention for a 1-element tuple
+		# ('(1,)') - disambiguates from a plain parenthesized expression in
+		# SOURCE syntax; not strictly needed for a printed VALUE the way it
+		# is for source, but kept for the familiar, recognizable shape
+		if self.__len__() == 0:
+			return '()'
+		parts: list[str] = list[str]()
+		i: usize = 0
+		with compiler.wrap_arithmetic:
+			while i < self.__len__():
+				val: T = self.__inner.__getitem__( i ).unwrap( 'VariadicTuple.__repr__: index in bounds by construction' )
+				parts.append( str( val ))
+				i += 1
+		if self.__len__() == 1:
+			return '(' + parts.__getitem__( 0 ).unwrap( 'VariadicTuple.__repr__: just appended' ) + ',)'
+		return '(' + ', '.join( parts ) + ')'
+
+	def __str__( self ) -> str:
+		return self.__repr__()
+
+def tuple[T, S: Iterable[T]]( src: S ) -> VariadicTuple[T]:
+	''' tuple(iterable) - real Python's own conversion constructor, over any
+	Iterable[T] (not just list[T] - a for-loop over src drives its own
+	__iter__()/Generator[T,StopIteration] the same way any other for-loop
+	over a real iterable does, no manual __next__() driving needed here). '''
+	raw: UnsafeList[T] = UnsafeList[T]()
+	for item in src:
+		raw.append( item )
+	return VariadicTuple[T]( raw )
