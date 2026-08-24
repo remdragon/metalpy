@@ -584,9 +584,21 @@ class str:
 	                     # codepoint takes >= 1 byte, so char_count <= byte_len <=
 	                     # byte_size, and idx >> 8 < entries for any valid idx.
 
+	__utf16: Ptr[u16] # lazily-computed null-terminated UTF-16LE cache (see
+	                   # to_utf16()) - None until first use. Plain pointer
+	                   # store, not atomic: a race between threads racing
+	                   # to_utf16() for the first time costs at most a
+	                   # redundant encode plus one leaked buffer, never a
+	                   # torn/corrupt read (pointer-sized stores are atomic
+	                   # on every real target this compiler emits for) -
+	                   # the same tradeoff CPython's own lazy UTF-8 cache
+	                   # on str objects makes.
+
 	def __del__( self ) -> None:
 		sys.free( self.__data )
 		sys.free( self.__index )
+		if self.__utf16 is not None:
+			sys.free( compiler.cast( Ptr[u8], self.__utf16 ))
 
 	@inline
 	def __str__( self ) -> str:
@@ -705,6 +717,29 @@ class str:
 		buf = bytearray( byte_len )
 		sys.memcpy( buf.get_ptr(), compiler.cast( ConstPtr[u8], ptr ), byte_len )
 		return utf16.decode( buf )
+
+	def to_utf16( self ) -> ConstPtr[u16]:
+		'''
+		self encoded as null-terminated UTF-16LE - e.g. for a Win32 *W
+		call's LPCWSTR argument. Cached after the first call (see __utf16's
+		own field comment), so repeated calls against the same str don't
+		re-encode.
+		'''
+		if self.__utf16 is not None:
+			return self.__utf16
+		from codecs.utf16 import utf16
+		encoded: bytes = utf16.encode( self ).unwrap( 'str.to_utf16: invalid UTF-8 in str' )
+		byte_len: usize = len( encoded )
+		with compiler.panic_arithmetic( 'a real string can never be within 2 bytes of usize::MAX' ):
+			alloc_size: usize = byte_len + 2
+			last_index: usize = alloc_size - 1
+		raw: Ptr[u8] = sys.alloc[u8]( alloc_size )
+		sys.memcpy( raw, encoded.get_const_ptr(), byte_len )
+		raw[byte_len] = 0
+		raw[last_index] = 0
+		buf: Ptr[u16] = compiler.cast( Ptr[u16], raw )
+		self.__utf16 = buf
+		return buf
 
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
@@ -2049,6 +2084,7 @@ class str:
 			__byte_size = byte_size_including_zero_terminator,
 			__char_count = char_count,
 			__index = char_index,
+			__utf16 = None,
 		)
 		return Result.Ok( s )
 

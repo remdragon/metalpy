@@ -1,6 +1,7 @@
-# Real-compile-and-run tests for str.from_utf16() (lib/builtins/__init__.py)
-# - builds a null-terminated u16 buffer by hand (no Windows API dependency)
-# so this exercises the decode path on any platform.
+# Real-compile-and-run tests for str.from_utf16()/to_utf16()
+# (lib/builtins/__init__.py) - builds/reads a null-terminated u16 buffer by
+# hand (no Windows API dependency) so this exercises both directions on any
+# platform.
 
 import unittest
 
@@ -56,6 +57,27 @@ def main() -> i32:
 			return 1
 		case Result.Err( _ ):
 			pass
+	return 0
+''' ),
+			( 'to_utf16_ascii_and_caches', '''
+def main() -> i32:
+	s: str = 'hello'
+	p1: ConstPtr[u16] = s.to_utf16()
+	p2: ConstPtr[u16] = s.to_utf16()
+	if p1 != p2:
+		return 1 # not cached - second call re-encoded into a new buffer
+
+	back: str = str.from_utf16( p1, 100 ).unwrap( 'decode failed' )
+	if back != s:
+		return 2
+	return 0
+''' ),
+			( 'to_utf16_surrogate_pair', '''
+def main() -> i32:
+	s: str = '😀'
+	p: ConstPtr[u16] = s.to_utf16()
+	if p[0] != 0xD83D or p[1] != 0xDE00 or p[2] != 0:
+		return 1
 	return 0
 ''' ),
 		])
