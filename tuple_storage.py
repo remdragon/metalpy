@@ -113,6 +113,7 @@ class TupleStorage:
 		tt.backing = backing
 		self._tuple_type_by_backing[ id( backing ) ] = tt
 		self._declare_sequence_conformance( tt, backing )
+		self._declare_repr_str( tt, backing )
 		# scheduled here (not left for lowering.py's own construction-site
 		# scheduling to discover) so a tuple[...] type reached ONLY through
 		# an annotation - a parameter/return type/field that's never locally
@@ -180,6 +181,40 @@ class TupleStorage:
 				self.discovery._parse_function( fn_node, backing )
 		backing.protocols.append( self.discovery._get_or_create_specialization( sequence_protocol, [ elem_type ] ))
 		backing.protocols.append( self.discovery._get_or_create_specialization( iterable_protocol, [ elem_type ] ))
+
+	def _declare_repr_str( self, tt: TupleType, backing: RCClass ) -> None:
+		''' unlike _declare_sequence_conformance above, this applies to EVERY
+		tuple[...] - heterogeneous included - since __repr__/__str__ only
+		ever need direct self._0.._n field access, never __getitem__/
+		__iter__'s own homogeneous-element-type requirement. Mirrors
+		VariadicTuple's own __repr__ (lib/builtins/__vartuple.py) exactly:
+		'()' for zero elements, real Python's own trailing-comma convention
+		for exactly one ('(1,)'), ', '.join(...) otherwise - and the same
+		str(elem) (not elem!r) per-element convention that file already
+		uses, for consistency between metalpy's two tuple kinds rather than
+		a new, third repr style. Confirmed real need, not speculative: a
+		real repro (grap.mpy's own f'{regs!r}' on a list[tuple[i32,i32]])
+		needs list[T].__repr__ itself (lib/builtins/__list.py), which in
+		turn needs ITS elements (here, tuple[i32,i32]) to have one too. '''
+		n = len( tt.elem_types )
+		if n == 0:
+			body = "\treturn '()'"
+		else:
+			appends = '\n'.join( f'\tparts.append( str( self._{i} ))' for i in range( n ))
+			if n == 1:
+				tail = "\treturn '(' + parts.__getitem__( 0 ).unwrap( 'just appended' ) + ',)'"
+			else:
+				tail = "\treturn '(' + ', '.join( parts ) + ')'"
+			body = f"\tparts: list[str] = list[str]()\n{appends}\n{tail}"
+		src = (
+			f'def __repr__( self ) -> str:\n{body}\n'
+			f'def __str__( self ) -> str:\n\treturn self.__repr__()\n'
+		)
+		module_ast = ast.parse( src )
+		with self.discovery.scope_context( backing ):
+			for fn_node in module_ast.body:
+				assert isinstance( fn_node, ast.FunctionDef )
+				self.discovery._parse_function( fn_node, backing )
 
 	def tuple_type_for( self, cls: object ) -> TupleType|None:
 		''' the reverse of get() - given a (already-resolved, concrete)

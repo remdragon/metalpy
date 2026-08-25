@@ -6040,6 +6040,27 @@ def main() -> i32:
 		return 0
 	return 99
 ''' ),
+			# __repr__/__str__ - empty, and a list of a type that has its own
+			# __repr__ (tuple[i32,i32] - the exact real-world repro this was
+			# found through: grap.mpy's f'{regs!r}' on a
+			# list[tuple[i32,i32]]), via both a direct method call and an
+			# f-string's own !r conversion
+			( 'list_repr_and_str_empty_and_of_tuples', '''
+def main() -> i32:
+	empty: list[i32] = list[i32]()
+	if empty.__repr__() != '[]':
+		return 1
+	regs: list[tuple[i32,i32]] = list[tuple[i32,i32]]()
+	regs.append(( 1, 2 ))
+	regs.append(( 3, 4 ))
+	if regs.__repr__() != '[(1, 2), (3, 4)]':
+		return 2
+	if regs.__str__() != regs.__repr__():
+		return 3
+	if f'{regs!r}' != '[(1, 2), (3, 4)]':
+		return 4
+	return 0
+''' ),
 		] )
 
 
@@ -10478,6 +10499,28 @@ def main() -> i32:
 	if one[0] != 20:
 		return 1
 	empty: tuple[()] = t[2:2]
+	return 0
+''' ),
+			# __repr__/__str__ - every arity/homogeneity shape: zero elements,
+			# exactly one (real Python's own disambiguating trailing comma,
+			# '(5,)'), heterogeneous, and via f-string !r (dispatches to
+			# __repr__ - see lowering.py's _lower_fstring_part), not just a
+			# direct method call
+			( 'tuple_repr_and_str_every_arity_and_homogeneity', '''
+def main() -> i32:
+	empty: tuple[()] = ()
+	if empty.__repr__() != '()':
+		return 1
+	single: tuple[i32] = ( 5, )
+	if single.__repr__() != '(5,)':
+		return 2
+	het: tuple[i32, str] = ( 7, 'x' )
+	if het.__repr__() != '(7, x)':
+		return 3
+	if het.__str__() != het.__repr__():
+		return 4
+	if f'{het!r}' != '(7, x)':
+		return 5
 	return 0
 ''' ),
 		] )

@@ -379,6 +379,34 @@ class list[T]( Sequence[T], Iterable[T] ):
 		with self.__lock:
 			return self.__inner.capacity()
 
+	# real Python's own list repr - '[' ']', ', '-joined elements, no
+	# trailing-comma special case for a single element (unlike a tuple's
+	# own repr, a list literal is never ambiguous with a parenthesized
+	# expression). str(elem) (not elem!r) per element, same convention
+	# VariadicTuple.__repr__ already uses (lib/builtins/__vartuple.py) -
+	# consistent across every container's repr rather than inventing a
+	# second style here.
+	def __repr__( self ) -> str:
+		# self.__inner.__len__() throughout, NOT self.__len__() - the latter
+		# re-acquires self.__lock itself, which would deadlock against the
+		# `with self.__lock:` already held here (mirrors __getitem__(slice)'s
+		# own identical use of self.__inner.__len__() just above).
+		with self.__lock:
+			n: usize = self.__inner.__len__()
+			if n == 0:
+				return '[]'
+			parts: list[str] = list[str]()
+			i: usize = 0
+			with compiler.wrap_arithmetic:
+				while i < n:
+					val: T = self.__inner.__getitem__( i ).unwrap( 'list.__repr__: index in bounds by construction' )
+					parts.append( str( val ))
+					i += 1
+			return '[' + ', '.join( parts ) + ']'
+
+	def __str__( self ) -> str:
+		return self.__repr__()
+
 	# Append a value at the end. Increfs val if T is an RC type.
 	def append( self, val: T ) -> None:
 		with self.__lock:
