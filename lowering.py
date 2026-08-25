@@ -3866,6 +3866,36 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'{target_id!r} is not a variable, {context}', node )
 		return existing
 
+	def _existing_loop_carried_or_none( self, target_id: str ) -> Variable | None:
+		''' `del x; x = value` inside a loop body looked like a fresh
+		declaration to _existing_local_or_none (del removes target_id from
+		fn.names), so _declare_local minted a brand-new, uid-suffixed C
+		variable for it - fine outside a loop, but the loop body is only ever
+		lowered once and its back-edge goto still targets the ORIGINAL C
+		variable, so the next iteration's own `del x` released that original
+		(already released, now-abandoned) variable again: a real double free.
+		cfg.py's loop_back_edge() didn't catch it either - entry and back-edge
+		bindings for `x` agree on OwnState (OWNED either way), and it never
+		compares Variable IDENTITY, only state.
+		Only consulted when the ordinary fn.names/module lookup already
+		missed: if target_id was ALSO bound at the innermost active loop's own
+		entry snapshot, resurrect and reuse that SAME Variable (same C
+		identifier) so the reassignment goes through the ordinary reuse path
+		below instead of _declare_local. Re-registers it into fn.names too -
+		unlike _declare_local, a plain reassign doesn't do that itself, and
+		later code (same iteration or after the loop) needs to find it again.
+		Only the innermost active loop is checked - a name loop-carried from
+		an OUTER loop but del'd/reassigned inside a NESTED one isn't handled
+		here yet. '''
+		if not self._loop_labels:
+			return None
+		entry_binding = self._loop_labels[-1].loop_snapshot.bindings.get( target_id )
+		if entry_binding is None:
+			return None
+		var = entry_binding.operand
+		self._current_fn.add_name( target_id, var )
+		return var
+
 	def _declare_local( self, target_id: str, node: ast.AST, lower_rhs: Callable[[Type|None],ir.Operand], *, default_type: Type|None = None ) -> tuple[Variable,ir.Operand]:
 		''' the RHS is lowered BEFORE target_id is registered - not the
 		other way around - because it may reference target_id itself: a
@@ -4025,6 +4055,8 @@ class FunctionLowering:
 		target = node.targets[0]
 		if isinstance( target, ast.Name ):
 			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
+			if existing is None:
+				existing = self._existing_loop_carried_or_none( target.id )
 			if existing is not None:
 				# a module-level global's own Variable may not have had its
 				# OWN .resolve run yet (its .type is None until then) if this
@@ -9299,6 +9331,8 @@ class FunctionLowering:
 		target = node.target
 		assert isinstance( target, ast.Name )
 		existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
+		if existing is None:
+			existing = self._existing_loop_carried_or_none( target.id )
 		if existing is not None:
 			self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 			self._cfg.unnarrow( target.id )
