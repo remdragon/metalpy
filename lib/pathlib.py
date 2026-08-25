@@ -385,7 +385,7 @@ class Path:
 		from fs import write_all
 		writer: BinaryWriter = File.binary_writer( self._raw, truncate = True ).or_return()
 		defer( writer.close() )
-		write_all( writer.fd(), data.get_const_ptr(), len( data )).or_return()
+		write_all( writer.fileno(), data.get_const_ptr(), len( data )).or_return()
 		return Result.Ok( None )
 
 	def read_text( self, codec: Codec = utf8 ) -> Result[str, OSError|CodecError]:
@@ -403,5 +403,5 @@ class Path:
 		from fs import write_all
 		writer: BinaryWriter = File.binary_writer( self._raw, truncate = True ).or_return()
 		defer( writer.close() )
-		write_all( writer.fd(), encoded.get_const_ptr(), len( encoded )).or_return()
+		write_all( writer.fileno(), encoded.get_const_ptr(), len( encoded )).or_return()
 		return Result.Ok( None )

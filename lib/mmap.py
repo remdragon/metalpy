@@ -14,10 +14,8 @@ own mmap.mmap(). length=0 means "map the whole file" (its current size,
 looked up via GetFileSizeEx/fstat), matching real Python.
 
 fileno is fs.FD (lib/fs.py) - the same platform-split file-descriptor type
-File.binary_reader()'s own BinaryReader.fd() returns, so `mmap.mmap(
-f.fd(), 0)` (or the deliberately-not-yet-renamed f.fileno(), matching real
-Python's own method name, if a caller's own File wrapper exposes that
-instead) lines up directly.
+File.binary_reader()'s own BinaryReader.fileno() returns, so
+`mmap.mmap(f.fileno(), 0)` lines up directly.
 '''
 
 import compiler

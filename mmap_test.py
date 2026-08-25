@@ -49,7 +49,7 @@ def main() -> i32:
 	r = File.binary_reader( {path_literal} )
 	f = r.unwrap( 'open failed' )
 	defer( f.close() )
-	result: Result[mmap.mmap, OSError] = mmap.mmap( f.fd(), 0, access = mmap.ACCESS_READ )
+	result: Result[mmap.mmap, OSError] = mmap.mmap( f.fileno(), 0, access = mmap.ACCESS_READ )
 	mm: mmap.mmap = result.unwrap( 'mmap failed' )
 	if len( mm ) != 18:
 		return 1
@@ -79,7 +79,7 @@ def main() -> i32:
 	r = File.binary_reader( {path_literal} )
 	f = r.unwrap( 'open failed' )
 	defer( f.close() )
-	mm: mmap.mmap = mmap.mmap( f.fd(), 0, access = mmap.ACCESS_READ ).unwrap( 'mmap failed' )
+	mm: mmap.mmap = mmap.mmap( f.fileno(), 0, access = mmap.ACCESS_READ ).unwrap( 'mmap failed' )
 	total: i32 = 0
 	with compiler.wrap_arithmetic:
 		for b in mm:
@@ -102,7 +102,7 @@ def main() -> i32:
 	r = File.binary_reader( {path_literal} )
 	f = r.unwrap( 'open failed' )
 	defer( f.close() )
-	result: Result[mmap.mmap, OSError] = mmap.mmap( f.fd(), 5, access = mmap.ACCESS_READ )
+	result: Result[mmap.mmap, OSError] = mmap.mmap( f.fileno(), 5, access = mmap.ACCESS_READ )
 	mm: mmap.mmap = result.unwrap( 'mmap failed' )
 	if len( mm ) != 5:
 		return 1
@@ -127,7 +127,7 @@ def main() -> i32:
 	r = File.binary_reader( {path_literal} )
 	f = r.unwrap( 'open failed' )
 	defer( f.close() )
-	mm: mmap.mmap = mmap.mmap( f.fd(), 0, access = mmap.ACCESS_READ ).unwrap( 'mmap failed' )
+	mm: mmap.mmap = mmap.mmap( f.fileno(), 0, access = mmap.ACCESS_READ ).unwrap( 'mmap failed' )
 	with memoryview( mm ) as mv:
 		whole: memoryview = mv[:len( mm )]
 		if len( whole ) != 18:
@@ -154,7 +154,7 @@ def main() -> i32:
 	r = File.binary_read_writer( {path_literal}, truncate = False )
 	f = r.unwrap( 'open failed' )
 	defer( f.close() )
-	mm: mmap.mmap = mmap.mmap( f.fd(), 0, access = mmap.ACCESS_WRITE ).unwrap( 'mmap failed' )
+	mm: mmap.mmap = mmap.mmap( f.fileno(), 0, access = mmap.ACCESS_WRITE ).unwrap( 'mmap failed' )
 	p: Ptr[u8] = mm.get_ptr()
 	p[0] = 74  # 'J' - was 'H'
 	mm.close()
@@ -177,7 +177,7 @@ def main() -> i32:
 	r = File.binary_read_writer( {path_literal}, truncate = False )
 	f = r.unwrap( 'open failed' )
 	defer( f.close() )
-	mm: mmap.mmap = mmap.mmap( f.fd(), 0, access = mmap.ACCESS_COPY ).unwrap( 'mmap failed' )
+	mm: mmap.mmap = mmap.mmap( f.fileno(), 0, access = mmap.ACCESS_COPY ).unwrap( 'mmap failed' )
 	p: Ptr[u8] = mm.get_ptr()
 	p[0] = 90  # 'Z' - copy-on-write, must never reach the file
 	mm.close()
