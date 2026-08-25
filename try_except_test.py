@@ -573,6 +573,32 @@ def main() -> i32:
 	return 0
 '''
 
+# regression: raise EXPR's own raised value used to be released (via the
+# ordinary end-of-statement pending-temp flush) BEFORE the dispatch below
+# ever assigned it into `e` - a real use-after-free, not just a leak. `e`
+# previously read freed memory here instead of the field it was just
+# constructed with.
+_RAISE_CAUGHT_BY_SAME_FUNCTION_EXCEPT_SINGLE_LEAF_FIELD_READABLE = '''
+class Boom:
+	code: i32
+	def __init__( self, code: i32 ) -> None:
+		self.code = code
+
+def run() -> i32:
+	try:
+		raise Boom( code = 5 )
+	except Boom as e:
+		result: i32 = e.code
+		compiler.decref( e )
+		return result
+	return 1
+
+def main() -> i32:
+	if run() != 5:
+		return 1
+	return 0
+'''
+
 # Change 2: raise EXPR caught by a tuple except-clause, `as e:` binding.
 _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING = '''
 class ErrorA:
@@ -1230,6 +1256,9 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_raise_caught_by_same_function_except_single_leaf( self ) -> None:
 		self.assert_programs_run([ ( 'raise_single_leaf', _RAISE_CAUGHT_BY_SAME_FUNCTION_EXCEPT_SINGLE_LEAF ) ])
+
+	def test_raise_caught_by_same_function_except_single_leaf_field_readable( self ) -> None:
+		self.assert_programs_run([ ( 'raise_single_leaf_field', _RAISE_CAUGHT_BY_SAME_FUNCTION_EXCEPT_SINGLE_LEAF_FIELD_READABLE ) ])
 
 	def test_raise_caught_by_tuple_except_clause_binding( self ) -> None:
 		self.assert_programs_run([ ( 'raise_tuple_except', _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING ) ])
