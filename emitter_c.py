@@ -5621,11 +5621,14 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 			parts.append( src )
 
 	if main_has_wrapper:
-		# the real, thin `int main(argc, argv)` - every ordinary program's
-		# actual OS entry point (see _USER_MAIN_C_NAME's own comment).
-		# Always synthesized, even under no_crt: mainCRTStartup (below) is
-		# the real freestanding /ENTRY there, but it calls this main()
-		# directly as a plain function, rather than duplicating its body.
+		# __metalpy_main - the single canonical orchestration function
+		# (argv capture -> __metalpy_init() -> __metalpy_user_main() ->
+		# __metalpy_deinit() -> return), named like every other PROLOGUE
+		# internal (__metalpy_init/__metalpy_deinit/__metalpy_install_crash_
+		# handler), NOT the real C `main` symbol itself - reused identically
+		# by both real OS-entry shims just below (the ordinary CRT-linked
+		# `int main(argc,argv)` forwarder, and no_crt's own mainCRTStartup),
+		# rather than overloading `main` itself to serve two roles.
 		argv_capture = (
 			f'\t{mangle_qualname( "sys._raw_argc" )} = argc;\n'
 			f'\t{mangle_qualname( "sys._raw_argv" )} = (uint8_t**)argv;\n'
@@ -5633,7 +5636,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		unused_marker = '\t(void)argc; (void)argv;\n' if not has_argv_globals else ''
 		deinit_call = '\t__metalpy_deinit();\n' if deinit_enabled else ''
 		parts.append(
-			'int main( int argc, char** argv ) {\n'
+			'static int __metalpy_main( int argc, char** argv ) {\n'
 			+ unused_marker
 			+ argv_capture # BEFORE __metalpy_init() - that's what builds sys.argv itself from these
 			+ '\t__metalpy_init();\n'
@@ -5642,11 +5645,31 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 			+ '\treturn __result;\n'
 			+ '}'
 		)
+		# only Windows has a genuine alternate OS entry point (mainCRTStartup,
+		# #ifdef _WIN32-guarded below) that can call __metalpy_main directly
+		# instead - POSIX always needs a real `main()` symbol regardless of
+		# no_crt (no freestanding-entry mechanism exists for it here), same
+		# "windows_no_crt" distinction the ordinary-functions loop above
+		# already draws.
+		windows_no_crt = no_crt and _target_os == 'windows'
+		if not windows_no_crt:
+			# the ONLY thing literally named `main` - a trivial one-line
+			# forwarder to __metalpy_main, needed because the real C `main`
+			# symbol can't be __metalpy_user_main directly (init/deinit have
+			# to wrap around it) and can't be __metalpy_main directly either
+			# under windows_no_crt (see mainCRTStartup below, which calls
+			# __metalpy_main itself - no main() symbol at all needed there).
+			parts.append(
+				'int main( int argc, char** argv ) {\n'
+				'\treturn __metalpy_main( argc, argv );\n'
+				'}'
+			)
 
 	# custom entry point when CRT is not linked - the linker expects
-	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls the
-	# real main() (which itself calls __metalpy_init()/__metalpy_deinit())
-	# and exits cleanly via the process itself.
+	# mainCRTStartup as the /ENTRY, so we provide a thin stub that calls
+	# __metalpy_main directly (no real main() symbol exists at all under
+	# no_crt - see main_has_wrapper's own comment) and exits cleanly via the
+	# process itself.
 	# Terminates via sys.exit()'s own mangled C symbol (mangle_qualname
 	# doesn't need a Function object - 'sys.exit' is a known, fixed qualname,
 	# same as _global_init_fn_name's approach) rather than a hardcoded raw
@@ -5654,6 +5677,11 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# whenever no_crt, so this always resolves to a real, lowered function
 	# with its own pass-1 prototype already emitted above.
 	if no_crt:
+		# rare parameterized-main lowering-fixture shape (main_has_wrapper
+		# False - see its own comment): __metalpy_main was never
+		# synthesized above, so fall back to calling the literal main()
+		# that IS defined in that case (old behavior, preserved unchanged).
+		entry_call = '__metalpy_main( 0, (char**)0 )' if main_has_wrapper else 'main( 0, (char**)0 )'
 		parts.append(
 			'#ifdef _WIN32\n'
 			'void mainCRTStartup( void ) {\n'
@@ -5662,7 +5690,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 			# it does the UCRT's own main()) - sys.argv (lib/sys.py) just
 			# stays empty here, a known, accepted limitation of no_crt
 			# builds specifically, not a bug.
-			'\tint __result = main( 0, (char**)0 );\n'
+			f'\tint __result = {entry_call};\n'
 			f'\t{mangle_qualname( "sys.exit" )}( (uint32_t)__result );\n'
 			'}\n'
 			'#endif'

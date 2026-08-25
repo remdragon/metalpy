@@ -281,7 +281,15 @@ class CcTool:
 					obj_args = obj_args + [ str( chkstk_obj ) ]
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 			if no_crt:
-				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
+				# /SUBSYSTEM:CONSOLE is required here now too - link.exe can
+				# normally infer the subsystem from a `main`-shaped symbol,
+				# but emitter_c.py's own __metalpy_main rename means no real
+				# `main` symbol exists at all under no_crt any more, so an
+				# explicit /ENTRY without this now hits LNK1221 "a subsystem
+				# can't be inferred and must be defined" (confirmed via a
+				# real link failure) - same fix as the clang/lld-link branch
+				# below needed for the identical reason.
+				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup', '/SUBSYSTEM:CONSOLE' ]
 			if debug or asan:
 				cmd += [ '/DEBUG' ]
 			if strip:
@@ -321,6 +329,23 @@ class CcTool:
 			# the bug never affected a real -l<name> flag before.
 			wide_int_lib = _find_wide_int_runtime_lib( self )
 			cmd = [ self.path ] + obj_args + ( [ wide_int_lib ] if wide_int_lib else [] ) + extra + [ '-o', str( exe ) ]
+			if no_crt and os.name != 'posix':
+				# clang on native Windows drives lld-link (MSVC-compatible) -
+				# unlike the 'cl' branch above, it never got an explicit
+				# /ENTRY flag; it inferred the entry point from a `main`-
+				# shaped symbol instead, which a freestanding build no longer
+				# defines (emitter_c.py's own mainCRTStartup rename -
+				# __metalpy_main is the only orchestrator now, no real
+				# `main` symbol exists at all under no_crt). Without this,
+				# lld-link fails with LNK1561 "entry point must be defined"
+				# (confirmed via a real link failure) - and once the entry
+				# is explicit, it also can no longer infer the subsystem
+				# from `main`'s presence either (LNK1221, the same fix the
+				# 'cl' branch above now needs too), so both need spelling
+				# out. gcc's own ELF/WSL target never reaches this
+				# branch in practice (mainCRTStartup is #ifdef _WIN32-only,
+				# so os.name == 'posix' there) - no GNU-ld equivalent needed.
+				cmd += [ '-Wl,-entry:mainCRTStartup', '-Wl,-subsystem:console' ]
 			if asan:
 				# clang/gcc's own driver acts as the linker frontend even for
 				# an objects-only link, and only links the ASan runtime when
