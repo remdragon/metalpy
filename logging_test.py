@@ -128,6 +128,63 @@ def main() -> i32:
 	return 0
 '''
 
+_CALLER_LOCATION = '''
+import logging
+
+class CapturingHandler( logging.Handler ):
+	last_line: i32
+	last_file: str
+
+	def __init__( self ) -> None:
+		super().__init__()
+		self.last_line = 0
+		self.last_file = ''
+
+	@virtual
+	def emit( self, record: logging.LogRecord ) -> Result[None, OSError]:
+		self.last_line = record.lineno
+		self.last_file = record.filename
+		return Result.Ok( None )
+
+def wrapper() -> None:
+	logging.debug( 'from wrapper' ) # a wrapper's own line, never bubbled to ITS caller below
+
+def main() -> i32:
+	handler: CapturingHandler = CapturingHandler()
+	root_logger: logging.Logger = logging.root()
+	root_logger.setLevel( logging.DEBUG )
+	root_logger.addHandler( handler )
+
+	logging.debug( 'first' ) # exercises the module-level debug() -> root().debug() -> Logger.log() 3-layer forward
+	first_line: i32 = handler.last_line
+	if handler.last_file != '__main__.py':
+		return 1
+
+	logging.debug( 'second' )
+	second_line: i32 = handler.last_line
+	if first_line == second_line:
+		return 2
+	if second_line <= first_line:
+		return 3
+
+	logger: logging.Logger = logging.getLogger( 'callerloc' )
+	logger.debug( 'explicit', _line = 999, _file = 'fake.py' )
+	if handler.last_line != 999:
+		return 4
+	if handler.last_file != 'fake.py':
+		return 5
+
+	wrapper()
+	wrapper_line: i32 = handler.last_line
+	if wrapper_line == second_line:
+		return 6
+	wrapper()
+	if handler.last_line != wrapper_line: # same wrapper body line every time it's called - no bubbling to the outer caller
+		return 7
+
+	return 0
+'''
+
 _PROPAGATION = '''
 import compiler
 import logging
@@ -196,6 +253,9 @@ class LoggingBehaviorTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_propagation( self ) -> None:
 		self.assert_programs_run([ ( 'propagation', _PROPAGATION ) ])
+
+	def test_caller_location( self ) -> None:
+		self.assert_programs_run([ ( 'caller_location', _CALLER_LOCATION ) ])
 
 
 if __name__ == '__main__':
