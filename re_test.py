@@ -579,6 +579,29 @@ def main() -> i32:
 	return 0
 '''
 
+_RE_METHOD_FINDITER = '''
+import re
+
+def main() -> i32:
+	p: re.Pattern = re.compile( r'\\d+' ).unwrap( 'bad pattern' )
+	count: usize = 0
+	total_len: usize = 0
+	for m in p.finditer( 'a1 b22 c333' ): # the REAL method, not the module-level free-function wrapper
+		with compiler.wrap_arithmetic:
+			count += 1
+		g: str|None = m.group()
+		if g is None:
+			return 1
+		gg: str = g
+		with compiler.wrap_arithmetic:
+			total_len += gg.byte_len()
+	if count != 3:
+		return 2
+	if total_len != 6:  # '1' + '22' + '333' = 1+2+3 chars
+		return 3
+	return 0
+'''
+
 _RE_IGNORECASE_LAZY_NAMED = '''
 import re
 
@@ -931,6 +954,16 @@ class RePhase6BehaviorTests( RealCompileMixin, unittest.TestCase ):
 		sub_split too. '''
 		self.assert_programs_run([
 			( 'finditer', _RE_FINDITER ),
+		])
+
+	def test_pattern_finditer_method_directly( self ) -> None:
+		''' PLAN_GENERATORS.md - generator methods are now supported;
+		Pattern.finditer() is a real method (not just the module-level
+		free-function wrapper exercised above), consumed via a for-loop
+		straight off the receiver, from a different module (this test
+		file) than lib/re.py itself. '''
+		self.assert_programs_run([
+			( 'pattern_finditer_method', _RE_METHOD_FINDITER ),
 		])
 
 
