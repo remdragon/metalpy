@@ -6986,30 +6986,26 @@ class FunctionLowering:
 		else:
 			operand = self._lower_expr( arg_node, None )
 		if operand.type is not None and cfg.rc_leaves( operand.type ):
-			# deliberately does NOT call cfg.manually_decreffed() (or
-			# anything else) to suppress operand's own scope-exit epilogue -
-			# lowering/emitter must not adjust automatic incref/decref
-			# behavior based on the mere PRESENCE of a manual
-			# compiler.decref() call; the epilogue's behavior is purely
-			# mechanical, driven by the variable's own scope/type, same as
-			# if this call weren't here at all. compiler.decref(x) is a
-			# REAL, independent, additional release - the caller (not this
-			# lowering) is responsible for making sure the total math works
-			# out, e.g. by never binding a manually-managed value to an
-			# ordinary owned local in the first place (see
-			# dict's own _release_key/_release_value in lib/builtins/
-			# __init__.py for the safe idiom: decref an inline expression -
-			# compiler.decref(compiler.cast(K, key_ptr)) - never a separately
-			# bound `existing: K = ...; compiler.decref(existing)`, which
-			# WOULD double-release once this local's own automatic epilogue
-			# runs too). A prior version of this DID suppress the epilogue
-			# here (cfg.manually_decreffed()) - removed after real,
-			# reproducible double-frees (compiler.__debug_quarantine__'s own
-			# detector) traced to that suppression silently not applying to
-			# union-typed operands, while callers had come to rely on it
-			# applying uniformly - exactly the "spooky action at a distance"
-			# this discipline avoids for good.
 			for instr in self._cfg.decref( operand.type, operand ):
+				self._emit( instr )
+			# Suppress operand's own scope-exit epilogue release - without
+			# this, a live OWNED local manually decref'd here (the
+			# established idiom throughout this stdlib for tearing down RC
+			# elements, and for tests verifying teardown by hand, e.g.
+			# `h: Holder = Holder(...); ...; compiler.decref(h)`) gets
+			# decref'd AGAIN once its scope ends - a real double-free (see
+			# cfg.manually_decreffed()'s own docstring). manually_decreffed()
+			# only recognizes a plain Variable operand (its Temp branch,
+			# for a NARROWED union member _lower_expr extracted above, is a
+			# no-op that leaves the union's OWN epilogue entry untouched) -
+			# that's deliberate here, not a gap to paper over: reactor.py's
+			# _set_current_deadline relies on exactly this narrowed-union
+			# non-suppression (see its own `old: _DeadlineBox|None` comment,
+			# tuned against a real double-free from trying to suppress
+			# there), and reconciling "moved on one branch, owned on the
+			# other" after a narrowing if/else is a merge_if() gap, not
+			# something to route around here.
+			for instr in self._cfg.manually_decreffed( operand ):
 				self._emit( instr )
 			# operand may be a fresh_temp()-registered Call/Allocate result
 			# (e.g. compiler.decref(self._read_element(...)), the "safe
@@ -7017,11 +7013,7 @@ class FunctionLowering:
 			# _flush_pending_temps doesn't ALSO decref it at end of statement
 			# (a real double-free, confirmed via the debug quarantine
 			# detector on list.erase_at). No-op for a Name/GetAttr operand
-			# never fresh_temp()-registered in the first place - this is NOT
-			# the named-local-epilogue suppression this function deliberately
-			# avoids above, just cancelling an unconsumed expression temp's
-			# own pending flush, same as the is_real_field branch's own
-			# untrack_temp( raw ) call.
+			# never fresh_temp()-registered in the first place.
 			self._cfg.untrack_temp( operand )
 			return
 		if operand.type is not None and self._in_generic_class_method():
