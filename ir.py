@@ -438,10 +438,13 @@ class OrJump( Instruction ):
 class ThrowLeaf:
 	''' one covered leaf of an ir.OrThrow's own error type - matched by
 	identity against the Err branch's runtime tag (same identity-leaf
-	convention _atomic_leaves/_union_member already use). `bind` is the
-	real local Variable `except T as e:` binds (None for a bare `except
-	T:`) - emitter_c.py assigns the narrowed payload into it, as an
-	ordinary already-registered local, before jumping to `label`. '''
+	convention _atomic_leaves/_union_member already use). `bind` is a real
+	local Variable (the handler's own TryHandler.raise_value_var - `except
+	T as e:` binds it to `e` itself, a bare `except T:` gets a hidden
+	compiler-synthesized one instead, needed for bare `raise` re-raise
+	support even without a user-facing name) - emitter_c.py assigns the
+	narrowed payload into it, as an ordinary already-registered local,
+	before jumping to `label`. '''
 	leaf: Type
 	bind: 'Variable|None'
 	label: str
