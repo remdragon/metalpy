@@ -186,7 +186,13 @@ def main() -> i32:
 		compiler = self._compile_source( source )
 		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), timeout = None )
 		self.assertEqual( result.returncode, 0, f'program failed: {result.stdout!r} {result.stderr!r}' )
-		hex_str = result.stdout.decode( 'utf-8' ).strip()
+		# first line only: a debug build's own __metalpy_deinit() appends a
+		# "-- live RC objects --" leak-check report (emitter_c.py's
+		# emit_c(..., leak_check=True), the default) AFTER main()'s real
+		# output - main() here only ever print()s the one hex line, so
+		# splitting it off is enough to stay robust to that regardless of
+		# whether anything's actually reported live
+		hex_str = result.stdout.decode( 'utf-8' ).splitlines()[0]
 		compressed = bytes.fromhex( hex_str )
 		decompressed = zlib.decompress( compressed, -15 )
 		self.assertEqual( decompressed, original )
