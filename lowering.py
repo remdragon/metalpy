@@ -6997,6 +6997,18 @@ class FunctionLowering:
 			# this discipline avoids for good.
 			for instr in self._cfg.decref( operand.type, operand ):
 				self._emit( instr )
+			# operand may be a fresh_temp()-registered Call/Allocate result
+			# (e.g. compiler.decref(self._read_element(...)), the "safe
+			# inline expression" idiom recommended above) - untrack it so
+			# _flush_pending_temps doesn't ALSO decref it at end of statement
+			# (a real double-free, confirmed via the debug quarantine
+			# detector on list.erase_at). No-op for a Name/GetAttr operand
+			# never fresh_temp()-registered in the first place - this is NOT
+			# the named-local-epilogue suppression this function deliberately
+			# avoids above, just cancelling an unconsumed expression temp's
+			# own pending flush, same as the is_real_field branch's own
+			# untrack_temp( raw ) call.
+			self._cfg.untrack_temp( operand )
 			return
 		if operand.type is not None and self._in_generic_class_method():
 			# a genuine no-op for THIS monomorphization (see the comment
