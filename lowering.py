@@ -7062,6 +7062,7 @@ class FunctionLowering:
 	def _stmt_While( self, node: ast.While ) -> None:
 		if node.orelse:
 			self.lowering.discovery.fail( 'while/else is not supported', node )
+		pre_loop_mark = len( self._instructions ) # see _lower_loop_body_with_ownership_retry's own docstring - a promoted name's one-time incref splices in here, strictly before start_label
 		start_label = self._new_label( 'while_start' )
 		end_label = self._new_label( 'while_end' )
 		# the test is positioned right after start_label (re-lowered here
@@ -7075,14 +7076,9 @@ class FunctionLowering:
 		# continue_captured unused here - start_label (this loop's own
 		# continue target) is always jumped to by the back edge below
 		# regardless of whether the body itself ever uses `continue`
-		break_narrowed, break_live, _ = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
+		break_narrowed, break_live, _ = self._lower_loop_body_with_ownership_retry(
+			node, node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot, pre_loop_mark = pre_loop_mark,
+		)
 		# Phase 7/8: reconcile every way execution can actually reach
 		# end_label - the loop's own natural (condition-false) exit, PLUS
 		# every break_narrowed record_break_narrowed() collected while
@@ -7120,6 +7116,74 @@ class FunctionLowering:
 		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed, natural_exit_live, break_live )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
+
+	def _lower_loop_body_with_ownership_retry(
+		self, node: ast.AST, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object, pre_loop_mark: int,
+	) -> tuple[list[dict[str,list[Variable]]],list[set[str]],bool]:
+		''' _lower_loop_body() + loop_back_edge() (+ emitting the back-edge
+		instructions and restore()'ing), run up to twice. A loop body is
+		lowered exactly ONCE and reused via the back edge, so a reassignment
+		like `path = file` (borrowed) / `path = os.path.join(...)` (owned) -
+		already reconciled by merge_if() into a single OWNED-with-flag state
+		for the REST of one iteration - still leaves the loop's own ENTRY
+		state (whatever `path` was before the loop, e.g. a borrowed
+		parameter) disagreeing with that back edge: BORROWED vs OWNED/COPY,
+		cfg.py's loop_back_edge() own hard error. Unlike merge_if's two
+		independently-lowered branches, there's no reconciling this after
+		the fact - the reassignment sites inside were already compiled
+		assuming the ENTRY state (BORROWED), so neither of them emitted the
+		decref-before-overwrite an OWNED entry would need on iteration 2+; a
+		bare "promote and hope" would leak one reference per iteration.
+
+		So: on the first CompileError from loop_back_edge, check whether
+		it's exactly that safe shape (cfg.py's find_promotable_loop_
+		mismatches - the same BORROWED-vs-OWNED/COPY case merge_if()
+		reconciles for if/else). If so, every side effect of that attempt is
+		rolled back - emitted instructions, cfg bindings/epilogue/cancel-flag
+		state (via hard_restore(), NOT the ordinary restore() lowering.py
+		uses on success - a defer registered while lowering the doomed
+		attempt gets fully discarded, not kept alive for a function epilogue
+		that will never see that code again, since the retried body below
+		re-registers a fresh one), defer-flag registrations, pending temps -
+		the mismatched names are then promoted to OWNED via promote_
+		borrowed_for_loop() - a ONE-TIME incref spliced in at pre_loop_mark,
+		strictly before this loop's own start label so the back-edge jump
+		(which targets that label directly) never re-runs it - and the body
+		is lowered again, this time with every reassignment site seeing the
+		true steady-state entry ownership up front. Any other CompileError,
+		or a mismatch still unresolved after that one retry, is reported for
+		real via discovery.fail(). '''
+		for attempt_number in ( 1, 2 ):
+			body_snapshot = self._cfg.snapshot()
+			instructions_mark = len( self._instructions )
+			defer_flags_mark = len( self._defer_flags )
+			cancel_flags_mark = self._cfg.cancel_flag_count
+			pending_temps_mark = len( self._pending_temps )
+			try:
+				break_narrowed, break_live, continue_captured = self._lower_loop_body(
+					body, continue_label = continue_label, break_label = break_label, loop_snapshot = loop_snapshot,
+				)
+				back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
+			except CompileError as e:
+				promotable = self._cfg.find_promotable_loop_mismatches( loop_snapshot.bindings ) if attempt_number == 1 else set()
+				if not promotable:
+					self.lowering.discovery.fail( str( e ), node )
+				del self._instructions[instructions_mark:]
+				del self._defer_flags[defer_flags_mark:]
+				self._cfg.truncate_cancel_flags( cancel_flags_mark )
+				del self._pending_temps[pending_temps_mark:]
+				self._cfg.hard_restore( body_snapshot )
+				promo_instructions: list[ir.Instruction] = []
+				for promoted_name in sorted( promotable ):
+					promo_instructions += self._cfg.promote_borrowed_for_loop( promoted_name )
+					loop_snapshot.bindings[promoted_name] = self._cfg.bindings[promoted_name]
+				self._instructions[pre_loop_mark:pre_loop_mark] = promo_instructions
+				continue
+			for instr in back_edge_instructions:
+				self._emit( instr )
+			self._cfg.restore( loop_snapshot )
+			return break_narrowed, break_live, continue_captured
+		assert False, 'unreachable' # the attempt_number==2 branch above always either returns or calls discovery.fail (NoReturn)
 
 	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> tuple[list[dict[str,list[Variable]]],list[set[str]],bool]:
 		self._loop_depth += 1
@@ -7379,6 +7443,7 @@ class FunctionLowering:
 		stop_var = self._declare_hidden_local( f'__for_stop_{self._label_id}', usize_cls, node )
 		self._emit( ir.Assign( dest = stop_var, src = stop_operand ))
 
+		pre_loop_mark = len( self._instructions ) # see _lower_loop_body_with_ownership_retry's own docstring - a promoted name's one-time incref splices in here, strictly before start_label
 		start_label = self._new_label( 'for_start' )
 		continue_label = self._new_label( 'for_continue' )
 		end_label = self._new_label( 'for_end' )
@@ -7390,14 +7455,9 @@ class FunctionLowering:
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body_with_ownership_retry(
+			node, node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot, pre_loop_mark = pre_loop_mark,
+		)
 		# Phase 8: a for-loop has no type(x) is T condition of its own to
 		# narrow FROM, but its natural exit (the range simply exhausted,
 		# including never having run the body at all - always reachable
@@ -7667,6 +7727,7 @@ class FunctionLowering:
 			target_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ elem_type, remaining_error_type ] )
 			self._declare_hidden_local( node.target.id, target_type, node, user_facing = True )
 
+		pre_loop_mark = len( self._instructions ) # see _lower_loop_body_with_ownership_retry's own docstring - a promoted name's one-time incref splices in here, strictly before start_label
 		start_label = self._new_label( 'for_start' )
 		continue_label = self._new_label( 'for_continue' )
 		end_label = self._new_label( 'for_end' )
@@ -7726,14 +7787,9 @@ class FunctionLowering:
 				remaining_leaves, remaining_error_type, stop_iteration_cls, end_label, unique,
 			)
 
-		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body_with_ownership_retry(
+			node, node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot, pre_loop_mark = pre_loop_mark,
+		)
 		# Phase 8 - see _lower_for_range's own identical call/comment
 		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 

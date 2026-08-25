@@ -1121,6 +1121,92 @@ class CFGState:
 				)
 		return instructions
 
+	def find_promotable_loop_mismatches( self, entry_bindings: Bindings ) -> set[str]:
+		''' loop_back_edge()'s own pre-check, for lowering.py's retry: which
+		names hit the SAME safe BORROWED-entering/OWNED-or-COPY-by-back-edge
+		shape merge_if() already reconciles for if/else branches (its own
+		owning/borrowed check above). A loop body is lowered exactly ONCE and
+		reused via the back edge (unlike an if's two independently-lowered
+		branches), so this can't be reconciled after the fact the way
+		merge_if's runtime flag does - a flag alone doesn't retroactively add
+		the decref-before-overwrite each promoted reassignment site now
+		needs on iteration 2+. lowering.py instead rolls back the whole
+		failed attempt and re-lowers with these names pre-promoted via
+		promote_borrowed_for_loop(), so every reassignment site sees the true
+		steady-state entry ownership up front. '''
+		back_edge = self.bindings
+		promotable: set[str] = set()
+		for name, entry_binding in entry_bindings.items():
+			back_binding = back_edge.get( name )
+			if back_binding is None or entry_binding.state == back_binding.state:
+				continue
+			if entry_binding.state == OwnState.BORROWED and back_binding.state in ( OwnState.OWNED, OwnState.COPY ):
+				promotable.add( name )
+		return promotable
+
+	def promote_borrowed_for_loop( self, name: str ) -> list[ir.Instruction]:
+		''' converts a currently-BORROWED binding to OWNED - a single
+		explicit incref before the loop starts (not a per-iteration cost),
+		conceptually the same "take my own copy" as a copy[T] parameter's
+		own prologue (_enter_parameter) - but pushed as OWNED, not COPY:
+		assign()'s own generic reassignment path (cfg.py's own assign(),
+		used by every ordinary `name = expr` inside the retried body)
+		unconditionally normalizes an overwritten binding's new state to
+		OWNED regardless of what it overwrote, so entering as COPY would
+		leave THIS name's own loop_back_edge() check comparing COPY (entry)
+        against OWNED (every reassignment site's own output) - a real,
+		confirmed mismatch (COPY != OWNED, despite both being decref'd
+		identically everywhere else) that would otherwise send the retry
+		straight back into a second, unpromotable failure. Called once per
+		name found by find_promotable_loop_mismatches(), right before
+		lowering.py re-lowers the loop from its own start label - the
+		returned instructions must be emitted there, before that label. '''
+		binding = self.bindings[name]
+		assert binding.state == OwnState.BORROWED, f'promote_borrowed_for_loop({name!r}): binding is {binding.state}, not BORROWED'
+		instructions = self._incref_instructions( binding.type, binding.operand )
+		self._push( binding.operand, binding.type, OwnState.OWNED, key = name )
+		return instructions
+
+	@property
+	def cancel_flag_count( self ) -> int:
+		''' len(self._cancel_flags) - lowering.py's loop-retry rollback uses
+		this to snapshot/truncate cancel flags minted by a failed attempt
+		(cancel_flags() itself always returns every flag ever minted, needed
+		as-is by _emit_epilogue - see its own docstring). '''
+		return len( self._cancel_flags )
+
+	def truncate_cancel_flags( self, count: int ) -> None:
+		''' drops every cancel flag minted since `count` (a prior
+		cancel_flag_count) - a failed loop-lowering attempt being rolled back
+		by lowering.py's retry must not leave its own now-unreferenced flags
+		behind, or _emit_epilogue would still splice in a real, always-True,
+		never-read local for each one (a guaranteed -Wunused-variable, or
+		worse a dead store some compilers might not even tolerate silently). '''
+		del self._cancel_flags[count:]
+
+	def hard_restore( self, snap: _Snapshot ) -> None:
+		''' like restore(), but discards EVERY entry pushed since the
+		snapshot, including flag-guarded/captured ones restore() deliberately
+		keeps alive (see its own docstring - a defer registered since the
+		snapshot, or an early return already committed to one of its own
+		labels). Only safe when the caller is about to fully re-lower that
+		exact same source code from scratch, which re-registers a fresh
+		replacement for anything genuinely still needed - lowering.py's own
+		loop-ownership retry rollback is the one caller (see
+		_lower_loop_body_with_ownership_retry): a defer statement textually
+		inside the loop body gets re-registered on the retried attempt, so
+		the ABANDONED attempt's own registration (and lowering.py's matching
+		_defer_flags entry, separately truncated there) can simply be
+		dropped rather than kept alive for a function epilogue that will
+		never see the abandoned code again. Using ordinary restore() here
+		would leave that stale entry referencing a flag lowering.py already
+		rolled out of _defer_flags - a dangling reference. '''
+		self.bindings = dict( snap.bindings )
+		self._unchecked_results = set( snap.results )
+		self._narrowed = dict( snap.narrowed )
+		self._live = set( snap.live )
+		del self._epilogue_stack[snap.stack_depth:]
+
 	def unwind_to( self, snap: _Snapshot ) -> list[ir.Instruction]:
 		''' break/continue - unwind everything pushed since `snap` (the
 		enclosing loop's own entry snapshot) in LIFO order, without

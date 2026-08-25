@@ -4121,6 +4121,69 @@ class Tests( unittest.TestCase ):
 			ir.FuncEnd( name = 'main' ),
 		])
 
+	def test_loop_promotes_borrowed_param_mixed_with_owned_reassignment( self ) -> None:
+		# regression test: reassigning a BORROWED parameter to either a
+		# borrowed alias or a freshly owned value inside a for-loop body used
+		# to hard-error ("... is in an indeterminate state across loop
+		# iterations") - the loop is lowered exactly once and reused via the
+		# back edge, so its entry state (BORROWED, from the parameter) never
+		# matched the back-edge state (OWNED, from merge_if's own if/else
+		# reconciliation of the two reassignment branches) - see
+		# _lower_loop_body_with_ownership_retry's own docstring for the fix
+		# (found via a real repro, grap.py's `r_filespec`/`path` handling)
+		code = '\n'.join([
+			'class Foo:',
+			'	pass',
+			'',
+			'def main( path: Foo, other: Foo, flag: bool ) -> None:',
+			'	items: list[Foo] = [ other ]',
+			'	for item in items:',
+			'		if flag:',
+			'			path = other',
+			'		else:',
+			'			path = Foo()',
+			'	return',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_loop_promotion_survives_nested_loop_with_its_own_defer( self ) -> None:
+		# regression test: the SAME promotion above, but with the mismatched
+		# for-loop nested inside an outer while-loop that itself needs its
+		# own retry (path's entry state, BORROWED, is only established
+		# before the OUTER loop - the for-loop's own successful promotion
+		# still leaves the while-loop's back edge disagreeing the same way).
+		# The outer retry's rollback used to be blocked by a defer entry any
+		# `for x in <a fresh iterable>:` loop always registers (to release
+		# its own iterator) - ordinary restore() deliberately keeps a defer
+		# entry alive past a loop's own teardown (it must still fire at the
+		# function's real epilogue), but that's wrong for a FAILED retry
+		# attempt about to be fully re-lowered from scratch - see
+		# cfg.py's hard_restore() docstring
+		code = '\n'.join([
+			'class Foo:',
+			'	pass',
+			'',
+			'def main( path: Foo, other: Foo, flag: bool ) -> None:',
+			'	items: list[Foo] = [ other ]',
+			'	i: usize = 0',
+			'	while i < 3:',
+			'		for item in items:',
+			'			if flag:',
+			'				path = other',
+			'			else:',
+			'				path = Foo()',
+			'		with compiler.wrap_arithmetic:',
+			'			i = i + 1',
+			'	return',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_while_else_is_rejected( self ) -> None:
 		code = '\n'.join([
 			'def main() -> None:',
