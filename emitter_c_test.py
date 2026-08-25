@@ -19363,25 +19363,57 @@ def main() -> i32:
 ''' ),
 			# !a (PLAN_FSTRINGS.md follow-up) - a dedicated real compile-and-run
 			# test against non-ASCII input, per the plan's own verification
-			# section. Expected text is real Python's own ascii()-equivalent
-			# escaping (repr() here has no surrounding quotes to strip since
-			# !a's own metalpy semantics never add quotes - see lowering.py's
-			# _lower_ascii_escape comment): a 2-byte-UTF8 codepoint (café,
-			# U+00E9) escapes as \xE9-style... actually str._ascii_escape's
-			# own lowercase-hex convention is checked directly against real
-			# Python's escaping of the bare codepoints, not against repr()'s
-			# own quoting.
+			# section. !a is ascii(x) == ascii-escape(repr(x)): __repr__ adds
+			# the surrounding quotes (str now has a real __repr__), then the
+			# ascii-escape pass replaces any non-ASCII codepoint repr() left
+			# as literal UTF-8 with its \\xXX/\\uXXXX/\\UXXXXXXXX escape -
+			# checked directly against real Python's own ascii() on the same
+			# inputs, quotes included.
 			( 'bang_a_conversion_escapes_non_ascii', '''
 def build( s: str ) -> str:
 	return f"{s!a}"
 
 def main() -> i32:
-	if build( 'caf\\u00e9' ) != 'caf\\\\xe9':
+	if build( 'caf\\u00e9' ) != "'caf\\\\xe9'":
 		return 1
-	if build( '\\u00e9\\u0100\\U0001F600' ) != '\\\\xe9\\\\u0100\\\\U0001f600':
+	if build( '\\u00e9\\u0100\\U0001F600' ) != "'\\\\xe9\\\\u0100\\\\U0001f600'":
 		return 2
-	if build( 'plain ascii' ) != 'plain ascii':
+	if build( 'plain ascii' ) != "'plain ascii'":
 		return 3
+	return 0
+''' ),
+			# str.__repr__ (real, since !r on str used to be a no-op identity -
+			# see the comment on _lower_fstring_part's own identity
+			# shortcut). Every expected string is cross-checked against real
+			# Python's own repr()/ascii() for the same input.
+			( 'str_repr_quoting_and_escaping', '''
+def main() -> i32:
+	if 'hello'.__repr__() != "'hello'":
+		return 1
+	if f"{'hello'!r}" != "'hello'":
+		return 2
+	# only a single quote present - switches to double-quoting rather than escaping it
+	if "it's".__repr__() != '"it\\'s"':
+		return 3
+	# only a double quote present - stays single-quoted, no escaping needed
+	if 'say "hi"'.__repr__() != '\\'say "hi"\\'':
+		return 4
+	# both present - single-quoted (the default), escaping just the embedded '
+	if 'both \\' and "'.__repr__() != '\\'both \\\\\\' and "\\'':
+		return 5
+	# \\n / \\t / a literal backslash each get their own 2-byte escape
+	if 'a\\nb\\tc\\\\d'.__repr__() != "'a\\\\nb\\\\tc\\\\\\\\d'":
+		return 6
+	# printable non-ASCII (café) stays literal in !r, unlike !a
+	if 'caf\\u00e9'.__repr__() != "'café'":
+		return 7
+	if f"{'caf\\u00e9'!a}" != "'caf\\\\xe9'":
+		return 8
+	# !a must not double-escape a backslash __repr__ already escaped - real
+	# ascii('a\\bé') doubles the one backslash (repr's own escaping)
+	# and separately hex-escapes the non-ASCII é, nothing more
+	if f"{'a\\\\b\\u00e9'!a}" != "'a\\\\\\\\b\\\\xe9'":
+		return 9
 	return 0
 ''' ),
 		] )

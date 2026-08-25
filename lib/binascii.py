@@ -21,7 +21,7 @@ class BinasciiError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"BinasciiError('{self.message}')"
+		return f"BinasciiError({self.message!r})"
 
 
 _HEX_LOWER: list[u8] = [

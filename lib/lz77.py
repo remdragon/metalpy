@@ -23,7 +23,7 @@ class LZ77Error:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"LZ77Error('{self.message}')"
+		return f"LZ77Error({self.message!r})"
 
 
 @cstruct

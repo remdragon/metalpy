@@ -17,7 +17,7 @@ class BitstreamError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"BitstreamError('{self.message}')"
+		return f"BitstreamError({self.message!r})"
 
 
 # ---------------------------------------------------------------------------

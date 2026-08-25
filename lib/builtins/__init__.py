@@ -90,7 +90,7 @@ from .__list import list, UnsafeList
 from .__vartuple import VariadicTuple, tuple
 from .__RawDict import RawDict, RawEntry
 from .__set import set
-from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one
+from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one, repr_escape_width, repr_escape_one, nonascii_escape_width, nonascii_escape_one
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
@@ -641,6 +641,53 @@ class str( Sequence[str], Iterable[str] ):
 		# str is immutable - str(x) is always just x itself, no copy.
 		return self
 
+	def __repr__( self ) -> str:
+		''' quotes and backslash-escapes self, matching Python's repr()
+		for str: single-quoted, unless self contains a "'" but no '"' (then
+		double-quoted instead). Printable non-ASCII codepoints are kept as
+		literal UTF-8, matching CPython - see __str.py's repr_escape_width/
+		repr_escape_one for the full per-codepoint escaping rule. Two
+		passes over the codepoints (first to pick the quote char, since its
+		own escape width depends on which one was picked, then the usual
+		size-then-fill pass every other string builder here uses). '''
+		self_len: usize = self.byte_len()
+		has_single: bool = False
+		has_double: bool = False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if cp == 0x27: # '
+					has_single = True
+				elif cp == 0x22: # "
+					has_double = True
+				i += consumed
+
+		quote: u8 = u8( 0x22 ) if ( has_single and not has_double ) else u8( 0x27 )
+
+		new_size: usize = 3 # opening + closing quote + zero terminator
+		i = 0
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				new_size += repr_escape_width( cp, quote )
+				i += consumed
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		new_buf[0] = quote
+		out: usize = 1
+		i = 0
+		with compiler.wrap_arithmetic:
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				out += repr_escape_one( new_buf, out, cp, quote )
+				i += consumed
+			new_buf[out] = quote
+			out += 1
+			new_buf[out] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in __repr__' )
+
 	@inline
 	@staticmethod
 	def __call__[T]( x: T ) -> str:
@@ -968,16 +1015,18 @@ class str( Sequence[str], Iterable[str] ):
 
 	@private
 	def _ascii_escape( self ) -> str:
-		''' backslash-escapes every non-ASCII codepoint and every non-
-		printable ASCII byte in self, matching Python's own ascii()/
-		repr() escaping rules - the f-string !a conversion's own second
-		half (lowering.py calls this on whatever text the !r-equivalent
-		resolution already produced - see _lower_fstring_part's own
-		comment on why this does NOT add surrounding quotes or escape a
-		literal quote character, unlike Python's real ascii()). Two
-		passes over the codepoints, same size-then-fill shape str.concat/
-		case_map/etc. already use - __str.py's own ascii_escape_width/
-		ascii_escape_one do the actual per-codepoint work. '''
+		''' f-string !a conversion's second pass, run on whatever text
+		__repr__() already produced (_lower_fstring_part calls __repr__
+		then this, matching Python's own ascii() == escape(repr(x))).
+		self is already fully escaped/quoted ASCII except for any
+		printable non-ASCII codepoints __repr__ deliberately left as
+		literal UTF-8 - so this only escapes THOSE (codepoints >= 0x80),
+		leaving every ASCII byte (including the backslashes/quotes
+		__repr__ itself inserted) untouched, matching Python's ascii()
+		against an already-repr'd string. __str.py's own
+		nonascii_escape_width/nonascii_escape_one do the actual
+		per-codepoint work; same size-then-fill shape every string
+		builder here uses. '''
 		self_len: usize = self.byte_len()
 		new_size: usize = 1 # zero terminator
 		i: usize = 0
@@ -985,7 +1034,7 @@ class str( Sequence[str], Iterable[str] ):
 		with compiler.panic_arithmetic( 'irrational string length' ):
 			while i < self_len:
 				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
-				new_size += ascii_escape_width( cp )
+				new_size += nonascii_escape_width( cp )
 				i += consumed
 
 		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
@@ -994,7 +1043,7 @@ class str( Sequence[str], Iterable[str] ):
 		with compiler.wrap_arithmetic:
 			while i < self_len:
 				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
-				out += ascii_escape_one( new_buf, out, cp )
+				out += nonascii_escape_one( new_buf, out, cp )
 				i += consumed
 		new_buf[out] = 0
 		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in _ascii_escape' )

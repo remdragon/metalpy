@@ -89,16 +89,26 @@ def encode_utf8_at( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
 	return 4
 
 # ---------------------------------------------------------------------------
-# f-string !a (ascii) conversion - str._ascii_escape() in __init__.py's own
-# str class calls these. Same size-then-fill two-pass convention as
-# utf8_encoded_len/encode_utf8_at just above, just producing an ASCII-only,
-# backslash-escaped encoding instead of UTF-8 - matches Python's own
-# ascii()/repr() escaping rules (backslash and \n/\r/\t as a 2-byte escape,
-# every other non-printable-ASCII byte as \xXX, and non-ASCII codepoints as
-# \xXX/\uXXXX/\UXXXXXXXX depending on range). Deliberately does NOT add
-# surrounding quotes or escape a literal quote character - see
-# _lower_fstring_part's own comment on why (str has no __repr__() of its
-# own for !a to match the quoting behavior of).
+# f-string !r/!a conversion and str.__repr__() - str.__repr__/_ascii_escape
+# in __init__.py's own str class call these. Same size-then-fill two-pass
+# convention as utf8_encoded_len/encode_utf8_at just above.
+#
+# ascii_escape_width/ascii_escape_one: Python's ascii()-style escaping of a
+# RAW (unquoted) string - backslash and \n/\r/\t as a 2-byte escape, every
+# other non-printable-ASCII byte as \xXX, non-ASCII codepoints as
+# \xXX/\uXXXX/\UXXXXXXXX depending on range. No quoting/quote-escaping (this
+# operates on an arbitrary string, not one that's already been through
+# __repr__).
+#
+# repr_escape_width/repr_escape_one: __repr__'s own per-codepoint rule -
+# like ascii_escape_*, but escapes the chosen quote char instead of passing
+# it through, and leaves printable non-ASCII codepoints as literal UTF-8
+# (matching CPython's repr(), which only escapes non-printable codepoints).
+#
+# nonascii_escape_width/nonascii_escape_one: f-string !a's second pass over
+# an already-__repr__'d string - repr() already escaped backslashes/quotes/
+# control chars, so this must leave ALL ASCII bytes alone and only escape
+# codepoints >= 0x80 that survived repr() unescaped (printable non-ASCII).
 # ---------------------------------------------------------------------------
 
 _ASCII_BACKSLASH: u8 = 0x5C # '\'
@@ -128,6 +138,43 @@ def ascii_escape_width( cp: u32 ) -> usize:
 		return 6
 	return 10
 
+def _escape_x( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
+	''' writes a \\xXX escape (4 bytes) - shared by ascii_escape_one,
+	repr_escape_one and nonascii_escape_one below, all of which need this
+	exact shape for codepoints 0x00-0xFF. '''
+	with compiler.wrap_arithmetic:
+		dest[i]   = _ASCII_BACKSLASH
+		dest[i+1] = u8( 0x78 ) # 'x'
+		dest[i+2] = _hex_nibble( ( cp >> 4 ) & 0xF )
+		dest[i+3] = _hex_nibble( cp & 0xF )
+	return 4
+
+def _escape_u( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
+	''' writes a \\uXXXX escape (6 bytes) - see _escape_x. '''
+	with compiler.wrap_arithmetic:
+		dest[i]   = _ASCII_BACKSLASH
+		dest[i+1] = u8( 0x75 ) # 'u'
+		dest[i+2] = _hex_nibble( ( cp >> 12 ) & 0xF )
+		dest[i+3] = _hex_nibble( ( cp >> 8 ) & 0xF )
+		dest[i+4] = _hex_nibble( ( cp >> 4 ) & 0xF )
+		dest[i+5] = _hex_nibble( cp & 0xF )
+	return 6
+
+def _escape_U( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
+	''' writes a \\UXXXXXXXX escape (10 bytes) - see _escape_x. '''
+	with compiler.wrap_arithmetic:
+		dest[i]   = _ASCII_BACKSLASH
+		dest[i+1] = u8( 0x55 ) # 'U'
+		dest[i+2] = _hex_nibble( ( cp >> 28 ) & 0xF )
+		dest[i+3] = _hex_nibble( ( cp >> 24 ) & 0xF )
+		dest[i+4] = _hex_nibble( ( cp >> 20 ) & 0xF )
+		dest[i+5] = _hex_nibble( ( cp >> 16 ) & 0xF )
+		dest[i+6] = _hex_nibble( ( cp >> 12 ) & 0xF )
+		dest[i+7] = _hex_nibble( ( cp >> 8 ) & 0xF )
+		dest[i+8] = _hex_nibble( ( cp >> 4 ) & 0xF )
+		dest[i+9] = _hex_nibble( cp & 0xF )
+	return 10
+
 def ascii_escape_one( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
 	''' encodes codepoint cp into dest starting at dest[i] per
 	ascii_escape_width's own rules above, returns the number of bytes
@@ -145,37 +192,63 @@ def ascii_escape_one( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
 				dest[i+1] = u8( 0x74 ) # 't'
 		return 2
 	if cp < 0x20 or cp == 0x7F or ( cp >= 0x80 and cp <= 0xFF ):
-		with compiler.wrap_arithmetic:
-			dest[i]   = _ASCII_BACKSLASH
-			dest[i+1] = u8( 0x78 ) # 'x'
-			dest[i+2] = _hex_nibble( ( cp >> 4 ) & 0xF )
-			dest[i+3] = _hex_nibble( cp & 0xF )
-		return 4
+		return _escape_x( dest, i, cp )
 	if cp < 0x7F:
 		with compiler.wrap_arithmetic:
 			dest[i] = u8( cp )
 		return 1
 	if cp <= 0xFFFF:
+		return _escape_u( dest, i, cp )
+	return _escape_U( dest, i, cp )
+
+def repr_escape_width( cp: u32, quote: u8 ) -> usize:
+	''' byte cost of codepoint cp inside a __repr__ body already bracketed
+	by `quote` - same as ascii_escape_width for ASCII and non-printable
+	non-ASCII codepoints, except the quote char itself is escaped (2
+	bytes) instead of passed through raw, and a PRINTABLE non-ASCII
+	codepoint is kept as literal UTF-8 (its own encoded width) rather
+	than backslash-escaped, matching CPython's repr(). '''
+	if cp == u32( quote ):
+		return 2
+	if cp < 0x80:
+		return ascii_escape_width( cp )
+	if is_printable_cp( cp ):
+		return utf8_encoded_len( cp )
+	return ascii_escape_width( cp ) # non-printable: same \xXX/\uXXXX/\UXXXXXXXX widths
+
+def repr_escape_one( dest: Ptr[u8], i: usize, cp: u32, quote: u8 ) -> usize:
+	''' encodes codepoint cp into dest per repr_escape_width's own rules
+	above, returns the number of bytes written. '''
+	if cp == u32( quote ):
 		with compiler.wrap_arithmetic:
 			dest[i]   = _ASCII_BACKSLASH
-			dest[i+1] = u8( 0x75 ) # 'u'
-			dest[i+2] = _hex_nibble( ( cp >> 12 ) & 0xF )
-			dest[i+3] = _hex_nibble( ( cp >> 8 ) & 0xF )
-			dest[i+4] = _hex_nibble( ( cp >> 4 ) & 0xF )
-			dest[i+5] = _hex_nibble( cp & 0xF )
-		return 6
-	with compiler.wrap_arithmetic:
-		dest[i]   = _ASCII_BACKSLASH
-		dest[i+1] = u8( 0x55 ) # 'U'
-		dest[i+2] = _hex_nibble( ( cp >> 28 ) & 0xF )
-		dest[i+3] = _hex_nibble( ( cp >> 24 ) & 0xF )
-		dest[i+4] = _hex_nibble( ( cp >> 20 ) & 0xF )
-		dest[i+5] = _hex_nibble( ( cp >> 16 ) & 0xF )
-		dest[i+6] = _hex_nibble( ( cp >> 12 ) & 0xF )
-		dest[i+7] = _hex_nibble( ( cp >> 8 ) & 0xF )
-		dest[i+8] = _hex_nibble( ( cp >> 4 ) & 0xF )
-		dest[i+9] = _hex_nibble( cp & 0xF )
-	return 10
+			dest[i+1] = quote
+		return 2
+	if cp < 0x80:
+		return ascii_escape_one( dest, i, cp )
+	if is_printable_cp( cp ):
+		return encode_utf8_at( dest, i, cp )
+	return ascii_escape_one( dest, i, cp )
+
+def nonascii_escape_width( cp: u32 ) -> usize:
+	''' f-string !a's second pass over a string that already went through
+	__repr__ - repr() already escaped backslashes/quotes/control chars
+	into plain ASCII, so this leaves EVERY ASCII byte alone (unlike
+	ascii_escape_width, which would re-escape them) and only escapes
+	codepoints >= 0x80 that repr() left as literal UTF-8 because they were
+	printable - same \\xXX/\\uXXXX/\\UXXXXXXXX widths ascii_escape_width
+	already uses for its own cp >= 0x80 cases. '''
+	if cp < 0x80:
+		return 1
+	return ascii_escape_width( cp )
+
+def nonascii_escape_one( dest: Ptr[u8], i: usize, cp: u32 ) -> usize:
+	''' encodes codepoint cp per nonascii_escape_width's own rules above. '''
+	if cp < 0x80:
+		with compiler.wrap_arithmetic:
+			dest[i] = u8( cp )
+		return 1
+	return ascii_escape_one( dest, i, cp )
 
 @compiler.target( os = 'windows' )
 def case_map( data: ConstPtr[u8], byte_len: usize, is_upper: bool, out_size: Ptr[usize] ) -> Ptr[u8]:

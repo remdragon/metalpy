@@ -14,7 +14,7 @@ class CodecError: # ( sys.Error ):
 		return f'{self.encoding} codec error: {self.message}'
 
 	def __repr__( self ) -> str:
-		return f"CodecError('{self.encoding}', '{self.message}')"
+		return f"CodecError({self.encoding!r}, {self.message!r})"
 
 class Codec:
 	@abstractmethod

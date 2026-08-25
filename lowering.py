@@ -9836,19 +9836,19 @@ class FunctionLowering:
 			return self._lower_dispatch_format_spec( operand, parsed_spec, str_type, node )
 
 		# conversion 114 == '!r' or 97 == '!a' (ascii wants a repr-shaped
-		# text, ascii-escaped below via _lower_ascii_escape - see its own
-		# comment on why this does NOT add surrounding quotes, unlike
-		# Python's real ascii(): str has no __repr__() of its own here for
-		# !a to match the quoting behavior of either, so !a just escapes
-		# whatever !r's own resolution already produces) both want
+		# text, ascii-escaped below via _lower_ascii_escape) both want
 		# __repr__; -1 (none) and 115 ('!s') want __str__ - just an ordinary
 		# method lookup, same as any other type: every fixed-width int
 		# scalar (i8/u8/.../isize/usize) has a real __str__/__repr__
 		# (lib/builtins/__scalar_dunders.py's i_str_signed/i_str_unsigned),
 		# same mechanism f64/f32's own __str__/__repr__ use (__float.py) -
 		# a scalar WITHOUT one (bool, currently) still fails cleanly here
-		# with a plain "method not found" error rather than being auto-boxed
-		if operand.type is str_type:
+		# with a plain "method not found" error rather than being auto-boxed.
+		# str itself only short-circuits to identity for !s/no-conversion
+		# (str.__str__ is itself an identity - see __init__.py); !r/!a on a
+		# str operand must still go through str.__repr__() for real quoting/
+		# escaping, so they're excluded from the identity shortcut here.
+		if operand.type is str_type and node.conversion not in ( 114, 97 ):
 			value_as_str = operand
 		else:
 			method_name = '__repr__' if node.conversion in ( 114, 97 ) else '__str__'
@@ -9866,10 +9866,13 @@ class FunctionLowering:
 		return value_as_str
 
 	def _lower_ascii_escape( self, operand: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
-		# f-string !a conversion's second half - operand is already str-
-		# typed (whatever the !r-equivalent resolution above produced);
-		# this just calls str._ascii_escape() (lib/builtins/__init__.py)
-		# on it.
+		# f-string !a conversion's second half - operand is already the
+		# result of __repr__() (called above, same as !r): real quoting/
+		# escaping already happened there, so this just needs to escape
+		# any printable non-ASCII codepoints __repr__ left as literal
+		# UTF-8 - str._ascii_escape() (lib/builtins/__init__.py) does
+		# exactly that, leaving every ASCII byte (including the quotes/
+		# backslashes __repr__ inserted) untouched.
 		return self._lower_method_call( operand, '_ascii_escape', [], str_type, node )
 
 	def _lower_dispatch_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
