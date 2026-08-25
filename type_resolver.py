@@ -5047,7 +5047,58 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				receiver_type = self._type_of_expr( node.func.value )
 				target = None
 				if receiver_type is not None:
+					original_receiver_spec = receiver_type if isinstance( receiver_type, Specialization ) else None
 					receiver_type = self.resolver.ensure_resolved( receiver_type )
+					# Monomorphizer.ensure_resolved has a documented,
+					# deliberate reentrancy fallback: resolving a generic
+					# CLASS's own method (e.g. `set[T].__iter__`) while that
+					# SAME class is itself still mid-build (a real,
+					# confirmed shape - a class's own method calling ANOTHER
+					# generic function whose own body needs `self`'s type
+					# back) silently degrades to the class's own ABSTRACT,
+					# still-TypeVar'd template (`return obj.base` - see its
+					# own comment on the identical dict[i32,i32].__iter__
+					# situation). Detectable here: the result is IDENTICALLY
+					# the original Specialization's own .base, discarding
+					# its real args entirely. Recover by looking up the
+					# SAME method on the abstract base (a cheap `.names`
+					# read, never itself triggering real monomorphization -
+					# see mpy_types.py's Specialization.names, a bare
+					# passthrough) and substituting its OWN declared return
+					# type against the ORIGINAL Specialization's real args
+					# directly, via the same primitive monomorphization
+					# itself uses - never letting the abstract template
+					# Function itself flow into this method's own shared
+					# "resolve/schedule/return type" handling below (target.
+					# resolve()/ensure_generator_synthesized(...)/resolve_
+					# declared_types(...) assume a real, individually-
+					# monomorphized Function safe to treat as its own
+					# compile unit, which the abstract template is not -
+					# confirmed via a real crash doing so). This can't
+					# recover a GENERATOR-shaped return type's own real
+					# synthesized backing class (that still needs the
+					# receiver class to finish building for real) - only
+					# matters for a caller reached in this exact reentrant
+					# window, an already-degraded case with no better answer
+					# available here regardless. Confirmed via two real
+					# repros: fixes a generic class's own generator-crossing
+					# match subject (permanently mistyped before this),
+					# without regressing the ORDINARY (non-reentrant) case
+					# (list[T].__iter__'s own real synthesized Generator
+					# return type, which needs the full ensure_resolved path
+					# below, unchanged, to stay correct).
+					if original_receiver_spec is not None and receiver_type is original_receiver_spec.base:
+						names = original_receiver_spec.names
+						abstract_target = names.get( node.func.attr ) if isinstance( names, dict ) else None
+						if isinstance( abstract_target, Function ):
+							if abstract_target.resolve is not None:
+								abstract_target.resolve()
+							owner_type_params = getattr( original_receiver_spec.base, 'type_params', None )
+							if owner_type_params:
+								return self.resolver.monomorphizer.substitute_type_params(
+									abstract_target.return_type, owner_type_params, original_receiver_spec.args,
+								)
+							return abstract_target.return_type
 					names = getattr( receiver_type, 'names', None )
 					if isinstance( names, dict ):
 						target = names.get( node.func.attr )

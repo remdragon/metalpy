@@ -22234,7 +22234,7 @@ def main() -> i32:
 ''' ),
 		])
 
-	def test_match_subject_reentrant_generic_class_resolution_declines_safely( self ) -> None:
+	def test_match_subject_reentrant_generic_class_resolution_recovers_correctly( self ) -> None:
 		''' Regression for a THIRD distinct bug in the same family as
 		test_match_on_fallible_call_subject_crossing_a_yield/test_match_
 		arm_binding_crossing_a_yield above, found while simplifying
@@ -22251,19 +22251,31 @@ def main() -> i32:
 		Monomorphizer.ensure_resolved's own documented, deliberate
 		reentrancy fallback (the identical dict[i32,i32].__iter__
 		situation its own comment already describes) to the class's
-		ABSTRACT, still-TypeVar'd shape. Before this fix, that degraded
-		type was accepted and promoted anyway, permanently baking
-		`Wrap.T` (the class template's own internal TypeVar) into the
-		promoted field's declared type - wrong for every instantiation,
-		not just the one that happened to trigger the reentrant path
-		first (confirmed via a real repro: mixing Wrap[i32] and Wrap[i64]
-		in one program produced "expected Result[Wrap.T,...], got
-		Result[intrinsics.i32,...]" real compile errors, not a crash).
-		Fixed by declining the reservation (Monomorphizer._is_concrete
-		check) whenever the resolved subject type still contains a free
-		TypeVar - safely falls back to today's pre-existing plain-local
-		behavior for exactly this narrow reentrant shape, same posture as
-		the pre-existing "subject_type is None" decline just above it. '''
+		ABSTRACT, still-TypeVar'd shape. Initially fixed by simply
+		DECLINING the reservation whenever the resolved subject type
+		still contains a free TypeVar (Monomorphizer._is_concrete) -
+		safe, but reintroduced the ORIGINAL pre-dc409bb uninitialized-
+		read risk for exactly this reentrant shape whenever T is RC (the
+		promoted field never gets promoted at all). Properly fixed
+		instead by RECOVERING the real answer: _type_of_expr's own
+		ast.Call branch now detects the exact degradation (ensure_
+		resolved returning literally the original Specialization's own
+		.base, discarding its args) and substitutes the found method's
+		declared return type against the ORIGINAL Specialization's real
+		args directly (Monomorphizer.substitute_type_params, via a cheap
+		Specialization.names lookup on the abstract base that never
+		itself retriggers the reentrancy) - never letting the abstract
+		template Function flow into this method's own "resolve and
+		schedule as a real compile unit" handling (an earlier attempt
+		that did so crashed elsewhere: AttributeError: 'Specialization'
+		object has no attribute 'node'). Confirmed via a real repro:
+		mixing Wrap[i32] and Wrap[i64] in one program used to produce
+		"expected Result[Wrap.T,...], got Result[intrinsics.i32,...]"
+		real compile errors; the sibling test below confirms the RC-
+		element case (where a scalar T like this test's own i32/i64
+		can't distinguish "declined, unpromoted, but still safe" from
+		"recovered, promoted, and correct" - both compile and run fine
+		for a scalar T) actually gets promoted, not just declined. '''
 		self.assert_programs_run([
 			( 'match_subject_reentrant_generic_class_resolution', '''
 class Wrap[T]:
@@ -22299,6 +22311,70 @@ def main() -> i32:
 	if v2 != i64( 43 ):
 		return 2
 
+	return 0
+''' ),
+		])
+
+	def test_match_subject_reentrant_generic_class_resolution_rc_element_no_uninitialized_warning( self ) -> None:
+		''' SIBLING of test_match_subject_reentrant_generic_class_
+		resolution_recovers_correctly above - that test's own T (i32/i64)
+		is scalar, so it can't distinguish "declined, unpromoted, still
+		correct by luck" from "recovered, actually promoted" (both run
+		fine for a scalar element - see MSVC's own /RTC1, which only
+		instruments RC-typed locals's own trailing decref, never a bare
+		scalar). This one uses a real RCClass element specifically to
+		confirm the field actually got PROMOTED (a real field on the
+		generator's own backing class, reassignment/destructor-driven
+		cleanup) rather than merely falling back to an unpromoted plain
+		local that happens to work today - compiler.refcount() before/
+		after a full iteration is the only observable signal a scalar
+		element can't give: an unpromoted local's own uninitialized-on-
+		resume trailing decref (the ORIGINAL dc409bb bug, reintroduced by
+		the DECLINE-only interim fix) either leaks (skips a legitimate
+		release) or crashes/corrupts (releases garbage) - a stable
+		refcount across the whole loop is only possible once promotion
+		actually landed. '''
+		self.assert_programs_run([
+			( 'match_subject_reentrant_generic_class_rc_element', '''
+class Elem:
+	pass
+
+class Wrap[T]:
+	v: T
+	def probe( self, ok: bool ) -> Result[T, IndexError]:
+		if ok:
+			return Result.Ok( self.v )
+		return Result.Err( IndexError() )
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return helper( self )
+
+def helper[T]( w: Wrap[T] ) -> Generator[T, StopIteration]:
+	i: usize = 0
+	while True:
+		match w.probe( i == 0 ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
+		with compiler.panic_arithmetic( 'not possible' ):
+			i += 1
+
+def main() -> i32:
+	e: Elem = Elem()
+	before: usize = compiler.refcount( e )
+	w: Wrap[Elem] = Wrap[Elem]( v = e )
+	g = w.__iter__()
+	got: Elem = g.__next__().unwrap( 'g' )
+	if compiler.refcount( got ) == before:
+		return 1
+	# the SECOND call resumes into the loop's post-yield code, drives it
+	# to the Err arm, and returns - this is what exercises the match's
+	# own trailing "release whichever variant's payload wasn't consumed"
+	# cleanup on a RESUMED call frame, the exact shape the original
+	# uninitialized-read bug (and this reentrant variant of it) needed a
+	# real resumed call to trigger at all
+	if not g.__next__().is_err():
+		return 2
 	return 0
 ''' ),
 		])
