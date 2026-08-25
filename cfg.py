@@ -44,9 +44,8 @@ it from fn.names at exactly the same point cfg.py tears down its entry.
 '''
 
 class OwnState( Enum ):
-	OWNED = 'owned'
+	OWNED = 'owned' # a real epilogue entry backs this binding - decref'd at scope exit. Covers every provenance: a fresh Call/Allocate result, a move[T]/copy[T] parameter (copy[T] takes its own Incref in the prologue - _enter_parameter - but is otherwise indistinguishable from any other OWNED binding; no consumer anywhere ever needed to tell them apart, so there's no separate COPY state)
 	BORROWED = 'borrowed'
-	COPY = 'copy'
 	MOVED = 'moved'
 
 # rc_leaves/_is_direct_pointer_rc used to be open-coded isinstance ladders
@@ -203,7 +202,7 @@ class CFGState:
 		self._live: set[str] = set() # names of locals DEFINITELY ASSIGNED on the current path - independent of RC tracking above (unlike bindings/rc_leaves, tracks EVERY local regardless of type - see assign()/is_live()/_expr_Name's own liveness gate). Parameters/self are always live from entry (seeded below/in enter_self()); a bare AnnAssign's own name is added to fn.names but NOT here until its first real assignment
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._narrowed: dict[str,list[Variable]] = {} # name -> the non-empty set of the UNION's own members it could still be (each .type the narrowed leaf, .stem the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead", and ONLY when the set has collapsed to exactly one member - see narrowed_member(). A single narrow() call always starts as a one-element list; merge_if's own soft-merge can grow it (two disagreeing-but-both-still-possible branches union together rather than discarding the fact) or drop it (a name narrowed on only SOME surviving paths)
-		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
+		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/MOVED)
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
 		self._construction_required: list[Variable] = [] # __init__'s own attributes that must all be initialized before self can escape/construction can complete
@@ -231,7 +230,7 @@ class CFGState:
 			# Incref right here in the prologue, matching Decref at exit
 			if rc_leaves( param.type ):
 				self.prologue_instructions += self._incref_instructions( param.type, param )
-				self._push( param, param.type, OwnState.COPY )
+				self._push( param, param.type, OwnState.OWNED )
 		elif rc_leaves( param.type ):
 			self.bindings[param.stem] = _Binding( operand = param, type = param.type, state = OwnState.BORROWED, entry = None )
 
@@ -777,7 +776,7 @@ class CFGState:
 		the join point) - a binding confined to one branch only exists on
 		that one path, so its teardown can't run at the shared join point
 		reached by both. Re-establishes exactly one epilogue entry per
-		surviving OWNED/COPY binding - both branches always push their OWN
+		surviving OWNED binding - both branches always push their OWN
 		entry when creating the same-named binding fresh, and only one of
 		the two ever actually runs, so those speculative entries must
 		never both survive onto the real stack.
@@ -860,7 +859,7 @@ class CFGState:
 		removed: list[str] = []
 
 		def reestablish( name: str, binding: _Binding, already_live: bool ) -> None:
-			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state == OwnState.OWNED:
 				if already_live:
 					self.bindings[name] = binding
 				else:
@@ -918,16 +917,16 @@ class CFGState:
 					# disagrees. That's not the hazard the error below exists
 					# for (a variable that might not exist at all) - it's the
 					# ordinary "fill in a default when still borrowed" idiom
-					# (`if x is None: x = Owned(...)`). Only OWNED/COPY-vs-
-					# BORROWED is safe to reconcile this way (the value is
-					# valid either way, only "do we own it" differs) - any
-					# OTHER disagreement (MOVED involved, etc) stays a hard
-					# error, unchanged.
+					# (`if x is None: x = Owned(...)`). Only OWNED-vs-BORROWED
+					# is safe to reconcile this way (the value is valid either
+					# way, only "do we own it" differs) - any OTHER
+					# disagreement (MOVED involved, etc) stays a hard error,
+					# unchanged.
 					owning, borrowed = (
-						( true_binding, false_binding ) if true_binding.state in ( OwnState.OWNED, OwnState.COPY )
+						( true_binding, false_binding ) if true_binding.state == OwnState.OWNED
 						else ( false_binding, true_binding )
 					)
-					if not ( owning.state in ( OwnState.OWNED, OwnState.COPY ) and borrowed.state == OwnState.BORROWED ):
+					if not ( owning.state == OwnState.OWNED and borrowed.state == OwnState.BORROWED ):
 						raise CompileError(
 							f"{ctx}: {name!r} is in an indeterminate state after the if - "
 							f"{true_binding.state.value} on one branch, {false_binding.state.value} on the other"
@@ -969,7 +968,7 @@ class CFGState:
 			# inside THAT branch's own code only
 			binding = true_binding if in_true else false_binding
 			assert binding is not None
-			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state in ( OwnState.OWNED, OwnState.COPY ) else []
+			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state == OwnState.OWNED else []
 			if in_true:
 				true_instructions += decref
 			else:
@@ -1109,7 +1108,7 @@ class CFGState:
 			if in_entry:
 				raise CompileError( f"{ctx}: {name!r} does not exist consistently across loop iterations" )
 			binding = back_edge[name]
-			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state == OwnState.OWNED:
 				instructions += self._decref_instructions( binding.type, binding.operand )
 		if entry_results is not None:
 			fresh_and_unchecked = self._unchecked_results - entry_results
@@ -1123,9 +1122,9 @@ class CFGState:
 
 	def find_promotable_loop_mismatches( self, entry_bindings: Bindings ) -> set[str]:
 		''' loop_back_edge()'s own pre-check, for lowering.py's retry: which
-		names hit the SAME safe BORROWED-entering/OWNED-or-COPY-by-back-edge
-		shape merge_if() already reconciles for if/else branches (its own
-		owning/borrowed check above). A loop body is lowered exactly ONCE and
+		names hit the SAME safe BORROWED-entering/OWNED-by-back-edge shape
+		merge_if() already reconciles for if/else branches (its own owning/
+		borrowed check above). A loop body is lowered exactly ONCE and
 		reused via the back edge (unlike an if's two independently-lowered
 		branches), so this can't be reconciled after the fact the way
 		merge_if's runtime flag does - a flag alone doesn't retroactively add
@@ -1140,27 +1139,18 @@ class CFGState:
 			back_binding = back_edge.get( name )
 			if back_binding is None or entry_binding.state == back_binding.state:
 				continue
-			if entry_binding.state == OwnState.BORROWED and back_binding.state in ( OwnState.OWNED, OwnState.COPY ):
+			if entry_binding.state == OwnState.BORROWED and back_binding.state == OwnState.OWNED:
 				promotable.add( name )
 		return promotable
 
 	def promote_borrowed_for_loop( self, name: str ) -> list[ir.Instruction]:
 		''' converts a currently-BORROWED binding to OWNED - a single
 		explicit incref before the loop starts (not a per-iteration cost),
-		conceptually the same "take my own copy" as a copy[T] parameter's
-		own prologue (_enter_parameter) - but pushed as OWNED, not COPY:
-		assign()'s own generic reassignment path (cfg.py's own assign(),
-		used by every ordinary `name = expr` inside the retried body)
-		unconditionally normalizes an overwritten binding's new state to
-		OWNED regardless of what it overwrote, so entering as COPY would
-		leave THIS name's own loop_back_edge() check comparing COPY (entry)
-        against OWNED (every reassignment site's own output) - a real,
-		confirmed mismatch (COPY != OWNED, despite both being decref'd
-		identically everywhere else) that would otherwise send the retry
-		straight back into a second, unpromotable failure. Called once per
-		name found by find_promotable_loop_mismatches(), right before
-		lowering.py re-lowers the loop from its own start label - the
-		returned instructions must be emitted there, before that label. '''
+		conceptually the same "take my own copy" a copy[T] parameter's own
+		prologue takes (_enter_parameter). Called once per name found by
+		find_promotable_loop_mismatches(), right before lowering.py re-lowers
+		the loop from its own start label - the returned instructions must
+		be emitted there, before that label. '''
 		binding = self.bindings[name]
 		assert binding.state == OwnState.BORROWED, f'promote_borrowed_for_loop({name!r}): binding is {binding.state}, not BORROWED'
 		instructions = self._incref_instructions( binding.type, binding.operand )
@@ -1296,7 +1286,7 @@ class CFGState:
 		this entry" rather than a borrow. Used by lowering.py's _stmt_Return
 		to decide whether an ALIASING return expression (self.lowering.
 		_is_aliasing_expr) needs its own Incref before being handed to the
-		caller: an OWNED/COPY local or a copy[T]/move[T] parameter has a live
+		caller: an OWNED local or a copy[T]/move[T] parameter has a live
 		entry here (a genuine move, no Incref needed - the source's own
 		decref is what's being skipped), but a BORROWED parameter/self (never
 		pushed - see _enter_parameter()'s own BORROWED branch) and an
@@ -2001,7 +1991,7 @@ class CFGState:
 			return instructions
 		existing = self.bindings.get( dest.stem )
 		if existing is not None and existing.entry is not None:
-			if existing.state in ( OwnState.OWNED, OwnState.COPY ):
+			if existing.state == OwnState.OWNED:
 				instructions += self._decref_instructions( dest.type, dest ) # release whatever dest held before - reads dest's CURRENT value, emitted before the Assign overwrites it
 			existing.entry.cancelled = False # dest is getting a real value again, even if it was MOVED/never-decref'd before
 			self.bindings[dest.stem] = _Binding( operand = dest, type = dest.type, state = OwnState.OWNED, entry = existing.entry )
@@ -2066,7 +2056,7 @@ class CFGState:
 				self._temp_states.pop( src.id, None )
 		existing = self.bindings.get( key )
 		if existing is not None and existing.entry is not None:
-			if is_rc and existing.state in ( OwnState.OWNED, OwnState.COPY ):
+			if is_rc and existing.state == OwnState.OWNED:
 				instructions += self._decref_instructions( attr.type, attr )
 			existing.entry.cancelled = False
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = existing.entry )
@@ -2216,7 +2206,7 @@ class CFGState:
 			binding = self.bindings.get( operand.stem )
 			if binding is None:
 				return [] # not RC-tracked (non-RC type) - nothing to do
-			if binding.state not in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state != OwnState.OWNED:
 				raise CompileError(
 					f'{target_qualname}: cannot move {operand.stem!r} into parameter {param_stem!r} - '
 					f'it is {binding.state.value}, not owned here'
@@ -2237,7 +2227,7 @@ class CFGState:
 	def _mint_cancel_flag( self ) -> Variable:
 		''' a fresh runtime bool for _neutralize()'s flag-guarded branch, OR
 		for merge_if()'s own ownership-disagreement reconciliation (an
-		OWNED/COPY-vs-BORROWED split across an if's two branches - "fill in
+		OWNED-vs-BORROWED split across an if's two branches - "fill in
 		a default when still borrowed") - both share the identical shape, so
 		this one minting helper covers both callers. Mirrors push_defer()'s
 		own flag exactly (a real Variable, spliced in as a body_start init by
@@ -2314,7 +2304,7 @@ class CFGState:
 
 	def deleted( self, variable: Variable, ctx: str ) -> list[ir.Instruction]:
 		''' called for `del x` (see lowering.py's _stmt_Delete) - returns
-		the Decref to emit right there (if x was OWNED/COPY), and
+		the Decref to emit right there (if x was OWNED), and
 		neutralizes its epilogue entry so it's never decref'd again.
 		Independent-of-RC unchecked-Result check first, same reasoning as
 		assign()'s own early check - del'ing a still-unchecked Result is
@@ -2344,7 +2334,7 @@ class CFGState:
 		if binding is None or binding.entry is None:
 			return []
 		instructions: list[ir.Instruction] = []
-		if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+		if binding.state == OwnState.OWNED:
 			instructions = self._decref_instructions( binding.type, variable )
 		instructions += self._neutralize( binding.entry )
 		return instructions
@@ -2356,7 +2346,7 @@ class CFGState:
 		_lower_compiler_decref) - x's own explicit Decref is emitted by
 		lowering.py right at the call site regardless; this only stops x's
 		binding from being auto-decref'd a SECOND time once its own scope
-		ends. Without this, a live OWNED/COPY local manually decref'd (the
+		ends. Without this, a live OWNED local manually decref'd (the
 		established idiom throughout this stdlib for tearing down RC
 		elements read out of a container - list.__del__/FastList.__del__/
 		dict's own _release_key/_release_value all do `val: T = <read>;
@@ -2381,7 +2371,7 @@ class CFGState:
 			binding = self.bindings.get( operand.stem )
 			if binding is None or binding.entry is None:
 				return []
-			if binding.state not in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state != OwnState.OWNED:
 				return []
 			instructions = self._neutralize( binding.entry )
 			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )

@@ -3042,7 +3042,7 @@ class FunctionLowering:
 		# _enter_parameter()) both alias a reference that SOMEONE ELSE
 		# still independently owns and will decref on their own schedule,
 		# so the caller needs a genuinely separate +1, not a bare pointer
-		# copy. An OWNED/COPY local (or a copy[T]/move[T] parameter) DOES
+		# copy. An OWNED local (or a copy[T]/move[T] parameter) DOES
 		# have a live entry - that's a real move (its own decref is what
 		# current_epilogue_label()/return_() skip below, by this same
 		# identity), and must NOT also get an Incref here, or the moved-
@@ -7215,7 +7215,7 @@ class FunctionLowering:
 		already reconciled by merge_if() into a single OWNED-with-flag state
 		for the REST of one iteration - still leaves the loop's own ENTRY
 		state (whatever `path` was before the loop, e.g. a borrowed
-		parameter) disagreeing with that back edge: BORROWED vs OWNED/COPY,
+		parameter) disagreeing with that back edge: BORROWED vs OWNED,
 		cfg.py's loop_back_edge() own hard error. Unlike merge_if's two
 		independently-lowered branches, there's no reconciling this after
 		the fact - the reassignment sites inside were already compiled
@@ -7225,8 +7225,8 @@ class FunctionLowering:
 
 		So: on the first CompileError from loop_back_edge, check whether
 		it's exactly that safe shape (cfg.py's find_promotable_loop_
-		mismatches - the same BORROWED-vs-OWNED/COPY case merge_if()
-		reconciles for if/else). If so, every side effect of that attempt is
+		mismatches - the same BORROWED-vs-OWNED case merge_if() reconciles
+		for if/else). If so, every side effect of that attempt is
 		rolled back - emitted instructions, cfg bindings/epilogue/cancel-flag
 		state (via hard_restore(), NOT the ordinary restore() lowering.py
 		uses on success - a defer registered while lowering the doomed
@@ -16591,7 +16591,7 @@ class FunctionLowering:
 			# CALLER's own binding, which still got an ordinary Decref at
 			# scope exit on top of that - two teardown paths for one struct).
 			# Also correctly rejects calling an @move method through a merely
-			# BORROWED receiver (move()'s own OWNED/COPY precondition), which
+			# BORROWED receiver (move()'s own OWNED precondition), which
 			# was never checked before either.
 			for instr in self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' ):
 				self._emit( instr )

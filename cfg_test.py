@@ -114,7 +114,7 @@ def foo( x: copy[Foo] ) -> None:
 		state = self._state( self._fn( 'foo' ))
 		self.assertEqual( self._kinds( state.prologue_instructions ), ['Incref'] )
 		self.assertIs( state.prologue_instructions[0].value, self._fn( 'foo' ).parameters[0] )
-		self.assertEqual( state.bindings['x'].state, cfg.OwnState.COPY )
+		self.assertEqual( state.bindings['x'].state, cfg.OwnState.OWNED )
 
 	def test_non_rc_parameter_is_not_tracked( self ) -> None:
 		self._import( '''
