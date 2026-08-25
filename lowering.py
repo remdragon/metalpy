@@ -8487,6 +8487,25 @@ class FunctionLowering:
 		# explored (merge_if, below), so neither branch's own instructions
 		# can be emitted directly as they're lowered
 		entry_snapshot = self._cfg.snapshot()
+		fn = self._current_fn
+		# fn.names is shared, mutable, function-wide state (no block scoping
+		# - cfg.py's own module docstring) that _stmt_Delete mutates
+		# directly (`del fn.names[x]`) with no snapshot/restore of its own,
+		# unlike self._cfg's state just above. Without this, `del x` inside
+		# ONE branch (even a TERMINATING one, which never reaches the join
+		# at all) permanently removes x from fn.names for the rest of the
+		# function - a sibling branch's own independent `del x`, or plain
+		# code after the if that expects x to still be a real name, then
+		# fails with a spurious "not a local variable"/"is not defined"
+		# instead of the correct per-path "not initialized on all code
+		# branches" _live already reports. Restored to entry between the two
+		# branches (mirrors entry_snapshot's own restore() below) and
+		# reconciled the same "never let a REMOVAL escape, only let a
+		# genuinely NEW name survive" way merge_if()'s own `removed` already
+		# is for RC bindings (see below) - a name deleted on either/both
+		# branches simply reverts to its entry state, a name newly declared
+		# on either branch survives.
+		entry_names = dict( fn.names )
 		outer_instructions = self._instructions
 		self._instructions = []
 		# no special protection needed here for entries that SURVIVE this if
@@ -8518,6 +8537,7 @@ class FunctionLowering:
 		true_end_results = self._cfg.unchecked_results()
 		true_end_narrowed = self._cfg.narrowed_snapshot()
 		true_end_live = self._cfg.live_snapshot()
+		true_names_end = dict( fn.names )
 		# return/break/continue as a branch's own last statement means
 		# that branch never reaches the if's join point at all - see
 		# merge_if()'s own comment on why that has to be treated
@@ -8528,6 +8548,8 @@ class FunctionLowering:
 
 		if node.orelse:
 			self._cfg.restore( entry_snapshot )
+			fn.names.clear()
+			fn.names.update( entry_names )
 			self._instructions = []
 			self._cfg.enter_branch( entry_snapshot.stack_depth )
 			try:
@@ -8543,6 +8565,7 @@ class FunctionLowering:
 			false_end_results = self._cfg.unchecked_results()
 			false_end_narrowed = self._cfg.narrowed_snapshot()
 			false_end_live = self._cfg.live_snapshot()
+			false_names_end = dict( fn.names )
 			false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
 		else:
 			false_captured = []
@@ -8550,9 +8573,25 @@ class FunctionLowering:
 			false_end_results = set( entry_snapshot.results )
 			false_end_narrowed = dict( entry_snapshot.narrowed )
 			false_end_live = set( entry_snapshot.live )
+			false_names_end = dict( entry_names )
 			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
+		# reconcile fn.names the same "never let a removal escape, only a
+		# genuinely new name survives" way as merge_if()'s own `removed`
+		# below - start from entry, then let each branch's own NEW
+		# declarations (never a name that was already in entry_names, del'd
+		# or not) back in. A name entry_names already had stays exactly as
+		# it was, regardless of whether either/both branches del'd it - see
+		# this method's own entry_names comment above.
+		fn.names.clear()
+		fn.names.update( entry_names )
+		for k, v in true_names_end.items():
+			if k not in entry_names:
+				fn.names[k] = v
+		for k, v in false_names_end.items():
+			if k not in entry_names:
+				fn.names[k] = v
 		self._instructions = outer_instructions
 		try:
 			true_extra, false_extra, removed = self._cfg.merge_if(

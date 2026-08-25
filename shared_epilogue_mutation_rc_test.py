@@ -61,7 +61,7 @@ class Guard:
 def run( bad: bool ) -> i32:
 	g: Guard = Guard( tag = 111 )
 	if bad:
-		compiler.decref( g )
+		del g
 		return -1
 	return 0
 
@@ -73,7 +73,7 @@ def main() -> i32:
 	return 0
 '''
 
-# both branches decref the SAME pre-if local (each on its own path) - a
+# both branches del the SAME pre-if local (each on its own path) - a
 # sanity check that the fix doesn't over-protect and cause a leak instead.
 _PLAIN_IF_ELSE_LOCAL_DECREFFED_ON_BOTH_BRANCHES = '''
 class Guard:
@@ -82,9 +82,9 @@ class Guard:
 def run( bad: bool ) -> i32:
 	g: Guard = Guard( tag = 111 )
 	if bad:
-		compiler.decref( g )
+		del g
 		return -1
-	compiler.decref( g )
+	del g
 	return 0
 
 def main() -> i32:
@@ -152,7 +152,7 @@ def run( bad: bool ) -> i32:
 	try:
 		g: Guard = Guard( tag = 111 )
 		if bad:
-			compiler.decref( g )
+			del g
 			raise Boom( tag = 222 )
 	except Boom as e:
 		compiler.decref( e )
@@ -189,7 +189,7 @@ def run( bad: bool ) -> i32:
 				raise Boom( tag = 222 )
 		except Boom as e:
 			compiler.decref( e )
-			compiler.decref( g )
+			del g
 			raise Bang( tag = 333 )
 	except Bang as e2:
 		compiler.decref( e2 )
