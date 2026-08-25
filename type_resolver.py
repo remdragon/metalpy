@@ -922,6 +922,27 @@ class TypeResolver:
 			subject_type = self._resolve_expr_type_for_desugar( fn, node.subject )
 			if subject_type is None:
 				continue
+			if not self.monomorphizer._is_concrete( subject_type ):
+				# a REENTRANT resolution (this match sits inside a generic
+				# CLASS's own method - e.g. set[T].__iter__ calling
+				# _sequence_iter(self) - reached here as a downstream effect
+				# of monomorphizing that SAME class, still mid-build)
+				# degrades gracefully to the class's own ABSTRACT, still-
+				# TypeVar'd shape (Monomorphizer.ensure_resolved's own
+				# documented, deliberate fallback for exactly this
+				# reentrancy - see its own comment on the identical
+				# dict[i32,i32].__iter__ situation) - NOT a real, usable
+				# type for this reservation. Confirmed via a real repro:
+				# accepting it here promoted a field typed
+				# `Result[Wrap.T,IndexError]` (the class's own internal
+				# TypeVar, permanently) instead of the real substituted
+				# element type, for EVERY later instantiation sharing this
+				# same match node. Declining is safe - same posture as
+				# subject_type is None just above (falls back to today's
+				# existing, potentially still-unsound-for-THIS-one-shape
+				# plain-local behavior) rather than silently promoting a
+				# field to a permanently wrong type.
+				continue
 			stem = f'__gen_match_subj_{self._match_subj_desugar_counter}'
 			self._match_subj_desugar_counter += 1
 			node.generator_promoted_subject_stem = stem
@@ -996,7 +1017,12 @@ class TypeResolver:
 				continue
 			match_nodes.append( node )
 			subject_type = self._resolve_expr_type_for_desugar( fn, node.subject )
-			if subject_type is None:
+			if subject_type is None or not self.monomorphizer._is_concrete( subject_type ):
+				# see _reserve_generator_match_subject_fields's own identical
+				# guard just above - a still-TypeVar'd subject_type here
+				# (this generic function's own match reached reentrantly,
+				# mid-build of an enclosing generic class) would substitute
+				# every binding's own type wrong too, permanently
 				continue
 			original_subject_name = node.subject.id if isinstance( node.subject, ast.Name ) else None
 			for case in node.cases:
@@ -4930,6 +4956,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			if isinstance( resolved_callee, Function ):
 				return resolved_callee.return_type
 			target: object|None
+			# set below, only when `target` is found via a GENERIC receiver's
+			# own plain .names dict (receiver_type.names.get(...), a few
+			# lines down) - that lookup returns the METHOD'S OWN DECLARED
+			# (unsubstituted) shape, still carrying the receiver class's own
+			# internal type param (Specialization.names is a bare passthrough
+			# to .base.names, never substituted - same "shared across every
+			# X[T]" shape Ptr[T]'s own dunders already document elsewhere in
+			# this codebase). Threaded down to the real `isinstance(target,
+			# Function)` return below so ITS return type can be substituted
+			# against this receiver's own concrete args before being handed
+			# back - confirmed necessary via a real repro: a generic class's
+			# own generic method call (e.g. `seq.__getitem__(i)` where
+			# `seq: Wrap[i32]`) used as a match subject crossing a yield came
+			# back typed as `Result[Wrap.T,IndexError]` (the class's own
+			# abstract T) instead of `Result[i32,IndexError]`, corrupting the
+			# generator's own promoted-field type once _reserve_generator_
+			# match_subject_fields reused this same best-effort resolution.
+			receiver_spec_for_substitution: 'Specialization|None' = None
 			if isinstance( node.func, ast.Attribute ):
 				if node.func.attr == 'or_return':
 					# <result_expr>.or_return() - recognized by AST shape
@@ -5007,6 +5051,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					names = getattr( receiver_type, 'names', None )
 					if isinstance( names, dict ):
 						target = names.get( node.func.attr )
+						if isinstance( target, Function ) and isinstance( receiver_type, Specialization ):
+							receiver_spec_for_substitution = receiver_type
 					if target is None:
 						# the attribute isn't on the union's OWN synthesized
 						# interface (Ok/Err-style member constructors etc) -
@@ -5080,7 +5126,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					target.resolve()
 				self.resolver.ensure_generator_synthesized( target )
 				self.resolver.resolve_declared_types( target )
-				return target.return_type if isinstance( target, Function ) else None
+				return_type = target.return_type if isinstance( target, Function ) else None
+				if return_type is not None and receiver_spec_for_substitution is not None:
+					owner_cls = receiver_spec_for_substitution.base
+					owner_type_params = getattr( owner_cls, 'type_params', None )
+					if owner_type_params:
+						return_type = self.resolver.monomorphizer.substitute_type_params(
+							return_type, owner_type_params, receiver_spec_for_substitution.args,
+						)
+				return return_type
 			if isinstance( target, Overload ):
 				# an @overload-decorated method group (e.g. Result[T,E].
 				# unwrap_or) - previously fell all the way through to the
