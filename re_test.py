@@ -999,6 +999,28 @@ class RePhase9BehaviorTests( RealCompileMixin, unittest.TestCase ):
 			( 'memoryview', _RE_MEMORYVIEW ),
 		])
 
+	def test_pattern_error_str( self ) -> None:
+		# regression: re.PatternError had no __str__ at all - `f'{e}'`/
+		# str(e) on a compile-error payload was a hard compile error (found
+		# via a real repro, grap.py's own filespec-pattern error message)
+		self.assert_programs_run([
+			( 'pattern_error_str', '''
+import re
+
+def main() -> i32:
+	bad: Result[re.Pattern, re.PatternError] = re.compile( r"(" )
+	match bad:
+		case Result.Err( e ):
+			if str( e ) != "re: unbalanced parenthesis":
+				return 1
+			if f"{e}" != "re: unbalanced parenthesis":
+				return 2
+			return 0
+		case Result.Ok( _ ):
+			return 3
+''' ),
+		])
+
 
 if __name__ == '__main__':
 	unittest.main()

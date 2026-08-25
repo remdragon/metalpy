@@ -55,8 +55,14 @@ def main() -> i32:
 	match str.from_utf16( compiler.cast( ConstPtr[u16], buf.get_const_ptr() ), 2 ):
 		case Result.Ok( _ ):
 			return 1
-		case Result.Err( _ ):
-			pass
+		case Result.Err( e ):
+			# regression: CodecError had no __str__ at all - str(e)/f'{e}'
+			# was a hard compile error (found via a real repro, grap.py's
+			# own encode()-error message)
+			if str( e ) != 'utf-16le codec error: missing null terminator':
+				return 2
+			if f'{e}' != 'utf-16le codec error: missing null terminator':
+				return 3
 	return 0
 ''' ),
 			( 'to_utf16_ascii_and_caches', '''
