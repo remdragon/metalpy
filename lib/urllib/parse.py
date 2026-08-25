@@ -49,6 +49,12 @@ class UrlParseError:
 	def __init__( self, message: str ) -> None:
 		self.message = message
 
+	def __str__( self ) -> str:
+		return self.message
+
+	def __repr__( self ) -> str:
+		return f"UrlParseError('{self.message}')"
+
 # ---------------------------------------------------------------------------
 # percent-encoding (RFC 3986) - quote()/quote_plus()
 # ---------------------------------------------------------------------------

@@ -256,4 +256,20 @@ def main() -> i32:
 		return 25
 	return 0
 ''' ),
+			( 'urlparseerror_str_and_repr', '''
+from urllib.parse import unquote
+
+def main() -> i32:
+	match unquote( '%zz' ):
+		case Result.Err( e ):
+			if str( e ) != 'invalid percent-encoding: not a hex digit':
+				return 1
+			if f'{e}' != 'invalid percent-encoding: not a hex digit':
+				return 2
+			if e.__repr__() != "UrlParseError('invalid percent-encoding: not a hex digit')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
+''' ),
 		])

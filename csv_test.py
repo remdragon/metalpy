@@ -281,6 +281,23 @@ def main() -> i32:
 		return 5
 	return 0
 ''' ),
+			( 'csv_error_str_and_repr', '''
+import csv
+
+def main() -> i32:
+	p = csv.RowParser()
+	match p.feed_line( '"a"b' ):
+		case Result.Err( e ):
+			if str( e ) != 'unexpected character after closing quote':
+				return 1
+			if f'{e}' != 'unexpected character after closing quote':
+				return 2
+			if e.__repr__() != "CsvError('unexpected character after closing quote')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
+''' ),
 		])
 
 

@@ -63,6 +63,8 @@ def main() -> i32:
 				return 2
 			if f'{e}' != 'utf-16le codec error: missing null terminator':
 				return 3
+			if e.__repr__() != "CodecError('utf-16le', 'missing null terminator')":
+				return 4
 	return 0
 ''' ),
 			( 'to_utf16_ascii_and_caches', '''

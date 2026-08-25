@@ -1015,6 +1015,8 @@ def main() -> i32:
 				return 1
 			if f"{e}" != "re: unbalanced parenthesis":
 				return 2
+			if e.__repr__() != "PatternError('re: unbalanced parenthesis')":
+				return 3
 			return 0
 		case Result.Ok( _ ):
 			return 3

@@ -91,6 +91,9 @@ class PatternError:
 	def __str__( self ) -> str:
 		return self.message
 
+	def __repr__( self ) -> str:
+		return f"PatternError('{self.message}')"
+
 
 @enum( i32 )
 class MatchError:

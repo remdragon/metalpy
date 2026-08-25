@@ -17,6 +17,12 @@ class BinasciiError:
 	def __init__( self, message: str ) -> None:
 		self.message = message
 
+	def __str__( self ) -> str:
+		return self.message
+
+	def __repr__( self ) -> str:
+		return f"BinasciiError('{self.message}')"
+
 
 _HEX_LOWER: list[u8] = [
 	0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,

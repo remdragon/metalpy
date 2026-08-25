@@ -93,9 +93,17 @@ def main() -> i32:
 
 	r = bitstream.BitReader( out )
 	r.read_bits( u32( 8 ) ).unwrap( 'first 8 bits, exactly the whole stream' )
-	if r.read_bits( u32( 1 ) ).is_ok():
-		return 1
-	return 0
+	match r.read_bits( u32( 1 ) ):
+		case Result.Err( e ):
+			if str( e ) != 'read_bits: unexpected end of stream':
+				return 1
+			if f'{e}' != 'read_bits: unexpected end of stream':
+				return 2
+			if e.__repr__() != "BitstreamError('read_bits: unexpected end of stream')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
 ''' ),
 			( 'bits_remaining_tracks_consumption', '''
 import bitstream

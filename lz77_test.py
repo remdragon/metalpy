@@ -152,4 +152,24 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			( 'lz77_error_str_and_repr', '''
+import lz77
+
+def main() -> i32:
+	out: UnsafeList[u8] = UnsafeList[u8]()
+	out.append( u8( 1 ) )
+	out.append( u8( 2 ) )
+
+	match lz77.copy_match( out, usize( 3 ), usize( 1 ) ): # distance > out_len
+		case Result.Err( e ):
+			if str( e ) != 'copy_match: distance out of range':
+				return 1
+			if f'{e}' != 'copy_match: distance out of range':
+				return 2
+			if e.__repr__() != "LZ77Error('copy_match: distance out of range')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
+''' ),
 		] )

@@ -49,6 +49,12 @@ class CsvError:
 	def __init__( self, message: str ) -> None:
 		self.message = message
 
+	def __str__( self ) -> str:
+		return self.message
+
+	def __repr__( self ) -> str:
+		return f"CsvError('{self.message}')"
+
 
 class MaybeRow:
 	''' row-or-end-of-input carrier - see the module docstring's point 2 on
