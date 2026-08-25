@@ -91,14 +91,14 @@ def main() -> i32:
 	i: i32 = 0
 	while i < 32:
 		r: Reader = Reader()
-		readers.append( r ).unwrap( 'append failed' )
-		threads.append( threading.Thread( r.run ) ).unwrap( 'append failed' )
+		readers.append( r )
+		threads.append( threading.Thread( r.run ) )
 		with compiler.wrap_arithmetic:
 			i = i + 1
 	i = 0
 	while i < 8:
 		w: Writer = Writer()
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			i = i + 1
 	k: usize = 0
@@ -191,8 +191,8 @@ def main() -> i32:
 	i: i32 = 0
 	while i < 64:
 		w: Worker = Worker()
-		workers.append( w ).unwrap( 'append failed' )
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		workers.append( w )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			i = i + 1
 	k: usize = 0
@@ -214,6 +214,78 @@ def main() -> i32:
 '''
 
 
+# a global's OWN initializing write racing a thread it spawns itself (via an
+# ordinary function call in its own initializer, legal per SYNTAX.md) which
+# reassigns that SAME global through the normal locked `global X; X = ...'
+# path while __metalpy_init() is still running - closes the gap
+# cfg.py's assign_global_initializer/lowering.py's run_global fix for:
+# previously _g's own init write bypassed cfg.assign() (and therefore the
+# lock) entirely, racing the writer thread's fully-locked writes.
+_GLOBAL_INIT_WRITE_RACE_STRESS = '''
+import compiler
+import threading
+from atomic import Atomic
+
+# tracks live Box count - a lost decref (the leak half of the race: neither
+# write path decrefs the value the OTHER one just clobbered) shows up here
+# as live count > 1 even after only one Box is actually reachable through _g
+_live: Atomic[i32] = Atomic[i32]( 0 )
+
+class Box:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+		_live.fetch_add( 1 )
+	def __del__( self ) -> None:
+		_live.fetch_add( -1 )
+
+_writer_thread: threading.Thread|None = None
+
+class Writer:
+	def run( self ) -> None:
+		global _g
+		i: i32 = 0
+		while i < 200000:
+			_g = Box( i )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+def spawn_writer() -> Box:
+	global _writer_thread
+	w: Writer = Writer()
+	t: threading.Thread = threading.Thread( w.run )
+	_writer_thread = t
+	# spin to give the writer thread a real chance to be mid-loop by the time
+	# this function returns and the caller (_g's own initializing write,
+	# outside this function) runs - widens the race window instead of
+	# relying on the writer losing the OS scheduler race entirely
+	j: i32 = 0
+	while j < 50000:
+		with compiler.wrap_arithmetic:
+			j = j + 1
+	return Box( -1 )
+
+_g: Box = spawn_writer()
+
+def main() -> i32:
+	if _writer_thread is None:
+		return 1
+	_writer_thread.join()
+	i: i32 = 0
+	while i < 2000:
+		b: Box = _g
+		if b.x < -1:
+			return 1
+		with compiler.wrap_arithmetic:
+			i = i + 1
+		# only the Box currently reachable through _g should still be alive -
+		# a lost decref from the race leaks the clobbered value, live > 1
+		if _live.load() != 1:
+			return 2
+	return 0
+'''
+
+
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile tests' )
 class ThreadSafeGlobalsTests( RealCompileMixin, unittest.TestCase ):
 	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
@@ -230,6 +302,12 @@ class ThreadSafeGlobalsTests( RealCompileMixin, unittest.TestCase ):
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
 		self.assert_programs_run([ ( 'narrowed_read_concurrent_stress', _NARROWED_READ_CONCURRENT_STRESS ) ], timeout = 30.0 )
+
+	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
+	def test_global_init_write_race_stress( self ) -> None:
+		# own executable: real OS threads, must not be merged with other
+		# cases via assert_programs_run
+		self.assert_programs_run([ ( 'global_init_write_race_stress', _GLOBAL_INIT_WRITE_RACE_STRESS ) ], timeout = 30.0 )
 
 
 if __name__ == '__main__':

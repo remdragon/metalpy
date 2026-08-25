@@ -87,7 +87,7 @@ class BinaryReader( Reader, Seekable ):
 			close_raw( self.__fd ).is_ok() # see __del__'s own comment
 			self.__fd = INVALID_FD
 
-	def fd( self ) -> FD:
+	def fileno( self ) -> FD:
 		return self.__fd
 
 	def _set_ops( self, aio: FileOpsInterface ) -> None:
@@ -122,7 +122,7 @@ class BinaryWriter( Writer, Seekable ):
 			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 			self.__fd = INVALID_FD
 
-	def fd( self ) -> FD:
+	def fileno( self ) -> FD:
 		return self.__fd
 
 	def _set_ops( self, aio: FileOpsInterface ) -> None:
@@ -160,7 +160,7 @@ class BinaryReadWriter( Reader, Writer, Seekable ):
 			close_raw( self.__fd ).is_ok() # see BinaryReader.__del__'s own comment
 			self.__fd = INVALID_FD
 
-	def fd( self ) -> FD:
+	def fileno( self ) -> FD:
 		return self.__fd
 
 	def _set_ops( self, aio: FileOpsInterface ) -> None:

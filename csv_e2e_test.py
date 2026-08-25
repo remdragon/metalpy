@@ -23,9 +23,9 @@ import csv
 
 def row_of( a: str, b: str, c: str ) -> list[str]:
 	r: list[str] = list[str]()
-	r.append( a ).unwrap( 'x' )
-	r.append( b ).unwrap( 'x' )
-	r.append( c ).unwrap( 'x' )
+	r.append( a )
+	r.append( b )
+	r.append( c )
 	return r
 
 def rows_equal( a: list[str], b: list[str] ) -> bool:
@@ -44,12 +44,12 @@ def main() -> i32:
 	path: str = 'csv_e2e_case1.tmp'
 
 	original: list[list[str]] = list[list[str]]()
-	original.append( row_of( 'plain', 'fields', 'here' )).unwrap( 'x' )
-	original.append( row_of( 'has,comma', 'plain', 'plain' )).unwrap( 'x' )
-	original.append( row_of( 'has"quote', 'plain', 'plain' )).unwrap( 'x' )
-	original.append( row_of( 'multi\\nline\\nfield', 'plain', 'plain' )).unwrap( 'x' )
-	original.append( row_of( '', '', 'trailing empty above' )).unwrap( 'x' )
-	original.append( row_of( 'combo: a,b"c\\nd', 'plain', 'plain' )).unwrap( 'x' )
+	original.append( row_of( 'plain', 'fields', 'here' ))
+	original.append( row_of( 'has,comma', 'plain', 'plain' ))
+	original.append( row_of( 'has"quote', 'plain', 'plain' ))
+	original.append( row_of( 'multi\\nline\\nfield', 'plain', 'plain' ))
+	original.append( row_of( '', '', 'trailing empty above' ))
+	original.append( row_of( 'combo: a,b"c\\nd', 'plain', 'plain' ))
 
 	w = csv.writer( path ).unwrap( 'open for write' )
 	w.writerows( original ).unwrap( 'writerows' )

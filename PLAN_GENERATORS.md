@@ -233,8 +233,8 @@ Generator functions (`yield`, state-machine transform)
 
 STATUS: v1 + Phase 2 (while loops) + Phase 3 (`for`-loop consumption) +
 Phase 4 (`for x in range(...):` containing yield) + Phase 5 (`for x in
-<expr>:` containing yield, over a non-range() indexable OR another
-generator) + Phase 6 (yield inside `if`/`if-else`, and yield wrapped in
+<expr>:` containing yield, over an Iterable[T]/IteratorProtocol[T]
+conformer) + Phase 6 (yield inside `if`/`if-else`, and yield wrapped in
 an arithmetic-mode `with` block) + Phase 7 (generic generator functions,
 `def gen[T](x: T) -> Iterator[T]:`, both explicit `gen[i32](...)` and
 inferred `gen(...)` instantiation, interim-scoped to reject a body that
@@ -254,6 +254,20 @@ already landed; the two schemes overlap in NAME but not in MEANING -
 watch for this when
 reading older commit messages/comments that say "Phase 1" or "Phase 2"
 meaning something other than the roadmap's own numbering.
+
+> **Note (2026-08-24): the `__len__`/`__getitem__` "indexable" for-loop
+> shape described throughout this doc (Phase 3/5, `_lower_for_over_
+> indexable`, `_desugar_indexable_for`, `_probe_indexlike_getitem`,
+> `_maybe_unwrap_call`) no longer exists.** Both lowering.py's top-level
+> `_stmt_For` and type_resolver.py's `_desugar_general_for` now dispatch
+> strictly by declared `IteratorProtocol[T]`/`Iterable[T]` conformance -
+> no duck typing. A conformer's `__iter__()` is called once and its
+> result driven via `__next__()`; `list[T]`/`set[T]`/`tuple[T,...]` all
+> declare `Sequence[T]`/`Iterable[T]` conformance instead of relying on
+> structural shape. The design reasoning in the sections below (why
+> `node.iter` is lowered exactly once, the StopIteration-stripping
+> binding shape, etc.) still applies unchanged - only the shape-detection
+> mechanism itself was replaced.
 
 Past the original roadmap's own 9 phases, `defer`/`errdefer` support
 inside a generator body has ALSO landed (own separate mini-plan, not
@@ -347,7 +361,8 @@ intrinsic" section, confirmed with the user 2026-08-15) - the sugar path
 the generator machinery to RECOGNIZE and desugar a for-loop that happens
 to iterate over a range() call, same as a user would write by hand today
 outside a generator. Phase 5 does the same for a for-loop over anything
-ELSE with a real for-loop shape (list-like, or another generator) - this
+ELSE with a real for-loop shape (an Iterable[T]/IteratorProtocol[T]
+conformer, or another generator) - this
 is what actually makes generators testable with realistic code (a
 generator consuming a real collection, or composing another generator),
 which is why the roadmap prioritized it first.
@@ -355,8 +370,8 @@ which is why the roadmap prioritized it first.
 `yield` may be a direct top-level statement of the function body (v1),
 the single yield inside a direct top-level `while` loop (Phase 2), or the
 single yield inside a direct top-level `for` loop - over range() (Phase
-4), a list-like indexable, or another generator's own `__next__()` (both
-Phase 5) - the last two desugared to the Phase 2 while shape before
+4), an Iterable[T]/IteratorProtocol[T] conformer, or another generator's
+own `__next__()` (both Phase 5) - the last two desugared to the Phase 2 while shape before
 anything else runs, same as range() already was. A yield nested inside
 an if/with/try, inside a for-loop over something with neither shape, or
 inside a loop that has more than one yield or any USER-written
@@ -411,19 +426,20 @@ each because the simpler thing turned out to already be sufficient:
    wouldn't need the dispatch mechanism to change, only the unit-
    recognition/guard-building logic.
 
-Phase 3 design (lowering.py's `_lower_for_over_iterator`, alongside the
-existing `_lower_for_range`/`_lower_for_over_indexable`): `for x in
-<expr>:` now recognizes a third shape - `<expr>`'s type has a `__next__()`
+Phase 3 design (lowering.py's `_lower_for_over_iterator`, alongside
+`_lower_for_range`): `for x in
+<expr>:` recognizes a shape where `<expr>`'s type has a `__next__()`
 returning `T|None` (checked generically, not generator-specific - any
 hand-written class implementing `__next__` this way qualifies too, see
 `test_for_loop_over_bad_next_shape_is_rejected`). `node.iter` is lowered
-exactly ONCE up front, then handed to whichever of the three paths
-applies (a pre-existing bug class this incidentally forecloses:
-`_lower_for_over_indexable` used to re-lower `node.iter` itself, which
-would have double-evaluated/double-constructed an iterable expression
-with a side effect - never triggered before because nothing passed to a
-`for` loop had a side effect worth noticing until a generator
-CONSTRUCTOR call became a realistic `node.iter`).
+exactly ONCE up front, then handed to whichever path applies - avoiding a
+bug class where a re-lowered `node.iter` would double-evaluate/double-
+construct an iterable expression with a side effect (never triggered
+before because nothing passed to a `for` loop had a side effect worth
+noticing until a generator CONSTRUCTOR call became a realistic
+`node.iter`). This later became `_stmt_For`'s own strict
+IteratorProtocol[T]/Iterable[T] dispatch (no `__len__`/`__getitem__`
+duck-typing) - see the STATUS section at top.
 
 Corrected finding from the v1 write-up above: reading a `T|None` value
 back out in narrowed form is NOT a dead end - it does NOT work via a
@@ -479,7 +495,7 @@ hand-written while-loop version (same instruction numbering, same
 `__gen_resuming_N` local) by inspecting it directly.
 
 Phase 5 design (type_resolver.py's `_desugar_general_for`/
-`_desugar_indexable_for`/`_desugar_iterator_for`) - the roadmap's own
+`_desugar_iterator_for`) - the roadmap's own
 Phase 1, landed the same session it was scoped in. `node.iter`'s type is
 resolved via a NEW `_resolve_expr_type_for_desugar` (a standalone,
 `.visit()`-never-called `_ReferenceResolver`, seeded with parameters plus
@@ -487,13 +503,12 @@ a permissive AnnAssign scan) reusing `_type_of_expr` - confirmed via
 research that this already resolves arbitrary expressions, including
 `obj.method()` calls recursing into the receiver, entirely from AST, no
 lowering needed (it's what `visit_Match` already uses for a match
-subject). `__len__`+`__getitem__` wins the SAME priority tie lowering.py's
-own ordinary `_stmt_For` gives it against `__next__`... no wait, the
-other way - `__next__` is checked FIRST, matching `_lower_for_over_
-iterator`'s own priority over indexable for an ordinary for-loop.
+subject). (Historical: at the time this landed, `__len__`+`__getitem__`
+was one of two shapes considered, with `__next__` checked first against
+it - see the 2026-08-24 note above for the current strict
+IteratorProtocol[T]/Iterable[T] dispatch that replaced this entirely.)
 
-Both desugared shapes hit a REAL fallibility snag the design didn't
-originally anticipate: `list[T]`'s own `__getitem__` (and, unusually,
+`list[T]`'s own `__getitem__` (and, unusually,
 NOT its `__len__`, confirmed by inspecting the emitted C - only
 `__getitem__` needed the fix) is genuinely fallible, `Result[T,
 IndexError]`, and this is true for an ORDINARY (non-generator) for-loop
@@ -501,13 +516,12 @@ too, confirmed via a standalone repro (an ordinary for-loop over `list
 [i32]` fails to compile inside a plain, non-Result-returning function
 with the exact same error) - not something generators broke. `[]`
 subscript syntax hard-codes PROPAGATION (needs the enclosing function to
-be Result-shaped), which `$$__next__` never is in v1 - so the desugaring
-calls `__getitem__`/`__len__` EXPLICITLY (not via `[]`) and passes each
-through a new `_maybe_unwrap_call` helper, which panics via `.unwrap(msg)`
-when the return type actually is `Result[T,E]`-shaped (structurally safe:
-every call site here has an index strictly less than a just-read length,
-same reasoning `_lower_for_range`'s own raw-AddWrap bypass already
-relies on) and passes a non-fallible call through unchanged otherwise.
+be Result-shaped), which `$$__next__` never is in v1. (Historical: the
+indexable desugaring handled this itself, panicking via `.unwrap(msg)`
+on a structurally-safe index; the current Iterable[T] dispatch instead
+routes through `_sequence_iter`'s own generator, which strips
+StopIteration out of the returned error the same way `_desugar_iterator_
+for`'s general binding already does below.)
 
 The iterated object itself (`__for_obj_N`) is typically RC-typed (a
 list, or another generator) - a real complication the roadmap's own
@@ -935,9 +949,10 @@ above (kept the sequential landed-phase numbering there; this roadmap's
 own 1-5 numbering is a separate scoping pass, not a renumbering - see
 the STATUS section's own note on why the two schemes overlap in name but
 not meaning). `for x in <expr>:` over a non-range() iterable inside a
-generator body, both the indexable shape (`__len__`+`__getitem__`) and
-the iterator shape (`__next__() -> T|None`, i.e. one generator consuming
-another), real-compile-and-run tested including nested RC correctness.
+generator body, both the Iterable[T] shape and
+the IteratorProtocol[T] shape (`__next__() -> Result[T,E]`, i.e. one
+generator consuming another), real-compile-and-run tested including
+nested RC correctness.
 
 Phase 2: LANDED (same session it was scoped in) - see "Phase 6 design"
 above (kept the sequential landed-phase numbering there; see the STATUS
@@ -1596,14 +1611,18 @@ is `Ptr[foo$$generator]`", and `foo$$generator.__next__`'s real return type
 is `T|None`.
 
 `for x in some_call_returning_a_generator():` needs `_stmt_For` to grow a
-third branch alongside today's `_lower_for_range`/`_lower_for_over_indexable`
+third branch alongside today's `_lower_for_range`
 (lowering.py:2562-2570): `_lower_for_over_iterator`, triggered when the
 iterated object's type has a `__next__` method whose return type is
 `<elem>|None`. Loop body: call `__next__`, `is None` check (existing union-
 narrowing) to decide break-vs-continue, bind the narrowed non-None value to
-the loop target. This is a new recognizer alongside `_is_range_call`, not a
-replacement for the existing `__len__`/`__getitem__` indexable path (both
-stay valid, for different callee shapes).
+the loop target. This is a new recognizer alongside `_is_range_call`.
+(Historical sketch: the original design paired this against a separate
+`__len__`/`__getitem__` indexable path; both the `T|None`/`is None` shape
+and the indexable path described in this section were later replaced by
+the Result[T,E]/StopIteration binding and strict IteratorProtocol[T]/
+Iterable[T] dispatch - see the "Corrected finding" note above and the
+2026-08-24 note near the top of this doc.)
 
 New IR
 

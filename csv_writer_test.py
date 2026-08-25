@@ -37,13 +37,13 @@ def main() -> i32:
 	w = csv.writer( path ).unwrap( 'open for write' )
 
 	row1: list[str] = list[str]()
-	row1.append( 'a' ).unwrap( 'x' )
-	row1.append( 'b,c' ).unwrap( 'x' )
+	row1.append( 'a' )
+	row1.append( 'b,c' )
 	w.writerow( row1 ).unwrap( 'writerow1' )
 
 	row2: list[str] = list[str]()
-	row2.append( '1' ).unwrap( 'x' )
-	row2.append( '2' ).unwrap( 'x' )
+	row2.append( '1' )
+	row2.append( '2' )
 	w.writerow( row2 ).unwrap( 'writerow2' )
 	w.close()
 
@@ -72,12 +72,12 @@ def main() -> i32:
 
 	rows: list[list[str]] = list[list[str]]()
 	row1: list[str] = list[str]()
-	row1.append( 'x' ).unwrap( 'x' )
-	row1.append( 'y' ).unwrap( 'x' )
-	rows.append( row1 ).unwrap( 'x' )
+	row1.append( 'x' )
+	row1.append( 'y' )
+	rows.append( row1 )
 	row2: list[str] = list[str]()
-	row2.append( 'z' ).unwrap( 'x' )
-	rows.append( row2 ).unwrap( 'x' )
+	row2.append( 'z' )
+	rows.append( row2 )
 
 	w.writerows( rows ).unwrap( 'writerows' )
 	w.close()
@@ -95,18 +95,18 @@ def main() -> i32:
 	w = csv.writer( path ).unwrap( 'open for write' )
 
 	row1: list[str] = list[str]()
-	row1.append( 'name' ).unwrap( 'x' )
-	row1.append( 'note' ).unwrap( 'x' )
+	row1.append( 'name' )
+	row1.append( 'note' )
 	w.writerow( row1 ).unwrap( 'x' )
 
 	row2: list[str] = list[str]()
-	row2.append( 'alice' ).unwrap( 'x' )
-	row2.append( 'has "quotes" and, a comma' ).unwrap( 'x' )
+	row2.append( 'alice' )
+	row2.append( 'has "quotes" and, a comma' )
 	w.writerow( row2 ).unwrap( 'x' )
 
 	row3: list[str] = list[str]()
-	row3.append( 'bob' ).unwrap( 'x' )
-	row3.append( 'multi\\nline\\nnote' ).unwrap( 'x' )
+	row3.append( 'bob' )
+	row3.append( 'multi\\nline\\nnote' )
 	w.writerow( row3 ).unwrap( 'x' )
 	w.close()
 

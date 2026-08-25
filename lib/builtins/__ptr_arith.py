@@ -222,7 +222,7 @@ def _ptr_hex_digits( addr: usize ) -> str:
 			digit: usize = v % 16
 			with compiler.panic_arithmetic( 'digit is bounded 0-15, cannot overflow' ):
 				digit_end: usize = digit + 1
-			digits.append( _HEX_DIGIT_CHARS._byte_slice( digit, digit_end )).unwrap( '_ptr_hex_digits: append failed' )
+			digits.append( _HEX_DIGIT_CHARS._byte_slice( digit, digit_end ))
 			v = v // 16
 	count: usize = digits.__len__()
 	ordered: list[str] = list[str]() # most-significant digit first
@@ -230,7 +230,7 @@ def _ptr_hex_digits( addr: usize ) -> str:
 	with compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):
 		while i > 0:
 			i -= 1
-			ordered.append( digits.__getitem__( i ).unwrap( '_ptr_hex_digits: index in bounds by construction' )).unwrap( '_ptr_hex_digits: append failed' )
+			ordered.append( digits.__getitem__( i ).unwrap( '_ptr_hex_digits: index in bounds by construction' ))
 	return ''.join( ordered )
 
 @private

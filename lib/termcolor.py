@@ -43,7 +43,7 @@ def colored( text: str, color: str|None = None, attrs: list[str]|None = None ) -
 	if color is not None:
 		match _codes().__getitem__( color ):
 			case Result.Ok( code ):
-				parts.append( code ).unwrap( 'termcolor.colored: append failed' )
+				parts.append( code )
 			case Result.Err( e ):
 				sys.panic( f'termcolor.colored: unknown color {color}' )
 	if attrs is not None:
@@ -53,7 +53,7 @@ def colored( text: str, color: str|None = None, attrs: list[str]|None = None ) -
 			while i < len( attr_list ):
 				attr: str = attr_list.__getitem__( i ).unwrap( 'termcolor.colored: attrs index in range' )
 				if attr == 'bold':
-					parts.append( '1' ).unwrap( 'termcolor.colored: append failed' )
+					parts.append( '1' )
 				else:
 					sys.panic( 'termcolor.colored: unknown attr ' + attr )
 				i += 1

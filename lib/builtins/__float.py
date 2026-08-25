@@ -97,16 +97,16 @@ def _group_integer_part( digits: str, sep: str ) -> str:
 		while end > 3:
 			with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
 				start: usize = end - 3
-			groups.append( int_part._byte_slice( start, end )).unwrap( '_group_integer_part: append failed' )
+			groups.append( int_part._byte_slice( start, end ))
 			end = start
-		groups.append( int_part._byte_slice( 0, end )).unwrap( '_group_integer_part: append failed' )
+		groups.append( int_part._byte_slice( 0, end ))
 		group_count: usize = groups.__len__()
 		ordered: list[str] = list[str]() # most-significant GROUP first
 		i: usize = group_count
 		with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
 			while i > 0:
 				i -= 1
-				ordered.append( groups.__getitem__( i ).unwrap( '_group_integer_part: index in bounds by construction' )).unwrap( '_group_integer_part: append failed' )
+				ordered.append( groups.__getitem__( i ).unwrap( '_group_integer_part: index in bounds by construction' ))
 	return sep.join( ordered ) + rest
 
 

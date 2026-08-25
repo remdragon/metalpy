@@ -1,4 +1,5 @@
 # stdlib imports:
+import copy
 import time
 import unittest
 
@@ -41,6 +42,49 @@ class TypeReprCycleTestCase( unittest.TestCase ):
 		text = repr( prev )
 		self.assertLess( time.perf_counter() - start, 1.0 )
 		self.assertEqual( text, "<Specialization 'S59'>" )
+
+class NameDeepcopyIdentityTestCase( unittest.TestCase ):
+	''' Name/Type/Function/... instances are process-wide identity-based
+	singletons (interned via Discovery._get_or_create_specialization and
+	friends) - copy.deepcopy() reaching one of these (typically via an AST
+	node's own cached resolved-reference tag, e.g. node.resolved_callee)
+	must never clone it, or every identity-keyed cache downstream silently
+	corrupts. Confirmed via a real repro: type_resolver.py's
+	_apply_live_flag_guards deep-copies a generator's promoted-field
+	assignment statement to build its "first assignment" branch - when
+	that statement's own value expression carried a resolved_callee tag
+	pointing at a real Function, deepcopy recursively cloned the Function's
+	entire return-type graph (including supposedly-singleton scalars like
+	i32), producing a second, non-identical object with the same qualname.
+	Two DIFFERENT generic instantiations of one shared generator sharing a
+	match-subject-crossing-a-yield promoted field then registered both the
+	original and the clone as compile units with the same qualname,
+	crashing with a RecursionError inside TaggedUnion's own dataclass
+	__eq__ (infinite structural comparison, no true cycle needed - just an
+	unbounded diamond of "equal but not the same object" nodes). '''
+
+	def test_deepcopy_of_a_type_object_returns_the_same_instance( self ) -> None:
+		rc = RCClass( stem = 'Foo', qualname = 'mymod.Foo', file = None, line = None )
+		self.assertIs( copy.deepcopy( rc ), rc )
+
+	def test_deepcopy_of_a_container_holding_a_type_object_preserves_identity( self ) -> None:
+		# the realistic shape: an AST node (here, a plain dict standing in
+		# for one) holds a reference to a Type/Function - deep-copying the
+		# CONTAINER (as _apply_live_flag_guards does for a whole ast.stmt)
+		# must still leave every Name-family value inside it untouched.
+		i32 = Scalar( stem = 'i32', qualname = 'intrinsics.i32', file = None, line = None, sizeof = 4 )
+		rc = RCClass( stem = 'Foo', qualname = 'mymod.Foo', file = None, line = None )
+		fn = Function( stem = 'bar', qualname = 'mymod.Foo.bar', file = None, line = None, cls = rc, node = None )
+		fn.return_type = i32
+		holder = { 'resolved_callee': fn, 'nested': [ rc, i32 ] }
+
+		cloned = copy.deepcopy( holder )
+
+		self.assertIsNot( cloned, holder ) # the container itself DOES copy
+		self.assertIs( cloned[ 'resolved_callee' ], fn )
+		self.assertIs( cloned[ 'resolved_callee' ].return_type, i32 )
+		self.assertIs( cloned[ 'nested' ][0], rc )
+		self.assertIs( cloned[ 'nested' ][1], i32 )
 
 if __name__ == '__main__':
 	unittest.main()

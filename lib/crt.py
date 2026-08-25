@@ -10,6 +10,27 @@ def __error() -> Ptr[i32]:
 def __error() -> Ptr[i32]:
 	...
 
+# split by target (unlike this file's other externs) so header='unistd.h'
+# can apply to the branch that's genuinely POSIX - a single ungated def here
+# would get discovered (and its header= registered) on EVERY target, since
+# nothing else in this file gates on @compiler.target the way its own
+# callers (lib/sys.py) do; confirmed via a real "Cannot open include file:
+# 'unistd.h'" error on Windows from an earlier, ungated attempt at this same
+# fix. See write's own identical comment below - this is the same pattern,
+# repeated for every unistd.h-shaped extern in this file.
+@compiler.target( os = not 'windows' )
+@extern( 'c', '_exit', header = 'unistd.h' )
+def _exit(
+	status: i32,
+) -> NoReturn:
+	...
+
+# no real Windows caller today (lib/sys.py's own exit() only ever reaches
+# this via its `os = not 'windows'` branch) - kept for symmetry with every
+# other os-split pair in this file, and so `from crt import _exit` still
+# resolves on every target. Deliberately no header= (unistd.h doesn't exist
+# on Windows).
+@compiler.target( os = 'windows' )
 @extern( 'c', '_exit' )
 def _exit(
 	status: i32,
@@ -91,10 +112,30 @@ def memmove(
 ) -> Ptr[None]:
 	...
 
+# deliberately NOT header='unistd.h' (unlike write/close/read/lseek/
+# ftruncate/getcwd/rmdir/unlink just below/above - all real POSIX.1 base
+# functions, visible in glibc's <unistd.h> under plain -std=c11): readlink
+# is XSI/BSD-gated in glibc, hidden under -std=c11's implied __STRICT_ANSI__
+# unless _GNU_SOURCE (or similar) is defined before the FIRST #include of
+# anything - confirmed via a real "implicit declaration of function
+# 'readlink'" GCC error even with unistd.h genuinely included. Defining
+# _GNU_SOURCE process-wide was tried and reverted: it also newly exposes
+# glibc's OWN clock_gettime through <pthread.h>'s transitively-included
+# <time.h> (previously hidden the same way), conflicting with lib/posix/
+# time.py's own hand-declared one (confirmed via a real "conflicting types
+# for 'clock_gettime'" error) - likely not the only such collision waiting
+# in every other hand-rolled POSIX extern in this codebase. Given that
+# blast radius, kept private/hand-declared here instead - the ConstPtr[None]/
+# Ptr[None] param types (not ConstPtr[u8]/Ptr[u8]) are still real readlink's
+# own signature (matching mkdir's void*-sidesteps-signedness posture above),
+# kept correct in case a future, more targeted fix (e.g. a readlink-specific
+# feature-test macro scoped narrower than _GNU_SOURCE) makes header=
+# viable again. Callers (lib/posix/fs.py's readlink) cast their
+# ConstPtr[u8]/Ptr[u8] arguments accordingly.
 @extern( 'c', 'readlink' )
 def readlink(
-	path: ConstPtr[u8],
-	buf: Ptr[u8],
+	path: ConstPtr[None],
+	buf: Ptr[None],
 	bufsize: usize,
 ) -> isize:
 	...
@@ -110,6 +151,24 @@ def strnlen(
 ) -> usize:
 	...
 
+# ConstPtr[None] (not ConstPtr[u8]) on the POSIX branch - see readlink's own
+# comment above for why (real write's `const void*` buffer, made visible by
+# header='unistd.h', conflicts with unsigned u8's pointee signedness).
+# Callers (lib/fs.py's write_raw) cast their ConstPtr[u8] argument
+# accordingly. emitter_c.py's own _PROLOGUE_CRASH_HANDLER now `#include
+# <unistd.h>` directly on the POSIX side instead of hand-declaring its own
+# write()/_exit() - safe now that this file's own prototype for both defers
+# to the same real header rather than guessing at an incompatible one.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'write', header = 'unistd.h' )
+def write(
+	fd: i32,
+	buf: ConstPtr[None],
+	count: usize,
+) -> isize:
+	...
+
+@compiler.target( os = 'windows' )
 @extern( 'c', 'write' )
 def write(
 	fd: i32,
@@ -126,12 +185,37 @@ def open(
 ) -> i32:
 	...
 
+# int/int32_t are the same underlying type on every real target here, so
+# this split exists purely to carry header='unistd.h' without also
+# registering it for a Windows build (see _exit's own comment above) - not
+# because close's own signature needed correcting.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'close', header = 'unistd.h' )
+def close(
+	fd: i32,
+) -> i32:
+	...
+
+@compiler.target( os = 'windows' )
 @extern( 'c', 'close' )
 def close(
 	fd: i32,
 ) -> i32:
 	...
 
+# Ptr[None] (not Ptr[u8]) on the POSIX branch - see write's own comment
+# above for why. Callers (lib/fs.py's read_raw) cast their Ptr[u8] argument
+# accordingly.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'read', header = 'unistd.h' )
+def read(
+	fd: i32,
+	buf: Ptr[None],
+	count: usize,
+) -> isize:
+	...
+
+@compiler.target( os = 'windows' )
 @extern( 'c', 'read' )
 def read(
 	fd: i32,
@@ -140,6 +224,20 @@ def read(
 ) -> isize:
 	...
 
+# i64 already matches real off_t (a 64-bit `long`/`long long` on every
+# 64-bit target this codebase supports) - this split exists purely to carry
+# header='unistd.h' without registering it on Windows too, same as close's
+# own comment above.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'lseek', header = 'unistd.h' )
+def lseek(
+	fd: i32,
+	offset: i64,
+	whence: i32,
+) -> i64:
+	...
+
+@compiler.target( os = 'windows' )
 @extern( 'c', 'lseek' )
 def lseek(
 	fd: i32,
@@ -148,6 +246,16 @@ def lseek(
 ) -> i64:
 	...
 
+# i64 already matches real off_t - see lseek's own comment just above.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'ftruncate', header = 'unistd.h' )
+def ftruncate(
+	fd: i32,
+	length: i64,
+) -> i32:
+	...
+
+@compiler.target( os = 'windows' )
 @extern( 'c', 'ftruncate' )
 def ftruncate(
 	fd: i32,
@@ -155,13 +263,103 @@ def ftruncate(
 ) -> i32:
 	...
 
+# Ptr[None] (not Ptr[u8]) param AND return on the POSIX branch - real
+# getcwd's `char*` conflicts with unsigned u8 both ways once header=
+# 'unistd.h' makes the real prototype visible. Callers (lib/os.py's
+# _getcwd) cast their Ptr[u8] argument accordingly; the None-vs-not-None
+# check on the returned pointer needs no cast either way.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'getcwd', header = 'unistd.h' )
+def getcwd(
+	buf: Ptr[None],
+	size: usize,
+) -> Ptr[None]:
+	# NULL on failure (e.g. ERANGE if buf is too small for the real cwd) -
+	# callers must check get_errno() to distinguish the failure reason.
+	...
+
+@compiler.target( os = 'windows' )
 @extern( 'c', 'getcwd' )
 def getcwd(
 	buf: Ptr[u8],
 	size: usize,
 ) -> Ptr[u8]:
-	# NULL on failure (e.g. ERANGE if buf is too small for the real cwd) -
-	# callers must check get_errno() to distinguish the failure reason.
+	...
+
+@extern( 'c', 'mkdir', header = 'sys/stat.h' )
+def mkdir(
+	# ConstPtr[None], not ConstPtr[u8] - lib/posix/stat.py's own stat()
+	# extern already pulls in sys/stat.h (real prototype: mkdir(const
+	# char*, mode_t)), and once a header makes the real prototype visible
+	# gcc hard-errors on a char*/unsigned-char* mismatch
+	# (-Wincompatible-pointer-types) - void* sidesteps the signedness
+	# distinction entirely, same posture as opendir/stat's own path params.
+	path: ConstPtr[None],
+	mode: i32,
+) -> i32:
+	...
+
+# ConstPtr[None] (not ConstPtr[u8]) on the POSIX branch - see mkdir's own
+# comment above for why. Callers (lib/os.py's rmdir) cast their ConstPtr[u8]
+# argument accordingly.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'rmdir', header = 'unistd.h' )
+def rmdir(
+	path: ConstPtr[None],
+) -> i32:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'c', 'rmdir' )
+def rmdir(
+	path: ConstPtr[u8],
+) -> i32:
+	...
+
+# ConstPtr[None] (not ConstPtr[u8]) on the POSIX branch - see mkdir's own
+# comment above for why. Callers (lib/os.py's unlink) cast their
+# ConstPtr[u8] argument accordingly.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'unlink', header = 'unistd.h' )
+def unlink(
+	path: ConstPtr[None],
+) -> i32:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'c', 'unlink' )
+def unlink(
+	path: ConstPtr[u8],
+) -> i32:
+	...
+
+@extern( 'c', 'rename' )
+def rename(
+	old: ConstPtr[u8],
+	new: ConstPtr[u8],
+) -> i32:
+	...
+
+# POSIX-only: os.rename()'s own fail-if-exists semantics (matching Windows)
+# are built on link()+unlink() rather than plain rename(2), which replaces
+# an existing destination - see lib/os.py's rename(). ConstPtr[None], not
+# ConstPtr[u8] - same char*/unsigned-char* mismatch as mkdir/rmdir/unlink's
+# own POSIX bindings above, once header= makes the real prototype visible.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'link', header = 'unistd.h' )
+def link(
+	oldpath: ConstPtr[None],
+	newpath: ConstPtr[None],
+) -> i32:
+	...
+
+@extern( 'c', 'getenv' )
+def getenv(
+	name: ConstPtr[u8],
+) -> ConstPtr[u8]:
+	# the returned pointer is owned by the CRT (valid only until the next
+	# environment mutation) - callers must copy it into a str immediately,
+	# never hold onto it.
 	...
 
 # ---------------------------------------------------------------------------

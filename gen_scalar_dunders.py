@@ -370,7 +370,7 @@ emit( '\t\twhile v != 0:' )
 emit( '\t\t\tdigit: T = v % 10' )
 emit( '\t\t\tdigit_index: usize = usize( digit )' )
 emit( '\t\t\tdigit_index_end: usize = digit_index + 1' )
-emit( "\t\t\tdigits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end )).unwrap( 'i_str_unsigned: append failed' )" )
+emit( "\t\t\tdigits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end ))" )
 emit( '\t\t\tv = v // 10' )
 emit( '\tcount: usize = digits.__len__()' )
 emit( '\tordered: list[str] = list[str]() # most-significant digit first' )
@@ -378,7 +378,7 @@ emit( '\ti: usize = count' )
 emit( "\twith compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):" )
 emit( '\t\twhile i > 0:' )
 emit( '\t\t\ti -= 1' )
-emit( "\t\t\tordered.append( digits.__getitem__( i ).unwrap( 'i_str_unsigned: index in bounds by construction' )).unwrap( 'i_str_unsigned: append failed' )" )
+emit( "\t\t\tordered.append( digits.__getitem__( i ).unwrap( 'i_str_unsigned: index in bounds by construction' ))" )
 emit( "\treturn ''.join( ordered )" )
 emit()
 
@@ -394,7 +394,7 @@ emit( '\t\t\tdigit: T = v % 10 # C-truncating: same sign as v (or zero), never M
 emit( '\t\t\tmagnitude_digit: T = -digit if digit < 0 else digit # a single digit (0-9) - safe to negate for any width, unlike v itself' )
 emit( '\t\t\tdigit_index: usize = usize( magnitude_digit )' )
 emit( '\t\t\tdigit_index_end: usize = digit_index + 1' )
-emit( "\t\t\tdigits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end )).unwrap( 'i_str_signed: append failed' )" )
+emit( "\t\t\tdigits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end ))" )
 emit( '\t\t\tv = v // 10' )
 emit( '\tcount: usize = digits.__len__()' )
 emit( '\tordered: list[str] = list[str]() # most-significant digit first' )
@@ -402,7 +402,7 @@ emit( '\ti: usize = count' )
 emit( "\twith compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):" )
 emit( '\t\twhile i > 0:' )
 emit( '\t\t\ti -= 1' )
-emit( "\t\t\tordered.append( digits.__getitem__( i ).unwrap( 'i_str_signed: index in bounds by construction' )).unwrap( 'i_str_signed: append failed' )" )
+emit( "\t\t\tordered.append( digits.__getitem__( i ).unwrap( 'i_str_signed: index in bounds by construction' ))" )
 emit( "\tjoined: str = ''.join( ordered )" )
 emit( "\tif is_negative:" )
 emit( "\t\treturn '-' + joined" )
@@ -418,6 +418,19 @@ emit()
 for t in UNSIGNED_INT_TYPES:
 	emit( f'{t}.__str__ = i_str_unsigned[{t}]' )
 	emit( f'{t}.__repr__ = i_str_unsigned[{t}]' )
+emit()
+
+# bool: the one remaining scalar PLAN_STR_FORMAT.md item 6 flagged as still
+# missing __str__/__repr__ once every fixed-width int type had one. 'True'/
+# 'False' (not lowercase) to match Python's own str(True)/str(False) exactly -
+# there's no pre-existing metalpy convention for boolean text output to
+# defer to instead (bool has never had __str__ here at all, per
+# compile_time_transformer.py's own long-standing fold-exclusion comment).
+emit( "def bool_str( value: bool ) -> str:" )
+emit( "\treturn 'True' if value else 'False'" )
+emit()
+emit( 'bool.__str__ = bool_str' )
+emit( 'bool.__repr__ = bool_str' )
 emit()
 
 from pathlib import Path

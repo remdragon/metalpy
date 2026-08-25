@@ -10,6 +10,12 @@ class CodecError: # ( sys.Error ):
 		self.encoding = encoding
 		self.message = message
 
+	def __str__( self ) -> str:
+		return f'{self.encoding} codec error: {self.message}'
+
+	def __repr__( self ) -> str:
+		return f"CodecError({self.encoding!r}, {self.message!r})"
+
 class Codec:
 	@abstractmethod
 	def encode( self, s: str ) -> Result[bytes,CodecError]:

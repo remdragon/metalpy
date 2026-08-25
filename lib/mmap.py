@@ -14,10 +14,8 @@ own mmap.mmap(). length=0 means "map the whole file" (its current size,
 looked up via GetFileSizeEx/fstat), matching real Python.
 
 fileno is fs.FD (lib/fs.py) - the same platform-split file-descriptor type
-File.binary_reader()'s own BinaryReader.fd() returns, so `mmap.mmap(
-f.fd(), 0)` (or the deliberately-not-yet-renamed f.fileno(), matching real
-Python's own method name, if a caller's own File wrapper exposes that
-instead) lines up directly.
+File.binary_reader()'s own BinaryReader.fileno() returns, so
+`mmap.mmap(f.fileno(), 0)` lines up directly.
 '''
 
 import compiler
@@ -28,7 +26,7 @@ ACCESS_WRITE: i32 = 2
 ACCESS_COPY:  i32 = 3
 
 
-class mmap:
+class mmap( Sequence[u8], Iterable[u8] ):
 	__ptr: Ptr[u8]
 	__len: usize
 
@@ -133,6 +131,14 @@ class mmap:
 
 	def __len__( self ) -> usize:
 		return self.__len
+
+	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
+		if index >= self.__len:
+			return Result.Err( IndexError() )
+		return Result.Ok( self.__ptr[index] )
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	def get_ptr( self ) -> Ptr[u8]:
 		return self.__ptr

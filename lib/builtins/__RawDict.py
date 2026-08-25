@@ -59,14 +59,14 @@ class RawDict:
 		return len( self.__entries )
 
 	# first position in __indices whose hash is >= target (lower_bound) -
-	# bisect_left_by_key over a borrowed slice[RawIndex] view of __indices
-	# (UnsafeList.as_slice(), no copy) keyed on .hash. Used to be a plain
+	# bisect_left_by_key operates directly on __indices (an UnsafeList
+	# [RawIndex], no view/copy needed) keyed on .hash. Used to be a plain
 	# manual binary search (see git history) written before Callable[...]
 	# existed to make bisect.py's own key= usable at all - now the first
 	# real caller of bisect.py anywhere in this codebase.
 	def _lower_bound( self, target_hash: u64 ) -> usize:
 		key: Ptr[Callable[[RawIndex],u64]] = _raw_index_hash
-		return bisect.bisect_left_by_key( self.__indices.as_slice(), target_hash, key )
+		return bisect.bisect_left_by_key( self.__indices, target_hash, key )
 
 	# the __entries index of the live entry matching (hash, key_ptr) via
 	# key_eq_fn, scanning every __indices position with the same hash

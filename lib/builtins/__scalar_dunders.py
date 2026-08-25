@@ -805,7 +805,7 @@ def i_str_unsigned[T]( value: T ) -> str:
 			digit: T = v % 10
 			digit_index: usize = usize( digit )
 			digit_index_end: usize = digit_index + 1
-			digits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end )).unwrap( 'i_str_unsigned: append failed' )
+			digits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end ))
 			v = v // 10
 	count: usize = digits.__len__()
 	ordered: list[str] = list[str]() # most-significant digit first
@@ -813,7 +813,7 @@ def i_str_unsigned[T]( value: T ) -> str:
 	with compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):
 		while i > 0:
 			i -= 1
-			ordered.append( digits.__getitem__( i ).unwrap( 'i_str_unsigned: index in bounds by construction' )).unwrap( 'i_str_unsigned: append failed' )
+			ordered.append( digits.__getitem__( i ).unwrap( 'i_str_unsigned: index in bounds by construction' ))
 	return ''.join( ordered )
 
 def i_str_signed[T]( value: T ) -> str:
@@ -828,7 +828,7 @@ def i_str_signed[T]( value: T ) -> str:
 			magnitude_digit: T = -digit if digit < 0 else digit # a single digit (0-9) - safe to negate for any width, unlike v itself
 			digit_index: usize = usize( magnitude_digit )
 			digit_index_end: usize = digit_index + 1
-			digits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end )).unwrap( 'i_str_signed: append failed' )
+			digits.append( _INT_DECIMAL_DIGIT_CHARS._byte_slice( digit_index, digit_index_end ))
 			v = v // 10
 	count: usize = digits.__len__()
 	ordered: list[str] = list[str]() # most-significant digit first
@@ -836,7 +836,7 @@ def i_str_signed[T]( value: T ) -> str:
 	with compiler.panic_arithmetic( 'bounded by count, cannot underflow' ):
 		while i > 0:
 			i -= 1
-			ordered.append( digits.__getitem__( i ).unwrap( 'i_str_signed: index in bounds by construction' )).unwrap( 'i_str_signed: append failed' )
+			ordered.append( digits.__getitem__( i ).unwrap( 'i_str_signed: index in bounds by construction' ))
 	joined: str = ''.join( ordered )
 	if is_negative:
 		return '-' + joined
@@ -869,3 +869,9 @@ u128.__str__ = i_str_unsigned[u128]
 u128.__repr__ = i_str_unsigned[u128]
 usize.__str__ = i_str_unsigned[usize]
 usize.__repr__ = i_str_unsigned[usize]
+
+def bool_str( value: bool ) -> str:
+	return 'True' if value else 'False'
+
+bool.__str__ = bool_str
+bool.__repr__ = bool_str

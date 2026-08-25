@@ -435,6 +435,93 @@ class OrJump( Instruction ):
 		return f'OrJump( dest={self.dest!r}, value={self.value!r}, target={self.target!r}, return_slot={self.return_slot!r} )'
 
 @dataclass( kw_only = True )
+class ThrowLeaf:
+	''' one covered leaf of an ir.OrThrow's own error type - matched by
+	identity against the Err branch's runtime tag (same identity-leaf
+	convention _atomic_leaves/_union_member already use). `bind` is a real
+	local Variable (the handler's own TryHandler.raise_value_var - `except
+	T as e:` binds it to `e` itself, a bare `except T:` gets a hidden
+	compiler-synthesized one instead, needed for bare `raise` re-raise
+	support even without a user-facing name) - emitter_c.py assigns the
+	narrowed payload into it, as an ordinary already-registered local,
+	before jumping to `label`. `epilogue` replays whatever's still
+	pending CONFINED to the covering try's own body (RC decrefs, defer/
+	errdefer) - everything pushed since that try's own entry snapshot,
+	excluding the leaf's own payload (which transfers into `bind`
+	instead) - a goto straight into a handler never otherwise unwinds
+	any of that (unlike a real function-level return/propagation - see
+	ir.Raise's own docstring), so without this it silently leaks:
+	confirmed by a real repro, an ordinary RC local declared earlier in
+	the try body, never touched again, leaking every time a later
+	covered `raise`/or_throw() dispatches past it. Emitted (see
+	emitter_c.py's own _emit_leaf_dispatch_case) right before the
+	assignment into `bind`. '''
+	leaf: Type
+	bind: 'Variable|None'
+	label: str
+	epilogue: 'list[Instruction]' = field( default_factory = list )
+
+@dataclass( kw_only = True )
+class OrThrow( Instruction ):
+	''' Result.or_throw(): like OrReturn/OrJump, but each leaf of the Err
+	branch's error type is checked against `dispatch` first - a leaf
+	matched there jumps straight into that except handler (binding its
+	payload if the clause names one), NEVER touching the enclosing
+	function's own return type at all. Only a leaf with NO entry in
+	dispatch falls back to exactly OrReturn's (target is None) or OrJump's
+	(target is a real epilogue label) own propagate-to-caller behavior, OR
+	(inside a multi-statement @inline splice's pre-return statements) the
+	splice-local inline_exit shape below - `epilogue`/`target`/
+	`return_slot` mirror OrReturn/OrJump exactly, and are only ever
+	consulted along that uncovered-leaf path (built and legality-checked
+	by lowering.py only when at least one leaf is actually uncovered - see
+	_lower_or_throw). '''
+	dest: Temp
+	value: Operand # a Result[T,E]
+	dispatch: list[ThrowLeaf]
+	epilogue: list['Instruction'] = field( default_factory = list )
+	target: str|None = None # None -> real C `return`, matching OrReturn; a real label -> `goto`, matching OrJump
+	return_slot: 'Variable|None' = None # only meaningful when target is not None
+	# PLAN_INLINE.md early-return generalization, same shape as OrReturn's own
+	# inline_exit field - set only for the uncovered-leaf fallback, reached
+	# from inside a multi-statement @inline splice's pre-return statements:
+	# widens into result_var (the SPLICE TARGET's own return type, not
+	# target/return_slot's enclosing-function one), arms exited_flag, and
+	# `goto`s merge_label instead of returning/jumping to a real epilogue.
+	# Mutually exclusive with target/return_slot being meaningfully set - see
+	# lowering.py's _emit_or_throw.
+	inline_exit: 'tuple[Variable,Variable,str]|None' = None
+
+	def test_repr( self ) -> str:
+		return f'OrThrow( dest={self.dest!r}, value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
+
+@dataclass( kw_only = True )
+class Raise( Instruction ):
+	''' `raise EXPR` (lowering.py's _stmt_Raise) - same per-leaf dispatch
+	shape as ir.OrThrow's own Err branch, but `value` here IS the error
+	itself (never a Result - contrast OrThrow.value), so there's no outer
+	Ok/Err tag to check first and no `dest`/Ok-arm at all: a raise never
+	falls through, there's no "otherwise" value. A covered leaf narrows
+	`value`'s payload into its handler's own bind and jumps straight to
+	`label` - no Result is ever built. An uncovered leaf propagates via a
+	REAL function return, built directly from the enclosing function's own
+	declared Result[T,E] return type (or return_slot's, when target is a
+	real epilogue label) - emitter_c.py reuses the exact same
+	_emit_widen_error-based machinery ir.OrThrow's own uncovered-leaf arm
+	already uses, just seeded from `value` directly instead of `(receiver).
+	data.err`. `dispatch`/`epilogue`/`target`/`return_slot`/`inline_exit`
+	mirror ir.OrThrow's own identical fields. '''
+	value: Operand # the raised error value itself - NOT a Result
+	dispatch: list[ThrowLeaf]
+	epilogue: list['Instruction'] = field( default_factory = list )
+	target: str|None = None # None -> real C `return`; a real label -> `goto`
+	return_slot: 'Variable|None' = None # only meaningful when target is not None
+	inline_exit: 'tuple[Variable,Variable,str]|None' = None # see ir.OrThrow's own identical field
+
+	def test_repr( self ) -> str:
+		return f'Raise( value={self.value!r}, dispatch={self.dispatch!r}, target={self.target!r} )'
+
+@dataclass( kw_only = True )
 class Unwrap( Instruction ): # Result.unwrap(errmsg): Err -> panic(errmsg); Ok -> dest = payload
 	dest: Temp
 	value: Operand # a Result[T,E]
@@ -553,6 +640,7 @@ class Allocate( Instruction ): # Foo.__allocate__( field = value, ... )
 	dest: Temp
 	cls: ClassLike
 	fields: dict[str,Operand]
+	loc: str|None = None # 'file:line' of the allocating source, debug-mode object tracking only (see emitter_c.py's dump_live_objects support) - set centrally by Lowering._emit, not by individual construction sites
 
 	def test_repr( self ) -> str:
 		return f'Allocate( dest={self.dest!r}, cls={self.cls.qualname!r}, fields={self.fields!r} )'
@@ -612,6 +700,32 @@ class ReleaseGlobalLock( Instruction ):
 
 	def test_repr( self ) -> str:
 		return f'ReleaseGlobalLock( var={self.var.qualname!r} )'
+
+@dataclass( kw_only = True )
+class AcquireFieldLock( Instruction ):
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part B - the AcquireGlobalLock/
+	ReleaseGlobalLock pair's per-OBJECT counterpart: marks the START of the
+	one critical section a single instance-field READ or WRITE needs (B.3's
+	"lock the access, not the statement" - never spans more than one field
+	access, so two accesses to the same object's fields in the same
+	statement/method get two separate critical sections, not one wrapping
+	both - this is what keeps B.4's same-thread reentrancy hazard from ever
+	materializing for straight-line code). `obj` is the RECEIVER operand
+	(not a Variable, unlike AcquireGlobalLock's `var` - the lock lives in
+	the object's OWN ObjectHeader, keyed off whichever expression currently
+	holds the reference, not off any particular binding of it). '''
+	obj: Operand
+
+	def test_repr( self ) -> str:
+		return f'AcquireFieldLock( obj={self.obj!r} )'
+
+@dataclass( kw_only = True )
+class ReleaseFieldLock( Instruction ):
+	''' the matching END marker for AcquireFieldLock. '''
+	obj: Operand
+
+	def test_repr( self ) -> str:
+		return f'ReleaseFieldLock( obj={self.obj!r} )'
 
 @dataclass( kw_only = True )
 class RefCount( Instruction ): # compiler.refcount(x) - reads x's current header refcount
@@ -784,6 +898,54 @@ class SizeOf( Instruction ): # compiler.sizeof(T) for a real ClassLike T - no fi
 
 	def test_repr( self ) -> str:
 		return f'SizeOf( dest={self.dest!r}, type={self.type.qualname!r} )'
+
+# --- debug-mode alloc-site tracking (dump_live_objects, PLAN in
+# i-want-to-investigate-kind-garden.md) - raw sys.alloc[T] buffers have no
+# ObjectHeader of their own. Tracked via a SIDE TABLE (a small tracking node,
+# allocated straight from the OS allocator, holding just {link, ptr, size})
+# rather than a hidden prefix header in front of the real block: sys.alloc[T]
+# must keep returning the EXACT pointer the OS allocator gave it, unchanged -
+# confirmed necessary by a real regression, not just caution: an earlier
+# version of this feature offset the returned pointer past a prefix header,
+# which broke sys_free_mempoison_test.py's direct HeapSize(ptr) query (HeapSize
+# requires the literal block-start pointer HeapAlloc returned; any offset
+# pointer is a hard crash, not just a wrong answer) - some existing code
+# legitimately queries the OS allocator directly on a sys.alloc'd pointer, so
+# that pointer's identity has to stay exactly what the OS handed back.
+# Threaded into a SEPARATE global list from the RC one (not the RC objects'
+# list - the two header shapes differ, so keeping them apart avoids any
+# runtime type-tag/reinterpret-cast dance when dump_live_objects walks
+# either). debug-only; compile_time_transformer folds every call site of
+# these away entirely in a release build (same `if compiler.target.debug:`
+# guard mempoison already uses), so emitter_c.py only ever sees these when
+# _target_debug is True. ---
+
+@dataclass( kw_only = True )
+class DebugRawTrack( Instruction ): # compiler.__debug_raw_track__(ptr, size) -> None - records a freshly allocated raw sys.alloc[T] buffer in the side-table tracking list (best-effort: silently does nothing if the side allocation itself fails - never crashes the real allocation path)
+	ptr: Operand
+	size: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugRawTrack( ptr={self.ptr!r}, size={self.size!r} )'
+
+@dataclass( kw_only = True )
+class DebugRawUntrack( Instruction ): # compiler.__debug_raw_untrack__(ptr) -> None - removes ptr's side-table tracking entry (a no-op if ptr was never tracked, e.g. a release-mode-allocated pointer reaching a debug-mode free somehow - shouldn't happen, but this stays a safe no-op rather than a crash either way)
+	ptr: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugRawUntrack( ptr={self.ptr!r} )'
+
+@dataclass( kw_only = True )
+class DumpLiveObjects( Instruction ): # compiler.dump_live_objects() - walks both debug-tracking lists (RC objects + raw sys.alloc buffers), aggregates by (type_name, alloc_loc), prints counts/bytes via _Stdout.write - see emitter_c.py's __metalpy_dump_live_objects
+	def test_repr( self ) -> str:
+		return 'DumpLiveObjects()'
+
+@dataclass( kw_only = True )
+class DebugUntrackRC( Instruction ): # debug-mode alloc tracking only (see DumpLiveObjects) - untracks an RC object's own debug_link WITHOUT going through release_object's normal refcount-hits-zero path. Needed by compiler.__raw_free__'s own codegen (Lowering._lower_compiler_raw_free): a not-yet-fully-alive RCClass whose __init__ failed is freed DIRECTLY via sys.free(), bypassing release_object entirely - confirmed as a real bug otherwise (not just theoretical): the object's own ir.Allocate already tracked it into the global RC list, so skipping this leaves a dangling entry pointing at memory that's about to be freed, which corrupts the list the moment anything else touches it (a real MSVC-only crash this fixed, root-caused via bisection - clang/gcc happened not to reorder/reuse the freed block in a way that tripped it, in the same debug-mode test run)
+	value: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugUntrackRC( value={self.value!r} )'
 
 @dataclass( kw_only = True )
 class Return( Instruction ):

@@ -48,7 +48,7 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 			name_size: usize = name_len + 1
 		name: str = str.from_cstr( name_ptr, name_size ).unwrap( 'os.listdir: invalid UTF-8 in filename' )
 		if name != '.' and name != '..':
-			entries.append( name ).unwrap( 'os.listdir: too many directory entries' )
+			entries.append( name )
 		if not FindNextFileA( handle, compiler.addrof( data )):
 			break
 	return Result.Ok( entries )
@@ -78,8 +78,143 @@ def listdir( dirpath: str ) -> Result[list[str], OSError]:
 			name_size: usize = name_len + 1
 		name: str = str.from_cstr( name_ptr, name_size ).unwrap( 'os.listdir: invalid UTF-8 in filename' )
 		if name != '.' and name != '..':
-			entries.append( name ).unwrap( 'os.listdir: too many directory entries' )
+			entries.append( name )
 	return Result.Ok( entries )
+
+
+# ---------------------------------------------------------------------------
+# mkdir / rmdir / unlink / rename
+# ---------------------------------------------------------------------------
+
+@compiler.target( os = 'windows' )
+def mkdir( dirpath: str ) -> Result[None, OSError]:
+	from windows.kernel32 import CreateDirectoryA, GetLastError
+	if not CreateDirectoryA( dirpath.get_cstr(), None ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def mkdir( dirpath: str ) -> Result[None, OSError]:
+	from crt import mkdir as _crt_mkdir, get_errno
+	if _crt_mkdir( compiler.cast( ConstPtr[None], dirpath.get_cstr() ), 0o777 ) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def rmdir( dirpath: str ) -> Result[None, OSError]:
+	from windows.kernel32 import RemoveDirectoryA, GetLastError
+	if not RemoveDirectoryA( dirpath.get_cstr() ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def rmdir( dirpath: str ) -> Result[None, OSError]:
+	from crt import rmdir as _crt_rmdir, get_errno
+	if _crt_rmdir( compiler.cast( ConstPtr[None], dirpath.get_cstr() )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def unlink( filepath: str ) -> Result[None, OSError]:
+	from windows.kernel32 import DeleteFileA, GetLastError
+	if not DeleteFileA( filepath.get_cstr() ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def unlink( filepath: str ) -> Result[None, OSError]:
+	from crt import unlink as _crt_unlink, get_errno
+	if _crt_unlink( compiler.cast( ConstPtr[None], filepath.get_cstr() )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def rename( src: str, dst: str ) -> Result[None, OSError]:
+	# MoveFileW - fails if dst exists (this module's own deliberate choice:
+	# ONE fail-if-exists behavior on every platform, rather than mirroring
+	# Python's own Windows-only-fails/POSIX-replaces split - see replace()
+	# below for "always replace" instead). *W not *A: the *A entry points
+	# go through CP_ACP (the process' ANSI codepage), not UTF-8, and
+	# mangle anything outside it.
+	from windows.kernel32 import MoveFileW, GetLastError
+	if not MoveFileW( src.to_utf16(), dst.to_utf16() ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def rename( src: str, dst: str ) -> Result[None, OSError]:
+	# matches Windows: fails if dst exists, rather than POSIX rename(2)'s
+	# own replace-on-exists default (see replace() below for that instead).
+	# link()+unlink() gives atomic fail-if-exists semantics for files -
+	# link(2) can't target a directory though, so a directory source falls
+	# back to plain rename(2) (still replaces an EMPTY dst dir, and fails
+	# ENOTEMPTY on a non-empty one - a safe outcome either way).
+	from crt import link as _crt_link, unlink as _crt_unlink, rename as _crt_rename, get_errno
+	if path.isdir( src ):
+		if _crt_rename( src.get_cstr(), dst.get_cstr() ) < 0:
+			return Result.Err( OSError( get_errno() ))
+		return Result.Ok( None )
+	if _crt_link( compiler.cast( ConstPtr[None], src.get_cstr() ), compiler.cast( ConstPtr[None], dst.get_cstr() )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if _crt_unlink( compiler.cast( ConstPtr[None], src.get_cstr() )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+@compiler.target( os = 'windows' )
+def replace( src: str, dst: str ) -> Result[None, OSError]:
+	# always replaces an existing dst, on every platform - the counterpart
+	# to rename()'s own fail-if-exists behavior above.
+	from windows.kernel32 import MoveFileExW, GetLastError, MOVEFILE_REPLACE_EXISTING
+	if not MoveFileExW( src.to_utf16(), dst.to_utf16(), MOVEFILE_REPLACE_EXISTING ):
+		return Result.Err( OSError( GetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not 'windows' )
+def replace( src: str, dst: str ) -> Result[None, OSError]:
+	# plain rename(2) already replaces an existing dst
+	from crt import rename as _crt_rename, get_errno
+	if _crt_rename( src.get_cstr(), dst.get_cstr() ) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
+# ---------------------------------------------------------------------------
+# getcwd / getenv
+# ---------------------------------------------------------------------------
+
+def getcwd() -> Result[str, OSError]:
+	return _getcwd()
+
+
+@compiler.target( os = 'windows' )
+def getenv( name: str ) -> str|None:
+	from windows.kernel32 import GetEnvironmentVariableA
+	buf_size: u32 = 4096
+	buf: Ptr[u8] = sys.alloc[u8]( usize( buf_size ))
+	defer( sys.free( buf ))
+	n: u32 = GetEnvironmentVariableA( name.get_cstr(), buf, buf_size )
+	if n == 0 or n >= buf_size:
+		# unset, or (rare) value too long for the 4096-byte buffer - both
+		# collapse to "not set" for this simple wrapper
+		return None
+	with compiler.panic_arithmetic( 'bounded by n < buf_size, cannot overflow' ):
+		size: usize = usize( n ) + 1
+	return str.from_cstr( compiler.cast( ConstPtr[u8], buf ), size ).unwrap( 'os.getenv: invalid UTF-8 in environment variable value' )
+
+@compiler.target( os = not 'windows' )
+def getenv( name: str ) -> str|None:
+	from crt import getenv as _crt_getenv
+	result: ConstPtr[u8] = _crt_getenv( name.get_cstr() )
+	if result is None:
+		return None
+	n: usize = sys.cstrlen( result, 4096 )
+	with compiler.panic_arithmetic( 'bounded by the 4096-byte cstrlen cap, cannot overflow' ):
+		size: usize = n + 1
+	return str.from_cstr( result, size ).unwrap( 'os.getenv: invalid UTF-8 in environment variable value' )
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +242,7 @@ def _getcwd() -> Result[str, OSError]:
 	buf_size: usize = 4096
 	buf: Ptr[u8] = sys.alloc[u8]( buf_size )
 	defer( sys.free( buf ))
-	result: Ptr[u8] = getcwd( buf, buf_size )
+	result: Ptr[None] = getcwd( compiler.cast( Ptr[None], buf ), buf_size )
 	if result is None:
 		return Result.Err( OSError( get_errno() ))
 	n: usize = sys.cstrlen( buf, buf_size )
@@ -210,6 +345,49 @@ class path:
 		mode: u32 = compiler.c_field( buf, 'st_mode', u32 )
 		return ( mode & S_IFMT ) == S_IFDIR
 
+	@compiler.target( os = 'windows' )
+	@staticmethod
+	def exists( p: str ) -> bool:
+		from windows.kernel32 import GetFileAttributesA, INVALID_FILE_ATTRIBUTES
+		return GetFileAttributesA( p.get_cstr() ) != INVALID_FILE_ATTRIBUTES
+
+	@compiler.target( os = not 'windows' )
+	@staticmethod
+	def exists( p: str ) -> bool:
+		from posix.stat import stat_t, stat
+		buf: Ptr[stat_t] = sys.alloc[stat_t]( 1 )
+		if buf is None:
+			return False
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		return stat( compiler.cast( ConstPtr[None], p.get_cstr() ), buf ) == 0
+
+	@compiler.target( os = 'windows' )
+	@staticmethod
+	def isfile( p: str ) -> bool:
+		# no full stat metadata on this platform (out of scope - see
+		# pathlib.py's own module docstring) - approximated as "exists and
+		# isn't a directory", which doesn't cleanly distinguish a regular
+		# file from a device/reparse-point the way POSIX S_ISREG does.
+		from windows.kernel32 import GetFileAttributesA, FILE_ATTRIBUTE_DIRECTORY, INVALID_FILE_ATTRIBUTES
+		attrs: u32 = GetFileAttributesA( p.get_cstr() )
+		if attrs == INVALID_FILE_ATTRIBUTES:
+			return False
+		return ( attrs & FILE_ATTRIBUTE_DIRECTORY ) == 0
+
+	@compiler.target( os = not 'windows' )
+	@staticmethod
+	def isfile( p: str ) -> bool:
+		from posix.stat import stat_t, stat, S_IFMT, S_IFREG
+		buf: Ptr[stat_t] = sys.alloc[stat_t]( 1 )
+		if buf is None:
+			return False
+		defer( sys.free( compiler.cast( Ptr[None], buf )))
+		rc: i32 = stat( compiler.cast( ConstPtr[None], p.get_cstr() ), buf )
+		if rc != 0:
+			return False
+		mode: u32 = compiler.c_field( buf, 'st_mode', u32 )
+		return ( mode & S_IFMT ) == S_IFREG
+
 	@staticmethod
 	def splitext( p: str ) -> tuple[str, str]:
 		# basename = whatever comes after the last '/' or '\\' (both
@@ -266,9 +444,9 @@ class path:
 					if len( kept ) > 0:
 						kept.pop().unwrap( 'os.path.normpath: pop failed' )
 					elif root == '':
-						kept.append( part ).unwrap( 'os.path.normpath: append failed' )
+						kept.append( part )
 					continue
-				kept.append( part ).unwrap( 'os.path.normpath: append failed' )
+				kept.append( part )
 
 		joined: str = sep.join( kept )
 		if root != '':
@@ -346,7 +524,7 @@ class path:
 				new_common: list[str] = list[str]()
 				k: usize = 0
 				while k < j:
-					new_common.append( common_parts.__getitem__( k ).unwrap( 'os.path.commonpath: index in bounds by construction' )).unwrap( 'os.path.commonpath: append failed' )
+					new_common.append( common_parts.__getitem__( k ).unwrap( 'os.path.commonpath: index in bounds by construction' ))
 					k += 1
 				common_parts = new_common
 
@@ -376,11 +554,11 @@ class path:
 			up_count: usize = len( start_parts ) - i
 			k: usize = 0
 			while k < up_count:
-				rel_parts.append( '..' ).unwrap( 'os.path.relpath: append failed' )
+				rel_parts.append( '..' )
 				k += 1
 			j: usize = i
 			while j < len( target_parts ):
-				rel_parts.append( target_parts.__getitem__( j ).unwrap( 'os.path.relpath: index in bounds by construction' )).unwrap( 'os.path.relpath: append failed' )
+				rel_parts.append( target_parts.__getitem__( j ).unwrap( 'os.path.relpath: index in bounds by construction' ))
 				j += 1
 
 		if len( rel_parts ) == 0:

@@ -12,11 +12,11 @@ from test_support import RealCompileMixin
 _LIST_REDUCTIONS = '''
 def main() -> i32:
 	lst: list[i32] = list[i32]()
-	lst.append( 3 ).unwrap( 'a' )
-	lst.append( 1 ).unwrap( 'b' )
-	lst.append( 4 ).unwrap( 'c' )
-	lst.append( 1 ).unwrap( 'd' )
-	lst.append( 5 ).unwrap( 'e' )
+	lst.append( 3 )
+	lst.append( 1 )
+	lst.append( 4 )
+	lst.append( 1 )
+	lst.append( 5 )
 	if min( lst ) != 1:
 		return 1
 	if max( lst ) != 5:
@@ -36,9 +36,9 @@ def main() -> i32:
 _ITER_NEXT_AND_ENUMERATE = '''
 def main() -> i32:
 	lst: list[i32] = list[i32]()
-	lst.append( 10 ).unwrap( 'a' )
-	lst.append( 20 ).unwrap( 'b' )
-	lst.append( 30 ).unwrap( 'c' )
+	lst.append( 10 )
+	lst.append( 20 )
+	lst.append( 30 )
 
 	it = iter( lst )
 	first: i32 = next( it ).unwrap( 'x' )
@@ -76,36 +76,19 @@ def add( a: i32, b: i32 ) -> i32:
 
 def main() -> i32:
 	lst: list[i32] = list[i32]()
-	lst.append( 1 ).unwrap( 'a' )
-	lst.append( 2 ).unwrap( 'b' )
-	lst.append( 3 ).unwrap( 'c' )
+	lst.append( 1 )
+	lst.append( 2 )
+	lst.append( 3 )
 
 	doubled: list[i32] = list[i32]()
 	for v in map( double, lst ):
-		doubled.append( v ).unwrap( 'd' )
+		doubled.append( v )
 	if sum( doubled ) != 12:
 		return 1
 
 	total: i32 = reduce( add, lst )
 	if total != 6:
 		return 2
-	return 0
-'''
-
-_SLICE_CONFORMANCE = '''
-def main() -> i32:
-	lst: list[i32] = list[i32]()
-	lst.append( 3 ).unwrap( 'a' )
-	lst.append( 1 ).unwrap( 'b' )
-	lst.append( 4 ).unwrap( 'c' )
-	lst.append( 1 ).unwrap( 'd' )
-	sl: slice[i32] = lst[1:4]
-	if sum( sl ) != 6: # 1+4+1
-		return 1
-	if min( sl ) != 1:
-		return 2
-	if max( sl ) != 4:
-		return 3
 	return 0
 '''
 
@@ -171,6 +154,63 @@ def main() -> i32:
 	return 0
 '''
 
+_STR_ITERABLE_CONFORMANCE = '''
+def main() -> i32:
+	s: str = 'abc'
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		for ch in s:
+			if ch == 'a':
+				count += 1
+			elif ch == 'b':
+				count += 2
+			elif ch == 'c':
+				count += 4
+	if count != 7:
+		return 1
+	if min( 'bca' ) != 'a':
+		return 2
+	if max( 'bca' ) != 'c':
+		return 3
+	return 0
+'''
+
+_BYTES_BYTEARRAY_MEMORYVIEW_ITERABLE_CONFORMANCE = '''
+def main() -> i32:
+	ba: bytearray = bytearray( 3 )
+	ba[0] = 1
+	ba[1] = 2
+	ba[2] = 3
+
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for x in ba:
+			total += i32( x )
+	if total != 6:
+		return 1
+
+	mv: memoryview = memoryview( ba )
+	total = 0
+	with compiler.wrap_arithmetic:
+		for x in mv:
+			total += i32( x )
+	if total != 6:
+		return 2
+
+	b: bytes = bytes.from_bytearray( move( bytearray( 3 )))
+	count: isize = 0
+	with compiler.wrap_arithmetic:
+		for x in b:
+			count += 1
+	if count != 3:
+		return 3
+
+	if b[0].unwrap( 'in bounds' ) != 0:
+		return 4
+
+	return 0
+'''
+
 _GENERIC_TUPLE_TYPED_PARAMETER_INFERENCE = '''
 def first_of[T]( t: tuple[T, T] ) -> T:
 	a, b = t
@@ -202,11 +242,6 @@ class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
 			( 'map_and_reduce', _MAP_AND_REDUCE ),
 		])
 
-	def test_slice_conformance( self ) -> None:
-		self.assert_programs_run([
-			( 'slice_conformance', _SLICE_CONFORMANCE ),
-		])
-
 	def test_homogeneous_tuple_conformance( self ) -> None:
 		self.assert_programs_run([
 			( 'homogeneous_tuple_conformance', _HOMOGENEOUS_TUPLE_CONFORMANCE ),
@@ -226,6 +261,22 @@ class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
 		usize index. '''
 		self.assert_programs_run([
 			( 'dict_iterable_conformance', _DICT_ITERABLE_CONFORMANCE ),
+		])
+
+	def test_str_iterable_conformance( self ) -> None:
+		''' str conforms to Sequence[str]/Iterable[str] via its existing
+		codepoint-indexed __getitem__(usize) - a plain for loop (not just
+		s[i] access) and min/max(str) now work. '''
+		self.assert_programs_run([
+			( 'str_iterable_conformance', _STR_ITERABLE_CONFORMANCE ),
+		])
+
+	def test_bytes_bytearray_memoryview_iterable_conformance( self ) -> None:
+		''' bytes/bytearray/memoryview all conform to Sequence[u8]/
+		Iterable[u8] - bytes needed a new scalar __getitem__(usize)
+		overload added alongside its pre-existing slice-only one. '''
+		self.assert_programs_run([
+			( 'bytes_bytearray_memoryview_iterable_conformance', _BYTES_BYTEARRAY_MEMORYVIEW_ITERABLE_CONFORMANCE ),
 		])
 
 	def test_generic_tuple_typed_parameter_inference( self ) -> None:

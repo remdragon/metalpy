@@ -177,6 +177,32 @@ def main() -> i32:
 				info_b = zf.getinfo( 'b.txt' )
 				self.assertEqual( info_b.compress_type, _pyzipfile.ZIP_DEFLATED )
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_zip_error_str_and_repr( self ) -> None:
+		''' regression: ZipError had no __str__/__repr__ - opening a file too
+		small to be a zip must produce a readable error message. '''
+		with tempfile.TemporaryDirectory() as tmp:
+			tiny_path = Path( tmp ) / 'tiny.bin'
+			tiny_path.write_bytes( b'xx' )
+			tiny_path_posix = tiny_path.as_posix()
+			source = f'''
+import zipfile
+
+def main() -> i32:
+	match zipfile.ZipFile.open( {_mpy_str_literal( tiny_path_posix )} ):
+		case Result.Err( e ):
+			if str( e ) != '_find_eocd: file too small to contain an End Of Central Directory record':
+				return 1
+			if f'{{e}}' != '_find_eocd: file too small to contain an End Of Central Directory record':
+				return 2
+			if e.__repr__() != "ZipError('_find_eocd: file too small to contain an End Of Central Directory record')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
+'''
+			self._assert_compiles_and_runs_isolated( source )
+
 	def _assert_compiles_and_runs_isolated( self, source: str ) -> None:
 		''' compiles+runs ONE standalone program (not merged with others via
 		assert_programs_run) so the test file paths embedded in `source`

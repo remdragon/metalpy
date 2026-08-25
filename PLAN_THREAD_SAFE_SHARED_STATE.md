@@ -3,17 +3,183 @@
 ## Status
 
 **Part A (module globals) implemented and confirmed correct for both
-direct and narrowed reads/writes, on both Windows and Linux.** Part B
-(instance fields, `ObjectHeader` growth) is still fully unimplemented - do
-not attempt without its own dedicated worktree/session, for the reasons
-this document's Part B section already gives.
+direct and narrowed reads/writes, on both Windows and Linux.** Part B's own
+**prerequisite** (class-level `_`/`__` field-visibility enforcement, see
+below) is implemented and merged.
+
+**Part B itself (the actual per-object lock) - status update: implemented,
+all previously-blocking bugs fixed, verified under real concurrent stress
+(see below), full 3-compiler suite (clang/MSVC/WSL-gcc) clean.** Not yet
+merged to master as of this writing - implementation soundness and the
+merge decision are separate questions.
+
+What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
+mirroring Part A's global-lock markers, keyed on the receiver operand
+instead of a Variable); `ObjectHeader` growth (`emitter_c.py`'s
+`_object_header_prologue()`, a `void*`/`pthread_mutex_t` lock field picked
+at emission time, same A.3 platform asymmetry as Part A - POSIX needs a
+real `pthread_mutex_init()` at every construction site, no zero-init
+guarantee); `acquire_field_lock`/`release_field_lock` helper functions that
+skip locking entirely for an IMMORTAL object (required, not optional - a
+compile-time-baked static instance's `.lock` field is never initialized,
+so locking it would be real UB); `GetAttr`/`SetAttr` wrapping at every
+genuine field chokepoint (`lowering.py`'s `_expr_Attribute`, `_stmt_
+Assign`'s plain-write and augmented-assign branches), gated on a new
+`_is_real_field_receiver` check (RCClass only - NOT CStruct, which has no
+`$header` of its own, embedded by value or, for `@interface`, heap-
+allocated without a header at all; NOT a TaggedUnion's own `.tag`/`.data`
+storage-view accessors either); a matching fix to `compiler.decref(obj.
+field)` (used by the synthesized destructor's own field teardown,
+`_build_field_teardown_ast`) to consume the field's own reference directly
+under one critical section rather than retain-then-immediately-undo. The
+whole-program on/off switch (Cost mitigations #1) was deliberately NOT
+built for this pass - Part A itself never had one either (see A.1's own
+scoping), and the memory-cost tradeoff didn't seem worth gating on an
+as-yet-unbuilt Thread-reachability analysis before landing correctness.
+
+**Four real bugs found and fixed during implementation, each confirmed via
+a real compile-and-run repro (not just reasoning), worth recording:**
+1. Locking a TaggedUnion's own internal `.data` payload view (indistin-
+   guishable in AST shape from a real field, reinterpret-cast to
+   ObjectHeader* is nonsense) - fixed via `_is_real_field_receiver`.
+2. Same shape for a by-value-embedded (or `@interface`, header-less)
+   CStruct field - `_is_real_field_receiver` narrowed to RCClass only,
+   not the wider InheritanceChainMixin `_check_field_visibility` uses.
+3. `compiler.decref(obj.field)` (the synthesized destructor's own field
+   teardown) leaked exactly one reference per torn-down RC field - the
+   naive retain-on-read at the GetAttr site created a SEPARATE owned copy
+   that `compiler.decref`'s own single explicit Decref then just
+   cancelled back out, never releasing the field's own original
+   reference. Fixed by lowering `compiler.decref(obj.field)` as its own
+   atomic acquire/bare-read/decref/release, bypassing the general
+   retain-on-read path entirely for this one intrinsic shape.
+4. **The loop-condition leak** (this section's own former blocker): a
+   while-loop's own condition (`_lower_truth_test(node.test)`,
+   `_stmt_While`) is lowered exactly ONCE at compile time, but the
+   resulting C sits physically inside the loop and re-executes once per
+   real iteration - a read-side `AcquireFieldLock`/incref emitted there
+   fired N times at runtime, while the matching decref (driven by
+   `_new_temp`/`fresh_temp`'s ordinary pending-temps flush, which only
+   runs once per STATEMENT-level lowering pass) fired exactly once.
+   Confirmed via `compiler.refcount()`: a generator's own `while i < b.v:`
+   condition (`b` a captured `Box` parameter) leaked 2 references after 2
+   iterations before the generator was dropped mid-consumption. Not
+   generator-specific - any while-loop condition reading an RC field
+   through a chained receiver has the same exposure; loop BODY statements
+   were never affected (each already gets its own per-iteration flush via
+   the ordinary `_lower_stmt` boundary - only the CONDITION expression,
+   lowered once but executed repeatedly, was exempt from that). **Fixed**
+   by an explicit `self._flush_pending_temps()` call in `_stmt_While`,
+   right after computing the condition and before its own `JumpIfFalse` -
+   safe even though the boolean `test` operand itself gets flushed too,
+   since `ir.DeleteTemp` is a pure bookkeeping no-op at emission time ("C
+   block scoping already handles temp lifetime"). `_lower_for_range`/
+   `_lower_for_over_indexable`/`_lower_for_over_iterator` were all audited
+   and confirmed NOT to share this exposure - their own per-iteration
+   tests are either purely-scalar synthesized comparisons or a real
+   `__next__()` Call (always a fresh, non-retained result), never a
+   chained field read. Two new regression tests
+   (`thread_safe_fields_test.py`) confirm this via `compiler.refcount()`,
+   each independently confirmed to fail when the fix is sabotaged.
+   A fifth, closely related ordering bug surfaced fixing this one and is
+   folded in here rather than given its own number: `_object_header_
+   prologue()`'s own `pthread_mutex_t lock;` field silently fell back to
+   C's legacy "implicit int" behavior on gcc (no error, wrong field type,
+   every `pthread_mutex_init()` call site then rejected as "incompatible
+   pointer type") because `<pthread.h>` was only ever included later, by
+   emit_c()'s own general required-headers loop - fixed by including it
+   directly inside `_object_header_prologue()` itself, ahead of the
+   struct definition it protects.
+
+**Real concurrent stress tests - status update: added, confirmed real.**
+`thread_safe_fields_test.py` now also covers, mirroring `thread_safe_
+globals_test.py`'s own three-way split for Part A:
+- **A direct read/write of a plain, non-Optional RC-typed field on a
+  shared object** (40 OS threads, 8 reassigning while 32 concurrently
+  read, 2000 iterations each - `test_concurrent_field_read_write_stress`).
+- **A narrowed read of a union-typed field** (`self.g: Box|None`, `if
+  self.g is not None: b: Box = self.g` read from 32 threads while 8
+  concurrently reassign it via a plain `self.g = Box(n)` SetAttr, 3000
+  iterations each, no manual lock at all -
+  `test_narrowed_field_read_concurrent_stress`). Deliberately built
+  around a pre-initialized field reassigned to a new value, not the
+  `if self.g is None: self.g = compute()` lazy-init shape Part A's own
+  equivalent global test uses - that specific "narrow after an in-branch
+  assignment" shape is NOT currently supported for a field at all
+  (confirmed via a real repro, `self.g: expected Box, got Box|NoneType`),
+  a genuine, separate, pre-existing compiler gap unrelated to Part B,
+  out of scope for this plan.
+- **A plain scalar field** (`test_scalar_field_unaffected` - functional
+  only, confirms Part B's own `cfg.rc_leaves`-gated early return still
+  correctly skips locking a field with no RC leaves at all, the field-
+  shaped counterpart of Part A's own `test_scalar_global_unaffected`).
+
+Both concurrency tests were confirmed to be REAL fixes, not no-ops that
+happen to pass: temporarily sabotaging `_is_real_field_receiver` to
+always return `False` (disabling Part B's locking entirely, the single
+chokepoint every read/write wrap site is gated on) reproduced a genuine
+crash (`STATUS_ILLEGAL_INSTRUCTION`, the same signature class this whole
+mechanism exists to close) in 15/15 runs of the read/write stress test
+and 5/5 of the narrowed-read one; 20/20 runs clean again once restored.
+Full 3-compiler suite (clang/MSVC/WSL-gcc, 1749 tests) clean.
+
+**Part B is now considered verified to the same bar Part A was** - no
+further blockers are tracked in this document. Whether/when to actually
+merge is a separate decision from whether the implementation itself is
+sound.
+
+**Field-visibility enforcement (the Prerequisite section below) - status
+update: implemented and merged**, not just designed. `Discovery.check_
+field_visibility` (discovery.py, mirroring `check_module_visibility`'s own
+shape) + `Type.in_protected_scope`/`InheritanceChainMixin.field_owner`
+(mpy_types.py, siblings of `in_private_scope`/`chain_lookup`) +
+`FunctionLowering._check_field_visibility` (lowering.py, wired into the 4
+genuine user-facing `obj.field` chokepoints: ordinary read, plain-assign
+write, augmented-assign, `compiler.addrof(x.field)` - deliberately NOT
+inside `_attr_lookup` itself, which is also reached by internal synthesized
+lookups like a tuple element's `_N` field that must stay unchecked).
+Confirmed via the exact repro this section's own text below gives (`b.
+__secret = 99` now a compile error) and via a real `lib/` audit: one
+genuine violation found and fixed (`datetime.timedelta`'s own `_total_us`
+field, read directly by `Date`/`Datetime` arithmetic in the same module but
+a different, non-subclass class - renamed to a public `total_us`, the
+"legitimately needs cross-class access" resolution this document's own
+Cost-mitigation-#2 discussion anticipated for the public/protected tiers).
+One real false positive found and fixed along the way, worth recording:
+the compiler-synthesized `$$__destructor__` (type_resolver.py's
+`_synthesize_rcclass_destructor`) is built with `cls=None` even though its
+whole job is decref'ing every field of its own class, public or private -
+now explicitly exempted (`Function.is_destructor`) rather than made to
+carry a real `.cls` neither its own synthesis nor anything else needed
+before now. See `discovery_test.py`'s new `FieldVisibilityEnforcementTests`
+for the regression suite. Full 3-compiler test suite (clang/MSVC/WSL-gcc)
+verified clean.
 
 What's actually shipped for Part A (`cfg.py`/`lowering.py`/`emitter_c.py`/
 `ir.py`/`mpy_types.py`):
 - Detection: `Variable.reassigned_outside_init`, flipped by `cfg.py`'s
   `assign()` the moment a `global X; X = ...` reassignment is lowered
-  (never for a global's own module-level initializer - `lower_global()`
-  bypasses `cfg.assign()` entirely, confirmed directly).
+  (never for a global's own module-level initializer). A global's own
+  initializing write goes through a *separate* method,
+  `cfg.py`'s `assign_global_initializer()` (called from `lowering.py`'s
+  `run_global()`) - structurally identical to `assign()`'s own
+  `dest.is_global` write branch, but deliberately does NOT flip
+  `reassigned_outside_init` itself. **Status update:** this used to be a
+  real gap - a global's initializer can call an ordinary function
+  (SYNTAX.md: initializers aren't restricted to compile-time constants,
+  they run real code at program-startup time), and that function can spawn
+  a thread which concurrently reassigns the SAME global through the
+  fully-locked ordinary path *while* `__metalpy_init()` is still running
+  other initializers - a genuine, reachable torn-write-plus-leak race
+  (confirmed: 8/20 sabotaged runs leaked a `Box`, 0/25 with the fix -
+  `thread_safe_globals_test.py`'s `test_global_init_write_race_stress`).
+  Fixed by giving a global's own initializing write the same
+  Acquire/decref-current-value/Assign/Release critical section an ordinary
+  reassignment gets, gated at emission time the same way every other
+  marker already is - so a global that's genuinely never reassigned from a
+  function body still costs nothing (the markers become no-ops), while one
+  that is gets real protection for its own first write too, not just
+  later ones.
 - A per-global lock, synthesized only for globals that end up needing
   one - platform-shaped, not a single portable primitive (A.3's own
   documented asymmetry): on Windows, a bare `static void*` holding an
@@ -669,11 +835,18 @@ machinery:
   Instead, every protected global's `pthread_mutex_init()` call is emitted
   directly into the synthesized `__metalpy_init()` function body's own
   text, unconditionally ahead of the topologically-sorted global-init
-  calls - safe with no ordering analysis needed at all, since (as
-  `Variable.reassigned_outside_init`'s own comment establishes) a global's
-  OWN init instructions never contain an `ir.AcquireGlobalLock`/
-  `ReleaseGlobalLock` marker in the first place; only ordinary function
-  bodies do, and those only ever run after `__metalpy_init()` returns.
+  calls - safe with no ordering analysis needed at all. **Correction:** a
+  global's own init instructions CAN now contain
+  `ir.AcquireGlobalLock`/`ReleaseGlobalLock` markers too (see the Status
+  section's update above - a global's own initializing write needs the
+  same protection an ordinary reassignment does, since its own initializer
+  can spawn a thread that reassigns it concurrently). The ordering claim
+  here stays true regardless, for a different reason than originally
+  stated: every lock's `pthread_mutex_init()` runs first, unconditionally,
+  before *any* global initializer runs (this global's own included) - so
+  by the time a global's own init function can reach its
+  `AcquireGlobalLock`, the lock it acquires is already initialized, same
+  as for a later ordinary-function reassignment.
 
 ### A.4 Where to insert acquire/release (the A.3 lock case)
 

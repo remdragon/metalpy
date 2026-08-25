@@ -393,7 +393,7 @@ class Monomorphizer:
 		spec.monomorphized = monomorphized
 		return monomorphized
 
-	def _build_monomorphized_function( self, base: Function, type_params: list[TypeVar], args: list[Type], qualname: str, substituted_cls: ClassLike|None = None ) -> Function:
+	def _build_monomorphized_function( self, base: Function, type_params: list[TypeVar], args: list[Type], qualname: str, substituted_cls: ClassLike|None = None, result_type_params: list[TypeVar]|None = None ) -> Function:
 		''' the substitution/copy core of monomorphized_function, split out
 		so lowering.py's eager return-only type-parameter inference (a
 		generic function whose return type is a bare type param that
@@ -407,7 +407,12 @@ class Monomorphizer:
 		substituted_cls defaults to base.cls unchanged - only
 		monomorphized_function's own "inherited from an enclosing generic
 		class" branch above ever needs to override it; this helper doesn't
-		need to know why, just what to substitute where. '''
+		need to know why, just what to substitute where. result_type_params
+		defaults to None (the result is fully concrete, no longer generic in
+		anything) - _partial_class_substituted_method below is the one
+		caller that needs the result to stay generic (in its OWN type
+		params, already substituted-bound copies), passing them through
+		here instead. '''
 		if substituted_cls is None:
 			substituted_cls = base.cls
 		substituted_params = [
@@ -428,8 +433,47 @@ class Monomorphizer:
 			return_type = substituted_return,
 			names = substituted_names,
 			node = copy.deepcopy( base.node ),
-			type_params = None,
+			type_params = result_type_params,
 			resolve = None,
+		)
+
+	def _partial_class_substituted_method( self, member: Function, class_type_params: list[TypeVar], class_args: list[Type], substituted_cls: ClassLike ) -> Function:
+		''' a method declaring its OWN type param(s) on top of its enclosing
+		generic class's (e.g. list[T].__init__[S: Iterable[T]]) can't be
+		fully monomorphized the moment the CLASS is specialized - S is only
+		known at the actual call site, resolved later through the ordinary
+		generic-call machinery (_lower_inferred_generic_call ->
+		monomorphized_function), same as monomorphize_class's own plain-
+		method loop already relies on for every other method. But the
+		class's own type params (T) must still be baked in NOW - substituted
+		into self/parameter/return types AND into S's own bound (Iterable[T]
+		-> Iterable[i32]) - or that later call site, which only ever infers
+		S, would have no other chance to. A fresh copy of each own type
+		param is built (bound substituted) rather than mutating the
+		original in place, so a DIFFERENT specialization of the same class
+		(list[str]) gets its own independently-bound S, not one shared and
+		clobbered across every specialization.
+
+		Once this returns, monomorphized_function's own "inherited from an
+		enclosing generic class" branch never fires for the eventual S-bound
+		call: base.type_params (S here) is already non-empty by the time
+		that runs, so base.cls (already substituted to the concrete class,
+		right here) is used as-is - no separate combined-substitution logic
+		needed there. '''
+		if member.resolve is not None:
+			member.resolve()
+		if member.broken:
+			raise RedundantCompilationError()
+		substituted_own_type_params = [
+			replace( tv, bound = self.substitute_type_params( tv.bound, class_type_params, class_args ))
+			for tv in member.type_params
+		]
+		combined_type_params = [ *class_type_params, *member.type_params ]
+		combined_args = [ *class_args, *substituted_own_type_params ]
+		qualname = f'{substituted_cls.qualname}.{member.stem}'
+		return self._build_monomorphized_function(
+			member, combined_type_params, combined_args, qualname, substituted_cls,
+			result_type_params = substituted_own_type_params,
 		)
 
 	def _substituted_overload( self, group: Overload, spec: Specialization ) -> Overload:
@@ -442,13 +486,14 @@ class Monomorphizer:
 		# branch in monomorphize_class already does, just once per member
 		# instead of a fresh, throwaway per-call-site copy every time this
 		# group is ever dispatched. A member with its OWN additional type
-		# params (independently generic beyond the class) is left
-		# unsubstituted, same carve-out monomorphize_class's own plain-
-		# method loop already applies - it's resolved through the ordinary
-		# generic-call machinery when actually invoked, not here.
+		# params (independently generic beyond the class) gets the class's
+		# own params baked in via _partial_class_substituted_method (same as
+		# monomorphize_class's own plain-method loop) but stays generic in
+		# its own params - those are resolved through the ordinary generic-
+		# call machinery when actually invoked, not here.
 		def sub_impl( fn: Function ) -> Function:
 			if fn.type_params:
-				return fn
+				return self._partial_class_substituted_method( fn, spec.base.type_params or [], spec.args, spec )
 			method_spec = self.discovery._get_or_create_specialization( fn, spec.args )
 			return self.monomorphized_function( method_spec )
 		substituted_impls = [ sub_impl( fn ) for fn in group.implementations ]
@@ -595,7 +640,14 @@ class Monomorphizer:
 				if isinstance( member, Overload ):
 					substituted_names[member.stem] = self._substituted_overload( member, spec )
 					continue
-				if not isinstance( member, Function ) or member.type_params:
+				if not isinstance( member, Function ):
+					continue
+				if member.type_params:
+					# its OWN additional type param(s) beyond the class's
+					# (e.g. list[T].__init__[S: Iterable[T]]) - bake the
+					# class's own params in now, stay generic in the rest
+					# (see _partial_class_substituted_method's own docstring)
+					substituted_names[member.stem] = self._partial_class_substituted_method( member, type_params, spec.args, spec )
 					continue
 				method_spec = self.discovery._get_or_create_specialization( member, spec.args )
 				substituted_names[member.stem] = self.monomorphized_function( method_spec )

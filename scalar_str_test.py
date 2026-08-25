@@ -203,5 +203,72 @@ def main() -> i32:
 ''', [ 'i128::MIN < 0', 'ordinary negative i128 literal unaffected' ] )
 
 
+# PLAN_STR_FORMAT.md item 6, bool half: bool.__str__/__repr__
+# (lib/builtins/__scalar_dunders.py's bool_str, registered via the same
+# `Scalar.method = fn` sigil as the int/float dunders above) - matches
+# Python's own str(True)/str(False) capitalization exactly ('True'/'False'),
+# not lowercase - no pre-existing metalpy convention for boolean text output
+# existed to defer to instead.
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile scalar-str tests' )
+class BoolStrBehaviorTests( RealCompileMixin, unittest.TestCase ):
+	def _assert_program_succeeds( self, code: str, check_names: list[str] ) -> None:
+		compiler = self._compile_source( code )
+		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), None )
+		if result.returncode == 0:
+			return
+		if 1 <= result.returncode <= len( check_names ):
+			failed = check_names[ result.returncode - 1 ]
+		else:
+			failed = f'(unmapped exit code {result.returncode} - possible crash/corruption, not a plain check failure)'
+		self.fail(
+			f'program exited {result.returncode}, expected 0. Failed check: {failed}\n'
+			f'stdout: {result.stdout}\nstderr: {result.stderr}'
+		)
+
+	def test_str_and_repr( self ) -> None:
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	t: bool = True
+	if t.__str__() != 'True':
+		return 1
+	if t.__repr__() != 'True':
+		return 2
+	f: bool = False
+	if f.__str__() != 'False':
+		return 3
+	if f.__repr__() != 'False':
+		return 4
+	return 0
+''', [
+			"True.__str__() == 'True'", "True.__repr__() == 'True'",
+			"False.__str__() == 'False'", "False.__repr__() == 'False'",
+		] )
+
+	def test_bare_fstring_interpolation( self ) -> None:
+		# the motivating case: bare f"{some_bool}" - no auto-boxing, ordinary
+		# method dispatch same as every other scalar (scalar_str_test.py's
+		# own int coverage above)
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	t: bool = True
+	if f'{t}' != 'True':
+		return 1
+	f: bool = False
+	if f'{f}' != 'False':
+		return 2
+	return 0
+''', [ "f'{True}' == 'True'", "f'{False}' == 'False'" ] )
+
+	def test_str_builtin_call( self ) -> None:
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	t: bool = True
+	s: str = str( t )
+	if s != 'True':
+		return 1
+	return 0
+''', [ 'str(True) == "True"' ] )
+
+
 if __name__ == '__main__':
 	unittest.main()

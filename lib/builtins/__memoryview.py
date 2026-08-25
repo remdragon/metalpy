@@ -20,7 +20,7 @@ analogous thing via its exporter's buffer-refcount protocol.
 import compiler
 from mmap import mmap
 
-class memoryview:
+class memoryview( Sequence[u8], Iterable[u8] ):
 	__ptr: Ptr[u8]
 	__len: usize
 	__source: bytearray|mmap
@@ -51,15 +51,18 @@ class memoryview:
 		return Result.Ok( self.__ptr[idx] )
 
 	@overload
-	def __getitem__( self, s: PySlice ) -> memoryview:
+	def __getitem__( self, s: slice ) -> memoryview:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
 		infallible, matching real Python's own slice semantics exactly -
 		out-of-range bounds silently clamp rather than raising (see
-		_resolve_pyslice_bounds), unlike single-element s[i] above, which
+		_resolve_slice_bounds), unlike single-element s[i] above, which
 		DOES error on an out-of-range index. Delegates to _byte_slice below
 		for the actual (non-copying) view construction. '''
-		( start, stop ) = _resolve_pyslice_bounds( s, self.__len )
+		( start, stop ) = _resolve_slice_bounds( s, self.__len )
 		return self._byte_slice( start, stop )
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	def get_ptr( self ) -> Ptr[u8]:
 		return self.__ptr
@@ -73,7 +76,7 @@ class memoryview:
 		str/bytearray's own _byte_slice (lib/builtins/__init__.py), this
 		does NOT copy, matching real Python's own memoryview slicing
 		semantics (a sub-view, not a fresh allocation). Called by
-		__getitem__(PySlice) above once bounds are validated - kept
+		__getitem__(slice) above once bounds are validated - kept
 		separate so trusted internal callers with already-valid bounds
 		don't pay for a redundant check. '''
 		with compiler.panic_arithmetic( 'memoryview slice: end < start, cannot overflow' ):

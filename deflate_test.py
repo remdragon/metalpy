@@ -161,6 +161,27 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			( 'deflate_error_str_and_repr', '''
+import deflate
+
+def main() -> i32:
+	original: bytes = 'hello world'.encode().unwrap( 'x' )
+	compressed: bytes = deflate.compress( original ).unwrap( 'compress' )
+	# wrong expected size -> decoded-size mismatch
+	with compiler.wrap_arithmetic:
+		wrong_size: usize = len( original ) + usize( 1 )
+	match deflate.decompress_exact( compressed, wrong_size ):
+		case Result.Err( e ):
+			if str( e ) != 'decompress_exact: decoded size does not match uncompressed_size':
+				return 1
+			if f'{e}' != 'decompress_exact: decoded size does not match uncompressed_size':
+				return 2
+			if e.__repr__() != "DeflateError('decompress_exact: decoded size does not match uncompressed_size')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
+''' ),
 		] )
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
@@ -186,7 +207,8 @@ def main() -> i32:
 		compiler = self._compile_source( source )
 		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), timeout = None )
 		self.assertEqual( result.returncode, 0, f'program failed: {result.stdout!r} {result.stderr!r}' )
-		hex_str = result.stdout.decode( 'utf-8' ).strip()
+		own_stdout = self._split_off_leak_report( result.stdout )
+		hex_str = own_stdout.decode( 'utf-8' ).strip()
 		compressed = bytes.fromhex( hex_str )
 		decompressed = zlib.decompress( compressed, -15 )
 		self.assertEqual( decompressed, original )

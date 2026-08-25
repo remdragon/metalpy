@@ -6,7 +6,7 @@ from typing import Callable, TypeVar as MyPyTypeVar
 
 # local imports:
 from errors import CompileError
-from mpy_types import Type, Function, Parameter, ConditionalDispatch, TypeVar
+from mpy_types import Type, Function, Parameter, ConditionalDispatch, TypeVar, Specialization
 
 T = MyPyTypeVar( 'T' )
 
@@ -104,6 +104,11 @@ class _Candidate:
 	# candidate also matches, never a source of the
 	# "no matching overload"/ambiguity errors on its own.
 	wildcard: tuple[bool,...]
+	# per call-slot, member's own declared parameter Type (param_types, pre-
+	# .leaves() decomposition) - kept around only so a wildcard slot's real
+	# TypeVar object (and its own .bound) is still reachable for the tied-
+	# wildcard-group disambiguation in resolve_call below; unused otherwise.
+	types: tuple[Type,...]
 
 @dataclass( kw_only = True )
 class _RankedMatch:
@@ -199,8 +204,52 @@ def _build_candidates( members: list[Function], call_slots: list[int|str], targe
 			target_params_list[i] if i < len( target_params_list ) else params[i]
 			for i in indices
 		)
-		candidates.append( _Candidate( member = member, target = target, required = required, target_params = target_params, wildcard = wildcard ))
+		candidates.append( _Candidate(
+			member = member, target = target, required = required,
+			target_params = target_params, wildcard = wildcard, types = tuple( param_types ),
+		))
 	return candidates
+
+def _candidates_tied( a: _Candidate, b: _Candidate, same_type: Callable[[Type,Type],bool] ) -> bool:
+	''' True iff box-subtraction (_sweep) can't tell `a` and `b` apart - same
+	wildcard shape, and identical (as sets) required leaves at every other
+	slot - so today's declaration-order fallback is the ONLY thing that
+	decides between them. Only candidates this indistinguishable are
+	eligible for the bound-conformance disambiguation below; anything
+	_sweep can already separate on its own is untouched by this change. '''
+	if a.wildcard != b.wildcard:
+		return False
+	return all(
+		a.wildcard[i] or (
+			len( a.required[i] ) == len( b.required[i] )
+			and all( _contains( b.required[i], t, same_type ) for t in a.required[i] )
+		)
+		for i in range( len( a.wildcard ))
+	)
+
+def _group_tied_wildcard_candidates( candidates: list[_Candidate], same_type: Callable[[Type,Type],bool] ) -> list[list[_Candidate]]:
+	''' Partitions `candidates` (already in resolve_call's own priority
+	order) into runs, preserving order - a run is either a single candidate,
+	or 2+ consecutive wildcard candidates all mutually tied per
+	_candidates_tied. Every OTHER candidate keeps going through resolve_
+	call's existing per-candidate sweep loop completely unchanged; only a
+	2+ run is eligible for bound-based disambiguation. '''
+	groups: list[list[_Candidate]] = []
+	i = 0
+	while i < len( candidates ):
+		c = candidates[i]
+		if not any( c.wildcard ):
+			groups.append( [ c ] )
+			i += 1
+			continue
+		group = [ c ]
+		j = i + 1
+		while j < len( candidates ) and any( candidates[j].wildcard ) and _candidates_tied( c, candidates[j], same_type ):
+			group.append( candidates[j] )
+			j += 1
+		groups.append( group )
+		i = j
+	return groups
 
 def _sweep(
 	state: _State, required: tuple[tuple[Type,...],...],
@@ -252,6 +301,7 @@ def resolve_call(
 	*,
 	qualname: str,
 	same_type: Callable[[Type,Type],bool] = _identity_same_type,
+	protocol_conforms: Callable[[Type,Type],bool]|None = None,
 ) -> tuple[list[ConditionalDispatch],Function]:
 	'''
 	Resolves an overloaded call site to either a single unconditional target
@@ -266,6 +316,26 @@ def resolve_call(
 	textually-identical-but-differently-resolved candidate parameter type
 	are correctly recognized as the same type, without this module itself
 	needing to depend on TypeResolver/Monomorphizer directly.
+
+	`protocol_conforms(concrete, protocol) -> bool` - same injection
+	pattern as `same_type`, mirroring lowering.py's own Lowering._type_
+	conforms_to_protocol signature exactly (a caller can pass that bound
+	method directly). Used ONLY to disambiguate two-or-more wildcard
+	candidates that _sweep itself can't tell apart (see _candidates_tied) -
+	e.g. two @overload members of the same arity, both bare-TypeVar-typed
+	at the same slot, differing only in that TypeVar's own .bound (see
+	list_init_overload_test.py's PickByProtocolBoundTests for a real
+	compile-and-run repro of exactly this shape). Left None (the default),
+	every existing caller/test keeps today's behavior exactly: first-
+	declared wildcard wins, no bound ever consulted. This
+	deliberately checks conformance to the bound's own PROTOCOL BASE only,
+	never its full parametrized args (e.g. `S: IteratorProtocol[T]`'s `T`)
+	- disambiguating which overload wins doesn't need T resolved, only
+	"does this argument conform to IteratorProtocol at all" vs "...to
+	Iterable at all"; the chosen candidate's own type_params (T included)
+	still get inferred and bound-checked in full afterwards, by the same
+	existing machinery (Lowering._check_type_param_bounds) every other
+	generic call already goes through.
 	'''
 	for fn in ( *stubs, *implementations ):
 		if fn.resolve is not None:
@@ -320,32 +390,81 @@ def resolve_call(
 
 	states = [ _State( slots = tuple( arg_leaves[key] for key in call_slots )) ]
 	matches: list[_RankedMatch] = []
+	original_by_slot: dict[int|str,Type] = { **{ i: a for i, a in enumerate( args ) }, **kwargs }
 
-	for candidate in overload_candidates:
-		next_states: list[_State] = []
+	def _record_full_match( candidate: _Candidate, matched: tuple[tuple[Type,...],...], needs_check: tuple[bool,...] ) -> None:
+		conditions: list[tuple[Parameter,Type]] = []
+		for i, need in enumerate( needs_check ):
+			if not need:
+				continue
+			leaves = matched[i]
+			if len( leaves ) > 1:
+				# ConditionalDispatch.conditions is a flat list of
+				# (Parameter, single Type) - it has no way to express
+				# "this slot's tag is one of {A,B}". Not reachable by
+				# anything in lib/ today (every real overload group's
+				# candidates fully pin down each slot they check) -
+				# fail clearly rather than silently pick one leaf
+				raise CompileError(
+					f'{qualname}: conditional dispatch requiring a multi-type check on a single parameter '
+					f'is not yet supported (slot {i}: {[t.qualname for t in leaves]})'
+				)
+			conditions.append(( candidate.target_params[i], leaves[0] ))
+		matches.append( _RankedMatch( target = candidate.target, conditions = conditions ))
+
+	for group in _group_tied_wildcard_candidates( overload_candidates, same_type ):
+		if len( group ) == 1 or protocol_conforms is None:
+			# the overwhelming common case (every existing call site/test
+			# that never passes protocol_conforms lands here unconditionally)
+			# - unchanged from before this function grew tied-group support
+			for candidate in group:
+				next_states: list[_State] = []
+				for state in states:
+					matched, needs_check, misses = _sweep( state, candidate.required, same_type, candidate.wildcard )
+					spend( len( misses ))
+					next_states.extend( misses )
+					if all( matched ):
+						_record_full_match( candidate, matched, needs_check )
+				states = next_states
+			continue
+
+		# 2+ candidates _sweep can't tell apart on its own - disambiguate by
+		# which ones' own TypeVar bound the real (undecomposed) argument
+		# type at each wildcard slot actually conforms to. required/wildcard
+		# are identical across the whole group by construction (that's what
+		# "tied" means), so the sweep itself only needs to run once.
+		rep = group[0]
+		next_states = []
 		for state in states:
-			matched, needs_check, misses = _sweep( state, candidate.required, same_type, candidate.wildcard )
+			matched, needs_check, misses = _sweep( state, rep.required, same_type, rep.wildcard )
 			spend( len( misses ))
 			next_states.extend( misses )
-			if all( matched ):
-				conditions: list[tuple[Parameter,Type]] = []
-				for i, need in enumerate( needs_check ):
-					if not need:
-						continue
-					leaves = matched[i]
-					if len( leaves ) > 1:
-						# ConditionalDispatch.conditions is a flat list of
-						# (Parameter, single Type) - it has no way to express
-						# "this slot's tag is one of {A,B}". Not reachable by
-						# anything in lib/ today (every real overload group's
-						# candidates fully pin down each slot they check) -
-						# fail clearly rather than silently pick one leaf
-						raise CompileError(
-							f'{qualname}: conditional dispatch requiring a multi-type check on a single parameter '
-							f'is not yet supported (slot {i}: {[t.qualname for t in leaves]})'
-						)
-					conditions.append(( candidate.target_params[i], leaves[0] ))
-				matches.append( _RankedMatch( target = candidate.target, conditions = conditions ))
+			if not all( matched ):
+				continue
+			survivors = [
+				c for c in group
+				if all(
+					not c.wildcard[i] or not isinstance( c.types[i], TypeVar ) or c.types[i].bound is None or
+					protocol_conforms(
+						original_by_slot[ call_slots[i] ],
+						c.types[i].bound.base if isinstance( c.types[i].bound, Specialization ) else c.types[i].bound,
+					)
+					for i in range( len( c.wildcard ))
+				)
+			]
+			if not survivors:
+				# no member of this tied group actually accepts the real
+				# argument type at its own bound - NOT a silent mispick:
+				# forward the state unclaimed so it still surfaces a clear
+				# error below (a later candidate/plain fallback, or the
+				# final "no overload matches argument types")
+				next_states.append( state )
+				continue
+			# 1 survivor: unambiguous, resolved by bound conformance alone.
+			# 2+: bound conformance couldn't separate them either - fall
+			# back to the existing declaration-order rule (group is already
+			# in that order), exactly as if protocol_conforms were None
+			_record_full_match( survivors[0], matched, needs_check )
 		states = next_states
 
 	unresolved: list[tuple[tuple[Type,...],list[_Candidate]]] = []
@@ -374,8 +493,31 @@ def resolve_call(
 			combo_targets.append(( combo, found[0].target ))
 
 	if unresolved:
+		# combo holds each slot's own decomposed LEAF (arg_leaves - every
+		# candidate is matched per-leaf, since a leaf can win independently
+		# of its siblings), not the slot's own real, undecomposed argument
+		# type - fine when the two agree (an ordinary, single-leaf
+		# argument), but silently misleading whenever they don't: a bare
+		# `Result[bytes,CodecError]` passed directly (never unwrapped) has
+		# TWO leaves, Ok(bytes) and Err(CodecError) - if only the Err leaf
+		# fails to match anything, the reported combo shows just
+		# `codecs.CodecError` with no indication that's a decomposed
+		# fragment of a whole `Result` argument, not literally what the
+		# caller wrote - confirmed via a real repro (`re.compile(b)`,
+		# `b: Result[bytes,CodecError]` from a forgotten `.unwrap()`)
+		# reporting `('codecs.CodecError',): no matching overload`, which
+		# reads as if a bare CodecError were passed positionally. Naming
+		# the real slot type alongside the leaf whenever they differ turns
+		# that into `(codecs.CodecError [leaf of argument 1's actual type
+		# builtins.Result[bytes,codecs.CodecError]],): no matching overload`.
+		# (original_by_slot itself is built once, above, before the main sweep)
+		def _describe_combo_slot( slot: int|str, leaf: Type ) -> str:
+			original = original_by_slot[slot]
+			if same_type( original, leaf ):
+				return leaf.qualname
+			return f'{leaf.qualname} [leaf of argument {slot!r}\'s actual type {original.qualname}]'
 		parts = [
-			f'{tuple( t.qualname for t in combo )}: ' + (
+			f'{tuple( _describe_combo_slot( call_slots[i], t ) for i, t in enumerate( combo ))}: ' + (
 				f'ambiguous - matches {[c.target.qualname for c in found]}' if found else 'no matching overload'
 			)
 			for combo, found in unresolved

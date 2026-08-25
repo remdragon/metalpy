@@ -59,7 +59,7 @@ def write_raw(
 ) -> Result[usize, OSError]:
 	''' POSIX: single write(2) call. '''
 	from crt import get_errno, write as _crt_write
-	written: isize = _crt_write( fd, buf, count )
+	written: isize = _crt_write( fd, compiler.cast( ConstPtr[None], buf ), count )
 	if written < isize( 0 ):
 		return Result.Err( OSError( get_errno() ))
 	else:
@@ -239,7 +239,7 @@ def read_raw(
 ) -> Result[usize, OSError]:
 	''' POSIX: single read(2) call. '''
 	from crt import get_errno, read
-	nread: isize = read( fd, buf, count )
+	nread: isize = read( fd, compiler.cast( Ptr[None], buf ), count )
 	if nread < isize( 0 ):
 		return Result.Err( OSError( get_errno() ))
 	else:

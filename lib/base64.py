@@ -21,6 +21,12 @@ class Base64Error:
 	def __init__( self, message: str ) -> None:
 		self.message = message
 
+	def __str__( self ) -> str:
+		return self.message
+
+	def __repr__( self ) -> str:
+		return f"Base64Error({self.message!r})"
+
 
 # 64-entry alphabets: 'A'-'Z', 'a'-'z', '0'-'9', then the two symbols that
 # differ between standard and urlsafe. Spelled out as byte literals - this

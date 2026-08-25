@@ -104,7 +104,7 @@ class _Headers:
 		return self.__entries.__len__()
 
 	def add( self, name: str, value: str ) -> None:
-		self.__entries.append( ( name, value )).unwrap( '_Headers.add: append failed' )
+		self.__entries.append( ( name, value ))
 
 	def set( self, name: str, value: str ) -> None:
 		''' replaces every existing entry with a matching (case-insensitive)
@@ -118,12 +118,12 @@ class _Headers:
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( '_Headers.set: index in bounds by construction' )
 			if _header_name_eq( entry[0], name ):
 				if not replaced:
-					rebuilt.append( ( name, value )).unwrap( '_Headers.set: append failed' )
+					rebuilt.append( ( name, value ))
 					replaced = True
 			else:
-				rebuilt.append( entry ).unwrap( '_Headers.set: append failed' )
+				rebuilt.append( entry )
 		if not replaced:
-			rebuilt.append( ( name, value )).unwrap( '_Headers.set: append failed' )
+			rebuilt.append( ( name, value ))
 		self.__entries = rebuilt
 
 	def delete( self, name: str ) -> None:
@@ -134,7 +134,7 @@ class _Headers:
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( '_Headers.delete: index in bounds by construction' )
 			if not _header_name_eq( entry[0], name ):
-				rebuilt.append( entry ).unwrap( '_Headers.delete: append failed' )
+				rebuilt.append( entry )
 		self.__entries = rebuilt
 
 	def get( self, name: str ) -> str|None:
@@ -154,7 +154,7 @@ class _Headers:
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( '_Headers.get_all: index in bounds by construction' )
 			if _header_name_eq( entry[0], name ):
-				result.append( entry[1] ).unwrap( '_Headers.get_all: append failed' )
+				result.append( entry[1] )
 		return result
 
 	def contains( self, name: str ) -> bool:
@@ -172,7 +172,7 @@ class _Headers:
 		i: usize = 0
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( '_Headers.keys: index in bounds by construction' )
-			result.append( entry[0] ).unwrap( '_Headers.keys: append failed' )
+			result.append( entry[0] )
 		return result
 
 	def values( self ) -> list[str]:
@@ -181,7 +181,7 @@ class _Headers:
 		i: usize = 0
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( '_Headers.values: index in bounds by construction' )
-			result.append( entry[1] ).unwrap( '_Headers.values: append failed' )
+			result.append( entry[1] )
 		return result
 
 	def items( self ) -> list[tuple[str,str]]:
@@ -190,7 +190,7 @@ class _Headers:
 		i: usize = 0
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( '_Headers.items: index in bounds by construction' )
-			result.append( entry ).unwrap( '_Headers.items: append failed' )
+			result.append( entry )
 		return result
 
 
@@ -211,14 +211,14 @@ def _split_unquoted_semicolons( s: str ) -> list[str]:
 		if b == 0x22: # '"'
 			in_quotes = not in_quotes
 		elif b == 0x3B and not in_quotes: # ';'
-			segments.append( s[start:i] ).unwrap( '_split_unquoted_semicolons: append failed' )
+			segments.append( s[start:i] )
 			with compiler.wrap_arithmetic:
 				i += 1
 			start = i
 			continue
 		with compiler.wrap_arithmetic:
 			i += 1
-	segments.append( s[start:n] ).unwrap( '_split_unquoted_semicolons: append failed' )
+	segments.append( s[start:n] )
 	return segments
 
 
@@ -251,7 +251,7 @@ def _parse_params( value: str ) -> list[tuple[str,str]]:
 			continue # no '=' in this segment - not a real parameter
 		key: str = kv[0].strip().lower()
 		val: str = _strip_quotes( kv[2] )
-		params.append( ( key, val )).unwrap( '_parse_params: append failed' )
+		params.append( ( key, val ))
 	return params
 
 
@@ -450,7 +450,7 @@ class Message:
 		convenience deviation from Python's own Message.attach (which
 		assumes a MIMEMultipart subclass already set Content-Type; this
 		module has no such subclass in v1 scope). '''
-		self.__parts.append( part ).unwrap( 'Message.attach: append failed' )
+		self.__parts.append( part )
 		self.__is_multipart = True
 		ct: str|None = self.__headers.get( 'Content-Type' )
 		is_multipart_ct: bool = False
@@ -467,7 +467,7 @@ class Message:
 		materialized (see the module docstring on why this can't be a lazy
 		iterator). '''
 		result: list[Message] = list[Message]()
-		result.append( self ).unwrap( 'Message.walk: append failed' )
+		result.append( self )
 		n: usize = self.__parts.__len__()
 		i: usize = 0
 		for i in range( n ):
@@ -477,7 +477,7 @@ class Message:
 			j: usize = 0
 			for j in range( m ):
 				item: Message = sub.__getitem__( j ).unwrap( 'Message.walk: sub index in bounds by construction' )
-				result.append( item ).unwrap( 'Message.walk: append failed' )
+				result.append( item )
 		return result
 
 	def get_payload_decoded( self ) -> Result[bytes, EmailError]:
@@ -762,7 +762,7 @@ def _unfold_headers( lines: list[str] ) -> list[str]:
 			folded: str = prev + ' ' + line.strip()
 			result.__setitem__( last_idx, folded ).unwrap( '_unfold_headers: setitem failed' )
 		else:
-			result.append( line ).unwrap( '_unfold_headers: append failed' )
+			result.append( line )
 	return result
 
 
@@ -815,7 +815,7 @@ def _split_multipart( body: str, boundary: str ) -> Result[list[Message], EmailE
 			next_pos: usize = usize( next_signed )
 		part_text: str = body[part_start:next_pos]
 		part_msg: Message = message_from_string( part_text ).or_return()
-		parts.append( part_msg ).unwrap( '_split_multipart: append failed' )
+		parts.append( part_msg )
 		with compiler.wrap_arithmetic:
 			pos = next_pos + 2
 

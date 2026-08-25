@@ -234,12 +234,13 @@ def main() -> None:
 		lf = self.compiler.functions[0]
 		# 'main' is reserved by discovery.py for the entry point - bare,
 		# never module-qualified (discovery.py:994-995) - and compiles to
-		# C's own real `int main(int argc, char** argv)` (argc/argv so
-		# sys.argv, lib/sys.py, can capture the real ones - see emit_c's
-		# own entry-point prelude), not `void`
+		# the private __metalpy_user_main( void ) helper (emit_c() itself
+		# synthesizes the real C `int main(argc, argv)` separately, which
+		# calls this, __metalpy_init(), and the debug-mode leak-check
+		# epilogue - see _USER_MAIN_C_NAME's own comment)
 		self.assertEqual( lf.function.qualname, 'main' )
 		src = emitter_c.emit_function( lf )
-		self.assertIn( 'int main( int argc, char** argv ) {', src )
+		self.assertIn( 'int __metalpy_user_main( void ) {', src )
 		self.assertIn( 'return 0;', src )
 		self.assertTrue( src.rstrip().endswith( '}' ))
 
@@ -250,7 +251,7 @@ def main() -> None:
 ''' )
 		lf = self.compiler.functions[0]
 		src = emitter_c.emit_function( lf, prototype_only = True )
-		self.assertEqual( src, 'int main( int argc, char** argv );' )
+		self.assertEqual( src, 'int __metalpy_user_main( void );' )
 
 	def test_non_entry_function_keeps_its_declared_return_type( self ) -> None:
 		self._run( '''
@@ -273,8 +274,10 @@ def main() -> None:
 ''' )
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn( 'ObjectHeader', src )
-		self.assertIn( 'int main( int argc, char** argv );', src ) # forward-declared
-		self.assertIn( 'int main( int argc, char** argv ) {', src ) # then defined
+		self.assertIn( 'int __metalpy_user_main( void );', src ) # forward-declared
+		self.assertIn( 'int __metalpy_user_main( void ) {', src ) # then defined
+		self.assertIn( 'static int __metalpy_main( int argc, char** argv ) {', src ) # canonical orchestrator
+		self.assertIn( 'int main( int argc, char** argv ) {\n\treturn __metalpy_main( argc, argv );\n}', src ) # trivial real entry point
 
 # shared by every test needing Result[T,E] - matches lowering_test.py's own
 # _RESULT_FIXTURE (self-contained snippet, not a real lib/ import -
@@ -505,7 +508,10 @@ def main() -> i32:
 		main_lf = next( lf for lf in self.compiler.functions if lf.function.qualname == 'main' )
 		kinds = [ type( i ).__name__ for i in main_lf.instructions ]
 		self.assertIn( 'AddCheck', kinds )
-		self.assertIn( 'OrReturn', kinds )
+		# auto-inserted (no enclosing try here) - degrades to exactly
+		# or_return()'s own semantics, general auto-or_throw() rule (see
+		# lowering.py's _auto_or_throw)
+		self.assertIn( 'OrThrow', kinds )
 		src = emitter_c.emit_function( main_lf )
 		self.assertIn( '__metalpy_add_overflow', src )
 		self.assertIn( 'tag == 1', src )
@@ -2483,8 +2489,8 @@ def main() -> i32:
 			( 'subscript_target_list_i32_element_augassign_fallback', '''
 def helper() -> Result[i32, IndexError]:
 	x: list[i32] = list[i32]()
-	x.append( 10 ).unwrap( 'x' )
-	x.append( 20 ).unwrap( 'x' )
+	x.append( 10 )
+	x.append( 20 )
 	with compiler.wrap_arithmetic:
 		x[0] += 5
 	if x.__getitem__( 0 ).unwrap( 'x' ) != 15:
@@ -2516,7 +2522,7 @@ class Counter:
 
 def helper() -> Result[i32, IndexError]:
 	x: list[Counter] = list[Counter]()
-	x.append( Counter( n = 0 )).unwrap( 'x' )
+	x.append( Counter( n = 0 ))
 	i: i32 = 0
 	while i < 50:
 		x[0] += 1
@@ -4123,6 +4129,37 @@ def main() -> i32:
 		return compute( 10 ) - 10
 ''', expected_exit = 0 )
 
+	def test_large_stack_frame_links_and_runs( self ) -> None:
+		# MSVC's own /Od backend silently emits `call __chkstk` in any
+		# function prologue whose local frame exceeds one page (4KB) - a
+		# freestanding no_crt build has no CRT to supply it (confirmed via a
+		# real LNK2019 "unresolved external symbol __chkstk" before
+		# linker_c.py's own _build_chkstk_obj started supplying an
+		# independently-assembled shim - see msvc_no_crt_missing_chkstk
+		# memory). 4096 i32 elements (16KB) spans 4 pages, exercising the
+		# shim's actual multi-page probe loop, not just its single-page fast
+		# path - clang/gcc need no such symbol at all (LLVM's own
+		# clang_rt.builtins already supplies the equivalent for a no_crt
+		# build), so this is a no-op assertion there, just extra coverage.
+		self._compile_and_run( '''
+@cstruct
+class BufLarge:
+	items: i32[4096] = 0
+
+def compute( x: i32 ) -> i32:
+	buf: BufLarge = BufLarge()
+	with compiler.wrap_arithmetic:
+		i: usize = usize( 0 )
+		while i < usize( 4096 ):
+			buf.items[i] = x + i32( i )
+			i += usize( 1 )
+		return buf.items[usize(4095)] - ( x + 4095 )
+
+def main() -> i32:
+	with compiler.panic_arithmetic( 'test' ):
+		return compute( 10 )
+''', expected_exit = 0 )
+
 class RequiresCrtDecoratorTests( unittest.TestCase ):
 	# @requires_crt (see mpy_types.Function.requires_crt/compiler.py's
 	# Compiler.requires_crt) - a library function marks itself, and if it's
@@ -4230,6 +4267,198 @@ def main() -> i32:
 	with compiler.panic_arithmetic( 'test' ):
 		return needs_crt() - 42
 ''', expected_exit = 0 )
+
+class CompilerErrorIntrinsicTests( CompilerTestCase ):
+	# compiler.error(msg) - a real compile-time diagnostic library code can
+	# raise itself (see PLAN_NONETYPE_GENERIC_VALUE.md). No real C compile
+	# needed here - compiler.error(...) always fails at DISCOVERY time
+	# (lowering.py's _lower_compiler_error), same as any other
+	# discovery.fail() call, so a plain CompilerTestCase._run() + errors
+	# check is enough, mirroring every other "rejected at compile time"
+	# test in this file (e.g. FixedSizeArrayFieldTests).
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_reachable_call_fails_with_the_exact_message( self ) -> None:
+		self._run( '''
+def boom() -> i32:
+	compiler.error( 'a custom, purpose-authored message' )
+	return 0
+
+def main() -> i32:
+	return boom()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'a custom, purpose-authored message', self.discovery.errors.errors[0] )
+
+	def test_unreachable_call_never_fires( self ) -> None:
+		# same reachability-gating every other compile-time-only construct
+		# in this compiler already has (@requires_crt, sys.panic, ...) - a
+		# function that's never actually called is never lowered, so its
+		# own compiler.error(...) call never runs
+		self._run( '''
+def boom() -> i32:
+	compiler.error( 'must never fire' )
+	return 0
+
+def main() -> i32:
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_non_literal_argument_is_rejected( self ) -> None:
+		self._run( '''
+def boom( msg: str ) -> i32:
+	compiler.error( msg )
+	return 0
+
+def main() -> i32:
+	return boom( 'not a literal' )
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'string-literal argument', self.discovery.errors.errors[0] )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class TypeIsGenericParamRealCompileTests( unittest.TestCase ):
+	# type(V) is T / type(V) is not T, where V is a generic class's own
+	# type parameter used bare (not an ordinary value) - see
+	# PLAN_NONETYPE_GENERIC_VALUE.md and type_resolver.py's own
+	# _try_fold_type_is_if. The critical property under test isn't just
+	# "does the boolean fold to the right answer" (type_resolver_test.py's
+	# own unit tests already cover that at the AST level) - it's that the
+	# UNTAKEN branch is never even lowered for a specialization that
+	# doesn't match, confirmed here via a real compile+run: a
+	# compiler.error(...) call placed in the untaken branch must never
+	# fire, for ANY V it doesn't apply to (a real repro found this exact
+	# gap - lowering.py's _stmt_If lowers BOTH branches of every `if`
+	# unconditionally, with no general dead-branch elimination for a
+	# merely-constant-folded condition, so this fold has to eliminate the
+	# branch at the AST level itself, before lowering ever sees it).
+	def _compile_and_run( self, source: str, expected_exit: int ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, expected_exit, f'exe exited {result.returncode}, expected {expected_exit} (stderr: {result.stderr})' )
+
+	def test_untaken_branch_for_non_matching_v_is_never_compiled( self ) -> None:
+		self._compile_and_run( '''
+class Box[V]:
+	def check( self ) -> i32:
+		if type( V ) is None:
+			compiler.error( 'must never fire for V=i32' )
+			return 1
+		return 0
+
+def main() -> i32:
+	b: Box[i32] = Box[i32]()
+	return b.check()
+''', expected_exit = 0 )
+
+	def test_taken_branch_for_matching_v_still_compiles_and_runs( self ) -> None:
+		self._compile_and_run( '''
+class Box[V]:
+	def is_none_type( self ) -> bool:
+		if type( V ) is None:
+			return True
+		return False
+
+def main() -> i32:
+	b_none: Box[None] = Box[None]()
+	b_i32: Box[i32] = Box[i32]()
+	if not b_none.is_none_type():
+		return 1
+	if b_i32.is_none_type():
+		return 2
+	return 0
+''', expected_exit = 0 )
+
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
+class DictNoneValueTypeRealCompileTests( unittest.TestCase ):
+	# dict[K, None] (and by extension set[None]) - PLAN_NONETYPE_GENERIC_
+	# VALUE.md's own scoped resolution: None can never be a Ptr[V]-erasure-
+	# backed generic container's value type (Ptr[None] already means
+	# "opaque erased pointer" everywhere else in this compiler - RawDict's
+	# own key_ptr/value_ptr fields - and that collides with "a real pointer
+	# to a NoneType value" the moment V is monomorphized to NoneType,
+	# producing a genuine C void*-deref type error). UnsafeDict.__init__
+	# now catches this with a clean, purpose-written compiler.error(...)
+	# message instead of letting it reach the C compiler.
+	def test_dict_none_value_type_is_rejected_with_a_clear_message( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	d: dict[str, None] = dict[str, None]()
+	return 0
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertTrue( discovery.errors.errors )
+		self.assertIn( 'dict[K, None]', discovery.errors.errors[0] )
+
+	def test_ordinary_dict_value_type_is_unaffected( self ) -> None:
+		# regression guard for the guard itself - the type(V) is None check
+		# must fold away to nothing for every OTHER value type, not just
+		# avoid firing at runtime (see TypeIsGenericParamRealCompileTests'
+		# own docstring for why "avoid firing at runtime" alone wouldn't
+		# have been enough)
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( '''
+def main() -> i32:
+	d: dict[str, i32] = dict[str, i32]()
+	d['a'] = 1
+	d['b'] = 2
+	with compiler.wrap_arithmetic:
+		return d['a'].unwrap( 'missing a' ) + d['b'].unwrap( 'missing b' ) - 3
+''', Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, 0, f'exe exited {result.returncode} (stderr: {result.stderr})' )
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang or gcc) found - skipping real-compile verification' )
 class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClassTestCase ):
@@ -4415,6 +4644,51 @@ class GlobalInitOrderingRealCompileTests( test_support.RealCompileMixin, RCClass
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
 
+	def test_global_reassigned_inside_main_before_any_other_use( self ) -> None:
+		# real, reachable crash: a RC-typed global reassigned via `global g;
+		# g = ...` directly inside main() - not a helper function main()
+		# calls, and with no PRIOR read of g anywhere earlier in main()'s
+		# own body - used to crash lowering itself (AttributeError:
+		# 'NoneType' object has no attribute 'rc_leaves', cfg.py's
+		# rc_leaves()) rather than failing to compile cleanly or misbehaving
+		# at runtime.
+		#
+		# Root cause: compiler.run() enqueues main() first, so main() is
+		# lowered before g's own compile unit is ever dequeued (Variable.
+		# resolve(), which populates .type, only runs when the Variable's
+		# OWN turn on the work queue arrives - see Compiler._lower's
+		# Variable branch). An ordinary READ of a global (_expr_Name) always
+		# calls lowering._ensure_resolved(name) first, forcing .type to be
+		# populated on demand - but the REASSIGNMENT path (_stmt_Assign's
+		# existing-binding branch, shared by AnnAssign/tuple-unpack/for-loop/
+		# walrus via _existing_local_or_none) read existing.type directly,
+		# with no such call. This was invisible whenever some OTHER
+		# reference to the global (a read, or the reassignment living in a
+		# function other than main()) happened to resolve it first - e.g.
+		# this file's own test_global_initializer_reading_another_globals_
+		# value_runs_in_dependency_order and thread_safe_globals_test.py's
+		# _REASSIGNED_GLOBAL_FIXTURE both reassign from a HELPER function,
+		# never main() itself, so they never hit this. Fixed by giving the
+		# reassignment path the same _ensure_resolved(existing) call
+		# AugAssign's own Name-target branch already had.
+		self._run( '\n'.join([
+			'class Foo:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'',
+			'g: Foo = Foo( 10 )',
+			'',
+			'def main() -> i32:',
+			'	global g',
+			'	g = Foo( 20 )',
+			'	if g.x != 20:',
+			'		return 1',
+			'	return 0',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 0 )
+
 class GlobalInitCycleDetectionTests( RCClassTestCase ):
 	def test_circular_global_value_dependency_is_a_clean_compile_error( self ) -> None:
 		# the one shape _topologically_sort_globals can never satisfy: two
@@ -4583,13 +4857,20 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		# not only the Windows-specific console-codepage setup (this is
 		# exactly the condition PLAN_GLOBAL_INIT.md's own implementation
 		# changed from `_is_entry_point(...) and active_target['os'] ==
-		# 'windows'` to a plain `_is_entry_point(...)`)
+		# 'windows'` to a plain `_is_entry_point(...)`). __metalpy_main
+		# (emit_c()'s own synthesized canonical orchestrator, called by both
+		# the real main() forwarder and mainCRTStartup) calls __metalpy_init()
+		# BEFORE calling __metalpy_user_main() - not necessarily the literal
+		# first statement any more (an unused-argc/argv marker or the
+		# sys.argv capture may precede it), so check ordering, not line
+		# position.
 		for target in ( self._WINDOWS_TARGET, self._LINUX_TARGET ):
 			with self.subTest( target = target[ 'os' ] ):
 				src = self._compiled_source( target )
-				main_start = src.index( 'int main( int argc, char** argv ) {' )
-				second_line = src[ main_start: ].split( '\n', 2 )[1]
-				self.assertIn( '__metalpy_init();', second_line )
+				main_start = src.index( 'static int __metalpy_main( int argc, char** argv ) {' )
+				end = src.index( '\n}', main_start )
+				body = src[ main_start : end ]
+				self.assertLess( body.index( '__metalpy_init();' ), body.index( '__metalpy_user_main();' ))
 
 	def test_metalpy_init_calls_every_non_trivial_globals_init_function( self ) -> None:
 		src = self._compiled_source( self._LINUX_TARGET )
@@ -4614,19 +4895,21 @@ class MacosGlobalLockPoisonPillTests( unittest.TestCase ):
 
 	_MACOS_TARGET = ActiveTarget( os = 'macos', arch = 'x86_64', family = 'unix', bits = 64, debug = True, posix = True )
 
+	# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: unlike Part A (only a
+	# genuinely reassigned global reaches _global_lock_supported() at all),
+	# Part B's own per-object lock is needed for ANY constructed RC object,
+	# not just a reassigned global - so this fixture, to stay a genuine
+	# "nothing needs ANY locking machinery" case, must construct no RC
+	# object at all (a scalar-only global, previously it built a real Foo
+	# instance - confirmed as a real regression once Part B's has_object_
+	# header_alloc scan started reaching _global_lock_supported() too).
 	_NO_REASSIGNMENT_FIXTURE = '\n'.join([
 		'import compiler',
-		'class Foo:',
-		'	x: i32',
-		'	@staticmethod',
-		'	def make( v: i32 ) -> Foo:',
-		'		return Foo.__allocate__( x = v )',
-		'',
-		'g1: Foo = Foo.make( 1 )',
+		'g1: i32 = 1',
 		'',
 		'def main() -> i32:',
 		'	with compiler.wrap_arithmetic:',
-		'		return g1.x - 1',
+		'		return g1 - 1',
 	])
 
 	# the exact "genuinely reassigned from inside a function body" shape
@@ -4673,6 +4956,30 @@ class MacosGlobalLockPoisonPillTests( unittest.TestCase ):
 
 	def test_protected_global_on_macos_raises_the_poison_pill( self ) -> None:
 		compiler = self._compile( self._REASSIGNED_GLOBAL_FIXTURE )
+		with self.assertRaises( AssertionError ) as ctx:
+			emitter_c.emit_c( compiler )
+		self.assertIn( 'completely untested', str( ctx.exception ))
+
+	def test_constructed_rc_object_on_macos_raises_the_poison_pill( self ) -> None:
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: every constructed RC
+		# object now needs its own per-object lock, unverified on macOS the
+		# same way Part A's per-global lock always was - this is the Part B
+		# counterpart of test_protected_global_on_macos_raises_the_poison_
+		# pill above, confirming the SAME poison pill now also fires for
+		# ordinary RC construction, not just a reassigned global.
+		source = '\n'.join([
+			'import compiler',
+			'class Foo:',
+			'	x: i32',
+			'	def __init__( self, v: i32 ) -> None:',
+			'		self.x = v',
+			'',
+			'def main() -> i32:',
+			'	f: Foo = Foo( 1 )',
+			'	with compiler.wrap_arithmetic:',
+			'		return f.x - 1',
+		])
+		compiler = self._compile( source )
 		with self.assertRaises( AssertionError ) as ctx:
 			emitter_c.emit_c( compiler )
 		self.assertIn( 'completely untested', str( ctx.exception ))
@@ -5398,11 +5705,9 @@ class ListGenericTests( test_support.RealCompileMixin, CompilerTestCase ):
 			( 'list_i32_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
 	if x.__len__() != 3:
 		return 1
 	g0: Result[i32,IndexError] = x.__getitem__( 0 )
@@ -5439,7 +5744,7 @@ def main() -> i32:
 			( 'list_rc_element_getitem_unwrap_chained_on_bare_receiver', '''
 def main() -> i32:
 	x: list[int] = list[int]()
-	x.append( int( 5 )).unwrap( 'x' )
+	x.append( int( 5 ))
 	got: int = x.__getitem__( 0 ).unwrap( 'getitem failed' )
 	if got != int( 5 ):
 		return 1
@@ -5454,9 +5759,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,BorrowError] = x.append( compiler.cast( i32, i ))
-			if ar.is_err():
-				return 9
+			x.append( compiler.cast( i32, i ))
 			i += 1
 	if x.__len__() != 20:
 		return 1
@@ -5481,14 +5784,12 @@ def main() -> i32:
 			( 'erase_at_preserves_positional_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	r3: Result[None,BorrowError] = x.append( 40 )
-	r4: Result[None,BorrowError] = x.append( 50 )
-	if r0.is_err() or r1.is_err() or r2.is_err() or r3.is_err() or r4.is_err():
-		return 9
-	er: Result[None,IndexError|BorrowError] = x.erase_at( 2 )
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
+	x.append( 40 )
+	x.append( 50 )
+	er: Result[None,IndexError] = x.erase_at( 2 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 4:
@@ -5513,14 +5814,10 @@ def main() -> i32:
 			( 'insert_shifts_tail_right_and_preserves_order', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
-	ir: Result[None,BorrowError] = x.insert( 1, 99 )
-	if ir.is_err():
-		return 8
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
+	x.insert( 1, 99 )
 	if x.__len__() != 4:
 		return 1
 	g0: Result[i32,IndexError] = x.__getitem__( 0 )
@@ -5542,13 +5839,9 @@ def main() -> i32:
 			( 'insert_past_end_clamps_to_append', '''
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	if r0.is_err() or r1.is_err():
-		return 9
-	ir: Result[None,BorrowError] = x.insert( 100, 30 )
-	if ir.is_err():
-		return 8
+	x.append( 10 )
+	x.append( 20 )
+	x.insert( 100, 30 )
 	if x.__len__() != 3:
 		return 1
 	g2: Result[i32,IndexError] = x.__getitem__( 2 )
@@ -5570,11 +5863,9 @@ def set_it( x: list[i32] ) -> Result[None,IndexError]:
 
 def main() -> i32:
 	x: list[i32] = list[i32]()
-	r0: Result[None,BorrowError] = x.append( 10 )
-	r1: Result[None,BorrowError] = x.append( 20 )
-	r2: Result[None,BorrowError] = x.append( 30 )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
+	x.append( 10 )
+	x.append( 20 )
+	x.append( 30 )
 	sr: Result[None,IndexError] = set_it( x )
 	if sr.is_err():
 		return 7
@@ -5594,10 +5885,8 @@ def main() -> i32:
 			( 'list_str_construct_append_getitem_del', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,BorrowError] = x.append( 'hello' )
-	r1: Result[None,BorrowError] = x.append( 'world' )
-	if r0.is_err() or r1.is_err():
-		return 9
+	x.append( 'hello' )
+	x.append( 'world' )
 	if x.__len__() != 2:
 		return 1
 	g0: Result[str,IndexError] = x.__getitem__( 0 )
@@ -5616,9 +5905,7 @@ def main() -> i32:
 	i: usize = 0
 	with compiler.panic_arithmetic( 'overflow' ):
 		while i < 20:
-			ar: Result[None,BorrowError] = x.append( 'item' )
-			if ar.is_err():
-				return 9
+			x.append( 'item' )
 			i += 1
 	if x.__len__() != 20:
 		return 1
@@ -5657,9 +5944,7 @@ class Holder:
 		self.items = list[i32]()
 
 	def add( self, v: i32 ) -> None:
-		r: Result[None,BorrowError] = self.items.append( v )
-		if r.is_err():
-			sys.panic( 'append failed' )
+		self.items.append( v )
 
 def main() -> i32:
 	h: Holder = Holder()
@@ -5714,9 +5999,7 @@ class Triple:
 
 def main() -> i32:
 	xs: list[Triple] = list[Triple]()
-	r1: Result[None,BorrowError] = xs.append( Triple( 5 ))
-	if r1.is_err():
-		return 1
+	xs.append( Triple( 5 ))
 	g1: Result[Triple,IndexError] = xs.__getitem__( 0 )
 	if g1.is_err():
 		return 2
@@ -5766,12 +6049,10 @@ def main() -> i32:
 			( 'list_str_erase_at_preserves_order_and_refcounts', '''
 def main() -> i32:
 	x: list[str] = list[str]()
-	r0: Result[None,BorrowError] = x.append( 'a' )
-	r1: Result[None,BorrowError] = x.append( 'b' )
-	r2: Result[None,BorrowError] = x.append( 'c' )
-	if r0.is_err() or r1.is_err() or r2.is_err():
-		return 9
-	er: Result[None,IndexError|BorrowError] = x.erase_at( 1 )
+	x.append( 'a' )
+	x.append( 'b' )
+	x.append( 'c' )
+	er: Result[None,IndexError] = x.erase_at( 1 )
 	if er.is_err():
 		return 8
 	if x.__len__() != 2:
@@ -5886,7 +6167,7 @@ class Pusher:
 		while i < 1000:
 			with compiler.wrap_arithmetic:
 				v: i32 = self.base + i
-			self.target.append( v ).unwrap( 'append failed' )
+			self.target.append( v )
 			with compiler.wrap_arithmetic:
 				i += 1
 
@@ -5898,7 +6179,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 1000
 		p: Pusher = Pusher.make( l, base )
-		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( p.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -5936,7 +6217,7 @@ class Pusher:
 		while i < 1000:
 			with compiler.wrap_arithmetic:
 				v: i32 = self.base + i
-			self.target.append( v ).unwrap( 'append failed' )
+			self.target.append( v )
 			with compiler.wrap_arithmetic:
 				i += 1
 
@@ -5951,7 +6232,7 @@ class Consumer:
 
 	def run( self ) -> None:
 		while self.popped < 8000:
-			r: Result[i32, IndexError|BorrowError] = self.source.pop()
+			r: Result[i32, IndexError] = self.source.pop()
 			if r.is_ok():
 				v: i32 = r.unwrap( 'checked is_ok' )
 				with compiler.wrap_arithmetic:
@@ -5968,7 +6249,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 1000
 		p: Pusher = Pusher.make( l, base )
-		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( p.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -6010,7 +6291,7 @@ class ItemPusher:
 			with compiler.wrap_arithmetic:
 				v: i32 = self.base + i
 			it: Item = Item.make( v )
-			self.target.append( it ).unwrap( 'append failed' )
+			self.target.append( it )
 			compiler.decref( it )
 			with compiler.wrap_arithmetic:
 				i += 1
@@ -6023,7 +6304,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 250
 		p: ItemPusher = ItemPusher.make( l, base )
-		threads.append( threading.Thread( p.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( p.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -6166,107 +6447,6 @@ def main() -> i32:
 		return 1
 	if result_b.load() != 222:
 		return 2
-	return 0
-''' ),
-			# real cross-thread stress test for list[T][a:b] slice syntax's
-			# RAII borrow tracking: N threads hammer append() on a list while
-			# the MAIN thread holds a live slice[T] view, then lets it go
-			# (del view) - a closed-form accounting check (every attempt is
-			# EITHER blocked with BorrowError OR succeeds, counted
-			# separately, and the two counts plus the list's own final
-			# length must all agree exactly) proves the borrow genuinely
-			# serializes against real concurrent mutation attempts, not just
-			# single-threaded reasoning - and that releasing it happens
-			# automatically via slice[T].__del__ (RAII), with no manual
-			# release call, unlike the old borrow_slice()/release_borrow()
-			# API this replaces. The busy-wait on `started` (same pattern
-			# independent_per_thread_slots above already uses) maximizes the
-			# chance every hammering thread has actually begun racing before
-			# the main thread drops the view - without it, a slow thread
-			# start could let every attempt land AFTER the view's __del__,
-			# proving nothing.
-			( 'slice_syntax_blocks_concurrent_mutation_and_unblocks_on_del', '''
-import threading
-import atomic
-
-class Hammerer:
-	target:  list[i32]
-	started: atomic.Atomic[i32]
-	blocked: atomic.Atomic[i32]
-	ok:      atomic.Atomic[i32]
-
-	@staticmethod
-	def make( target: list[i32], started: atomic.Atomic[i32], blocked: atomic.Atomic[i32], ok: atomic.Atomic[i32] ) -> Hammerer:
-		return Hammerer.__allocate__( target = target, started = started, blocked = blocked, ok = ok )
-
-	def run( self ) -> None:
-		self.started.fetch_add( 1 )
-		i: i32 = 0
-		while i < 20000:
-			if self.target.append( 1 ).is_ok():
-				self.ok.fetch_add( 1 )
-			else:
-				self.blocked.fetch_add( 1 )
-			with compiler.wrap_arithmetic:
-				i += 1
-
-def main() -> i32:
-	l: list[i32] = list[i32]()
-	started = atomic.Atomic[i32]( 0 )
-	blocked = atomic.Atomic[i32]( 0 )
-	ok      = atomic.Atomic[i32]( 0 )
-
-	view: slice[i32] = l[0:l.__len__()]
-
-	threads: list[threading.Thread] = list[threading.Thread]()
-	t: i32 = 0
-	while t < 4:
-		h: Hammerer = Hammerer.make( l, started, blocked, ok )
-		threads.append( threading.Thread( h.run ) ).unwrap( 'append failed' )
-		with compiler.wrap_arithmetic:
-			t += 1
-
-	while started.load() < 4:
-		pass
-	# also wait for real, observed contention (not just thread startup)
-	# before releasing - under extreme scheduler oversubscription (e.g. 16
-	# parallel test shards, each spawning their own threads), a bare
-	# `started.load() < 4` busy-wait can race: all 4 hammering threads can
-	# run their ENTIRE workload to completion in one scheduling burst
-	# before this thread's own busy-wait ever gets a chance to notice and
-	# release, making `blocked` a coin flip instead of a near-certainty.
-	# 20000 iterations/thread (vs the smaller count this used to have)
-	# makes that one-uninterrupted-burst scenario far less likely on its
-	# own already; waiting for a real blocked count on top removes the
-	# remaining race on THAT assertion specifically.
-	while blocked.load() < 100:
-		pass
-
-	# view's own length, captured before `del` ends its lifetime - the
-	# borrow-count decrement (unblocking every hammering thread) happens
-	# right here, inside del, entirely automatically
-	view_len: usize = view.__len__()
-	del view
-
-	i: usize = 0
-	while i < 4:
-		th: threading.Thread = threads.__getitem__( i ).unwrap( 'getitem failed' )
-		th.join()
-		with compiler.wrap_arithmetic:
-			i += 1
-
-	if view_len != 0:
-		return 1
-	if blocked.load() == 0:
-		return 2
-	if ok.load() == 0:
-		return 3
-	with compiler.wrap_arithmetic:
-		total: i32 = blocked.load() + ok.load()
-	if total != 80000:
-		return 4
-	if l.__len__() != usize( ok.load() ):
-		return 5
 	return 0
 ''' ),
 		], timeout = 30 )
@@ -7212,7 +7392,7 @@ def main() -> i32:
 	rc0: usize = compiler.refcount( c )
 
 	lst = list[Closure[[], None]]()
-	lst.append( c ).unwrap( 'append failed' )
+	lst.append( c )
 	rc1: usize = compiler.refcount( c )
 	with compiler.wrap_arithmetic:
 		if rc1 != rc0 + 1:
@@ -7693,7 +7873,7 @@ def main() -> i32:
 	threads: list[threading.Thread] = list[threading.Thread]()
 	i: usize = 0
 	while i < 8:
-		threads.append( threading.Thread( closure ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( closure ) )
 		with compiler.wrap_arithmetic:
 			i += 1
 	i = 0
@@ -7980,7 +8160,7 @@ def main() -> i32:
 	if '-'.join( empty ) != '':
 		return 2
 	single: list[str] = list[str]()
-	single.append( 'solo' ).unwrap( 'append failed' )
+	single.append( 'solo' )
 	if '-'.join( single ) != 'solo':
 		return 3
 	return 0
@@ -8949,6 +9129,103 @@ def main() -> i32:
 		] )
 
 
+class BinaryFileHandleFieldTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' BinaryWriter/BinaryReader (lib/builtins/__File.py) held as a
+	user-defined class's own field. Previously crashed the COMPILER ITSELF
+	(not a normal compile error) with `AttributeError: 'NoneType' object has
+	no attribute 'is_rc_pointer'` in type_resolver.py's
+	_build_field_teardown_ast, called from _synthesize_rcclass_destructor
+	while auto-generating the owning class's __del__. Root cause:
+	BinaryReader/BinaryWriter/BinaryReadWriter were declared in __File.py but
+	never actually exported by lib/builtins/__init__.py's own
+	`from .__File import File` (only File itself was named) - referencing
+	any of them anywhere, not just as a field, failed to resolve with a
+	CompileError that discovery.py's _resolve_guarded swallows by design
+	(a broken symbol is only ever attempted once - see its own docstring),
+	leaving the field's Variable.type permanently None instead of ever
+	surfacing the error. No prior test anywhere in the repo constructed a
+	real BinaryWriter/BinaryReader (only File.binary_writer/reader's own
+	internal factory methods touch them, as local variables, never as a
+	field), so this gap was never exercised. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		with tempfile.TemporaryDirectory() as data_dir:
+			write_path = ( Path( data_dir ) / 'written.bin' ).as_posix()
+			read_path = Path( data_dir ) / 'preexisting.bin'
+			read_path.write_bytes( b'xyz' )
+			self.assert_programs_run([
+				# the original crash repro: a class whose only field is a
+				# BinaryWriter, no user __del__ - the auto-synthesized
+				# destructor is exactly what walked into the None field_type.
+				( 'binary_writer_field_write_and_synthesized_destructor_close', f'''
+class Thing:
+	__writer: BinaryWriter
+	def __init__( self, path: str ) -> Result[None, OSError]:
+		self.__writer = File.binary_writer( path, append = False, truncate = True ).or_return()
+		return Result.Ok( None )
+	def write_all( self, buf: bytearray ) -> Result[usize, OSError]:
+		p: ConstPtr[u8] = buf.get_const_ptr()
+		return self.__writer.write( p, len( buf ))
+
+def main() -> i32:
+	r = Thing( "{write_path}" )
+	if r.is_err():
+		return 1
+	t = r.unwrap( "construct failed" )
+	b: bytearray = bytearray( 3 )
+	p: Ptr[u8] = b.get_ptr()
+	p[0] = 65
+	p[1] = 66
+	p[2] = 67
+	wr = t.write_all( b )
+	if wr.is_err():
+		return 2
+	if wr.unwrap( "write failed" ) != 3:
+		return 3
+	return 0
+''' ),
+				# same shape with BinaryReader - a second, independently
+				# resolved field type through the identical teardown path.
+				( 'binary_reader_field_read_and_synthesized_destructor_close', f'''
+class Reader:
+	__reader: BinaryReader
+	def __init__( self, path: str ) -> Result[None, OSError]:
+		self.__reader = File.binary_reader( path ).or_return()
+		return Result.Ok( None )
+	def read_all( self, buf: bytearray ) -> Result[usize, OSError]:
+		p: Ptr[u8] = buf.get_ptr()
+		return self.__reader.read( p, len( buf ))
+
+def main() -> i32:
+	r = Reader( "{read_path.as_posix()}" )
+	if r.is_err():
+		return 1
+	rd = r.unwrap( "construct failed" )
+	b: bytearray = bytearray( 3 )
+	rr = rd.read_all( b )
+	if rr.is_err():
+		return 2
+	if rr.unwrap( "read failed" ) != 3:
+		return 3
+	p: ConstPtr[u8] = b.get_const_ptr()
+	if p[0] != 120 or p[1] != 121 or p[2] != 122: # 'x','y','z'
+		return 4
+	return 0
+''' ),
+			] )
+			# the writer program's own file survives its process exit only if
+			# the synthesized destructor actually ran close_raw() (BinaryWriter
+			# has no explicit .close() call anywhere above) - confirms the
+			# teardown path this bug lived in genuinely executed, not just
+			# that the program happened to exit 0.
+			self.assertEqual( Path( write_path ).read_bytes(), b'ABC' )
+
+
 class DictTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' dict[K,V] (lib/builtins/__init__.py's own dict class + lib/builtins/
 	__RawDict.py's RawDict/RawEntry/RawIndex) end-to-end - see
@@ -9390,13 +9667,11 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
-			# for x in my_set: - proves the __len__ + __getitem__(usize)
-			# "indexable" for-loop protocol wiring (lowering.py's
-			# _lower_for_over_indexable) actually works for set[T], with no
-			# compiler changes of its own. The per-iteration bind desugars
-			# to obj[i].or_return() (since __getitem__ returns
-			# Result[T,IndexError]), which requires the ENCLOSING function
-			# to itself return a Result[_,IndexError]-shaped type - main()
+			# for x in my_set: - proves set[T]'s own Sequence[T]/Iterable[T]
+			# conformance (its __iter__ delegates to _sequence_iter) drives a
+			# real for-loop with no compiler changes of its own. The bound
+			# helper returns Result[_,IndexError] because _sequence_iter's
+			# own StopIteration-stripped remaining error is IndexError - main()
 			# returns plain i32 (needed for this test harness's own exit-
 			# code dispatch), so the loop lives in a small helper instead,
 			# unwrapped by main(). xor-checksum the visited elements
@@ -9590,7 +9865,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 100
 		w: DictWriter = DictWriter.make( d, base )
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -9645,7 +9920,7 @@ def main() -> i32:
 	inc: Incrementer = Incrementer.make( d )
 	t: i32 = 0
 	while t < 8:
-		threads.append( threading.Thread( inc.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( inc.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -9703,7 +9978,7 @@ def main() -> i32:
 		with compiler.wrap_arithmetic:
 			base: i32 = t * 50
 		w: StrDictWriter = StrDictWriter.make( d, base )
-		threads.append( threading.Thread( w.run ) ).unwrap( 'append failed' )
+		threads.append( threading.Thread( w.run ) )
 		with compiler.wrap_arithmetic:
 			t += 1
 	i: usize = 0
@@ -9733,13 +10008,13 @@ def main() -> i32:
 class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' lib/bisect.py's bisect_left/bisect_right (direct T-vs-T comparison)
 	and bisect_left_by_key/bisect_right_by_key (key: Ptr[Callable[[T],K]]
-	extractor, T and K allowed to differ) - and UnsafeList[T].as_slice(),
-	the slice[T] view bridge these need arr: slice[T] parameters from.
-	Never compiled/run anywhere before this - lib/builtins/__RawDict.py used
-	to hand-roll its own binary search specifically because bisect.py's
-	key= couldn't be made to work (no Callable[...] support, then no
-	slice[T] construction path); RawDict._lower_bound now calls
-	bisect_left_by_key for real (see DictTests). '''
+	extractor, T and K allowed to differ) - both operate directly on an
+	arr: UnsafeList[T] (no view/copy of their own; see lib/bisect.py's own
+	comment). Never compiled/run anywhere before this - lib/builtins/
+	__RawDict.py used to hand-roll its own binary search specifically
+	because bisect.py's key= couldn't be made to work (no Callable[...]
+	support, then no way to pass it a plain buffer reference); RawDict.
+	_lower_bound now calls bisect_left_by_key for real (see DictTests). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -9751,111 +10026,10 @@ class BisectTests( test_support.RealCompileMixin, CompilerTestCase ):
 		single executable (one build for the whole class); a nonzero exit is
 		decoded back to the failing sub-program and its own return code. '''
 		self.assert_programs_run([
-			( 'as_slice_over_value_typed_elements', '''
-def main() -> i32:
-	arr: UnsafeList[i32] = UnsafeList[i32]()
-	arr.append( 10 )
-	arr.append( 20 )
-	arr.append( 30 )
-	s: slice[i32] = arr.as_slice()
-	if len( s ) != 3:
-		return 1
-	if s.get_unchecked( 0 ) != 10 or s.get_unchecked( 1 ) != 20 or s.get_unchecked( 2 ) != 30:
-		return 2
-	return 0
-''' ),
-			# as_slice() over an EMPTY list - _slot_ptr(0) is deliberately not
-			# bounds-checked against __len for exactly this case (see its own
-			# docstring); a zero-length slice must still be constructible and
-			# safe (nothing can read through it - every real read goes
-			# through an index < len() check first)
-			( 'as_slice_over_empty_list', '''
-def main() -> i32:
-	arr: UnsafeList[i32] = UnsafeList[i32]()
-	s: slice[i32] = arr.as_slice()
-	if len( s ) != 0:
-		return 1
-	return 0
-''' ),
-			# as_slice() over an RC element type (str) - slice[T]'s own _ptr is
-			# untyped (ConstPtr[None]) and get_unchecked already does the
-			# compiler.is_rc(T) handle-vs-value branch - confirms the two
-			# containers' buffer layouts genuinely agree for RC T too
-			( 'as_slice_over_rc_elements', '''
-def main() -> i32:
-	arr: UnsafeList[str] = UnsafeList[str]()
-	arr.append( 'apple' )
-	arr.append( 'banana' )
-	arr.append( 'cherry' )
-	s: slice[str] = arr.as_slice()
-	if s.get_unchecked( 0 ) != 'apple':
-		return 1
-	if s.get_unchecked( 1 ) != 'banana':
-		return 2
-	if s.get_unchecked( 2 ) != 'cherry':
-		return 3
-	return 0
-''' ),
-			# get_unchecked's own Incref for RC T, bound to a named local -
-			# above's 'apple'/'banana'/'cherry' are all string LITERALS, which
-			# compile to immortal (ref_count == METALPY_IMMORTAL_REFCOUNT)
-			# static objects whose Incref/Decref are silent no-ops (see
-			# emitter_c.py's retain_object/release_object) - that masks this
-			# entire bug class. heap_str() builds a genuine, normally-
-			# refcounted heap string at runtime instead - concatenating two
-			# CONSTANT strings (e.g. 'heap_' + 'string') gets constant-folded
-			# back into a single immortal literal (confirmed empirically),
-			# but 'heap_' + str(n) can't be, since n is a plain i32 parameter.
-			( 'get_unchecked_increfs_rc_element_bound_to_local', '''
-def heap_str( n: i32 ) -> str:
-	return 'heap_' + str( n )
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		x: str = heap_str( 1 )
-		arr: UnsafeList[str] = UnsafeList[str]()
-		arr.append( x )
-		s: slice[str] = arr.as_slice()
-		before: usize = compiler.refcount( x )
-		got: str = s.get_unchecked( 0 )
-		after: usize = compiler.refcount( x )
-		if after != before + 1:
-			return 1
-		if got != x:
-			return 2
-		compiler.decref( got )
-		restored: usize = compiler.refcount( x )
-		if restored != before:
-			return 3
-	return 0
-''' ),
-			# same non-literal-heap-string setup, but the read is INLINE
-			# (never bound to a name) - the exact shape lib/bisect.py's own
-			# get_unchecked calls use. get_unchecked's own Incref and the
-			# compiler's automatic scope-exit Decref on the unnamed temp
-			# holding the comparison's operand must cancel out net zero.
-			( 'get_unchecked_inline_read_is_refcount_neutral', '''
-def heap_str( n: i32 ) -> str:
-	return 'inline_' + str( n )
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		x: str = heap_str( 1 )
-		arr: UnsafeList[str] = UnsafeList[str]()
-		arr.append( x )
-		s: slice[str] = arr.as_slice()
-		before: usize = compiler.refcount( x )
-		if s.get_unchecked( 0 ) != x:
-			return 1
-		after: usize = compiler.refcount( x )
-		if after != before:
-			return 2
-	return 0
-''' ),
 			# bisect_left/bisect_right over an RC element type (str) end to
 			# end - every prior bisect test here uses a non-RC T (i32/Node),
 			# so this is the first real exercise of bisect.py's inline
-			# get_unchecked calls against RC elements.
+			# __getitem__(...).unwrap(...) reads against RC elements.
 			( 'bisect_left_and_right_over_rc_elements', '''
 import bisect
 
@@ -9869,35 +10043,11 @@ def main() -> i32:
 		arr.append( heap_str( 2 ) )
 		arr.append( heap_str( 2 ) )
 		arr.append( heap_str( 3 ) )
-		s: slice[str] = arr.as_slice()
 		target: str = heap_str( 2 )
-		if bisect.bisect_left( s, target ) != 1:
+		if bisect.bisect_left( arr, target ) != 1:
 			return 1
-		if bisect.bisect_right( s, target ) != 3:
+		if bisect.bisect_right( arr, target ) != 3:
 			return 2
-	return 0
-''' ),
-			# repeated named-local + explicit compiler.decref reads over many
-			# iterations with a fresh heap (non-literal) string each time -
-			# mirrors FStringTests' own repeated_fstring_construction_does_
-			# not_leak_or_double_free stress shape; a leak grows memory
-			# silently but a double-free/UAF here crashes the process,
-			# turning a wrong exit code into a hard failure.
-			( 'repeated_slice_get_unchecked_read_does_not_leak_or_double_free', '''
-def heap_str( n: i32 ) -> str:
-	return 'value_' + str( n )
-
-def main() -> i32:
-	with compiler.wrap_arithmetic:
-		for i in range( 1000 ):
-			x: str = heap_str( 7 )
-			arr: UnsafeList[str] = UnsafeList[str]()
-			arr.append( x )
-			s: slice[str] = arr.as_slice()
-			got: str = s.get_unchecked( 0 )
-			if got != heap_str( 7 ):
-				return 1
-			compiler.decref( got )
 	return 0
 ''' ),
 			( 'bisect_left_and_right_direct_comparison', '''
@@ -9910,17 +10060,16 @@ def main() -> i32:
 	arr.append( 3 )
 	arr.append( 5 )
 	arr.append( 7 )
-	s: slice[i32] = arr.as_slice()
-	if bisect.bisect_left( s, 3 ) != 1:
+	if bisect.bisect_left( arr, 3 ) != 1:
 		return 1
-	if bisect.bisect_right( s, 3 ) != 3:
+	if bisect.bisect_right( arr, 3 ) != 3:
 		return 2
-	if bisect.bisect_left( s, 0 ) != 0:
+	if bisect.bisect_left( arr, 0 ) != 0:
 		return 3
-	if bisect.bisect_right( s, 100 ) != 5:
+	if bisect.bisect_right( arr, 100 ) != 5:
 		return 4
 	empty: UnsafeList[i32] = UnsafeList[i32]()
-	if bisect.bisect_left( empty.as_slice(), 5 ) != 0:
+	if bisect.bisect_left( empty, 5 ) != 0:
 		return 5
 	return 0
 ''' ),
@@ -9945,10 +10094,9 @@ def main() -> i32:
 	arr.append( Node( hash = 3, payload = 2 ))
 	arr.append( Node( hash = 5, payload = 3 ))
 	key: Ptr[Callable[[Node],u64]] = hash_of
-	s: slice[Node] = arr.as_slice()
-	if bisect.bisect_left_by_key( s, u64( 3 ), key ) != 1:
+	if bisect.bisect_left_by_key( arr, u64( 3 ), key ) != 1:
 		return 1
-	if bisect.bisect_right_by_key( s, u64( 3 ), key ) != 3:
+	if bisect.bisect_right_by_key( arr, u64( 3 ), key ) != 3:
 		return 2
 	return 0
 ''' ),
@@ -10066,8 +10214,8 @@ def main() -> i32:
 			( 'list_of_tuple_as_explicit_constructor_type_argument', '''
 def main() -> i32:
 	entries: list[tuple[str,str]] = list[tuple[str,str]]()
-	entries.append( ( "Content-Type", "text/plain" ) ).unwrap( 'append' )
-	entries.append( ( "X-Test", "1" ) ).unwrap( 'append' )
+	entries.append( ( "Content-Type", "text/plain" ) )
+	entries.append( ( "X-Test", "1" ) )
 	if len( entries ) != 2:
 		return 1
 	first: tuple[str,str] = entries.__getitem__( 0 ).unwrap( 'idx' )
@@ -10245,7 +10393,142 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# `for a, b in EXPR:` - a Tuple for-loop target, desugared
+			# (type_resolver.py's _desugar_tuple_for_target) into `for
+			# __for_tuple_N in EXPR: a, b = __for_tuple_N`, reusing the
+			# ordinary tuple-unpacking-Assign machinery this whole test
+			# class already exercises above rather than a second copy of it
+			( 'tuple_unpack_for_loop_target', '''
+def main() -> i32:
+	pairs: list[tuple[i32, i32]] = list[tuple[i32, i32]]()
+	pairs.append(( 1, 10 ))
+	pairs.append(( 2, 20 ))
+	pairs.append(( 3, 30 ))
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for i, j in pairs:
+			total += i + j
+	if total != 66:
+		return 1
+	return 0
+''' ),
+			# an RC element (str) destructured out of a for-loop's own tuple
+			# target, dropped without crashing - same shape as
+			# tuple_unpack_rc_element_dropped_without_crashing above, just
+			# reached via the for-loop desugar instead of a bare Assign
+			( 'tuple_unpack_for_loop_target_rc_element_dropped_without_crashing', '''
+def main() -> i32:
+	pairs: list[tuple[str, i32]] = list[tuple[str, i32]]()
+	pairs.append(( "a", 1 ))
+	pairs.append(( "bb", 2 ))
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for s, n in pairs:
+			total += n
+	if total != 3:
+		return 1
+	return 0
+''' ),
+			# t[a:b] on a homogeneous tuple - compile-time-constant bounds
+			# build a fresh, DIFFERENT fixed-arity tuple[T,...] via field
+			# copies (_lower_tuple_slice), not a runtime __getitem__(slice)
+			# dispatch (no single return type could express "the arity
+			# depends on the caller's own literal bounds"). Covers a full
+			# slice, a middle slice, and both one-sided forms
+			( 'homogeneous_tuple_slice_various_bounds', '''
+def main() -> i32:
+	t: tuple[i32, i32, i32, i32] = ( 10, 20, 30, 40 )
+	mid = t[1:3]
+	if mid[0] != 20 or mid[1] != 30:
+		return 1
+	full = t[0:4]
+	if full[0] != 10 or full[1] != 20 or full[2] != 30 or full[3] != 40:
+		return 2
+	no_upper = t[2:]
+	if no_upper[0] != 30 or no_upper[1] != 40:
+		return 3
+	no_lower = t[:2]
+	if no_lower[0] != 10 or no_lower[1] != 20:
+		return 4
+	return 0
+''' ),
+			# out-of-range/inverted bounds clamp instead of erroring, same
+			# tolerance every other slice target already has
+			# (_resolve_slice_bounds, lib/builtins/__init__.py) - t[2:99]
+			# clamps stop to 4, still 2+ elements after clamping so it
+			# doesn't hit the arity<2 rejection
+			( 'homogeneous_tuple_slice_out_of_range_clamps', '''
+def main() -> i32:
+	t: tuple[i32, i32, i32, i32] = ( 10, 20, 30, 40 )
+	clamped = t[2:99]
+	if clamped[0] != 30 or clamped[1] != 40:
+		return 1
+	return 0
+''' ),
+			# RC-correctness: slicing must incref each copied element (a
+			# fresh, independent owner alongside the source tuple's own
+			# field), and release them again when the slice itself goes out
+			# of scope - checked via before/during/after compiler.refcount()
+			# rather than just "didn't crash"
+			( 'homogeneous_tuple_slice_rc_element_refcount_correct', '''
+class Elem:
+	pass
+
+def take_slice( t: tuple[Elem,Elem,Elem,Elem] ) -> usize:
+	s = t[1:3]
+	return compiler.refcount( s[0] )
+
+def main() -> i32:
+	t: tuple[Elem,Elem,Elem,Elem] = ( Elem(), Elem(), Elem(), Elem() )
+	with compiler.wrap_arithmetic:
+		before: usize = compiler.refcount( t[1] )
+		during: usize = take_slice( t )
+		if during != before + 1:
+			return 1
+		after: usize = compiler.refcount( t[1] )
+		if after != before:
+			return 2
+	return 0
+''' ),
+			# arity 0/1 slice RESULTS - once 0/1-arity tuple[...] became a
+			# real, first-class type (annotation + literal, discovery.py's
+			# visit_Subscript/_expr_Tuple), _lower_tuple_slice's own earlier
+			# arity<2 rejection was lifted too - t[i:i] (empty range) and
+			# t[i:i+1] (single element) both now just build the matching
+			# tuple[] / tuple[T] result, no different from any other arity
+			( 'homogeneous_tuple_slice_arity_zero_and_one_results', '''
+def main() -> i32:
+	t: tuple[i32, i32, i32, i32] = ( 10, 20, 30, 40 )
+	one = t[1:2]
+	if one[0] != 20:
+		return 1
+	empty: tuple[()] = t[2:2]
+	return 0
+''' ),
 		] )
+
+	def test_homogeneous_tuple_slice_non_constant_bound_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	i: usize = 1',
+			'	s = t[i:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'tuple slicing requires compile-time-constant integer bounds', errors[0] )
+
+	def test_homogeneous_tuple_slice_step_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	t: tuple[i32, i32, i32] = ( 1, 2, 3 )',
+			'	s = t[0:3:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
 
 	def test_tuple_unpack_arity_mismatch_is_rejected( self ) -> None:
 		self._run( '\n'.join([
@@ -10374,6 +10657,355 @@ def main() -> i32:
 	return 0
 ''' ),
 		] )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile tests' )
+class VariadicTupleTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' tuple[T, ...] - Python's own spelling for a variable-length,
+	homogeneous tuple, distinct from the fixed-arity tuple[T0,T1,...] tested
+	above (TupleTests). Resolves to a Specialization of the real
+	VariadicTuple[T] class (lib/builtins/__vartuple.py, built on the same
+	UnsafeList[T] storage list[T] wraps) rather than a TupleStorage-
+	synthesized fixed layout - see discovery.py's visit_Subscript. The
+	public constructor is `tuple(some_iterable)`, an ordinary generic-
+	function call inferring T (and the source's own Iterable[T] bound) from
+	its argument (confirmed already supported for a bare, non-subscripted
+	generic construction call - no new compiler machinery needed for that
+	part) - accepts any Iterable[T], not just list[T] (an ordinary for-loop
+	over the generic source drives its own __iter__()). __eq__/__ne__
+	(positional + length, real Python's own tuple equality contract) and
+	__str__/__repr__ (Python's own '(1, 2, 3)'/'(x,)'/'()' formatting,
+	including the single-element trailing-comma convention) round it out. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'construct_from_list_and_read_back', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	if len( t ) != 3:
+		return 1
+	if t.__getitem__( 0 ).unwrap( 'idx' ) != 1:
+		return 2
+	if t.__getitem__( 1 ).unwrap( 'idx' ) != 2:
+		return 3
+	if t.__getitem__( 2 ).unwrap( 'idx' ) != 3:
+		return 4
+	return 0
+''' ),
+			# an out-of-range constant/runtime index is a real Err, same as
+			# list[T] - unlike the FIXED-arity tuple's own t[0] sugar (a
+			# compile-time-checked direct field read), this is an ordinary
+			# fallible method call
+			( 'out_of_range_index_is_err', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	t: tuple[i32, ...] = tuple( xs )
+	if t.__getitem__( 1 ).is_ok():
+		return 1
+	return 0
+''' ),
+			( 'empty_tuple_from_empty_list', '''
+def main() -> i32:
+	t: tuple[i32, ...] = tuple( list[i32]() )
+	if len( t ) != 0:
+		return 1
+	if t:
+		return 2 # Python-style truthiness: empty is falsy
+	return 0
+''' ),
+			( 'slicing_returns_a_copy', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 10 )
+	xs.append( 20 )
+	xs.append( 30 )
+	xs.append( 40 )
+	t: tuple[i32, ...] = tuple( xs )
+	s = t[1:3]
+	if len( s ) != 2:
+		return 1
+	if s.__getitem__( 0 ).unwrap( 'idx' ) != 20:
+		return 2
+	if s.__getitem__( 1 ).unwrap( 'idx' ) != 30:
+		return 3
+	return 0
+''' ),
+			( 'iteration_via_for_loop', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	xs.append( 4 )
+	t: tuple[i32, ...] = tuple( xs )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t:
+			total += v
+	if total != 10:
+		return 1
+	return 0
+''' ),
+			# RC-correctness: constructing a tuple[T,...] from a list[T] must
+			# incref each copied element (independent ownership alongside the
+			# source list's own), and release them all again when the tuple
+			# itself goes out of scope - not a leak, not a premature free
+			( 'rc_element_refcount_correct_across_construct_and_teardown', '''
+class Elem:
+	pass
+
+def during_refcount( e: Elem ) -> usize:
+	xs: list[Elem] = list[Elem]()
+	xs.append( e )
+	t = tuple( xs )
+	return compiler.refcount( e )
+
+def main() -> i32:
+	e: Elem = Elem()
+	before: usize = compiler.refcount( e )
+	during: usize = during_refcount( e )
+	after: usize = compiler.refcount( e )
+	with compiler.wrap_arithmetic:
+		# +2: xs's own copy (from append) + tuple(xs)'s own copy
+		if during != before + 2:
+			return 1
+	if after != before:
+		return 2
+	return 0
+''' ),
+			# tuple[T,...] and the fixed-arity tuple[T0,T1,...] are genuinely
+			# different types that both happen to spell as `tuple[...]` -
+			# confirms they coexist without one shadowing/confusing the other
+			( 'variadic_and_fixed_arity_tuple_coexist', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	variadic: tuple[i32, ...] = tuple( xs )
+	fixed: tuple[i32, i32] = ( 1, 2 )
+	if len( variadic ) != 2:
+		return 1
+	if fixed[0] != 1 or fixed[1] != 2:
+		return 2
+	return 0
+''' ),
+			# tuple(...) accepts any Iterable[T], not just list[T] - here,
+			# ANOTHER tuple[T,...] (a real repro: constructing a copy)
+			( 'construct_from_arbitrary_iterable_not_just_list', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	t: tuple[i32, ...] = tuple( xs )
+	u: tuple[i32, ...] = tuple( t )
+	if len( u ) != 2:
+		return 1
+	if u.__getitem__( 0 ).unwrap( 'idx' ) != 1 or u.__getitem__( 1 ).unwrap( 'idx' ) != 2:
+		return 2
+	return 0
+''' ),
+			( 'equality_positional_and_length_sensitive', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	t: tuple[i32, ...] = tuple( xs )
+	same: tuple[i32, ...] = tuple( xs )
+	if not ( t == same ):
+		return 1
+	if t != same:
+		return 2
+	xs.append( 3 )
+	longer: tuple[i32, ...] = tuple( xs )
+	if t == longer:
+		return 3
+	if not ( t != longer ):
+		return 4
+	ys: list[i32] = list[i32]()
+	ys.append( 2 )
+	ys.append( 1 )
+	reordered: tuple[i32, ...] = tuple( ys )
+	if t == reordered: # same elements, different order - real tuples ARE order-sensitive
+		return 5
+	return 0
+''' ),
+			( 'str_and_repr_match_python_formatting', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	if str( t ) != '(1, 2, 3)':
+		return 1
+	if t.__repr__() != '(1, 2, 3)':
+		return 2
+	single_src: list[i32] = list[i32]()
+	single_src.append( 7 )
+	single: tuple[i32, ...] = tuple( single_src )
+	if str( single ) != '(7,)': # real Python's own trailing-comma convention
+		return 3
+	empty: tuple[i32, ...] = tuple( list[i32]() )
+	if str( empty ) != '()':
+		return 4
+	return 0
+''' ),
+			# for-loop iteration over an RC-element tuple[T,...] with ZERO
+			# elements - a real, previously-confirmed bug (a since-deleted
+			# indexable for-loop lowering: the loop body never running at all
+			# used to leak a per-iteration temp's cleanup outside the loop,
+			# reading uninitialized stack memory as an ObjectHeader*).
+			# VariadicTuple has no direct __next__, only Iterable[T]'s
+			# __iter__ (list[T] has the identical split), so `for x in
+			# some_tuple:` calls __iter__() once and drives the resulting
+			# generator - this is a real regression guard, not a redundant
+			# check.
+			( 'empty_and_single_element_iteration_no_crash', '''
+class Elem:
+	pass
+
+def main() -> i32:
+	empty: tuple[Elem, ...] = tuple( list[Elem]() )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		for e in empty:
+			count += 1
+	if count != 0:
+		return 1
+	single_src: list[Elem] = list[Elem]()
+	single_src.append( Elem() )
+	single: tuple[Elem, ...] = tuple( single_src )
+	count = 0
+	with compiler.wrap_arithmetic:
+		for e in single:
+			count += 1
+	if count != 1:
+		return 2
+	return 0
+''' ),
+			# RC-correctness across a full for-loop: no leak, no premature
+			# free of any element once the loop (and its own per-iteration
+			# binds) finishes
+			( 'iteration_rc_refcount_stable_across_full_loop', '''
+class Elem:
+	pass
+
+def main() -> i32:
+	xs: list[Elem] = list[Elem]()
+	a: Elem = Elem()
+	b: Elem = Elem()
+	c: Elem = Elem()
+	xs.append( a )
+	xs.append( b )
+	xs.append( c )
+	t: tuple[Elem, ...] = tuple( xs )
+	before_a: usize = compiler.refcount( a )
+	before_b: usize = compiler.refcount( b )
+	before_c: usize = compiler.refcount( c )
+	count: i32 = 0
+	with compiler.wrap_arithmetic:
+		for e in t:
+			count += 1
+	if count != 3:
+		return 1
+	if compiler.refcount( a ) != before_a:
+		return 2
+	if compiler.refcount( b ) != before_b:
+		return 3
+	if compiler.refcount( c ) != before_c:
+		return 4
+	return 0
+''' ),
+			# slicing edge cases: empty source, empty result (both an
+			# explicit empty range and inverted bounds), out-of-range
+			# clamping, a full unbounded slice, and slice-of-a-slice
+			( 'slicing_edge_cases', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	empty: tuple[i32, ...] = tuple( list[i32]() )
+	if len( empty[0:5] ) != 0: # slicing an empty tuple
+		return 1
+	if len( t[1:1] ) != 0: # explicit empty range
+		return 2
+	if len( t[2:0] ) != 0: # inverted bounds
+		return 3
+	if len( t[1:99] ) != 2: # out-of-range clamps
+		return 4
+	full = t[:]
+	if len( full ) != 3 or not ( full == t ):
+		return 5
+	mid = t[0:2]
+	inner = mid[1:2]
+	if len( inner ) != 1 or inner.__getitem__( 0 ).unwrap( 'idx' ) != 2:
+		return 6
+	return 0
+''' ),
+			# iterate a SLICE result directly, and iterate the same tuple
+			# twice + nested (no shared mutable iterator state - each for-
+			# loop is its own independent index walk, not a stored cursor)
+			( 'iterate_slice_result_and_repeated_nested_iteration', '''
+def main() -> i32:
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	xs.append( 3 )
+	t: tuple[i32, ...] = tuple( xs )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t[1:3]:
+			total += v
+	if total != 5:
+		return 1
+	total1: i32 = 0
+	total2: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t:
+			total1 += v
+		for v in t:
+			total2 += v
+	if total1 != 6 or total2 != 6:
+		return 2
+	pairs: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in t:
+			for w in t:
+				pairs += 1
+	if pairs != 9:
+		return 3
+	return 0
+''' ),
+		] )
+
+	def test_variadic_tuple_slice_step_is_rejected( self ) -> None:
+		# unlike the fixed-arity tuple[T0,T1,...] (its own dedicated
+		# _lower_tuple_slice), tuple[T,...] goes through the generic
+		# __getitem__(slice) dispatch (_lower_slice_subscript) - same
+		# rejection, different code path
+		self._run( '\n'.join([
+			'def main() -> i32:',
+			'	xs: list[i32] = list[i32]()',
+			'	xs.append( 1 )',
+			'	t: tuple[i32, ...] = tuple( xs )',
+			'	s = t[0:1:2]',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'slice step is not supported', errors[0] )
 
 
 class UnionLeafCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -11694,10 +12326,16 @@ def main() -> i32:
 	x: i32 = maybe_get()
 	return 0
 ''' )
+		# `x: i32 = maybe_get()` is now case 2 of the general auto-or_throw()
+		# rule (Result[i32,OverflowError] flowing into an i32-typed target) -
+		# it auto-.or_throw()s instead of reaching the old dest-typing bug
+		# this test used to pin down, and THAT then fails to compile because
+		# main() (-> i32) can't propagate OverflowError anywhere - still
+		# exactly one clean discovery error, still no emitter crash, just a
+		# different (and more informative) message
 		errors = self.discovery.errors.errors
 		self.assertEqual( len( errors ), 1 )
-		self.assertIn( 'expected intrinsics.i32', errors[0] )
-		self.assertIn( 'got builtins.Result', errors[0] )
+		self.assertIn( 'requires the enclosing function to return Result', errors[0] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_result_returning_call_assigned_to_matching_result_type_still_compiles( self ) -> None:
@@ -12389,7 +13027,7 @@ def main() -> i32:
 
 class SliceSyntaxTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' x[a:b] / x[:b] / x[a:] (ast.Slice) - dispatches through an ordinary
-	__getitem__(PySlice) overload (lowering.py's _lower_slice_subscript),
+	__getitem__(slice) overload (lowering.py's _lower_slice_subscript),
 	so any type declaring one supports slice syntax; str/bytearray/
 	memoryview are the built-in ones. str's slicing is byte-offset, not
 	this codebase's own Unicode-codepoint s[i] convention - see
@@ -12502,6 +13140,33 @@ def main() -> i32:
 		return 2
 	if len( b[2:1] ) != 0:
 		return 3
+	return 0
+''' ),
+			# bytes had no slice syntax at all before (no __getitem__(slice)
+			# overload) - this is new coverage, not a regression guard.
+			# Clamping semantics mirror bytearray's own test above exactly;
+			# content (not just length) is checked via decode() since bytes
+			# has no __eq__ of its own.
+			( 'bytes_slice_out_of_range_bounds_clamp', '''
+from codecs.utf8 import utf8
+
+def main() -> i32:
+	buf: bytearray = bytearray( 5 )
+	p: Ptr[u8] = buf.get_ptr()
+	p[0] = 104
+	p[1] = 101
+	p[2] = 108
+	p[3] = 108
+	p[4] = 111
+	b: bytes = bytes( buf )
+	if utf8.decode( b[1:4] ).unwrap( 'decode failed' ) != 'ell':
+		return 1
+	if len( b[1000:2000] ) != 0:
+		return 2
+	if len( b[4:1] ) != 0:
+		return 3
+	if utf8.decode( b[0:1000] ).unwrap( 'decode failed' ) != 'hello':
+		return 4
 	return 0
 ''' ),
 			( 'memoryview_slice_out_of_range_bounds_clamp', '''
@@ -13074,7 +13739,7 @@ def main() -> i32:
 class GenericClassOverloadMonomorphizationRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' discovery.py's _get_or_create_specialization cached its result keyed
 	purely by a STRING (base.qualname + args' qualnames) - found while
-	giving list[T]/UnsafeList[T] a second __getitem__ overload (PySlice, for
+	giving list[T]/UnsafeList[T] a second __getitem__ overload (slice, for
 	slice syntax) alongside their existing single-index one. monomorphize.
 	py's _substituted_overload (used whenever a generic class's own
 	@overload group gets specialized, e.g. list[T].__getitem__ specialized
@@ -13085,7 +13750,7 @@ class GenericClassOverloadMonomorphizationRealCompileTests( test_support.RealCom
 	specialization request silently hit the cache under the SAME key the
 	first leaf's request had already populated, returning the FIRST leaf's
 	monomorphized Function instead of creating its own. Confirmed via a real
-	repro: list[i32].__getitem__(PySlice) resolved to the SAME (usize-
+	repro: list[i32].__getitem__(slice) resolved to the SAME (usize-
 	taking) implementation as list[i32].__getitem__(usize), regardless of
 	which overload should have matched. Fixed by keying the cache on
 	(id(base), name) instead of name alone - base is always the same
@@ -13219,10 +13884,9 @@ class OverloadedGetitemDispatchTests( test_support.RealCompileMixin, CompilerTes
 	every one of __getitem__'s call sites the instant a type gains a second
 	__getitem__ overload) - found while adding slice-syntax support
 	(container[a:b] as a second __getitem__ overload alongside the existing
-	single-index one). Three call sites share this gap: plain `x[i]` reads
-	(_expr_Subscript), `x[i] += y` (_stmt_AugAssign's Subscript target), and
-	`for v in x:` over an indexable with no __iter__ (_lower_for_over_
-	indexable). Fixed via a new _find_indexlike_getitem helper (NOT
+	single-index one). Two call sites share this gap: plain `x[i]` reads
+	(_expr_Subscript) and `x[i] += y` (_stmt_AugAssign's Subscript target).
+	Fixed via a new _find_indexlike_getitem helper (NOT
 	_find_dunder_for_arg, which needs the caller to already know the exact
 	argument type to match against - an ordinary index's own type is instead
 	INFERRED FROM __getitem__'s declared parameter type, so there's no
@@ -13230,7 +13894,7 @@ class OverloadedGetitemDispatchTests( test_support.RealCompileMixin, CompilerTes
 	repro during development, a @cstruct with def __getitem__(self, i: i32),
 	broke when this first required an exact usize match instead of picking
 	whichever candidate is Scalar-typed at all). RangeKey (a plain @cstruct,
-	not a Scalar) stands in for the eventual real second leaf (PySlice, not
+	not a Scalar) stands in for the eventual real second leaf (slice, not
 	added yet) - it only needs to NOT be a Scalar, to confirm the fix
 	structurally prefers the Scalar (index-like) leaf over a compound one,
 	the same shape the real slice-syntax feature will need. '''
@@ -13290,18 +13954,11 @@ def main() -> i32:
 		x[0] += 5
 	if x[0] != 15:
 		return 2
-	# for v in x: over an indexable with no __iter__ (_lower_for_over_indexable)
-	total: i32 = 0
-	with compiler.wrap_arithmetic:
-		for v in x:
-			total += v
-	if total != 15 + 20 + 30:
-		return 3
 	# the OTHER overload leaf (compound arg type) still resolves too, via
 	# ordinary method-call overload resolution - confirms the Overload
 	# group itself is intact, not just the index leaf
 	if x.__getitem__( RangeKey( lo = 99 )) != 99:
-		return 4
+		return 3
 	return 0
 ''' ),
 		] )
@@ -15992,7 +16649,7 @@ def main() -> i32:
 	empty_list: list[i32] = list[i32]()
 	if empty_list:
 		return 1
-	empty_list.append( 1 ).unwrap( 'append failed' )
+	empty_list.append( 1 )
 	if not empty_list:
 		return 2
 
@@ -16428,8 +17085,8 @@ def add_two( x: i32 ) -> i32:
 
 def main() -> i32:
 	arr: list[Ptr[Callable[[i32],i32]]] = list[Ptr[Callable[[i32],i32]]]()
-	arr.append( add_one ).unwrap( 'append' )
-	arr.append( add_two ).unwrap( 'append' )
+	arr.append( add_one )
+	arr.append( add_two )
 	f: Ptr[Callable[[i32],i32]] = arr.__getitem__( 0 ).unwrap( 'getitem' )
 	result0: i32 = f( 5 )
 	result1: i32 = arr.__getitem__( 1 ).unwrap( 'getitem' )( 5 )
@@ -16637,6 +17294,35 @@ def main() -> i32:
 	result: i32 = apply_or_default( 21, k, 0 )
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 42
+	return diff
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_field_lazy_init_narrows_past_if( self ) -> None:
+		# regression: `if self.g is None: self.g = Owned(...)` never narrowed
+		# self.g on the path after the if, even though every reaching path
+		# provably reassigns it - the identical `if _g is None: _g = ...`
+		# shape already narrowed fine for a module global. Root cause:
+		# visit_If's "did the other branch reassign the subject to the
+		# narrowed type" check reads type_resolver.py's own self.locals,
+		# which visit_Assign only ever populated for a bare Name target,
+		# never for an Attribute (field) target.
+		self._run( '''
+class Box:
+	x: i32
+
+class Holder:
+	g: Box|None = None
+
+def main() -> i32:
+	h: Holder = Holder()
+	if h.g is None:
+		h.g = Box( x = 42 )
+	b: Box = h.g
+	with compiler.wrap_arithmetic:
+		diff: i32 = b.x - 42
 	return diff
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -18637,7 +19323,7 @@ class FStringTests( test_support.RealCompileMixin, CompilerTestCase ):
 		single executable (one build for the whole class); a nonzero exit is
 		decoded back to the failing sub-program and its own return code. '''
 		self.assert_programs_run([
-			# exercises the real N-part runtime path (UnsafeList[str]/slice[str]/
+			# exercises the real N-part runtime path (UnsafeList[str]/
 			# str.concat) - a and b are real runtime parameters (not folded away
 			# by compile_time_transformer.py), so this is the test that actually
 			# proves the whole pass end to end, not just compile-time folding
@@ -18713,25 +19399,57 @@ def main() -> i32:
 ''' ),
 			# !a (PLAN_FSTRINGS.md follow-up) - a dedicated real compile-and-run
 			# test against non-ASCII input, per the plan's own verification
-			# section. Expected text is real Python's own ascii()-equivalent
-			# escaping (repr() here has no surrounding quotes to strip since
-			# !a's own metalpy semantics never add quotes - see lowering.py's
-			# _lower_ascii_escape comment): a 2-byte-UTF8 codepoint (café,
-			# U+00E9) escapes as \xE9-style... actually str._ascii_escape's
-			# own lowercase-hex convention is checked directly against real
-			# Python's escaping of the bare codepoints, not against repr()'s
-			# own quoting.
+			# section. !a is ascii(x) == ascii-escape(repr(x)): __repr__ adds
+			# the surrounding quotes (str now has a real __repr__), then the
+			# ascii-escape pass replaces any non-ASCII codepoint repr() left
+			# as literal UTF-8 with its \\xXX/\\uXXXX/\\UXXXXXXXX escape -
+			# checked directly against real Python's own ascii() on the same
+			# inputs, quotes included.
 			( 'bang_a_conversion_escapes_non_ascii', '''
 def build( s: str ) -> str:
 	return f"{s!a}"
 
 def main() -> i32:
-	if build( 'caf\\u00e9' ) != 'caf\\\\xe9':
+	if build( 'caf\\u00e9' ) != "'caf\\\\xe9'":
 		return 1
-	if build( '\\u00e9\\u0100\\U0001F600' ) != '\\\\xe9\\\\u0100\\\\U0001f600':
+	if build( '\\u00e9\\u0100\\U0001F600' ) != "'\\\\xe9\\\\u0100\\\\U0001f600'":
 		return 2
-	if build( 'plain ascii' ) != 'plain ascii':
+	if build( 'plain ascii' ) != "'plain ascii'":
 		return 3
+	return 0
+''' ),
+			# str.__repr__ (real, since !r on str used to be a no-op identity -
+			# see the comment on _lower_fstring_part's own identity
+			# shortcut). Every expected string is cross-checked against real
+			# Python's own repr()/ascii() for the same input.
+			( 'str_repr_quoting_and_escaping', '''
+def main() -> i32:
+	if 'hello'.__repr__() != "'hello'":
+		return 1
+	if f"{'hello'!r}" != "'hello'":
+		return 2
+	# only a single quote present - switches to double-quoting rather than escaping it
+	if "it's".__repr__() != '"it\\'s"':
+		return 3
+	# only a double quote present - stays single-quoted, no escaping needed
+	if 'say "hi"'.__repr__() != '\\'say "hi"\\'':
+		return 4
+	# both present - single-quoted (the default), escaping just the embedded '
+	if 'both \\' and "'.__repr__() != '\\'both \\\\\\' and "\\'':
+		return 5
+	# \\n / \\t / a literal backslash each get their own 2-byte escape
+	if 'a\\nb\\tc\\\\d'.__repr__() != "'a\\\\nb\\\\tc\\\\\\\\d'":
+		return 6
+	# printable non-ASCII (café) stays literal in !r, unlike !a
+	if 'caf\\u00e9'.__repr__() != "'café'":
+		return 7
+	if f"{'caf\\u00e9'!a}" != "'caf\\\\xe9'":
+		return 8
+	# !a must not double-escape a backslash __repr__ already escaped - real
+	# ascii('a\\bé') doubles the one backslash (repr's own escaping)
+	# and separately hex-escapes the non-ASCII é, nothing more
+	if f"{'a\\\\b\\u00e9'!a}" != "'a\\\\\\\\b\\\\xe9'":
+		return 9
 	return 0
 ''' ),
 		] )
@@ -19348,13 +20066,97 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class ForLoopIteratorIterableProtocolTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' `for x in y:` strictly requires y to conform to IteratorProtocol[T]
+	(a real __next__ - drives it directly) or Iterable[T] (a real __iter__ - called
+	once to get a real iterator, which is then driven the same way) - no
+	structural __len__/__getitem__(usize) duck-typing any more (confirmed
+	with the user; the old _lower_for_over_indexable mechanism is gone
+	entirely). This is a real, confirmed correctness fix, not just
+	stricter typing: dict[K,V] never declared __next__ directly and has no
+	usize-keyed __getitem__ at all - the old duck-typing fell through to
+	positionally indexing it with `__getitem__(key: K)`, which only even
+	type-checked when K happened to be usize-compatible, and would have
+	silently walked "positions" instead of real keys had anything ever
+	actually hit that combination (nothing did, until now). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# the actual bug: dict[K,V] iterates real KEYS, not positions
+			( 'dict_iterates_real_keys_not_positions', '''
+def main() -> i32:
+	d: dict[i32, i32] = dict[i32, i32]()
+	d.__setitem__( 10, 100 )
+	d.__setitem__( 20, 200 )
+	d.__setitem__( 30, 300 )
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for k in d:
+			total += k
+	if total != 60: # 10+20+30 - would be 0+1+2=3 if silently misused as positional indexing
+		return 1
+	return 0
+''' ),
+			# a hand-written IteratorProtocol[T] conformer (a real __next__,
+			# no __iter__ at all) drives directly - "iter() on an iterator
+			# returns itself" is subsumed by this taking priority over the
+			# Iterable[T] branch, not by every IteratorProtocol[T] also
+			# needing its own __iter__ returning self
+			( 'custom_iterator_conformer_drives_directly', '''
+class CountUpTo( IteratorProtocol[i32] ):
+	current: i32
+	limit: i32
+
+	def __init__( self, limit: i32 ) -> None:
+		self.current = 0
+		self.limit = limit
+
+	def __next__( self ) -> Result[i32, StopIteration]:
+		if self.current >= self.limit:
+			return Result.Err( StopIteration() )
+		v: i32 = self.current
+		with compiler.panic_arithmetic( 'bounded by limit' ):
+			self.current += 1
+		return Result.Ok( v )
+
+def main() -> i32:
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for v in CountUpTo( 4 ):
+			total += v
+	if total != 0 + 1 + 2 + 3:
+		return 1
+	return 0
+''' ),
+		] )
+
+	def test_missing_iterator_or_iterable_conformance_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'class NotIterable:',
+			'	pass',
+			'',
+			'def main() -> None:',
+			'	for x in NotIterable():',
+			'		pass',
+			'	return',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'for loop requires an IteratorProtocol[T] or Iterable[T] conformer', errors[0] )
+
+
 class GeneratorFunctionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' PLAN_GENERATORS.md - a plain function containing `yield`, where
 	every yield is a direct top-level statement (v1), the single yield
 	inside a direct top-level while loop (Phase 2 - PLAN_GENERATORS.md's
 	own motivating range()-style example), or the single yield inside a
-	direct top-level for loop - over range() (Phase 4), a list-like
-	__len__/__getitem__ indexable, or another generator's own __next__()
+	direct top-level for loop - over range() (Phase 4), an Iterable[T]
+	conformer like list[T], or another generator's own __next__()
 	(both Phase 5, matching the user-facing "remaining phases roadmap"'s
 	own Phase 1 - one generator consuming another this way is the
 	realistic way generators actually get exercised/tested). Real
@@ -19758,9 +20560,9 @@ def double_all( xs: list[i32] ) -> Iterator[Result[i32, StopIteration]]:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		xs: list[i32] = list[i32]()
-		xs.append( 1 ).unwrap( 'append failed' )
-		xs.append( 2 ).unwrap( 'append failed' )
-		xs.append( 3 ).unwrap( 'append failed' )
+		xs.append( 1 )
+		xs.append( 2 )
+		xs.append( 3 )
 		g = double_all( xs )
 		a = g.__next__()
 		match a:
@@ -19806,9 +20608,9 @@ def make_and_partially_consume( xs: list[i32] ) -> None:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		xs: list[i32] = list[i32]()
-		xs.append( 1 ).unwrap( 'append failed' )
-		xs.append( 2 ).unwrap( 'append failed' )
-		xs.append( 3 ).unwrap( 'append failed' )
+		xs.append( 1 )
+		xs.append( 2 )
+		xs.append( 3 )
 		if compiler.refcount( xs ) != 1:
 			return 1
 		make_and_partially_consume( xs )
@@ -20601,9 +21403,9 @@ def consume_fully( xs: list[Box] ) -> None:
 def main() -> i32:
 	with compiler.wrap_arithmetic:
 		xs: list[Box] = list[Box]()
-		xs.append( Box( v = 10 ) ).unwrap( 'append failed' )
-		xs.append( Box( v = 20 ) ).unwrap( 'append failed' )
-		xs.append( Box( v = 30 ) ).unwrap( 'append failed' )
+		xs.append( Box( v = 10 ) )
+		xs.append( Box( v = 20 ) )
+		xs.append( Box( v = 30 ) )
 		consume_fully( xs )
 		if compiler.refcount( xs ) != 1:
 			return 1
@@ -21030,9 +21832,10 @@ def main() -> i32:
 		])
 
 	def test_for_loop_over_neither_shape_is_rejected( self ) -> None:
-		# PLAN_GENERATORS.md Phase 1 - a for loop over something with
-		# neither __len__/__getitem__ NOR __next__ must be a clear
-		# compile error, not a silently wrong state machine
+		# a for loop over something conforming to neither IteratorProtocol[T]
+		# nor Iterable[T] must be a clear compile error, not a silently
+		# wrong state machine - same strict-dispatch gate lowering.py's
+		# _stmt_For enforces for an ordinary (non-generator-body) for loop
 		self._run( '''
 class NotIterable:
 	pass
@@ -21045,16 +21848,22 @@ def main() -> None:
 	g = gen( NotIterable() )
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
-		self.assertIn( '__len__', str( self.discovery.errors.errors[0] ))
+		self.assertIn( 'IteratorProtocol[T] or Iterable[T]', str( self.discovery.errors.errors[0] ))
 
 	def test_for_loop_over_bad_next_shape_is_rejected( self ) -> None:
 		# a __next__() that returns something other than Result[T,E] (E
 		# including StopIteration) - real, not a generator's own (compiler-
 		# synthesized __next__ always has the right shape) - must be a
 		# clear compile error, not a miscompile. Not generator-specific:
-		# any user class implementing __next__ by hand hits the same check.
+		# any user class implementing __next__ by hand hits the same check
+		# (declares Iterator[i32] conformance so it passes the strict
+		# Iterator[T]/Iterable[T] gate lowering.py's _stmt_For checks first
+		# - protocol conformance validation is NAME-only, see discovery.py's
+		# _validate_protocol_conformance, so this doesn't itself catch the
+		# bad shape; the deeper shape check inside _lower_for_over_iterator,
+		# reached only once a real __next__ exists, still does).
 		self._run( '''
-class NotReallyAnIterator:
+class NotReallyAnIterator( Iterator[i32] ):
 	def __next__( self ) -> i32:
 		return 1
 
@@ -21488,6 +22297,341 @@ def main() -> i32:
 			return 1
 		# 0 + (-1) + 2 + (-3) + 4
 		if total != 2:
+			return 2
+		return 0
+''' ),
+		])
+
+	def test_match_subject_reentrant_generic_class_resolution_recovers_correctly( self ) -> None:
+		''' Regression for a THIRD distinct bug in the same family as
+		test_match_on_fallible_call_subject_crossing_a_yield/test_match_
+		arm_binding_crossing_a_yield above, found while simplifying
+		lib/builtins/__init__.py's _sequence_iter to use match (not
+		merged - see PLAN_SEQUENCE_ITER_FOLLOWUPS.md). A generic generator
+		function's own match-subject/binding promotion (_reserve_
+		generator_match_subject_fields/_reserve_generator_match_binding_
+		fields) can be reached REENTRANTLY: when the generator is called
+		from within ANOTHER generic CLASS's own method body (e.g. `class
+		Wrap[T](Sequence[T]): def __iter__(self): return helper(self)`),
+		resolving that method's own return type as part of monomorphizing
+		Wrap[i32] itself needs to resolve helper[i32,Wrap[i32]]'s own
+		match subject type WHILE Wrap[i32] is still mid-build - hitting
+		Monomorphizer.ensure_resolved's own documented, deliberate
+		reentrancy fallback (the identical dict[i32,i32].__iter__
+		situation its own comment already describes) to the class's
+		ABSTRACT, still-TypeVar'd shape. Initially fixed by simply
+		DECLINING the reservation whenever the resolved subject type
+		still contains a free TypeVar (Monomorphizer._is_concrete) -
+		safe, but reintroduced the ORIGINAL pre-dc409bb uninitialized-
+		read risk for exactly this reentrant shape whenever T is RC (the
+		promoted field never gets promoted at all). Properly fixed
+		instead by RECOVERING the real answer: _type_of_expr's own
+		ast.Call branch now detects the exact degradation (ensure_
+		resolved returning literally the original Specialization's own
+		.base, discarding its args) and substitutes the found method's
+		declared return type against the ORIGINAL Specialization's real
+		args directly (Monomorphizer.substitute_type_params, via a cheap
+		Specialization.names lookup on the abstract base that never
+		itself retriggers the reentrancy) - never letting the abstract
+		template Function flow into this method's own "resolve and
+		schedule as a real compile unit" handling (an earlier attempt
+		that did so crashed elsewhere: AttributeError: 'Specialization'
+		object has no attribute 'node'). Confirmed via a real repro:
+		mixing Wrap[i32] and Wrap[i64] in one program used to produce
+		"expected Result[Wrap.T,...], got Result[intrinsics.i32,...]"
+		real compile errors; the sibling test below confirms the RC-
+		element case (where a scalar T like this test's own i32/i64
+		can't distinguish "declined, unpromoted, but still safe" from
+		"recovered, promoted, and correct" - both compile and run fine
+		for a scalar T) actually gets promoted, not just declined. '''
+		self.assert_programs_run([
+			( 'match_subject_reentrant_generic_class_resolution', '''
+class Wrap[T]:
+	v: T
+	def probe( self, ok: bool ) -> Result[T, IndexError]:
+		if ok:
+			return Result.Ok( self.v )
+		return Result.Err( IndexError() )
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return helper( self )
+
+def helper[T]( w: Wrap[T] ) -> Generator[T, StopIteration]:
+	i: usize = 0
+	while True:
+		match w.probe( i == 0 ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
+		with compiler.panic_arithmetic( 'not possible' ):
+			i += 1
+
+def main() -> i32:
+	w1: Wrap[i32] = Wrap[i32]( v = 42 )
+	g1 = w1.__iter__()
+	v1: i32 = g1.__next__().unwrap( 'g1' )
+	if v1 != 42:
+		return 1
+
+	w2: Wrap[i64] = Wrap[i64]( v = i64( 43 ))
+	g2 = w2.__iter__()
+	v2: i64 = g2.__next__().unwrap( 'g2' )
+	if v2 != i64( 43 ):
+		return 2
+
+	return 0
+''' ),
+		])
+
+	def test_match_subject_reentrant_generic_class_resolution_rc_element_no_uninitialized_warning( self ) -> None:
+		''' SIBLING of test_match_subject_reentrant_generic_class_
+		resolution_recovers_correctly above - that test's own T (i32/i64)
+		is scalar, so it can't distinguish "declined, unpromoted, still
+		correct by luck" from "recovered, actually promoted" (both run
+		fine for a scalar element - see MSVC's own /RTC1, which only
+		instruments RC-typed locals's own trailing decref, never a bare
+		scalar). This one uses a real RCClass element specifically to
+		confirm the field actually got PROMOTED (a real field on the
+		generator's own backing class, reassignment/destructor-driven
+		cleanup) rather than merely falling back to an unpromoted plain
+		local that happens to work today - compiler.refcount() before/
+		after a full iteration is the only observable signal a scalar
+		element can't give: an unpromoted local's own uninitialized-on-
+		resume trailing decref (the ORIGINAL dc409bb bug, reintroduced by
+		the DECLINE-only interim fix) either leaks (skips a legitimate
+		release) or crashes/corrupts (releases garbage) - a stable
+		refcount across the whole loop is only possible once promotion
+		actually landed. '''
+		self.assert_programs_run([
+			( 'match_subject_reentrant_generic_class_rc_element', '''
+class Elem:
+	pass
+
+class Wrap[T]:
+	v: T
+	def probe( self, ok: bool ) -> Result[T, IndexError]:
+		if ok:
+			return Result.Ok( self.v )
+		return Result.Err( IndexError() )
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return helper( self )
+
+def helper[T]( w: Wrap[T] ) -> Generator[T, StopIteration]:
+	i: usize = 0
+	while True:
+		match w.probe( i == 0 ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
+		with compiler.panic_arithmetic( 'not possible' ):
+			i += 1
+
+def main() -> i32:
+	e: Elem = Elem()
+	before: usize = compiler.refcount( e )
+	w: Wrap[Elem] = Wrap[Elem]( v = e )
+	g = w.__iter__()
+	got: Elem = g.__next__().unwrap( 'g' )
+	if compiler.refcount( got ) == before:
+		return 1
+	# the SECOND call resumes into the loop's post-yield code, drives it
+	# to the Err arm, and returns - this is what exercises the match's
+	# own trailing "release whichever variant's payload wasn't consumed"
+	# cleanup on a RESUMED call frame, the exact shape the original
+	# uninitialized-read bug (and this reentrant variant of it) needed a
+	# real resumed call to trigger at all
+	if not g.__next__().is_err():
+		return 2
+	return 0
+''' ),
+		])
+
+	def test_match_subject_reentrant_generic_class_resolution_overloaded_getitem( self ) -> None:
+		''' SIBLING of test_match_subject_reentrant_generic_class_
+		resolution_rc_element_no_uninitialized_warning above, found while
+		attempting to rewrite lib/builtins/__init__.py's own
+		_sequence_iter with match (see PLAN_SEQUENCE_ITER_FOLLOWUPS.md):
+		the reentrancy-recovery fix's own abstract-method lookup only
+		handled a plain (non-overloaded) Function - VariadicTuple[T]
+		(tuple[T,...]'s real backing class)'s own __getitem__ is
+		@overload'd (usize index / slice), so `names.get('__getitem__')`
+		returns an Overload group, not a Function, and the recovery
+		silently declined to fire at all for it - confirmed via a real
+		repro (tuple[Elem,...] iteration, Elem an RCClass) still showing
+		the original C4700 on __match_subj_0/item under MSVC even with
+		the plain-Function recovery in place. Fixed by resolving the
+		Overload group's own winning leaf first (via the SAME arg-
+		matching _overload_call_return_type this method already uses for
+		an ordinary Overload-typed call target), then substituting THAT
+		leaf's return type exactly like the plain-Function case. '''
+		self.assert_programs_run([
+			( 'match_subject_reentrant_generic_class_overloaded_getitem', '''
+class Elem:
+	pass
+
+class Box[T]( Sequence[T] ):
+	v: T
+	@overload
+	def __getitem__( self, i: usize ) -> Result[T, IndexError]:
+		if i == 0:
+			return Result.Ok( self.v )
+		return Result.Err( IndexError() )
+	@overload
+	def __getitem__( self, s: slice ) -> Box[T]:
+		return self
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return helper( self )
+
+def helper[T]( b: Box[T] ) -> Generator[T, StopIteration]:
+	i: usize = 0
+	while True:
+		match b.__getitem__( i ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
+		with compiler.panic_arithmetic( 'not possible' ):
+			i += 1
+
+def main() -> i32:
+	e: Elem = Elem()
+	before: usize = compiler.refcount( e )
+	b: Box[Elem] = Box[Elem]( v = e )
+	g = b.__iter__()
+	got: Elem = g.__next__().unwrap( 'g' )
+	if compiler.refcount( got ) == before:
+		return 1
+	if not g.__next__().is_err():
+		return 2
+	return 0
+''' ),
+		])
+
+	def test_match_same_name_reuse_narrowing_inside_generator( self ) -> None:
+		''' Regression for a DISTINCT bug from test_match_on_fallible_call_
+		subject_crossing_a_yield/test_match_arm_binding_crossing_a_yield
+		above (both about a promoted field's own trailing decref reading
+		garbage post-resume) - this one is about the same-name-reuse
+		NARROWING feature (`match x: case T(x): ...` - rebinding a name to
+		itself narrows its existing binding instead of shadowing it with a
+		fresh one) being silently non-functional for any generator at all.
+		visit_Match's own `original_subject_name = node.subject.id if
+		isinstance(node.subject, ast.Name) else None` ran LATE (during the
+		synthesized $$__next__/$$__resume__ method's own normal
+		resolution), well AFTER _GeneratorNameRenamer's earlier whole-body
+		rename pass had already rewritten node.subject from a plain
+		ast.Name into `self.<attr>` whenever the subject is a promoted
+		local/parameter - true for essentially every generator local,
+		since _collect_generator_locals requires one. isinstance(node.
+		subject, ast.Name) then always came back False, so the reuse-
+		narrowing branch never fired and `case T(x):` silently fell back
+		to ordinary extract-and-bind, leaving x's own type stuck at the
+		wider union - confirmed via a real repro that failed to compile at
+		all (`Result[Box,IndexError] has no attribute 'v'`), not just a
+		silent behavior change. Fixed in two parts (type_resolver.py):
+		1. _reserve_generator_match_subject_fields (already runs EARLY,
+		   before the rename pass, to reserve promoted subject fields) now
+		   also tags ANY qualifying match's ORIGINAL bare-Name subject
+		   (`node.generator_original_subject_name`), unconditionally, not
+		   just when an arm crosses a yield - the rename-timing gap applies
+		   to every generator match regardless of yield-crossing.
+		   visit_Match reads this tag back before falling to its own
+		   (now rename-broken) isinstance check.
+		2. Once the reuse shape is correctly recognized again, a SECOND,
+		   more subtle gap surfaced: _match_union_member built the narrow-
+		   marker keyed by the bare source name ('x'), but every actual
+		   READ of that name in the arm's own body was ALREADY renamed to
+		   `self.x` - a distinct synthetic 'self::x' key by this file's own
+		   _narrow_subject_key/_attribute_chain_key convention (already
+		   used elsewhere for `self.field is not None:` narrowing) - so the
+		   two never matched and the narrowing was invisible to any read.
+		   Fixed by deriving the narrow-marker's key/attr_base/attr_hops
+		   from _narrow_subject_key(node.subject) - node.subject already
+		   reflects whatever CURRENT form (bare name or self.<attr>) the
+		   original subject has, generalizing for free (a bare ast.Name
+		   still resolves to the plain, unchanged key). '''
+		self.assert_programs_run([
+			( 'match_same_name_reuse_narrows_promoted_local_then_yields_field', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( i: usize ) -> Result[Box, IndexError]:
+	with compiler.wrap_arithmetic:
+		if i >= 3:
+			return Result.Err( IndexError())
+		return Result.Ok( Box( v = i32( i )))
+
+def gen() -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			r: Result[Box, IndexError] = maybe( i )
+			match r:
+				case Result.Ok( r ):
+					yield r.v
+				case Result.Err( _ ):
+					return
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		total: i32 = 0
+		count: usize = 0
+		for v in gen():
+			total += v
+			count += 1
+		if count != 3:
+			return 1
+		if total != 0 + 1 + 2:
+			return 2
+		return 0
+''' ),
+			# stress the RC ownership path specifically: the narrowed field
+			# holds a REAL retained reference (Result.Ok(b)'s own wrap
+			# constructor retains its argument, a real copy not a move) -
+			# a shared Box threaded through several resumed calls, checking
+			# compiler.refcount() before/after full exhaustion catches
+			# either a leak (narrowing skips a needed release) or a
+			# double-free (narrowing releases something it doesn't own),
+			# not just "does it compile and return the right sum"
+			( 'match_same_name_reuse_narrowing_no_rc_leak_across_resumes', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def maybe( b: Box, i: usize ) -> Result[Box, IndexError]:
+	with compiler.wrap_arithmetic:
+		if i >= 3:
+			return Result.Err( IndexError())
+		return Result.Ok( b )
+
+def gen( b: Box ) -> Iterator[Result[i32, StopIteration]]:
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while True:
+			r: Result[Box, IndexError] = maybe( b, i )
+			match r:
+				case Result.Ok( r ):
+					yield r.v
+				case Result.Err( _ ):
+					return
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b: Box = Box( v = i32( 7 ))
+		before: usize = compiler.refcount( b )
+		total: i32 = 0
+		for v in gen( b ):
+			total += v
+		after: usize = compiler.refcount( b )
+		if before != after:
+			return 1
+		if total != 7 + 7 + 7:
 			return 2
 		return 0
 ''' ),
@@ -22130,17 +23274,13 @@ def main() -> i32:
 				case Result.Ok( _ ):
 					pass
 			count += 1
-	# _desugar_indexable_for's own generated while-loop splices the
-	# original for-loop's body in verbatim, WITHOUT re-scanning it for a
-	# further nested for-loop-with-yield of its own - confirmed via a
-	# real repro to leave the inner one un-desugared, falling through to
-	# lowering.py's ordinary (non-generator-aware) for-loop lowering
-	# instead: compiled clean, but crashed at runtime under MSVC (debug:
-	# heap-corruption breakpoint; release: access violation) - clang/gcc's
-	# own codegen happened not to visibly corrupt anything for the same
-	# wrong IR, masking it completely. _recurse_desugar_for_loops now
-	# recurses into a for-loop-with-yield's own desugared output too, not
-	# just plain if/while/for/with bodies.
+	# a desugared for-loop's generated while-loop splices the original
+	# body in verbatim - a nested for-loop-with-yield inside that body
+	# must still get desugared too, not fall through to lowering.py's
+	# ordinary for-loop lowering (which crashed at runtime under MSVC,
+	# masked entirely under clang/gcc's codegen for the same wrong IR).
+	# _recurse_desugar_for_loops recurses into a for-loop-with-yield's own
+	# desugared output too, not just plain if/while/for/with bodies.
 	if count != 3:
 		return 1
 	return 0
@@ -22169,6 +23309,142 @@ def main() -> None:
 ''' )
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( "type parameter 'T' is inferred as both", str( self.discovery.errors.errors[0] ))
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generator_method_programs_compile_and_run( self ) -> None:
+		''' generator METHODS - a class method containing `yield`, no
+		longer rejected (PLAN_GENERATORS.md's own "explicitly not planned"
+		list, lifted now there's a real forcing use case - lib/re.py's
+		Pattern.finditer). self is architecturally just another captured
+		parameter (see type_resolver.py's _generator_self_parameter/
+		_generator_effective_parameters) - assigned once at construction,
+		valid unconditionally for the generator's whole lifetime, torn down
+		via the ordinary unmodified $$__destructor__ cascade like any other
+		captured RC-typed parameter, no live-flag needed. '''
+		self.assert_programs_run([
+			( 'simple_generator_method_no_other_captures', '''
+class Counter:
+	limit: i32
+	def __init__( self, limit: i32 ) -> None:
+		self.limit = limit
+	def count( self ) -> Iterator[Result[i32, StopIteration]]:
+		i: i32 = 0
+		while i < self.limit:
+			yield i
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		c = Counter( limit = 3 )
+		g = c.count()
+		total: i32 = 0
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( x ):
+					total += x
+		if total != 3: # 0 + 1 + 2
+			return 1
+		return 0
+''' ),
+			( 'generator_method_also_captures_other_locals_and_params', '''
+class Adder:
+	base: i32
+	def __init__( self, base: i32 ) -> None:
+		self.base = base
+	def added_range( self, count: i32, step: i32 ) -> Iterator[Result[i32, StopIteration]]:
+		i: i32 = 0
+		with compiler.wrap_arithmetic:
+			while i < count:
+				yield self.base + i * step
+				i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		a = Adder( base = 100 )
+		g = a.added_range( 3, 10 )
+		total: i32 = 0
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( x ):
+					total += x
+		if total != 330: # 100 + 110 + 120
+			return 1
+		return 0
+''' ),
+			( 'generator_method_mutates_field_on_self_across_a_yield', '''
+class Accumulator:
+	total: i32
+	def __init__( self ) -> None:
+		self.total = 0
+	def gen( self, count: i32 ) -> Iterator[Result[i32, StopIteration]]:
+		i: i32 = 0
+		with compiler.wrap_arithmetic:
+			while i < count:
+				self.total += i
+				yield self.total
+				i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		acc = Accumulator()
+		g = acc.gen( 3 )
+		last: i32 = -1
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( x ):
+					last = x
+		# self.total observable through the ORIGINAL object too - proves
+		# self.<field> writes inside the generator method really land on
+		# the shared instance, not some disconnected copy
+		if acc.total != 3 or last != 3: # 0 + 1 + 2
+			return 1
+		return 0
+''' ),
+			( 'dropped_mid_iteration_decrefs_captured_self', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Holder:
+	b: Box
+	def __init__( self, b: Box ) -> None:
+		self.b = b
+	def gen( self ) -> Iterator[Result[i32, StopIteration]]:
+		yield self.b.v
+		yield self.b.v
+
+def make_and_partially_consume( h: Holder ) -> None:
+	g = h.gen()
+	first = g.__next__().is_ok() # only one of two yields ever consumed
+	if first: pass
+	# g goes out of scope here, still mid-iteration - the generator's own
+	# captured `self` (the Holder) must still release correctly, via the
+	# ordinary $$__destructor__ cascade, same as any other captured
+	# RC-typed parameter
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 42 )
+		h = Holder( b = b )
+		if compiler.refcount( h ) != 1:
+			return 1
+		make_and_partially_consume( h )
+		if compiler.refcount( h ) != 1:
+			return 2
+		return 0
+''' ),
+		])
 
 
 class DelRedeclareRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
@@ -22434,16 +23710,16 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> i32:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 		return 42
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t as v:
-		log.append( v ).unwrap( 'overflow' )
+		log.append( v )
 	if log.__len__() != 3:
 		return 1
 	if log.__getitem__( 0 ).unwrap( 'idx' ) != 1:
@@ -22464,15 +23740,15 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t:
-		log.append( 99 ).unwrap( 'overflow' )
+		log.append( 99 )
 	if log.__len__() != 3:
 		return 1
 	return 0
@@ -22489,13 +23765,13 @@ class Trace:
 	def __enter__( self ) -> None:
 		pass
 	def __exit__( self ) -> None:
-		self.log.append( 7 ).unwrap( 'overflow' )
+		self.log.append( 7 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t:
-		log.append( 1 ).unwrap( 'overflow' )
+		log.append( 1 )
 		return 0
 	return 1
 ''' )
@@ -22518,16 +23794,16 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	log = list[i32]()
 	t = Trace( log )
 	with t:
-		log.append( 99 ).unwrap( 'overflow' )
-	log.append( 3 ).unwrap( 'overflow' )
+		log.append( 99 )
+	log.append( 3 )
 	if log.__len__() != 4:
 		return 1
 	if log.__getitem__( 3 ).unwrap( 'idx' ) != 3:
@@ -22693,16 +23969,16 @@ class Trace:
 		self.log = log
 		self.tag = tag
 	def __enter__( self ) -> None:
-		self.log.append( self.tag ).unwrap( 'overflow' )
+		self.log.append( self.tag )
 	def __exit__( self ) -> None:
 		with compiler.wrap_arithmetic:
-			self.log.append( self.tag + 100 ).unwrap( 'overflow' )
+			self.log.append( self.tag + 100 )
 
 def main() -> i32:
 	log = list[i32]()
 	with Trace( log, 1 ):
 		with Trace( log, 2 ):
-			log.append( 0 ).unwrap( 'overflow' )
+			log.append( 0 )
 	if log.__len__() != 5:
 		return 1
 	expected: list[i32] = [ 1, 2, 0, 102, 101 ]
@@ -22731,7 +24007,7 @@ class Trace:
 	def __enter__( self ) -> None:
 		pass
 	def __exit__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 
 def main() -> i32:
 	log = list[i32]()
@@ -22774,9 +24050,9 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 1 ).unwrap( 'overflow' )
+		self.log.append( 1 )
 	def __exit__( self ) -> None:
-		self.log.append( 2 ).unwrap( 'overflow' )
+		self.log.append( 2 )
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -22817,7 +24093,7 @@ class Trace:
 	def __enter__( self ) -> None:
 		pass
 	def __exit__( self ) -> None:
-		self.log.append( 7 ).unwrap( 'overflow' )
+		self.log.append( 7 )
 
 def main() -> i32:
 	with compiler.wrap_arithmetic:
@@ -22926,7 +24202,7 @@ class Trace:
 	def __init__( self, log: list[i32] ) -> None:
 		self.log = log
 	def __enter__( self ) -> None:
-		self.log.append( 99 ).unwrap( 'overflow' )
+		self.log.append( 99 )
 	def __exit__( self ) -> None:
 		pass
 
@@ -22935,7 +24211,7 @@ def main() -> i32:
 	i: usize = 0
 	while i < 3:
 		with compiler.wrap_arithmetic:
-			log.append( i32( i )).unwrap( 'overflow' )
+			log.append( i32( i ))
 			i = i + 1
 	with Trace( log ):
 		pass

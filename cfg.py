@@ -44,9 +44,8 @@ it from fn.names at exactly the same point cfg.py tears down its entry.
 '''
 
 class OwnState( Enum ):
-	OWNED = 'owned'
+	OWNED = 'owned' # a real epilogue entry backs this binding - decref'd at scope exit. Covers every provenance: a fresh Call/Allocate result, a move[T]/copy[T] parameter (copy[T] takes its own Incref in the prologue - _enter_parameter - but is otherwise indistinguishable from any other OWNED binding; no consumer anywhere ever needed to tell them apart, so there's no separate COPY state)
 	BORROWED = 'borrowed'
-	COPY = 'copy'
 	MOVED = 'moved'
 
 # rc_leaves/_is_direct_pointer_rc used to be open-coded isinstance ladders
@@ -151,12 +150,23 @@ class InlineScope:
 @dataclass
 class _Snapshot:
 	''' captured by snapshot(), consumed by restore() - see the IF/loop
-	orchestration lowering.py performs around branches/loop bodies. '''
+	orchestration lowering.py performs around branches/loop bodies.
+	entry_cancelled/entry_captured/entry_flag record every SURVIVING
+	entry's (index < stack_depth) own Epilogue state as of snapshot time -
+	restore() itself never applies these (see its own docstring - a
+	branch's own captured/flag-guarded entries are meant to keep whatever
+	CURRENT state they have across an ordinary restore()); hard_restore()
+	is the one consumer, for the loop-ownership retry's own "discard this
+	WHOLE attempt, including anything it did to an entry declared before
+	the loop" rollback - see its own docstring. '''
 	bindings: Bindings
 	stack_depth: int
 	results: set[str]
 	narrowed: dict[str,Variable]
 	live: set[str]
+	entry_cancelled: list[bool]
+	entry_captured: list[bool]
+	entry_flag: list['Variable | None']
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -196,6 +206,7 @@ class CFGState:
 		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
 		self._cancel_flags: list[Variable] = [] # see _neutralize()/cancel_flags() - minted lazily, only for an entry that turns out to need one
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
+		self._protected_entries: list[set[int]] = [] # see enter_diverging_paths()/exit_diverging_paths() - id()s of every entry a currently-lowering try's own body/handlers must NOT statically cancel
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self._break_live_stack: list[list[set[str]]] = [] # the definite-assignment analogue of _break_narrowed_stack above - one set[str] snapshot per break, see record_break_live()
@@ -203,7 +214,7 @@ class CFGState:
 		self._live: set[str] = set() # names of locals DEFINITELY ASSIGNED on the current path - independent of RC tracking above (unlike bindings/rc_leaves, tracks EVERY local regardless of type - see assign()/is_live()/_expr_Name's own liveness gate). Parameters/self are always live from entry (seeded below/in enter_self()); a bare AnnAssign's own name is added to fn.names but NOT here until its first real assignment
 		self._unchecked_results: set[str] = set() # names of locals currently holding a Result[T,E] that hasn't been is_ok()/is_err()/or_return()/unwrap()/unwrap_or()'d or match'd yet - independent of RC tracking above, see track_result()/clear_result()
 		self._narrowed: dict[str,list[Variable]] = {} # name -> the non-empty set of the UNION's own members it could still be (each .type the narrowed leaf, .stem the v_<stem> payload field) - see narrow()/unnarrow()/narrowed_member(). A pure compile-time READ-REWRITE fact, no RC implications at all: the name's own real Variable/storage never changes, this only says "a read of this name, right here, may be rewritten to read through the union's own payload instead", and ONLY when the set has collapsed to exactly one member - see narrowed_member(). A single narrow() call always starts as a one-element list; merge_if's own soft-merge can grow it (two disagreeing-but-both-still-possible branches union together rather than discarding the fact) or drop it (a name narrowed on only SOME surviving paths)
-		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/COPY/MOVED)
+		self._temp_states: dict[int,Type] = {} # ir.Temp.id -> its type, only while OWNED (temps are never BORROWED/MOVED)
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
 		self._construction_required: list[Variable] = [] # __init__'s own attributes that must all be initialized before self can escape/construction can complete
@@ -231,7 +242,7 @@ class CFGState:
 			# Incref right here in the prologue, matching Decref at exit
 			if rc_leaves( param.type ):
 				self.prologue_instructions += self._incref_instructions( param.type, param )
-				self._push( param, param.type, OwnState.COPY )
+				self._push( param, param.type, OwnState.OWNED )
 		elif rc_leaves( param.type ):
 			self.bindings[param.stem] = _Binding( operand = param, type = param.type, state = OwnState.BORROWED, entry = None )
 
@@ -358,6 +369,9 @@ class CFGState:
 		return _Snapshot(
 			bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ),
 			narrowed = dict( self._narrowed ), live = set( self._live ),
+			entry_cancelled = [ e.cancelled for e in self._epilogue_stack ],
+			entry_captured = [ e.captured for e in self._epilogue_stack ],
+			entry_flag = [ e.flag for e in self._epilogue_stack ],
 		)
 
 	def restore( self, snap: _Snapshot ) -> None:
@@ -386,12 +400,33 @@ class CFGState:
 		assumed definitely-assigned once back outside it - merge_if()/
 		merge_loop_exits() are what let a name's liveness survive past the
 		construct, via their own explicit reconciliation, same split of
-		responsibility as bindings/narrowed above. '''
+		responsibility as bindings/narrowed above.
+
+		A CAPTURED plain entry also survives, same as a flag-guarded one -
+		current_epilogue_label() already handed its .name out as a live goto
+		target (this can happen even for a genuinely branch-scoped entry
+		when the pushing code itself is UNCONFINED at push time - e.g.
+		_stmt_Try's own try body, which never wraps itself in enter_branch()
+		since it always runs exactly once when reached, unlike a handler -
+		see its own docstring). Dropping it here would leave that goto
+		dangling once build_epilogue_ladder() never emits the matching
+		Label - confirmed by a real repro (a named Result local, or a
+		compiler-synthesized match subject, declared directly inside a
+		try body, with a `return`/match arm reachable from inside that same
+		body). Safe to keep unconditionally: an entry that's NOT captured
+		here is confined-and-never-jumped-to, so its teardown is already
+		fully handled by whichever reconciliation call (merge_if()/
+		merge_loop_exits()) is about to run instead - and an entry that's
+		genuinely confined (pushed at or after a live enter_branch()/
+		enter_loop() depth) never reaches captured=True in the first place,
+		since current_epilogue_label() refuses to hand out a label for one
+		(see its own docstring) - so this can never resurrect an entry that
+		was truly meant to be block-scoped. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
-		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded ]
+		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.captured ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
 
@@ -553,6 +588,44 @@ class CFGState:
 
 	def exit_branch( self ) -> None:
 		self._confinement_depths.pop()
+
+	def enter_diverging_paths( self, floor: int ) -> None:
+		''' any construct that lowers more than one MUTUALLY-EXCLUSIVE
+		sibling pass over its own body, each independently restore()'d
+		back to the SAME entry snapshot (_stmt_If's true/false branches,
+		_stmt_Try's try-body-fall-through/each-handler,
+		_lower_binary_branch's own true/false thunks - every one of them
+		shares this exact `entry_snapshot = snapshot(); ...; restore(
+		entry_snapshot)` shape). Every SURVIVING entry below `floor` -
+		index < floor, i.e. declared BEFORE this construct - has its own
+		Epilogue object shared by reference across every sibling pass,
+		never copied per restore() (see restore()'s own comment) - a
+		manually_decreffed()/move()/deleted() call on one, already-lowered
+		sibling (e.g. `compiler.decref(g)` on an if's own true branch, or
+		a try body's own fall-through) would otherwise permanently mutate
+		the SAME object an earlier-taken, mutually-exclusive sibling still
+		depends on. Confirmed by real repros in EVERY one of these
+		constructs, not just _stmt_Try: an ordinary local declared before
+		a PLAIN `if bad: compiler.decref(g); return -1` (no try/except,
+		no loop at all) leaked on the `bad=False` path, because that
+		branch's own `return 0` walked right past an entry the OTHER,
+		already-lowered branch had already (wrongly, from this branch's
+		own perspective) cancelled.
+
+		Recorded by id() (Epilogue is unhashable-by-default dataclass
+		identity, and entries can't be deep-copied - see Epilogue.type's
+		own docstring on why instructions are always regenerated fresh)
+		rather than by index: indices can still shift beneath a nested
+		construct's own narrower protection. A stack (not a single set),
+		same shape as _confinement_depths, so nesting composes - an entry
+		protected by an outer construct stays protected for the whole
+		time an inner one is ALSO being lowered, popped back to the outer
+		construct's own view once the inner one exits. See _neutralize()'s
+		own use of this. '''
+		self._protected_entries.append({ id( e ) for e in self._epilogue_stack[:floor] })
+
+	def exit_diverging_paths( self ) -> None:
+		self._protected_entries.pop()
 
 	# --- union narrowing (compile-time only - see _narrowed's own comment) -
 
@@ -756,7 +829,7 @@ class CFGState:
 		the join point) - a binding confined to one branch only exists on
 		that one path, so its teardown can't run at the shared join point
 		reached by both. Re-establishes exactly one epilogue entry per
-		surviving OWNED/COPY binding - both branches always push their OWN
+		surviving OWNED binding - both branches always push their OWN
 		entry when creating the same-named binding fresh, and only one of
 		the two ever actually runs, so those speculative entries must
 		never both survive onto the real stack.
@@ -839,7 +912,7 @@ class CFGState:
 		removed: list[str] = []
 
 		def reestablish( name: str, binding: _Binding, already_live: bool ) -> None:
-			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state == OwnState.OWNED:
 				if already_live:
 					self.bindings[name] = binding
 				else:
@@ -874,7 +947,30 @@ class CFGState:
 			if survivor is not None:
 				for name, binding in survivor.items():
 					prior = entry_bindings.get( name )
-					already_live = prior is not None and prior.entry is binding.entry
+					# an entry can be "already live" two ways: present (by
+					# identity) in entry_bindings (the ordinary case), OR -
+					# for a binding declared MID-BODY, after entry_bindings
+					# was captured, so never eligible for the first check at
+					# all - already sitting in self._epilogue_stack right
+					# now because restore() (called by the caller before
+					# this method runs) preserved it as a flag-guarded/
+					# captured survivor (see restore()'s own "survivors"
+					# comment). Missing this second case double-pushes a
+					# BRAND NEW entry for the SAME already-tracked object -
+					# the new one's own natural release fires unconditionally
+					# (never flag-guarded itself), stacking on top of the
+					# original's own still-live flag-guarded one - confirmed
+					# by a real repro (a name manually compiler.decref()d only
+					# on a terminating branch of a construct nested inside an
+					# enclosing one - e.g. or_throw(mapper)'s own err_thunk
+					# decref'ing its receiver, or a raise inside a nested
+					# try's own handler decref'ing an outer local before
+					# re-raising outward): a real double release/heap
+					# corruption on the OTHER (surviving) path, which never
+					# actually touched the entry at all.
+					already_live = ( prior is not None and prior.entry is binding.entry ) or (
+						binding.entry is not None and any( e is binding.entry for e in self._epilogue_stack )
+					)
 					reestablish( name, binding, already_live )
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
@@ -897,16 +993,16 @@ class CFGState:
 					# disagrees. That's not the hazard the error below exists
 					# for (a variable that might not exist at all) - it's the
 					# ordinary "fill in a default when still borrowed" idiom
-					# (`if x is None: x = Owned(...)`). Only OWNED/COPY-vs-
-					# BORROWED is safe to reconcile this way (the value is
-					# valid either way, only "do we own it" differs) - any
-					# OTHER disagreement (MOVED involved, etc) stays a hard
-					# error, unchanged.
+					# (`if x is None: x = Owned(...)`). Only OWNED-vs-BORROWED
+					# is safe to reconcile this way (the value is valid either
+					# way, only "do we own it" differs) - any OTHER
+					# disagreement (MOVED involved, etc) stays a hard error,
+					# unchanged.
 					owning, borrowed = (
-						( true_binding, false_binding ) if true_binding.state in ( OwnState.OWNED, OwnState.COPY )
+						( true_binding, false_binding ) if true_binding.state == OwnState.OWNED
 						else ( false_binding, true_binding )
 					)
-					if not ( owning.state in ( OwnState.OWNED, OwnState.COPY ) and borrowed.state == OwnState.BORROWED ):
+					if not ( owning.state == OwnState.OWNED and borrowed.state == OwnState.BORROWED ):
 						raise CompileError(
 							f"{ctx}: {name!r} is in an indeterminate state after the if - "
 							f"{true_binding.state.value} on one branch, {false_binding.state.value} on the other"
@@ -930,10 +1026,17 @@ class CFGState:
 					entry.flag = flag
 					continue
 				prior = entry_bindings.get( name )
+				# see the survivor-path's own identical comment above for why
+				# a mid-body entry needs this second check too - a shared
+				# entry already flag-guard-surviving in self._epilogue_stack
+				# right now, not just one present in entry_bindings.
 				already_live = (
 					prior is not None
 					and prior.entry is true_binding.entry
 					and prior.entry is false_binding.entry
+				) or (
+					true_binding.entry is not None and true_binding.entry is false_binding.entry
+					and any( e is true_binding.entry for e in self._epilogue_stack )
 				)
 				reestablish( name, true_binding, already_live )
 				continue
@@ -948,7 +1051,7 @@ class CFGState:
 			# inside THAT branch's own code only
 			binding = true_binding if in_true else false_binding
 			assert binding is not None
-			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state in ( OwnState.OWNED, OwnState.COPY ) else []
+			decref = self._decref_instructions( binding.type, binding.operand ) if binding.state == OwnState.OWNED else []
 			if in_true:
 				true_instructions += decref
 			else:
@@ -1088,7 +1191,7 @@ class CFGState:
 			if in_entry:
 				raise CompileError( f"{ctx}: {name!r} does not exist consistently across loop iterations" )
 			binding = back_edge[name]
-			if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state == OwnState.OWNED:
 				instructions += self._decref_instructions( binding.type, binding.operand )
 		if entry_results is not None:
 			fresh_and_unchecked = self._unchecked_results - entry_results
@@ -1099,6 +1202,111 @@ class CFGState:
 					f"before the next iteration overwrites it - use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match"
 				)
 		return instructions
+
+	def find_promotable_loop_mismatches( self, entry_bindings: Bindings ) -> set[str]:
+		''' loop_back_edge()'s own pre-check, for lowering.py's retry: which
+		names hit the SAME safe BORROWED-entering/OWNED-by-back-edge shape
+		merge_if() already reconciles for if/else branches (its own owning/
+		borrowed check above). A loop body is lowered exactly ONCE and
+		reused via the back edge (unlike an if's two independently-lowered
+		branches), so this can't be reconciled after the fact the way
+		merge_if's runtime flag does - a flag alone doesn't retroactively add
+		the decref-before-overwrite each promoted reassignment site now
+		needs on iteration 2+. lowering.py instead rolls back the whole
+		failed attempt and re-lowers with these names pre-promoted via
+		promote_borrowed_for_loop(), so every reassignment site sees the true
+		steady-state entry ownership up front. '''
+		back_edge = self.bindings
+		promotable: set[str] = set()
+		for name, entry_binding in entry_bindings.items():
+			back_binding = back_edge.get( name )
+			if back_binding is None or entry_binding.state == back_binding.state:
+				continue
+			if entry_binding.state == OwnState.BORROWED and back_binding.state == OwnState.OWNED:
+				promotable.add( name )
+		return promotable
+
+	def promote_borrowed_for_loop( self, name: str ) -> list[ir.Instruction]:
+		''' converts a currently-BORROWED binding to OWNED - a single
+		explicit incref before the loop starts (not a per-iteration cost),
+		conceptually the same "take my own copy" a copy[T] parameter's own
+		prologue takes (_enter_parameter). Called once per name found by
+		find_promotable_loop_mismatches(), right before lowering.py re-lowers
+		the loop from its own start label - the returned instructions must
+		be emitted there, before that label. '''
+		binding = self.bindings[name]
+		assert binding.state == OwnState.BORROWED, f'promote_borrowed_for_loop({name!r}): binding is {binding.state}, not BORROWED'
+		instructions = self._incref_instructions( binding.type, binding.operand )
+		self._push( binding.operand, binding.type, OwnState.OWNED, key = name )
+		return instructions
+
+	@property
+	def cancel_flag_count( self ) -> int:
+		''' len(self._cancel_flags) - lowering.py's loop-retry rollback uses
+		this to snapshot/truncate cancel flags minted by a failed attempt
+		(cancel_flags() itself always returns every flag ever minted, needed
+		as-is by _emit_epilogue - see its own docstring). '''
+		return len( self._cancel_flags )
+
+	def truncate_cancel_flags( self, count: int ) -> None:
+		''' drops every cancel flag minted since `count` (a prior
+		cancel_flag_count) - a failed loop-lowering attempt being rolled back
+		by lowering.py's retry must not leave its own now-unreferenced flags
+		behind, or _emit_epilogue would still splice in a real, always-True,
+		never-read local for each one (a guaranteed -Wunused-variable, or
+		worse a dead store some compilers might not even tolerate silently). '''
+		del self._cancel_flags[count:]
+
+	def hard_restore( self, snap: _Snapshot ) -> None:
+		''' like restore(), but discards EVERY entry pushed since the
+		snapshot, including flag-guarded/captured ones restore() deliberately
+		keeps alive (see its own docstring - a defer registered since the
+		snapshot, or an early return already committed to one of its own
+		labels). Only safe when the caller is about to fully re-lower that
+		exact same source code from scratch, which re-registers a fresh
+		replacement for anything genuinely still needed - lowering.py's own
+		loop-ownership retry rollback is the one caller (see
+		_lower_loop_body_with_ownership_retry): a defer statement textually
+		inside the loop body gets re-registered on the retried attempt, so
+		the ABANDONED attempt's own registration (and lowering.py's matching
+		_defer_flags entry, separately truncated there) can simply be
+		dropped rather than kept alive for a function epilogue that will
+		never see the abandoned code again. Using ordinary restore() here
+		would leave that stale entry referencing a flag lowering.py already
+		rolled out of _defer_flags - a dangling reference.
+
+		Also reverts every SURVIVING entry's (index < stack_depth, i.e.
+		declared BEFORE the loop) own .cancelled/.captured/.flag back to
+		snap's own recording - those Epilogue objects are shared by
+		reference and NOT freshly re-declared by the retried attempt (only
+		entries pushed AFTER the snapshot are, via the del below), so
+		anything the ABANDONED attempt did to one - e.g. compiler.decref()
+		on a name captured earlier in that SAME abandoned attempt, which
+		mints a cancel flag and stores it on entry.flag - would otherwise
+		leak into the retried attempt exactly like restore()'s own
+		identical problem for _stmt_Try (see enter_diverging_paths()'s docstring).
+		Confirmed by a real repro: a loop whose body both captures a pre-
+		loop local via an early return and then compiler.decref()s it,
+		combined with an unrelated borrowed-to-owned promotion that
+		triggers this exact retry - "use of undeclared identifier
+		__cancel_flag_0" from clang, because the retried attempt reused
+		attempt 1's own now-truncated-out-of-_cancel_flags flag reference
+		instead of minting its own. Unlike restore() (which must NOT do
+		this - a genuinely surviving branch's own capture/flag has to
+		remain live), hard_restore()'s whole point is discarding
+		EVERYTHING about the abandoned attempt, entry-internal state
+		included. '''
+		self.bindings = dict( snap.bindings )
+		self._unchecked_results = set( snap.results )
+		self._narrowed = dict( snap.narrowed )
+		self._live = set( snap.live )
+		for e, cancelled, captured, flag in zip(
+			self._epilogue_stack[:snap.stack_depth], snap.entry_cancelled, snap.entry_captured, snap.entry_flag,
+		):
+			e.cancelled = cancelled
+			e.captured = captured
+			e.flag = flag
+		del self._epilogue_stack[snap.stack_depth:]
 
 	def unwind_to( self, snap: _Snapshot ) -> list[ir.Instruction]:
 		''' break/continue - unwind everything pushed since `snap` (the
@@ -1113,6 +1321,29 @@ class CFGState:
 			if entry.cancelled or entry.is_flag_guarded:
 				continue
 			instructions += self._decref_instructions( entry.type, entry.operand ) # regenerated fresh, not entry.instructions - see Epilogue.type's docstring
+		return instructions
+
+	def unwind_confined( self, floor: int, exclude: 'ir.Operand | None' = None ) -> list[ir.Instruction]:
+		''' unwind_to()'s own exclusion-aware sibling - a covered `raise`/
+		or_throw() dispatch (lowering.py's _dispatch_leaves_against_try_
+		stack/ir.ThrowLeaf.epilogue) needs everything confined to the
+		covering try's own body released before its goto into the handler,
+		same as unwind_to() already does for break/continue leaving a loop
+		- EXCEPT the raised value's own entry, if it's a plain Variable
+		(`raise x`): that one's ownership is transferring INTO the handler's
+		own bind, not ending here (see ir.ThrowLeaf.epilogue's own
+		docstring). `floor` is the covering TryContext's own
+		entry_stack_depth, not necessarily the innermost try on the stack -
+		an outer handler catching a leaf the inner try doesn't cover has to
+		unwind everything back to ITS OWN entry, past the inner try's own
+		portion too. '''
+		instructions: list[ir.Instruction] = []
+		for entry in reversed( self._epilogue_stack[floor:] ):
+			if entry.cancelled or entry.is_flag_guarded:
+				continue
+			if exclude is not None and entry.operand is exclude:
+				continue
+			instructions += self._decref_instructions( entry.type, entry.operand )
 		return instructions
 
 	def check_loop_exit_unchecked_results( self, entry_results: set[str], ctx: str ) -> None:
@@ -1189,7 +1420,7 @@ class CFGState:
 		this entry" rather than a borrow. Used by lowering.py's _stmt_Return
 		to decide whether an ALIASING return expression (self.lowering.
 		_is_aliasing_expr) needs its own Incref before being handed to the
-		caller: an OWNED/COPY local or a copy[T]/move[T] parameter has a live
+		caller: an OWNED local or a copy[T]/move[T] parameter has a live
 		entry here (a genuine move, no Incref needed - the source's own
 		decref is what's being skipped), but a BORROWED parameter/self (never
 		pushed - see _enter_parameter()'s own BORROWED branch) and an
@@ -1894,12 +2125,48 @@ class CFGState:
 			return instructions
 		existing = self.bindings.get( dest.stem )
 		if existing is not None and existing.entry is not None:
-			if existing.state in ( OwnState.OWNED, OwnState.COPY ):
+			if existing.state == OwnState.OWNED:
 				instructions += self._decref_instructions( dest.type, dest ) # release whatever dest held before - reads dest's CURRENT value, emitted before the Assign overwrites it
 			existing.entry.cancelled = False # dest is getting a real value again, even if it was MOVED/never-decref'd before
 			self.bindings[dest.stem] = _Binding( operand = dest, type = dest.type, state = OwnState.OWNED, entry = existing.entry )
 		else:
 			self._push( dest, dest.type, OwnState.OWNED )
+		return instructions
+
+	def assign_global_initializer( self, dest: Variable ) -> list[ir.Instruction]:
+		''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: the Acquire+decref-
+		current-value half of a global's OWN initializing write (lowering.py's
+		run_global emits the actual ir.Assign itself, then ir.ReleaseGlobalLock,
+		mirroring _cfg_assign's own write-side split for the identical "the
+		Assign is its own separate textual read/write in the generated C"
+		reason). Structurally IDENTICAL to assign()'s own `dest.is_global`
+		write branch above, with ONE deliberate difference: this does NOT
+		flip dest.reassigned_outside_init - a global written only by its own
+		initializer, never reassigned from a function body, is still provably
+		single-write and needs no lock at all (that flag's own comment); this
+		method's own Acquire/Release markers become no-ops for exactly that
+		case, gated at EMISSION time the same way every other marker already
+		is (see the is_alias branch above's identical "final value isn't
+		known yet here" reasoning).
+
+		Needed despite that "provably single-write" framing because it was
+		never quite true: a global's initializer can call an ordinary
+		function, and SYNTAX.md documents that as fully legal ("not
+		restricted to a compile-time constant... can call ordinary functions
+		at real program-startup time") - if that function spawns a thread
+		(joined or not), the spawned thread can reassign THIS global (or read
+		it) through the fully-locked ordinary `global X; X = ...` path WHILE
+		__metalpy_init() is still running, concurrently with this global's
+		own unlocked initializing write - confirmed as a real, reachable
+		race, not a theoretical one, once a global with a real initializer
+		exists alongside ANY reassignment of it from a thread-reachable
+		function. rc_leaves(dest.type) early-return matches assign()'s own -
+		Part A (and this fix) is scoped to RC-typed globals only, same as
+		everywhere else in this mechanism. '''
+		if not rc_leaves( dest.type ):
+			return []
+		instructions: list[ir.Instruction] = [ ir.AcquireGlobalLock( var = dest ) ]
+		instructions += self._decref_instructions( dest.type, dest ) # reads dest's CURRENT (zero-initialized, pre-first-write) value - release_object()'s own NULL check makes this a safe no-op the very first time
 		return instructions
 
 	def attr_assign( self, attr: Variable, src: ir.Operand, *, is_alias: bool ) -> list[ir.Instruction]:
@@ -1923,7 +2190,7 @@ class CFGState:
 				self._temp_states.pop( src.id, None )
 		existing = self.bindings.get( key )
 		if existing is not None and existing.entry is not None:
-			if is_rc and existing.state in ( OwnState.OWNED, OwnState.COPY ):
+			if is_rc and existing.state == OwnState.OWNED:
 				instructions += self._decref_instructions( attr.type, attr )
 			existing.entry.cancelled = False
 			self.bindings[key] = _Binding( operand = attr, type = attr.type, state = OwnState.OWNED, entry = existing.entry )
@@ -2073,7 +2340,7 @@ class CFGState:
 			binding = self.bindings.get( operand.stem )
 			if binding is None:
 				return [] # not RC-tracked (non-RC type) - nothing to do
-			if binding.state not in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state != OwnState.OWNED:
 				raise CompileError(
 					f'{target_qualname}: cannot move {operand.stem!r} into parameter {param_stem!r} - '
 					f'it is {binding.state.value}, not owned here'
@@ -2094,7 +2361,7 @@ class CFGState:
 	def _mint_cancel_flag( self ) -> Variable:
 		''' a fresh runtime bool for _neutralize()'s flag-guarded branch, OR
 		for merge_if()'s own ownership-disagreement reconciliation (an
-		OWNED/COPY-vs-BORROWED split across an if's two branches - "fill in
+		OWNED-vs-BORROWED split across an if's two branches - "fill in
 		a default when still borrowed") - both share the identical shape, so
 		this one minting helper covers both callers. Mirrors push_defer()'s
 		own flag exactly (a real Variable, spliced in as a body_start init by
@@ -2159,8 +2426,17 @@ class CFGState:
 		branch (an already-flag-guarded entry must keep being replayed -
 		by build_epilogue_ladder()'s own "cancelled entries get no
 		instructions" rule, cancelling it too would just silently drop the
-		flag check itself). '''
-		if not entry.captured:
+		flag check itself).
+
+		enter_diverging_paths()'s own protection is the SAME "must go through the flag
+		instead of a static cancel" situation, just without an actual
+		captured goto target - a try's own handler, restored back to this
+		SAME entry's snapshot, is a mutually-exclusive sibling path that
+		may independently still need this entry released, exactly like an
+		earlier captured return would. See enter_diverging_paths()'s own docstring for
+		the real repro this fixes. '''
+		protected = any( id( entry ) in prot for prot in self._protected_entries )
+		if not entry.captured and not protected:
 			entry.cancelled = True
 			return []
 		if entry.flag is None:
@@ -2171,7 +2447,7 @@ class CFGState:
 
 	def deleted( self, variable: Variable, ctx: str ) -> list[ir.Instruction]:
 		''' called for `del x` (see lowering.py's _stmt_Delete) - returns
-		the Decref to emit right there (if x was OWNED/COPY), and
+		the Decref to emit right there (if x was OWNED), and
 		neutralizes its epilogue entry so it's never decref'd again.
 		Independent-of-RC unchecked-Result check first, same reasoning as
 		assign()'s own early check - del'ing a still-unchecked Result is
@@ -2201,7 +2477,7 @@ class CFGState:
 		if binding is None or binding.entry is None:
 			return []
 		instructions: list[ir.Instruction] = []
-		if binding.state in ( OwnState.OWNED, OwnState.COPY ):
+		if binding.state == OwnState.OWNED:
 			instructions = self._decref_instructions( binding.type, variable )
 		instructions += self._neutralize( binding.entry )
 		return instructions
@@ -2213,7 +2489,7 @@ class CFGState:
 		_lower_compiler_decref) - x's own explicit Decref is emitted by
 		lowering.py right at the call site regardless; this only stops x's
 		binding from being auto-decref'd a SECOND time once its own scope
-		ends. Without this, a live OWNED/COPY local manually decref'd (the
+		ends. Without this, a live OWNED local manually decref'd (the
 		established idiom throughout this stdlib for tearing down RC
 		elements read out of a container - list.__del__/FastList.__del__/
 		dict's own _release_key/_release_value all do `val: T = <read>;
@@ -2238,7 +2514,7 @@ class CFGState:
 			binding = self.bindings.get( operand.stem )
 			if binding is None or binding.entry is None:
 				return []
-			if binding.state not in ( OwnState.OWNED, OwnState.COPY ):
+			if binding.state != OwnState.OWNED:
 				return []
 			instructions = self._neutralize( binding.entry )
 			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )

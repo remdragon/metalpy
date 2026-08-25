@@ -1,0 +1,11 @@
+def count( start: int = 0, step: int = 1 ) -> Iterator[int,StopIteration]:
+	while 1:
+		yield start
+		start += step
+
+I = TypeVar( isize, usize, i8, u8, i16, u16, i32, u32, i64, u64, i128, u128 )
+
+def count[I]( start: I = 0, step: I = 1 ) -> Iterator[I,OverflowError|StopIteration]:
+	while 1:
+		yield start
+		start += step

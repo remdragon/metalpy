@@ -79,7 +79,7 @@ class DateError:
 
 
 class timedelta:
-	_total_us: i64  # can be negative; the one stored field, everything else is derived
+	total_us: i64  # can be negative; the one stored field, everything else is derived
 
 	def __init__(
 		self,
@@ -100,86 +100,86 @@ class timedelta:
 			total += i64( seconds ) * _US_PER_SECOND
 			total += i64( milliseconds ) * 1000
 			total += i64( microseconds )
-			self._total_us = total
+			self.total_us = total
 
 	@staticmethod
 	def _from_total_us( total_us: i64 ) -> timedelta:
-		return timedelta.__allocate__( _total_us = total_us )
+		return timedelta.__allocate__( total_us = total_us )
 
 	@property
 	def days( self ) -> i32:
 		with compiler.wrap_arithmetic:
-			return i32( floordiv_i64( self._total_us, _US_PER_DAY ) )
+			return i32( floordiv_i64( self.total_us, _US_PER_DAY ) )
 
 	@property
 	def seconds( self ) -> i32:
 		''' 0 <= seconds < 86400 - matches Python's own normalized invariant
 		(only .days can be negative). '''
-		rem: i64 = floormod_i64( self._total_us, _US_PER_DAY )
+		rem: i64 = floormod_i64( self.total_us, _US_PER_DAY )
 		with compiler.wrap_arithmetic:
 			return i32( floordiv_i64( rem, _US_PER_SECOND ) )
 
 	@property
 	def microseconds( self ) -> i32:
 		''' 0 <= microseconds < 1_000_000. '''
-		rem: i64 = floormod_i64( self._total_us, _US_PER_DAY )
+		rem: i64 = floormod_i64( self.total_us, _US_PER_DAY )
 		with compiler.wrap_arithmetic:
 			return i32( floormod_i64( rem, _US_PER_SECOND ) )
 
 	def total_seconds( self ) -> f64:
 		with compiler.wrap_arithmetic:
-			return f64( self._total_us ) / 1_000_000.0
+			return f64( self.total_us ) / 1_000_000.0
 
 	def __add__( self, other: timedelta ) -> timedelta:
 		with compiler.wrap_arithmetic:
-			result_us: i64 = self._total_us + other._total_us
+			result_us: i64 = self.total_us + other.total_us
 		return timedelta._from_total_us( result_us )
 
 	def __sub__( self, other: timedelta ) -> timedelta:
 		with compiler.wrap_arithmetic:
-			result_us: i64 = self._total_us - other._total_us
+			result_us: i64 = self.total_us - other.total_us
 		return timedelta._from_total_us( result_us )
 
 	def __neg__( self ) -> timedelta:
 		with compiler.wrap_arithmetic:
-			result_us: i64 = -self._total_us
+			result_us: i64 = -self.total_us
 		return timedelta._from_total_us( result_us )
 
 	def __mul__( self, n: i32 ) -> timedelta:
 		''' timedelta * n only - n * timedelta (right-hand operand) isn't
 		attemptable, no __r*__ dispatch exists anywhere in this compiler. '''
 		with compiler.wrap_arithmetic:
-			result_us: i64 = self._total_us * i64( n )
+			result_us: i64 = self.total_us * i64( n )
 		return timedelta._from_total_us( result_us )
 
 	def __floordiv__( self, n: i32 ) -> timedelta:
-		result_us: i64 = floordiv_i64( self._total_us, i64( n ) )
+		result_us: i64 = floordiv_i64( self.total_us, i64( n ) )
 		return timedelta._from_total_us( result_us )
 
 	def __eq__( self, other: timedelta ) -> bool:
-		return self._total_us == other._total_us
+		return self.total_us == other.total_us
 
 	def __ne__( self, other: timedelta ) -> bool:
 		return not self.__eq__( other )
 
 	def __lt__( self, other: timedelta ) -> bool:
-		return self._total_us < other._total_us
+		return self.total_us < other.total_us
 
 	def __le__( self, other: timedelta ) -> bool:
-		return self._total_us <= other._total_us
+		return self.total_us <= other.total_us
 
 	def __gt__( self, other: timedelta ) -> bool:
-		return self._total_us > other._total_us
+		return self.total_us > other.total_us
 
 	def __ge__( self, other: timedelta ) -> bool:
-		return self._total_us >= other._total_us
+		return self.total_us >= other.total_us
 
 	def __str__( self ) -> str:
 		''' Python's own timedelta.__str__ shape - NOT ISO-8601 (timedelta
 		has no real isoformat() in Python either): "H:MM:SS[.ffffff]", or
 		"D day(s), H:MM:SS[.ffffff]" when days != 0. '''
 		d: i32 = self.days
-		rem_us: i64 = floormod_i64( self._total_us, _US_PER_DAY )
+		rem_us: i64 = floormod_i64( self.total_us, _US_PER_DAY )
 		secs_of_day: i64 = floordiv_i64( rem_us, _US_PER_SECOND )
 		us64: i64 = floormod_i64( rem_us, _US_PER_SECOND )
 		with compiler.panic_arithmetic( 'unreachable: divisors are non-zero literals' ):
@@ -647,7 +647,7 @@ class datetime:
 				+ i64( self.second ) * _US_PER_SECOND
 				+ i64( self.microsecond )
 			)
-			total_us: i64 = days * _US_PER_DAY + us_of_day + delta._total_us
+			total_us: i64 = days * _US_PER_DAY + us_of_day + delta.total_us
 		new_epoch_day: i64 = floordiv_i64( total_us, _US_PER_DAY )
 		new_us_of_day: i64 = floormod_i64( total_us, _US_PER_DAY )
 		civil = civil_from_days( new_epoch_day )

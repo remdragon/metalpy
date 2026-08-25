@@ -94,14 +94,14 @@ from urllib.parse import urlencode, parse_qsl
 
 def main() -> i32:
 	pairs: list[tuple[str,str]] = list[tuple[str,str]]()
-	pairs.append( ( 'a', '1' )).unwrap( 'append' )
-	pairs.append( ( 'b', 'hello world' )).unwrap( 'append' )
+	pairs.append( ( 'a', '1' ))
+	pairs.append( ( 'b', 'hello world' ))
 	encoded: str = urlencode( pairs )
 	if encoded != 'a=1&b=hello+world':
 		return 1
 
 	special: list[tuple[str,str]] = list[tuple[str,str]]()
-	special.append( ( 'key', 'a&b=c' )).unwrap( 'append' )
+	special.append( ( 'key', 'a&b=c' ))
 	if urlencode( special ) != 'key=a%26b%3Dc':
 		return 2
 
@@ -255,5 +255,21 @@ def main() -> i32:
 	if urljoin( base, 'g:h' ) != 'g:h':
 		return 25
 	return 0
+''' ),
+			( 'urlparseerror_str_and_repr', '''
+from urllib.parse import unquote
+
+def main() -> i32:
+	match unquote( '%zz' ):
+		case Result.Err( e ):
+			if str( e ) != 'invalid percent-encoding: not a hex digit':
+				return 1
+			if f'{e}' != 'invalid percent-encoding: not a hex digit':
+				return 2
+			if e.__repr__() != "UrlParseError('invalid percent-encoding: not a hex digit')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
 ''' ),
 		])

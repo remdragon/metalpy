@@ -10,6 +10,7 @@ stat_t = compiler.c_type( 'struct stat', header = 'sys/stat.h' )
 
 S_IFMT:  u32 = compiler.cexpr( 'S_IFMT',  'sys/stat.h', u32 )
 S_IFDIR: u32 = compiler.cexpr( 'S_IFDIR', 'sys/stat.h', u32 )
+S_IFREG: u32 = compiler.cexpr( 'S_IFREG', 'sys/stat.h', u32 )
 
 @extern( 'c', 'stat', header = 'sys/stat.h' )
 def stat(

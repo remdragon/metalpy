@@ -17,8 +17,8 @@ import socket
 import atomic
 
 if compiler.target.os == 'windows':
-	from windows.kernel32 import _SRWLOCK
-	LockOpaque: TypeAlias = _SRWLOCK
+	from windows.kernel32 import SRWLOCK
+	LockOpaque: TypeAlias = SRWLOCK
 	# a Win32 thread HANDLE is a void* (Ptr[None])
 	ThreadHandle: TypeAlias = Ptr[None]
 else:
@@ -33,7 +33,7 @@ else:
 
 
 class FastLock:
-	__lock: Ptr[LockOpaque]  # Ptr[_SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
+	__lock: Ptr[LockOpaque]  # Ptr[SRWLOCK] on Windows, Ptr[pthread_mutex_t] on Linux
 	__locked: bool
 
 	# ------------------------------------------------------------------
@@ -440,7 +440,7 @@ class _PoolWorker:
 			limit: usize = self.__max_depth
 			if self.__jobs.__len__() >= limit:
 				return Result.Err( QueueFullError() )
-		self.__jobs.append( job ).unwrap( '_PoolWorker.submit: queue overflow' )
+		self.__jobs.append( job )
 		poke: bytes = b'x'
 		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.submit: wake failed' )
 		return Result.Ok( None )
@@ -512,9 +512,9 @@ class ThreadPool:
 		i: usize = 0
 		while i < size:
 			w: _PoolWorker = _PoolWorker( max_queue_depth )
-			self.__workers.append( w ).unwrap( 'ThreadPool.__init__: worker list overflow' )
+			self.__workers.append( w )
 			t: Thread = Thread( w.run_forever )
-			self.__threads.append( t ).unwrap( 'ThreadPool.__init__: thread list overflow' )
+			self.__threads.append( t )
 			with compiler.wrap_arithmetic:
 				i = i + 1
 

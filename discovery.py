@@ -137,6 +137,29 @@ def _folds_into_package( stem: str ) -> bool:
 	degenerate case of the same rule rather than a separate one. '''
 	return stem.startswith( '__' )
 
+def _is_cexpr_bound_constant( var: 'Variable' ) -> bool:
+	''' true for `NAME: T = compiler.cexpr('C_EXPR_TEXT', 'header.h', T)` -
+	a raw C-level expression/macro pulled in verbatim (lib/posix/unistd.py's
+	own `_SC_NPROCESSORS_ONLN`, matching <unistd.h>'s real macro name, is
+	the motivating case: sys.py's cpu_count() reaches it cross-package,
+	which is fine - see Discovery.check_module_visibility's own docstring
+	for why a leading underscore here reflects the FOREIGN macro's own
+	spelling, not this codebase's privacy intent, mirroring the identical
+	`@extern`-bound-Function exemption right next to this check's own use
+	of it). Recognized purely by AST shape, the same "textually special,
+	not a real resolvable call" posture compiler.sizeof/compiler.cast/etc.
+	already use throughout discovery.py/lowering.py - cexpr itself is never
+	a real Function (compiler's own intrinsics have no Function objects at
+	all, see CompilerModule), so there's no .extern_lib-equivalent flag on
+	the Variable itself to check directly; this AST-shape check is the
+	closest analog. '''
+	init = var.init
+	return (
+		isinstance( init, ast.Call )
+		and isinstance( init.func, ast.Attribute ) and init.func.attr == 'cexpr'
+		and isinstance( init.func.value, ast.Name ) and init.func.value.id == 'compiler'
+	)
+
 
 # every ast.stmt kind Discovery's own module-body/class-body scan loops
 # (import_code, _make_class_resolver's body_fn) are prepared to hand to
@@ -652,6 +675,177 @@ class Discovery( ast.NodeVisitor ):
 			raise RedundantCompilationError()
 		return found
 
+	def check_module_visibility( self, target: object, ctx: ast.AST, accessing_module: 'Module|None' ) -> None:
+		''' SYNTAX.md: a module-level name starting with `__` (and NOT also
+		ending with `__` - a real dunder like `__init__`/`__str__` is
+		untouched) is private to its own defining module/file; one starting
+		with a single `_` is accessible only from within its defining
+		module's own PACKAGE - itself, any sibling, and any subpackage at
+		any depth, but nothing outside it. This is a NEW compiler-enforced
+		semantic (Python's own underscore convention is purely stylistic) -
+		see PLAN_THREAD_SAFE_SHARED_STATE.md's own "field-visibility
+		enforcement doesn't exist today" note, which flagged this as
+		missing; this covers the MODULE-level half of that gap only -
+		class-level `_`/`__` field/method access (a separate, still-
+		unenforced convention, SYNTAX.md's own protected/private field
+		spec) is deliberately untouched here.
+
+		A safe no-op for anything this doesn't apply to, so every call site
+		can call this unconditionally on whatever it just resolved rather
+		than pre-filtering itself: only ever fires for a genuine module-
+		level Function (target.cls is None - a class METHOD, even one
+		reached via a module-qualified path to its owning class, is a
+		different, not-yet-enforced convention), a global Variable
+		(target.is_global), or a module-level class (target.module is not
+		None - RCClass/CStruct/CUnion/CEnum/TaggedUnion/Protocol all reach
+		here via the shared Type base, see Type.module's own comment; None
+		for every OTHER Type kind - Scalar, Specialization, a synthesized
+		anonymous union, ... - none of those have a real defining module)
+		- never a class attribute, a local, or anything else find_name/
+		names.get() might hand back. Also a no-op for an `@extern`-bound
+		Function (target.extern_lib is
+		not None) - a leading underscore there (e.g. crt.py's `_exit`,
+		binding the real `@extern('c', '_exit')` symbol) reflects the
+		FOREIGN library's own C symbol spelling, not a privacy declaration
+		this codebase's own author made; confirmed as a real false positive
+		via lib/sys.py's own `from crt import _exit` (its exit()'s non-
+		Windows branch) - crt._exit is a real POSIX libc function that
+		happens to start with an underscore, not an internal helper crt.py
+		is hiding from the rest of the runtime. Same reasoning, same no-op,
+		for a `compiler.cexpr(...)`-bound Variable (_is_cexpr_bound_constant)
+		- e.g. lib/posix/unistd.py's `_SC_NPROCESSORS_ONLN`, mirroring the
+		real <unistd.h> macro name verbatim - confirmed as a real false
+		positive via lib/sys.py's own cpu_count() reaching it cross-package.
+
+		`accessing_module` is passed explicitly by every caller, never read
+		implicitly off self.module_stack[-1] here - confirmed necessary via
+		a real false positive: mid-LOWERING, type-resolution can push its
+		OWN nested module_context (e.g. monomorphizing a callee like an
+		@inline generic dunder's own module, to resolve ITS body) while
+		still examining the CALLER's own operands for type inference -
+		self.module_stack[-1] at that instant reflects whose SYNTAX is
+		being interpreted for name resolution, not who actually triggered
+		this particular access, and the two are NOT the same thing during
+		that window (confirmed via lib/csv.py's own `_ST_START_FIELD`
+		comparison, dispatched through a generic scalar_eq[T] living in
+		builtins - flagged as "accessed from builtins" even though the
+		real access is csv's own comparison). Discovery-time callers
+		(visit_ImportFrom - a single, non-reentrant sequential pass with no
+		generic-instantiation side effects mid-walk) can safely still pass
+		self.module_stack[-1] directly; lowering-time callers must pass
+		whatever module OWNS the function/global actually being lowered
+		right now (FunctionLowering's own fixed-for-the-whole-pass owning
+		module), not the ambient module_context. '''
+		if isinstance( target, Function ):
+			if target.cls is not None or target.extern_lib is not None:
+				return
+		elif isinstance( target, Variable ):
+			if not target.is_global or _is_cexpr_bound_constant( target ):
+				return
+		elif isinstance( target, Type ):
+			if target.module is None:
+				return
+		else:
+			return
+		stem = target.stem
+		if stem.startswith( '__' ):
+			if stem.endswith( '__' ):
+				return # a real dunder (__init__, __str__, ...) - always public
+			kind = 'module'
+		elif stem.startswith( '_' ):
+			kind = 'package'
+		else:
+			return # ordinary public name
+		defining_module = target.module
+		if defining_module is None:
+			return # shouldn't happen given the is_global/cls checks above, but this check has no business crashing the compiler over it
+		if accessing_module is None or accessing_module is defining_module:
+			return
+		if kind == 'module':
+			self.fail(
+				f'{target.qualname!r} is private to its own module ({defining_module.qualname}) - '
+				f'not accessible from {accessing_module.qualname}\n'
+				f'\tnote: a name starting with \'__\' (and not also ending with \'__\') is module-private',
+				ctx,
+			)
+			return
+		# kind == 'package': accessible from the defining module's own
+		# package namespace at any depth (itself, siblings, subpackages) -
+		# NOT from a sibling package. A module with no enclosing package of
+		# its own (defining_module.package == '', e.g. a bare top-level
+		# lib/foo.py) is still meaningfully grouped with every OTHER bare
+		# top-level module - confirmed as a real false positive:
+		# lib/threading.py's FastLock genuinely needs lib/sys.py's own
+		# `_alloc`, and the two are no less "the same package" than two
+		# files that happen to share one subdirectory - both just sit
+		# directly under lib/ instead. The user's own entry point
+		# (__main__, also package == '') is deliberately EXCLUDED from
+		# this top-level grouping on BOTH sides - it's the caller's own
+		# application code, not part of whichever library package it
+		# happens to compile against; granting it (or granting FROM it)
+		# blanket top-level-sibling access would defeat package-privacy
+		# for the single most common case, a user program importing lib/
+		# modules directly.
+		if defining_module.package:
+			owning_namespace = defining_module.package
+			accessible = accessing_module.qualname == owning_namespace or accessing_module.qualname.startswith( owning_namespace + '.' )
+		else:
+			owning_namespace = 'the top level'
+			accessible = (
+				accessing_module.package == ''
+				and defining_module.qualname != '__main__'
+				and accessing_module.qualname != '__main__'
+			)
+		if accessible:
+			return
+		self.fail(
+			f'{target.qualname!r} is only accessible within its own package ({owning_namespace} and its '
+			f'subpackages) - not accessible from {accessing_module.qualname}\n'
+			f'\tnote: a name starting with a single \'_\' is package-private',
+			ctx,
+		)
+
+	def check_field_visibility( self, field_var: 'Variable', defining_cls: 'InheritanceChainMixin', ctx: ast.AST, accessing_cls: 'Type|None' ) -> None:
+		''' SYNTAX.md's class-level field-privacy tier, the class-scoped
+		counterpart to check_module_visibility above -
+		PLAN_THREAD_SAFE_SHARED_STATE.md's own "field-visibility enforcement
+		doesn't exist today" prerequisite (required before Part B's
+		write-once-after-__init__ exemption can be sound). `__field` (not
+		also ending `__`) is accessible only from a method textually inside
+		its own DEFINING class (mpy_types.py's Type.in_private_scope - the
+		same check Class.__allocate__() already enforces); `_field` is
+		accessible from that class or any (possibly indirect) subclass
+		(Type.in_protected_scope). `defining_cls` must be the class whose
+		OWN .names actually declares field_var (InheritanceChainMixin.
+		field_owner) - NOT necessarily the concrete receiver's type, since a
+		field can be read/written through a subclass instance.
+		`accessing_cls` is the currently-lowering method's own class
+		(FunctionLowering._current_fn.cls) - the same source of truth
+		_try_lower_allocate_call's identical private-access check already
+		uses; None (module-level code, no enclosing method) is never in
+		scope for any `_`/`__` field. A safe no-op for a public field (no
+		leading underscore) or a real dunder (`__init__`-shaped, leading AND
+		trailing `__`). '''
+		stem = field_var.stem
+		if stem.startswith( '__' ):
+			if stem.endswith( '__' ):
+				return
+			if accessing_cls is not None and defining_cls.in_private_scope( accessing_cls ):
+				return
+			self.fail(
+				f'{defining_cls.qualname}.{stem} is private - only accessible from a method of {defining_cls.qualname} itself\n'
+				f'\tnote: a field starting with \'__\' (and not also ending with \'__\') is class-private',
+				ctx,
+			)
+		elif stem.startswith( '_' ):
+			if accessing_cls is not None and defining_cls.in_protected_scope( accessing_cls ):
+				return
+			self.fail(
+				f'{defining_cls.qualname}.{stem} is protected - only accessible from {defining_cls.qualname} or a subclass\n'
+				f'\tnote: a field starting with a single \'_\' is protected',
+				ctx,
+			)
+
 	def visit( self, node: ast.AST ) -> Any:
 		method = f'visit_{node.__class__.__name__}'
 		handler = getattr( self, method, None )
@@ -755,6 +949,15 @@ class Discovery( ast.NodeVisitor ):
 		if name_obj is None:
 			self.fail( f'{base.qualname} has no member {node.attr!r}', node )
 		assert isinstance( name_obj, Name )
+		# module-level `_x`/`__x` privacy (SYNTAX.md, extended to cover
+		# classes too) - this is discovery's own dotted-reference resolver,
+		# used for a TYPE-position dotted path (an annotation, a base
+		# class, a decorator argument, ...) - a single, sequential,
+		# non-reentrant pass (unlike TypeResolver._try_resolve_namespace,
+		# which has an unrelated re-probe consumer - see check_module_
+		# visibility's own comment), so self.module_stack[-1] is always
+		# correctly "whoever is doing the accessing" here.
+		self.check_module_visibility( name_obj, node, self.module_stack[-1] if self.module_stack else None )
 		return name_obj
 
 	def visit_BinOp( self, node: ast.BinOp ) -> TaggedUnion:
@@ -949,15 +1152,37 @@ class Discovery( ast.NodeVisitor ):
 		# established casing - from a user's perspective this reads as an
 		# ordinary builtin, not compiler magic the way Callable/Closure are.
 		if isinstance( node.value, ast.Name ) and node.value.id == 'tuple':
-			arity_ok = isinstance( node.slice, ast.Tuple ) and len( node.slice.elts ) >= 2
-			if not arity_ok:
-				# arity 0/1 (bare `tuple[T]`, or no elements at all) is a
-				# real Python ast.Tuple parsing ambiguity (a 1-tuple LITERAL
-				# needs a trailing comma to disambiguate from a plain
-				# parenthesized expression) - deferred rather than guessed
-				# at, see PLAN_TUPLE.md's own "Deferred" list
-				self.fail( f'tuple[...] needs at least 2 type arguments: {ast.unparse(node)}', node )
-			elem_types = [ self.visit( elt ) for elt in node.slice.elts ] # type: ignore
+			# tuple[T, ...] - Python's own spelling for a VARIABLE-length,
+			# homogeneous tuple (unlike every arity below, this ISN'T a
+			# TupleStorage-synthesized fixed layout at all - it resolves to
+			# a Specialization of the real VariadicTuple[T] class, lib/
+			# builtins/__vartuple.py, built on the same UnsafeList[T]
+			# storage list[T] itself uses). Checked first and specifically:
+			# `tuple[T1, T2]` also parses as a 2-element ast.Tuple slice, so
+			# only the exact "second element is the literal Ellipsis
+			# constant" shape means variadic, not merely length == 2.
+			if (
+				isinstance( node.slice, ast.Tuple ) and len( node.slice.elts ) == 2
+				and isinstance( node.slice.elts[1], ast.Constant ) and node.slice.elts[1].value is Ellipsis
+			):
+				elem_type = self.visit( node.slice.elts[0] )
+				variadic_cls = self.find_name( 'VariadicTuple', node )
+				return self._get_or_create_specialization( variadic_cls, [ elem_type ] )
+			# arity >= 2 always parses as ast.Tuple(elts=[...]) (real commas
+			# in the subscript); arity 0 (`tuple[()]`, an empty tuple LITERAL
+			# as the single slice element) parses the SAME way, with elts=[]
+			# - both handled identically here. Arity 1 (`tuple[T]`, no comma
+			# at all) is the one genuinely different shape: Python's own ast
+			# never wraps a LONE subscript index in ast.Tuple, so node.slice
+			# there is just T itself - the only way to tell "one type
+			# argument" apart from "the tuple type is itself the single
+			# argument" (e.g. `tuple[tuple[i32,i32]]`, a tuple holding one
+			# nested tuple - node.slice is an ast.Subscript there, still not
+			# an ast.Tuple) is exactly this shape check.
+			if isinstance( node.slice, ast.Tuple ):
+				elem_types = [ self.visit( elt ) for elt in node.slice.elts ]
+			else:
+				elem_types = [ self.visit( node.slice ) ]
 			return self._get_or_create_tuple_type( elem_types )
 
 		# Iterator[T] - PLAN_GENERATORS.md. Recognized textually, same
@@ -1070,6 +1295,24 @@ class Discovery( ast.NodeVisitor ):
 			self.fail( f'{base.qualname} expects {len(type_params)} type argument(s), got {len(arg_nodes)}', node )
 
 		args = [ self.visit( arg_node ) for arg_node in arg_nodes ]
+		if base is self.find_name_or_none( 'Result' ) and len( args ) == 2:
+			# Result[T,E] may not itself nest another Result anywhere inside
+			# T or E (directly, or as one leaf of a union) - a double-wrapped
+			# Result is never a legitimate shape (just a confusing way to
+			# spell the outer Result's own Ok/Err again) and banning it
+			# outright removes a real ambiguity for the general auto-
+			# or_throw() machinery: an unbound generic parameter's argument
+			# being Result-shaped can now always be safely auto-unwrapped,
+			# since a caller can never have "genuinely meant" a nested
+			# Result there - see feedback_auto_or_return_scope memory
+			for arg in args:
+				for leaf in arg.leaves():
+					if self._result_shape_or_none( leaf ) is not None:
+						self.fail(
+							f'Result[T,E] cannot itself contain a nested Result - {leaf.qualname} inside '
+							f'{arg.qualname} is itself Result[...]: {ast.unparse(node)}',
+							node,
+						)
 		return self._get_or_create_specialization( base, args )
 
 	def _result_shape_or_none( self, t: Type ) -> 'tuple[Type,Type]|None':
@@ -1278,7 +1521,7 @@ class Discovery( ast.NodeVisitor ):
 		# _substituted_overload's own sub_impl (monomorphize.py) calls this
 		# once per implementation when substituting an @overload group
 		# declared inside a generic class - list[T].__getitem__'s two
-		# leaves (idx: usize, s: PySlice) both qualname to
+		# leaves (idx: usize, s: slice) both qualname to
 		# 'builtins.list.__getitem__', so the SECOND leaf's own
 		# monomorphization request silently returned the FIRST leaf's
 		# already-cached Specialization instead of creating its own - every
@@ -1373,6 +1616,7 @@ class Discovery( ast.NodeVisitor ):
 			item = mod.get_local_or_raise( alias.name )
 			if not item:
 				self.fail( f'module {package} does not export {alias.name!r}', node )
+			self.check_module_visibility( item, node, self.module_stack[-1] if self.module_stack else None )
 			scope.add_name( alias.asname or alias.name, item )
 
 	# --- globals / attributes ---------------------------------------------------------------
@@ -1399,6 +1643,7 @@ class Discovery( ast.NodeVisitor ):
 			line = node.lineno,
 			init = init,
 			is_global = scope is module,
+			module = module if scope is module else None,
 		)
 		var_obj.resolve = self._make_annotation_resolver( var_obj, node.annotation, module, scope )
 		scope.add_name( var_obj.stem, var_obj )
@@ -1597,7 +1842,16 @@ class Discovery( ast.NodeVisitor ):
 		# global variable or a class attribute with no annotation - its type
 		# defers to whatever self.visit() resolves the rvalue expression to
 		if len( node.targets ) != 1:
-			self.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
+			# `a = b = c = value` - a global/class-attribute declaration, not
+			# a sequenced runtime statement, so (unlike lowering.py's own
+			# _stmt_Assign, function-body case) there's no need for a
+			# once-only-evaluated temp: just re-declare each target against
+			# its own copy of the (already compile-time-folded) value node.
+			for target in node.targets:
+				split = ast.Assign( targets = [ target ], value = copy.deepcopy( node.value ))
+				ast.copy_location( split, node )
+				self.visit( split )
+			return None
 		target = node.targets[0]
 		if isinstance( target, ast.Attribute ):
 			base = self.visit( target.value )
@@ -1666,6 +1920,7 @@ class Discovery( ast.NodeVisitor ):
 			line = node.lineno,
 			init = init,
 			is_global = scope is module,
+			module = module if scope is module else None,
 		)
 		var_obj.resolve = self._make_value_resolver( var_obj, init, module, scope )
 		scope.add_name( var_obj.stem, var_obj )
@@ -2057,6 +2312,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			value_type = value_type,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@enum {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2105,6 +2361,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			packed = packed,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@cstruct {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2140,6 +2397,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			is_interface = True,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if len( node.bases ) > 1:
 			self.fail(
@@ -2190,6 +2448,7 @@ class Discovery( ast.NodeVisitor ):
 			file = module.file,
 			line = node.lineno,
 			packed = packed,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@cunion {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2218,6 +2477,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@union {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2246,6 +2506,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.keywords:
 			self.fail( f'class {qualname} cannot have keywords ({node.keywords!r})', node )
@@ -2319,6 +2580,7 @@ class Discovery( ast.NodeVisitor ):
 			qualname = qualname,
 			file = module.file,
 			line = node.lineno,
+			module = module if self.scope_stack[-1] is module else None,
 		)
 		if node.bases:
 			self.fail( f'@protocol {qualname} cannot have a base classes ({node.bases!r})', node )
@@ -2666,6 +2928,15 @@ class Discovery( ast.NodeVisitor ):
 			# reserved, not any particular shape of definition.
 			self.fail(
 				f"'or_return' is reserved for the compiler's own Result[T,E].or_return() - it can't be defined as a real "
+				f'function or method: {qualname}',
+				node,
+			)
+
+		if node.name == 'or_throw':
+			# same reservation as 'or_return' above, for Result[T,E].or_throw() -
+			# see _lower_or_throw's own comment
+			self.fail(
+				f"'or_throw' is reserved for the compiler's own Result[T,E].or_throw() - it can't be defined as a real "
 				f'function or method: {qualname}',
 				node,
 			)

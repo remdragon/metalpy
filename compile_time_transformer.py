@@ -291,8 +291,8 @@ class _ConstFolder( ast.NodeTransformer ):
 		if not isinstance( value.value, ast.Constant ):
 			return None
 		v = value.value.value
-		if isinstance( v, bool ) or not isinstance( v, ( str, int )):
-			return None # bool excluded: metalpy has no bool.__str__() this fold could match at runtime (Python's str(True) == 'True' has no metalpy equivalent)
+		if not isinstance( v, ( str, int )): # bool is also an int here (Python's own subclassing) - handled explicitly below, not folded through the int paths
+			return None
 
 		spec_text = None
 		if value.format_spec is not None:
@@ -302,7 +302,7 @@ class _ConstFolder( ast.NodeTransformer ):
 			spec_text = ''.join( part.value for part in values )
 
 		if value.conversion in ( 114, 115 ): # '!r' or '!s' - a format spec, if present, applies to the RESULTING str (not the original value) - matches lowering.py's own _lower_fstring_part ordering
-			text = repr( v ) if value.conversion == 114 else str( v ) # str(v)/repr(v) here match metalpy's own int.__str__()/__repr__() exactly (plain decimal digits + optional leading '-', nothing else - see int_test.py's own round-trip assertions) - a genuine constant fold, not an approximation
+			text = repr( v ) if value.conversion == 114 else str( v ) # str(v)/repr(v) here match metalpy's own int.__str__()/__repr__() exactly (plain decimal digits + optional leading '-', nothing else - see int_test.py's own round-trip assertions), and bool.__str__()/__repr__() exactly ('True'/'False', PLAN_STR_FORMAT.md item 6) - a genuine constant fold, not an approximation. Safe for bool too: this branch always formats the resulting STR text, never dispatches a numeric spec against `v` itself.
 			if spec_text is None:
 				return text
 			try:
@@ -313,6 +313,10 @@ class _ConstFolder( ast.NodeTransformer ):
 				return None
 
 		# conversion == -1 - no explicit conversion
+		if isinstance( v, bool ):
+			if spec_text is not None:
+				return None # bare bool with an explicit format spec - metalpy's bool has only __str__/__repr__ (item 6), no numeric-format-spec dispatch the way Python's own int-subclassing gives bool (format(True, 'd') == '1') - stays unfoldable rather than guessing at behavior lowering.py's runtime path doesn't implement
+			return str( v ) # matches metalpy's own bool.__str__() exactly ('True'/'False')
 		if spec_text is None:
 			return str( v ) # matches int.__str__()/plain str exactly, same as the conversion 114/115 branch's own comment
 		try:

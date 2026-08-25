@@ -5,7 +5,7 @@ import itertools
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable
+from typing import Callable, Iterable, NoReturn
 
 # local imports:
 import arithmetic_mode
@@ -17,7 +17,7 @@ from fstring_format_spec import FStringFormatSpec, FormatSpecError, parse_format
 from mpy_types import (
 	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Module, CType,
 	Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, Move, Copy, RCClass, Scalar,
-	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range, GeneratorType, Protocol,
+	CallableType, ClosureType, TupleType, FixedArrayType, int_stem_range, GeneratorType, Protocol, InheritanceChainMixin,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -406,6 +406,11 @@ class Lowering:
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		return FunctionLowering( self, None ).run_global( var )
 
+	def lower_deinit_epilogue( self, ordered_vars: list[Variable] ) -> list[ir.Instruction]:
+		''' emitter_c.py's own __metalpy_deinit() synthesis - see
+		FunctionLowering.run_deinit_epilogue's docstring. '''
+		return FunctionLowering( self, None ).run_deinit_epilogue( ordered_vars )
+
 	# --- __init__ construction (RCCLASS ATTRIBUTE LIFETIME.md) -----------------
 
 	def _init_fallibility( self, fn: Function ) -> bool:
@@ -600,16 +605,21 @@ class Lowering:
 		# Ptr[T] (not ConstPtr[T]: every op here either writes through the
 		# pointer, or (atomic_load) is only meaningful on a location another
 		# thread can concurrently write - a genuinely immutable location
-		# needs no atomic access at all) with T a plain scalar. RC types are
-		# rejected deliberately: atomically swapping an RC pointer without
-		# incref/decref bookkeeping is exactly the lock-free-RC rabbit hole
-		# this intentionally stays out of (see the plan's own Context).
+		# needs no atomic access at all) with T a plain scalar OR a raw
+		# Ptr[U]/ConstPtr[U] (same single-machine-word representation as a
+		# scalar - e.g. a lock-free lazily-published cache pointer, see
+		# str.to_utf16()). Bare RC types are still rejected deliberately:
+		# atomically swapping an RC pointer without incref/decref
+		# bookkeeping is exactly the lock-free-RC rabbit hole this
+		# intentionally stays out of (see the plan's own Context) - a raw
+		# Ptr[U]/ConstPtr[U] carries no refcount, so that concern doesn't
+		# apply to it.
 		if not ( isinstance( ptr_type, Specialization ) and isinstance( ptr_type.base, Scalar ) and ptr_type.base.stem == 'Ptr' ):
 			self.discovery.fail( f'compiler.atomic_*(...) argument must be Ptr[T]: {ast.unparse(node)}', node )
 		pointee = ptr_type.args[0]
-		if not isinstance( pointee, Scalar ):
+		if not ( isinstance( pointee, Scalar ) or self._type_resolver._is_ptr_specialization( pointee )):
 			self.discovery.fail(
-				f'compiler.atomic_*(...) argument must point to a plain scalar, not '
+				f'compiler.atomic_*(...) argument must point to a plain scalar or raw pointer, not '
 				f'{pointee.qualname if pointee else "?"}: {ast.unparse(node)}',
 				node,
 			)
@@ -1039,11 +1049,41 @@ class Lowering:
 	def _find_iterator_next_method( self, owner_type: Type|None ) -> Function|None:
 		# PLAN_GENERATORS.md Phase 3 - a non-failing probe (same posture as
 		# _find_method above): "this type has no __next__" is a normal
-		# outcome (falls through to the __len__/__getitem__ indexable path),
-		# not an error. Shape validation (does __next__ actually return
-		# T|None) happens once, in _lower_for_over_iterator itself, where a
-		# real error location is available.
+		# outcome, not an error. Shape validation (does __next__ actually
+		# return T|None) happens once, in _lower_for_over_iterator itself,
+		# where a real error location is available. Only ever called on a
+		# type _stmt_For has ALREADY confirmed conforms to IteratorProtocol[T] (see
+		# _type_conforms_to_protocol) - never a raw duck-typing probe.
 		return self._find_method( owner_type, '__next__' )
+
+	def _type_conforms_to_protocol( self, owner_type: Type|None, protocol: ClassLike ) -> bool:
+		''' does the resolved concrete type declare conformance to
+		`protocol` (a bare Protocol/ClassLike, e.g. the real Iterator or
+		Iterable class object - not parametrized) - a membership check
+		against .protocols, mirroring mpy_types.TypeVar.bound_satisfied_by's
+		own bare-Protocol case (discovery.py's _validate_protocol_
+		conformance already verified, at that class's own definition, that
+		every required method actually exists - this doesn't re-verify
+		that, just asks "did this class declare it"). Identity-compares
+		each declared protocol's own unparametrized .base, so this matches
+		regardless of which concrete T the class happened to parametrize
+		it with (list[i32]'s own Iterable[i32] conformance still matches a
+		bare `protocol=Iterable` lookup here). '''
+		resolved = self._ensure_resolved( owner_type )
+		base = resolved.base if isinstance( resolved, Specialization ) else resolved
+		if isinstance( base, TupleType ):
+			# tuple[...] isn't an RCClass itself - a homogeneous tuple's
+			# declared protocol conformance lives on its lazily-synthesized
+			# backing RCClass instead (tuple_storage.py); a heterogeneous
+			# tuple has no backing at all (never conforms to anything)
+			base = base.backing
+		if not isinstance( base, RCClass ):
+			return False
+		for p in base.protocols:
+			p_base = p.base if isinstance( p, Specialization ) else p
+			if p_base is protocol:
+				return True
+		return False
 
 	def _is_range_call( self, node: ast.expr ) -> str|None:
 		# range(...) is textually recognized as compiler sugar, same as
@@ -1618,8 +1658,23 @@ class Lowering:
 			self.schedule( del_fn )
 
 	_OR_RETURN_ALTERNATIVES = 'or_return() always propagates the error to the caller - there is no other way for the enclosing function to receive it'
-	_FALLIBLE_METHOD_ALTERNATIVES = 'wrap this in `with compiler.panic_arithmetic(...):` instead'
+	_OR_THROW_ALTERNATIVES = (
+		'or_throw() propagates any leaf not caught by an except clause of any enclosing try (innermost first) to the caller, '
+		'exactly like or_return() - there is no other way for the enclosing function to receive it'
+	)
+	_RAISE_ALTERNATIVES = (
+		'raise propagates any leaf not caught by an except clause of any enclosing try (innermost first) to the caller, '
+		'exactly like or_return() - there is no other way for the enclosing function to receive it'
+	)
 	_RESULT_CONSUMING_METHODS = ( 'is_ok', 'is_err', 'unwrap', 'unwrap_or' ) # or_return() is handled separately - see _lower_or_return
+	# shared "alternatives" text for the general auto-or_throw() rule (a
+	# discarded Result statement, or a Result flowing into a context wanting
+	# its own Ok payload directly) - wrap in try/except to catch specific
+	# leaves, or consume it explicitly first
+	_AUTO_CONSUME_ALTERNATIVES = (
+		'wrap this in try/except to catch specific error leaves, or consume it yourself first '
+		'via .unwrap()/.or_return()/match'
+	)
 
 	def _unify_type_param( self, type_params: list[TypeVar], declared: Type|None, actual: Type|None, bindings: dict[int,Type], node: ast.AST, context_qualname: str ) -> None:
 		# generalized over an explicit type_params list (rather than always
@@ -1670,36 +1725,40 @@ class Lowering:
 				base = actual.base if isinstance( actual, Specialization ) else actual
 				if isinstance( base, TupleType ):
 					base = base.backing
-				skip_reentrant = isinstance( actual, Specialization ) and id( actual ) in self._type_resolver.monomorphizer._building
-				if isinstance( actual, Specialization ) and isinstance( base, RCClass ) and not skip_reentrant:
-					# _building guard (skip_reentrant) - see mpy_types.py's
-					# identical guard on TypeVar.bound_satisfied_by for the
-					# full "why" (a real repro: this SAME reentrant-
-					# monomorphize shape, reached through a different call
-					# chain, caused a RecursionError without it).
-					base = self._type_resolver.monomorphizer.monomorphize_class( actual )
-				if isinstance( base, RCClass ) and not skip_reentrant:
-					# skip_reentrant gates the WHOLE lookup, not just the
-					# monomorphize call above: base.protocols would still be
-					# base's own ABSTRACT, unsubstituted list in the reentrant
-					# case (base fell back to actual.base, never substituted) -
-					# unifying against THOSE args binds the outer type param to
-					# the WRONG (abstract, wrong-class) TypeVar instead of the
-					# real concrete type, which is worse than leaving it
-					# unbound (confirmed by a real repro: a generated `Result.
-					# Err(StopIteration())` construction inside _sequence_iter
-					# [T,slice[i32]] ended up with T bound to slice[T]'s OWN
-					# unrelated T instead of i32, surfacing far downstream as
-					# "Specialization not concrete" rather than a clean "T
-					# unbound" - silently wrong data flow, not just a locally
-					# imprecise check the way bound_satisfied_by's identical
-					# skip is safe to allow, since binding is the whole point
-					# here, not just a true/false verdict).
+				if isinstance( base, RCClass ):
 					for entry in base.protocols:
-						if isinstance( entry, Specialization ) and entry.base is declared.bound.base:
-							for b_arg, e_arg in zip( declared.bound.args, entry.args ):
-								self._unify_type_param( type_params, b_arg, e_arg, bindings, node, context_qualname )
-							break
+						if not ( isinstance( entry, Specialization ) and entry.base is declared.bound.base ):
+							continue
+						entry_args = entry.args
+						if isinstance( actual, Specialization ):
+							# base here is still the ABSTRACT class template
+							# (actual.base) - substitute its declared protocol
+							# args against actual.args directly, rather than
+							# fully building actual via monomorphize_class
+							# first (the old approach, which re-entered
+							# monomorphize_class whenever actual was its OWN
+							# still-in-progress build - e.g. set[T]'s __iter__
+							# body needing set[T]'s own Sequence[T] conformance
+							# to reverse-unify T - and had to skip the whole
+							# lookup via a _building guard to avoid either a
+							# RecursionError or binding to the wrong, still-
+							# abstract TypeVar; skipping instead silently left
+							# T unbound forever, confirmed by a real repro: the
+							# shared _sequence_iter's return type never
+							# resolved past its abstract T the first time any
+							# caller's __iter__ actually needed it). A
+							# protocol entry's own .base is always the
+							# Protocol, never `actual`'s class, so
+							# substituting just its args can't re-enter
+							# monomorphize_class for `actual` at all - no
+							# guard needed.
+							entry_args = [
+								self._type_resolver.monomorphizer.substitute_type_params( a, base.type_params or [], actual.args )
+								for a in entry_args
+							]
+						for b_arg, e_arg in zip( declared.bound.args, entry_args ):
+							self._unify_type_param( type_params, b_arg, e_arg, bindings, node, context_qualname )
+						break
 			return
 		if isinstance( declared, Specialization ):
 			# _as_specialization, not a bare isinstance(actual, Specialization)
@@ -1851,6 +1910,55 @@ class _LoopContext:
 	continue_captured: bool = False
 
 
+@dataclass
+class TryHandler:
+	''' one `except T:`/`except (A,B) as e:` clause of some enclosing try
+	(FunctionLowering._try_stack) - `leaves` are the resolved error-class
+	leaves this clause covers (each may itself be one class, or several
+	for a tuple-of-classes clause). `bind` is the real, already-registered
+	local Variable `as NAME` binds (see _stmt_Try), or None for a bare
+	`except T:` - kept None in that case since nothing user-visible should
+	depend on it existing. `raise_value_var` is ALWAYS a real registered
+	local of the same type `bind` would have (equal to `bind` itself when
+	the clause wrote `as NAME`, otherwise a hidden compiler-synthesized
+	one) - a bare `raise` inside this handler's own body re-raises
+	whatever this holds (see FunctionLowering._active_raise_values), so
+	every handler needs one regardless of whether the user named it.
+	`matched` is set True the moment ANY leaf of this handler is actually
+	selected by a .or_throw()/raise dispatch anywhere inside this
+	handler's own try body (see _dispatch_leaves_against_try_stack) - an
+	except clause left False once its own try's body is fully lowered is
+	unreachable dead code, a compile error (_stmt_Try's own check, after
+	the try_stack pop). '''
+	leaves: list[Type]
+	label: str
+	bind: 'Variable|None'
+	raise_value_var: 'Variable'
+	matched: bool = False
+
+
+@dataclass
+class TryContext:
+	''' one entry of FunctionLowering._try_stack - a try statement
+	currently being lowered (nested trys push one entry each, innermost
+	last). Consulted by .or_throw()/raise (_dispatch_leaves_against_try_stack)
+	textually inside its own body, in the SAME function - an uncovered
+	leaf walks the WHOLE stack innermost-first, checking every textually
+	enclosing try's own handlers before falling back to propagating to
+	the caller. `entry_stack_depth` is this try's own entry_snapshot.
+	stack_depth (the try body is UNCONFINED - see TryHandler's own
+	docstring - so this is the one place that boundary is still recorded):
+	a covered `raise`/or_throw() dispatch straight into this try's own
+	handler is a goto that never otherwise unwinds anything (see ir.
+	ThrowLeaf.epilogue's own docstring) - everything the try BODY pushed
+	since this depth is about to become unreachable from the handler and
+	must be released right before the jump, same as unwind_to() already
+	does for break/continue leaving a loop. '''
+	handlers: list[TryHandler]
+	end_label: str
+	entry_stack_depth: int
+
+
 class FunctionLowering:
 	'''
 	Everything Lowering.lower_function/lower_global need that's scoped to ONE
@@ -1898,6 +2006,37 @@ class FunctionLowering:
 		# own Parameter exists (not yet constructed this early).
 		self._ever_declared_stems: set[str] = { p.stem for p in ( fn.parameters or [] )} if fn is not None else set()
 		self._current_fn = fn
+		# ambient "line we're currently lowering", refreshed at the top of
+		# _lower_stmt/_lower_expr - debug-info only (Allocate.loc, see _emit),
+		# never save/restored, doesn't need to be exact for nested sub-exprs
+		self._current_lineno = 0
+		# set for real in run()/run_global(), right before either enters its
+		# own module_context - see check_module_visibility's own comment on
+		# why this (not discovery.module_stack[-1]) is what every privacy
+		# check reached from this instance uses. None here only covers the
+		# brief window before run()/run_global() itself runs (never actually
+		# observed - nothing calls check_module_visibility that early).
+		self._owning_module: 'Module|None' = None
+		# id()s of Variable objects CURRENTLY bound as an @inline splice's
+		# own self/parameter aliases (both _lower_inline_call's single-
+		# expression path and _splice_multi_statement_inline_body's own
+		# copy add/remove their own bound ids here) - a name resolving to
+		# one of these is a pure ALIAS for whatever the ORIGINAL call site
+		# already passed in (e.g. `other` inside an inlined scalar_eq[T]
+		# resolving straight through to the caller's own operand, zero-
+		# copy - see _lower_inline_call's own "when the operand is ALREADY
+		# a Variable" comment), not a fresh access in its own right -
+		# check_module_visibility's 3 lowering.py call sites skip re-
+		# checking these: the ORIGINAL operand expression already got its
+		# own, correct check when IT was first lowered at the real call
+		# site, before ever being threaded through the splice. Confirmed
+		# necessary via a real false positive: lib/csv.py's own `self.
+		# __state == _ST_START_FIELD` got flagged as builtins illegally
+		# reaching csv's own package-private constant, purely because the
+		# generic scalar_eq[i32] dunder this dispatches through re-resolves
+		# its own `other` parameter (bound directly to _ST_START_FIELD)
+		# while lowering ITS OWN body, under builtins' own module context.
+		self._inline_param_alias_ids: set[int] = set()
 		self._arithmetic_mode: list[arithmetic_mode.ArithmeticMode] = [ arithmetic_mode.ArithmeticChecked() ]
 		self._loop_depth = 0
 		self._loop_labels: list[_LoopContext] = []
@@ -1922,6 +2061,18 @@ class FunctionLowering:
 		# _lower_with_context_manager) - unique per with-statement in this
 		# function, only for the synthesized ctx-holding local's own stem
 		self._with_ctx_id = 0
+		# try/except/else/finally - .or_throw()/raise textually inside the
+		# CURRENT try body (same function) consults this; see TryContext's
+		# own docstring. An uncovered leaf walks the WHOLE stack innermost-
+		# first (_dispatch_leaves_against_try_stack), so a nested try's own
+		# uncovered leaf DOES fall back to an outer try's own handlers.
+		self._try_stack: list[TryContext] = []
+		# bare `raise` (re-raise) - the innermost enclosing except handler's
+		# own TryHandler.raise_value_var, pushed right before that handler's
+		# body is lowered and popped right after (_stmt_Try) - a nested
+		# handler's own push shadows its enclosing handler's for the
+		# duration of ITS body, matching real re-raise scoping.
+		self._active_raise_values: list[Variable] = []
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
 		# _inlining_stack (by id(target)) is the reentrancy guard - a target
 		# already present means direct or mutual @inline recursion, rejected
@@ -1965,6 +2116,14 @@ class FunctionLowering:
 	def run( self ) -> list[ir.Instruction]:
 		fn = self._current_fn
 		module = self.lowering._find_module_for( fn )
+		# fixed for this WHOLE lowering pass, unlike discovery.module_stack
+		# (which type-resolution can transiently re-push mid-lowering, e.g.
+		# monomorphizing an @inline generic dunder call - see check_module_
+		# visibility's own comment on why that's a real, confirmed false-
+		# positive source for module-privacy checks specifically) - every
+		# check_module_visibility call site reached from within this
+		# FunctionLowering instance uses THIS, not the ambient stack top.
+		self._owning_module = module
 		if fn.extern_lib is not None:
 			# @extern(lib, symbol) - a foreign call signature declaration,
 			# not a real body to lower (discovery.py already required a
@@ -2292,6 +2451,7 @@ class FunctionLowering:
 
 	def run_global( self, var: Variable ) -> list[ir.Instruction]:
 		module = self.lowering._find_module_for( var )
+		self._owning_module = module # see run()'s own identical comment
 
 		with self.lowering.discovery.module_context( module ):
 			if var.init is not None:
@@ -2312,10 +2472,53 @@ class FunctionLowering:
 				)
 				self._pending_temps = []
 				operand = self._lower_expr( var.init, var.type )
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part A: this global's own
+				# initializing write needs the SAME critical section an
+				# ordinary `global X; X = ...` reassignment gets, in case the
+				# initializer (or something it calls) spawns a thread that
+				# reassigns this global before this write itself runs - see
+				# cfg.py's assign_global_initializer's own docstring for the
+				# confirmed race this closes. The Assign has to stay INSIDE
+				# the same critical section as the Acquire/decref (not
+				# reconstructed after the fact) for the identical reason
+				# _cfg_assign's own write-side split already documents: it's
+				# its own separate textual read/write of `var` in the
+				# generated C, not covered by whatever the decref touched.
+				for instr in self._cfg.assign_global_initializer( var ):
+					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
+				if cfg.rc_leaves( var.type ):
+					self._emit( ir.ReleaseGlobalLock( var = var ))
 				for t in reversed( self._pending_temps ):
 					self._emit( ir.DeleteTemp( temp = t ))
 
+		return self._instructions
+
+	def run_deinit_epilogue( self, ordered_vars: list[Variable] ) -> list[ir.Instruction]:
+		''' debug-mode automatic leak-check epilogue (emitter_c.py's
+		__metalpy_deinit()) - decrefs every global RC variable in
+		`ordered_vars` (caller passes them in REVERSE dependency order,
+		undoing __metalpy_init()'s own construction order - see emitter_c.
+		py's own __metalpy_deinit assembly). Same "real CFGState, fn=None"
+		shape as run_global above (no self/construction of its own), reused
+		here purely for its union-aware decref() (cfg.py's
+		_tag_gated_refcount_instructions) - a nested-union RC global needs
+		the identical runtime tag dispatch an ordinary local/field release
+		already gets, not a hand-rolled duplicate. '''
+		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
+		self._cfg = cfg.CFGState(
+			None,
+			bool_type = bool_cls,
+			new_temp = self._new_temp,
+			new_label = self._new_label,
+			union_storage = self.lowering._union_storage.get,
+			resolve_type = self.lowering._ensure_resolved,
+		)
+		for var in ordered_vars:
+			for instr in self._cfg.decref( var.type, var ):
+				self._emit( instr )
+		for t in reversed( self._pending_temps ):
+			self._emit( ir.DeleteTemp( temp = t ))
 		return self._instructions
 
 	def _emit_epilogue( self, fn: Function, none_type: Type, body_start: int ) -> None:
@@ -2524,13 +2727,19 @@ class FunctionLowering:
 		self.lowering.schedule( base_init.return_type )
 		for param in base_init.parameters or []:
 			self.lowering.schedule( param.type )
+		# see the .or_return() recognizer's own identical snapshot/comment
+		# (_expr_Call) - args/kwargs below can themselves retain a Part B
+		# field receiver (e.g. `super().__init__(self.some_field)`) that's
+		# fully consumed by the call and must be released regardless of
+		# which leg fires, same reasoning as any other or_return() receiver
+		receiver_pending_start = len( self._pending_temps )
 		args, kwargs = self._lower_call_args( base_init, init_call )
 		dest = self._new_temp( base_init.return_type ) if is_fallible else None
 		call = ir.Call( dest = dest, target = base_init, receiver = self_param, args = args, kwargs = kwargs, is_super_init_call = True )
 		self._emit( call )
 		if or_return_call is not None:
 			assert dest is not None
-			self._lower_or_return( or_return_call, dest, want_result = False )
+			self._lower_or_return( or_return_call, dest, want_result = False, receiver_pending_start = receiver_pending_start )
 		self._cfg.complete_base_construction( self_cls.base.flattened_attributes() )
 		return fn.node.body[1:]
 
@@ -2567,21 +2776,36 @@ class FunctionLowering:
 		self._instructions.append( instr )
 
 	def _emit( self, instr: ir.Instruction ) -> None:
-		# a Call/Allocate's dest is always a genuinely fresh, owned value
-		# from the caller's perspective (same rule _is_aliasing_expr already
-		# encodes for Call; Allocate is fresh by definition) - registering it
-		# here, centrally, at the exact moment it's actually emitted, is what
+		# a Call/CallIndirect/Allocate's dest is always a genuinely fresh,
+		# owned value from the caller's perspective (same rule _is_aliasing_
+		# expr already encodes for Call; Allocate is fresh by definition;
+		# CallIndirect - calling THROUGH a Ptr[Callable[...]]/closure value,
+		# e.g. a real capturing closure passed to or_return(mapper) - is the
+		# identical "fresh owned handoff" shape as an ordinary Call, just
+		# reached through a different ir.Instruction) - registering it here,
+		# centrally, at the exact moment it's actually emitted, is what
 		# guarantees every one of these sites is covered instead of needing
 		# individual fresh_temp() calls hunted down at each of the many
-		# places that build a Call/Allocate (plain calls, generic calls,
-		# conditional dispatch, union-receiver dispatch, struct/union
-		# construction, ...). Gated on self._current_fn - lower_global()
-		# never constructs a CFGState at all, and self._cfg would otherwise
-		# be whatever function was lowered most recently (this Lowering
-		# instance is reused across units), a strictly worse outcome than
-		# just skipping it for globals
-		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
+		# places that build a Call/CallIndirect/Allocate (plain calls,
+		# generic calls, conditional dispatch, union-receiver dispatch,
+		# struct/union construction, ...). CallIndirect was missing from
+		# this check entirely until confirmed via a real repro: its own
+		# result, passed directly into a retaining constructor (e.g.
+		# `Result.Err(some_closure())`), never got queued for the ordinary
+		# end-of-statement decref that cancels the constructor's own
+		# retain out to net-one - a permanent one-reference-per-call leak
+		# for any RC-typed indirect/closure call result, regardless of
+		# what consumes it (not specific to or_return(mapper) - the same
+		# repro leaks with a bare `return Result.Err(closure())`, no
+		# generator/or_return involved at all). Gated on self._current_fn -
+		# lower_global() never constructs a CFGState at all, and self._cfg
+		# would otherwise be whatever function was lowered most recently
+		# (this Lowering instance is reused across units), a strictly worse
+		# outcome than just skipping it for globals
+		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.CallIndirect, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
 			self._cfg.fresh_temp( instr.dest, instr.dest.type )
+		if self._current_fn is not None and isinstance( instr, ir.Allocate ):
+			instr.loc = f'{self._current_fn.file}:{self._current_lineno}'
 		if self._current_fn is not None:
 			self._check_self_escape_in( instr )
 		self._instructions.append( instr )
@@ -2652,6 +2876,7 @@ class FunctionLowering:
 	# --- statements ------------------------------------------------------------
 
 	def _lower_stmt( self, node: ast.stmt ) -> None:
+		self._current_lineno = getattr( node, 'lineno', self._current_lineno )
 		# _pending_temps is shared/mutable rather than passed explicitly, so a
 		# statement whose own handler recursively lowers nested statements
 		# (currently only _stmt_With) must not let those nested calls' own
@@ -2708,6 +2933,56 @@ class FunctionLowering:
 				self._emit( instr )
 			self._emit( ir.DeleteTemp( temp = t ))
 		self._pending_temps = []
+
+	def _flush_new_pending_temps( self, start_index: int, *keep: ir.Operand ) -> None:
+		''' shared by _consume_checked_result/_emit_or_throw: flushes every
+		pending temp added SINCE `start_index` (an index into
+		self._pending_temps, snapshotted by the caller right before
+		lowering the checked receiver expression - see _lower_or_return/
+		_lower_or_throw's own `receiver_pending_start`), except those in
+		`keep` (the checked receiver/result value itself, still needed by
+		the OrReturn/OrJump/OrThrow/Unwrap instruction about to be
+		emitted). Restores `keep`'s own still-pending entries afterward so
+		their normal, later lifecycle (the natural end-of-statement flush,
+		same as always) is completely unaffected.
+
+		Deliberately scoped to start_index onward, NOT "everything
+		currently pending": an OUTER, still-in-progress expression this
+		checked value is only PART of (e.g. the first half of a chained
+		`k + str(':') + v.or_return()` concatenation) can have its OWN
+		still-needed pending temp sitting BEFORE start_index - flushing
+		that too corrupts it out from under the rest of the expression,
+		confirmed as a real bug (not hypothetical): an earlier version of
+		this fix flushed unconditionally and caused exactly that shape to
+        read a freed string's length as its concatenation grew, aborting
+		with "out of memory" on the very first nested json.dumps() call in
+		the test suite - lib/json.py's own `_json_escape_string(k) + ':' +
+		_dump_value(v).or_return()` in its Object dump arm.
+
+		What's actually left to flush after start_index, once `keep` is
+		excluded, is exactly the receiver's OWN sub-expression temps -
+		most commonly Part B's own retain-on-read for a chained field
+		receiver used only to build the checked value, e.g. `self.a.b.
+		method(...).or_return()` - which must be released regardless of
+		which leg (Ok/Err) actually fires, since neither leg needs it
+		afterward. Without this it's dead code exactly like _stmt_If's own
+		sibling bug: the checked call's Err leg is a real early exit (a
+		genuine `return`/`goto` under the hood, same as or_return()'s own
+		declared spec says), so it skips right past the ordinary once-per-
+		statement flush that would otherwise release it - confirmed via a
+		real compiler.refcount()/AddressSanitizer repro (`self.__raw.
+		_ptr_at(idx).or_return()` permanently over-retained self.__raw, a
+		leak found only once _stmt_If's own sibling bug was fixed and
+		stopped masking it). `keep` uses Temp.id, not Python identity -
+		operands round-trip through dataclasses that don't override
+		__eq__/__hash__ for this purpose. '''
+		keep_ids = { k.id for k in keep if isinstance( k, ir.Temp ) }
+		older = self._pending_temps[:start_index]
+		newer = self._pending_temps[start_index:]
+		kept = [ t for t in newer if t.id in keep_ids ]
+		self._pending_temps = [ t for t in newer if t.id not in keep_ids ]
+		self._flush_pending_temps()
+		self._pending_temps = older + kept
 
 	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False ) -> None:
 		''' shared by _stmt_Return and @inline splicing (_lower_inline_call/
@@ -2789,7 +3064,7 @@ class FunctionLowering:
 		# _enter_parameter()) both alias a reference that SOMEONE ELSE
 		# still independently owns and will decref on their own schedule,
 		# so the caller needs a genuinely separate +1, not a bare pointer
-		# copy. An OWNED/COPY local (or a copy[T]/move[T] parameter) DOES
+		# copy. An OWNED local (or a copy[T]/move[T] parameter) DOES
 		# have a live entry - that's a real move (its own decref is what
 		# current_epilogue_label()/return_() skip below, by this same
 		# identity), and must NOT also get an Incref here, or the moved-
@@ -2907,11 +3182,22 @@ class FunctionLowering:
 			):
 				widened = self._maybe_widen_return_result( node, value, fn_type )
 				if widened is None:
-					self.lowering.discovery.fail(
-						f'{ast.unparse(node)}: function returns '
-						f'{fn_type.qualname if fn_type else "None"}, not {value.type.qualname if value.type else "?"}',
-						node,
-					)
+					# case 2 of the general auto-or_throw() rule (see _auto_or_
+					# throw's own docstring): `return a + b` inside a function
+					# declared to return plain T (not Result[T,E]) - this
+					# method lowers `value` with strict=False (see this
+					# method's own comment above), so it never reaches
+					# _coerce_or_check_operand's own identical hook; reuses
+					# the exact same shared probe instead of a second copy of
+					# the guard
+					consumed = self._maybe_auto_consume_result( node, value, fn_type, self.lowering._AUTO_CONSUME_ALTERNATIVES )
+					if consumed is None:
+						self.lowering.discovery.fail(
+							f'{ast.unparse(node)}: function returns '
+							f'{fn_type.qualname if fn_type else "None"}, not {value.type.qualname if value.type else "?"}',
+							node,
+						)
+					widened = consumed
 				return_value = widened
 		try:
 			self._cfg.check_unchecked_results( value )
@@ -3033,6 +3319,30 @@ class FunctionLowering:
 			# return_() own comment). Still has to replay any pending
 			# defer/errdefer entries itself (return_() does this now too -
 			# they're just as "pending" as an RC decref from here)
+			#
+			# self._return_value_var populated here too, ONLY when a live
+			# errdefer entry could actually need it: _build_is_err_check's
+			# own is_err() probe (invoked lazily, only if return_() below
+			# finds one to replay) unconditionally reads self._return_
+			# value_var as ITS receiver, with no other way to learn what
+			# THIS return's own value even is - previously only assigned on
+			# the shared-label branch above. Confirmed missing via a real
+			# repro: an errdefer entry sitting beneath a CONFINED entry (an
+			# ordinary RC-typed local declared earlier in the same still-
+			# open branch, forcing this inline path instead of the shared-
+			# label one) silently checked a stale/uninitialized self.
+			# _return_value_var instead of this return's real Err value -
+			# the errdefer fired 0 times instead of once, no error, no
+			# crash, just silently skipped cleanup. Gated on an actual live
+			# errdefer entry (not unconditional like the label branch above)
+			# - an earlier, unconditional version of this fix broke many
+			# unrelated functions ("variable has incomplete type void") by
+			# forcing self._return_value_var's own declaration/reference
+			# into functions that never otherwise touch it at all.
+			if self._return_value_var is not None and value is not None and any(
+				e.is_err_only and not e.cancelled for e in self._cfg._epilogue_stack
+			):
+				self._emit( ir.Assign( dest = self._return_value_var, src = return_value ))
 			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
 			# same reasoning as the label-is-not-None branch above - flush
@@ -3583,6 +3893,20 @@ class FunctionLowering:
 			broken = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = None, broken = True, needs_uid_suffix = needs_uid_suffix )
 			fn.add_name( broken.stem, broken )
 			raise
+		# NOTE: deliberately does NOT auto-.or_throw() an unannotated fresh
+		# local just because its RHS happens to be Result-shaped - `r =
+		# some_fallible_call()` (no annotation) has always captured the raw
+		# Result, precisely so it can be inspected via .is_ok()/match right
+		# after (confirmed by real fixtures: test_fallible_init_shape_has_
+		# ok_err_branches, match's own __match_subj_N desugaring reaching
+		# this SAME path). Case 1/2 of the general auto-or_throw() rule
+		# (_coerce_or_check_operand, _stmt_Return, discard sites - see
+		# _auto_or_throw's own docstring) still fire the moment `var` is
+		# later used somewhere that actually wants its own T rather than
+		# the whole Result - an unannotated arithmetic result that's never
+		# inspected as a Result and only ever flows into a T-typed context
+		# still ends up auto-consumed there, just one statement later than
+		# it used to be eagerly consumed at its own declaration
 		var = Variable( stem = target_id, qualname = f'{fn.qualname}.{target_id}', file = fn.file, line = getattr( node, 'lineno', None ), type = operand.type, needs_uid_suffix = needs_uid_suffix )
 		fn.add_name( var.stem, var )
 		self.lowering.schedule( var.type )
@@ -3702,6 +4026,12 @@ class FunctionLowering:
 		if isinstance( target, ast.Name ):
 			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 			if existing is not None:
+				# a module-level global's own Variable may not have had its
+				# OWN .resolve run yet (its .type is None until then) if this
+				# reassignment is the FIRST thing to touch it - see AugAssign's
+				# identical _ensure_resolved(existing) call above for the full
+				# reasoning
+				self.lowering._ensure_resolved( existing )
 				self._cfg.unnarrow( target.id ) # a real reassignment invalidates whatever this name was previously narrowed to - see cfg.py's own comment
 				# every local (including a `case T(name):` match-arm binding -
 				# see is_match_binding below) is function-scoped, no per-arm/
@@ -3787,6 +4117,7 @@ class FunctionLowering:
 				self._cfg.unnarrow( target_key )
 			obj, writeback = self._lower_attr_target_obj( target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, target.attr, target )
+			self._check_field_visibility( obj.type, attr_var, target.attr, target )
 			if isinstance( attr_var.type, FixedArrayType ):
 				# same restriction as the GetAttr (read) side - a bare C array
 				# member is never assignable via `=` (only a whole containing
@@ -3799,6 +4130,7 @@ class FunctionLowering:
 					target,
 				)
 			operand = self._lower_expr( node.value, attr_var.type )
+			needs_field_lock = False
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> = value, inside __init__ construction itself -
 				# tracked for definite-assignment/self-escape purposes (see
@@ -3856,12 +4188,25 @@ class FunctionLowering:
 				# cfg.py doesn't track arbitrary struct instances' field
 				# CONTENTS across statements (v1 scope cut - see cfg.py's
 				# module docstring), so the current value is always read
-				# fresh here rather than consulted from any tracked state
+				# fresh here rather than consulted from any tracked state.
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: this whole
+				# sequence (read-old, decref-old/incref-new, the SetAttr
+				# below) is ONE critical section, the field-locking
+				# counterpart of Part A's identical "the Assign has to stay
+				# INSIDE the same critical section as the Acquire/decref"
+				# rule - a concurrent reader/writer on the SAME object's
+				# SAME field must never observe a state between the decref
+				# of the old value and the store of the new one.
+				needs_field_lock = self._is_real_field_receiver( obj.type )
+				if needs_field_lock:
+					self._emit( ir.AcquireFieldLock( obj = obj ))
 				old = self._new_temp( attr_var.type )
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = target.attr ))
 				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand )):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
+			if needs_field_lock:
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
@@ -3940,6 +4285,7 @@ class FunctionLowering:
 					self._emit( ir.GetAttr( dest = elem, obj = value, attr = f'_{i}' ))
 					existing = self._existing_local_or_none( elt.id, node, 'cannot assign to it' )
 					if existing is not None:
+						self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 						self._cfg.unnarrow( elt.id )
 						final = self._coerce_or_check_operand( elem, existing.type, node )
 						is_alias = not getattr( final, 'is_union_coerce_result', False )
@@ -4013,7 +4359,17 @@ class FunctionLowering:
 				# matches what the delegated path below would compute
 				# anyway (_is_aliasing_expr never treats a bare BinOp as
 				# aliasing, regardless of its operands)
-				result = self._lower_binop_values( node, existing, right, existing.type )
+				# _lower_binop_values is called directly here (not through
+				# _lower_expr, which _expr_BinOp's own callers get for free) -
+				# its own raw, possibly-still-Result-shaped return needs the
+				# SAME case-2 auto-or_throw() coercion _lower_expr's tail
+				# would otherwise apply, or an unconsumed checked-arithmetic
+				# Result would get passed straight to _cfg_assign/ir.Assign
+				# below - confirmed via a real repro (auto_or_throw_test.py's
+				# own AugAssign coverage): `lst[0] += 10` compiled to invalid
+				# C, passing a raw Result struct where __setitem__'s plain-T
+				# parameter was declared
+				result = self._coerce_or_check_operand( self._lower_binop_values( node, existing, right, existing.type ), existing.type, node )
 				self._cfg.unnarrow( node.target.id )
 				self._cfg_assign( existing, result, is_alias = False, node = node )
 				return
@@ -4028,8 +4384,35 @@ class FunctionLowering:
 		elif isinstance( node.target, ast.Attribute ):
 			obj, writeback = self._lower_attr_target_obj( node.target.value )
 			attr_var = self.lowering._attr_lookup( obj.type, node.target.attr, node.target )
+			self._check_field_visibility( obj.type, attr_var, node.target.attr, node.target )
 			old = self._new_temp( attr_var.type )
-			self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
+			old_is_rc = bool( cfg.rc_leaves( attr_var.type )) and self._is_real_field_receiver( obj.type )
+			if old_is_rc:
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: `old` stays alive
+				# (as the iplace-dunder receiver, or as an attr_replace/
+				# _lower_binop_values operand) across evaluating node.value
+				# below, which can run arbitrary code - a bare, unretained
+				# GetAttr here would leave the exact "reader loads a pointer,
+				# gets preempted before its own incref, writer frees it"
+				# window A.3 describes, just for a field instead of a global.
+				# Retained here, under its own critical section (never held
+				# across node.value's own lowering - "lock the access, not
+				# the statement"), and registered fresh_temp so it's treated
+				# as an already-owned value the rest of this function - NOT
+				# double-counted against attr_replace's own unconditional
+				# decref of `old` below: that decref balances the FIELD's
+				# original ownership, this incref adds a SEPARATE, temp-
+				# owned reference that this statement's own pending_temps
+				# cleanup balances at the end (see _new_temp/fresh_temp) -
+				# two owners in, two decrefs out, whichever branch below runs.
+				self._emit( ir.AcquireFieldLock( obj = obj ))
+				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
+				for instr in self._cfg.incref( attr_var.type, old ):
+					self._emit( instr )
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._cfg.fresh_temp( old, attr_var.type )
+			else:
+				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
 			field_is_rc = self.lowering._ensure_resolved( attr_var.type ).is_rc_pointer()
 			if field_is_rc:
 				# no hint - see the Name branch's identical comment: a field's
@@ -4045,15 +4428,22 @@ class FunctionLowering:
 			iplace_method = self._find_iplace_dunder( attr_var.type, type( node.op ), right.type ) if field_is_rc else None
 			if iplace_method is not None:
 				# old aliases the SAME heap object attr_var's own field
-				# already points to (a plain GetAttr read, no incref of its
-				# own) - mutating it in place via __iadd__ already mutates
-				# the field's pointee; the field's own pointer value never
-				# changes, so SetAttr/writeback would be redundant (and, for
-				# writeback in particular, actively pointless - only the
-				# field's pointee changed, not the struct holding the field)
+				# already points to (Part B's own temp-owned reference on
+				# top, if old_is_rc - see its own comment above; the field's
+				# own pointer value never changes) - mutating it in place via
+				# __iadd__ already mutates the field's pointee, so SetAttr/
+				# writeback would be redundant (and, for writeback in
+				# particular, actively pointless - only the field's pointee
+				# changed, not the struct holding the field). old's own
+				# pending_temps cleanup (if old_is_rc) balances the extra
+				# temp-owned reference automatically on this early return,
+				# same as any other fresh_temp-registered value.
 				self._emit_iplace_dunder_call( node, iplace_method, old, right )
 				return
-			result = self._lower_binop_values( node, old, right, attr_var.type )
+			# see the Name-target branch's identical comment on why this
+			# needs its own explicit case-2 coercion
+			result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, attr_var.type ), attr_var.type, node )
+			needs_field_lock = False
 			if self._construction_self is not None and obj is self._construction_self:
 				# self.<attr> += value, inside __init__ construction itself -
 				# same definite-assignment/self-escape tracking an ordinary
@@ -4064,10 +4454,21 @@ class FunctionLowering:
 				# ordinary SetAttr on an already-constructed instance - `old`
 				# is exactly the CURRENT value _stmt_Assign's own Attribute
 				# branch would otherwise re-read via its own fresh GetAttr;
-				# reusing it here avoids a redundant third read
+				# reusing it here avoids a redundant third read. Its own
+				# SEPARATE critical section, same reasoning _stmt_Assign's
+				# identical branch already documents - not merged with the
+				# read-side lock above (node.value's own lowering ran in
+				# between, and could itself touch this SAME object's OTHER
+				# fields - B.4's reentrancy hazard, avoided by never holding
+				# the lock across anything but one field access).
+				needs_field_lock = self._is_real_field_receiver( obj.type )
+				if needs_field_lock:
+					self._emit( ir.AcquireFieldLock( obj = obj ))
 				for instr in self._cfg.attr_replace( attr_var.type, old, result, is_alias = False ):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = node.target.attr, value = result ))
+			if needs_field_lock:
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( node.target, ast.Subscript ):
@@ -4088,7 +4489,9 @@ class FunctionLowering:
 				old = self._new_temp( elem_type )
 				self._emit( ir.GetItem( dest = old, obj = obj, index = index ))
 				right = self._lower_expr( node.value, old.type )
-				result = self._lower_binop_values( node, old, right, old.type )
+				# see the Name-target branch's identical comment on why this
+				# needs its own explicit case-2 coercion
+				result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, old.type ), old.type, node )
 				self._emit( ir.SetItem( obj = obj, index = index, value = result ))
 			else:
 				# a real __getitem__/__setitem__ pair. Tries an __iadd__-
@@ -4148,15 +4551,26 @@ class FunctionLowering:
 					self.lowering._type_resolver._require_chained_result_return(
 						node.target, result_cls, error_classes, self.lowering._SUBSCRIPT_ALTERNATIVES, fn = self._current_fn,
 					)
-				old = self._consume_checked_result( node.target, get_dest, get_shape[0], extra = None ) if get_shape is not None else get_dest
-				result = self._lower_binop_values( node, old, right, old.type )
+				# pre_checked=True: coverage for BOTH steps' error types was
+				# already validated together above via
+				# _require_chained_result_return - _auto_or_throw must not
+				# re-validate (and re-report) either one on its own
+				old = (
+					self._auto_or_throw( node.target, get_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = True, pre_checked = True )
+					if get_shape is not None else get_dest
+				)
+				assert old is not None # want_result=True above guarantees this
+				# see the Name-target branch's identical comment on why this
+				# needs its own explicit case-2 coercion (setitem_fn's own
+				# `val` parameter wants old.type directly, never a Result)
+				result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, old.type ), old.type, node )
 				if setitem_fn.return_type is self.lowering.discovery.get_none_type():
 					self._emit( ir.Call( dest = None, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
 				else:
 					set_dest = self._new_temp( setitem_fn.return_type )
 					self._emit( ir.Call( dest = set_dest, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
 					if set_shape is not None:
-						self._consume_checked_result( node.target, set_dest, set_shape[0], extra = None )
+						self._auto_or_throw( node.target, set_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = False, pre_checked = True )
 		else:
 			self.lowering.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
 
@@ -4198,6 +4612,15 @@ class FunctionLowering:
 			return
 		if self.lowering._is_compiler_call( node.value ) == '__raw_free__':
 			self._lower_compiler_raw_free( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == 'dump_live_objects':
+			self._lower_compiler_dump_live_objects( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == '__debug_raw_track__':
+			self._lower_compiler_debug_raw_track( node.value )
+			return
+		if self.lowering._is_compiler_call( node.value ) == '__debug_raw_untrack__':
+			self._lower_compiler_debug_raw_untrack( node.value )
 			return
 		if isinstance( node.value, ast.Yield ):
 			# PLAN_GENERATORS.md Phase F - a bare (statement-position)
@@ -4488,7 +4911,11 @@ class FunctionLowering:
 
 	def _stmt_With( self, node: ast.With ) -> None:
 		if len( node.items ) != 1:
-			self.lowering.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
+			# NOT ast.unparse(node) here - that would dump this with-
+			# statement's entire BODY into the message too (a real repro:
+			# a multi-statement with-block produced a multi-line error
+			# message that buried the actual problem)
+			self.lowering.discovery.fail( f'unsupported with statement (only a single context manager is supported, got {len(node.items)})', node )
 		item = node.items[0]
 		context_expr = item.context_expr
 
@@ -4506,7 +4933,7 @@ class FunctionLowering:
 				mode = arithmetic_mode.ArithmeticSaturate()
 			elif self.lowering._is_compiler_call( context_expr ) == 'panic_arithmetic':
 				if len( context_expr.args ) != 1 or context_expr.keywords:
-					self.lowering.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
+					self.lowering.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(context_expr)}', node )
 				str_cls = self.lowering.discovery.find_name( 'str', node )
 				errmsg = self._lower_expr( context_expr.args[0], str_cls )
 				mode = arithmetic_mode.ArithmeticPanic( errmsg )
@@ -4597,15 +5024,20 @@ class FunctionLowering:
 		design or real Python's own `with` semantics (which also introduces
 		no new scope - NAME/x stay bound and alive for the rest of the
 		enclosing scope there too). '''
+		# neither message below unparses `node` itself - it's the whole
+		# with-statement INCLUDING its body, which would dump the entire
+		# block into the error message (a real repro: a multi-statement
+		# with-body produced a multi-line error that buried the actual
+		# problem); `node`'s own lineno (passed as the location) already
+		# pinpoints the with-statement precisely enough
 		if self._loop_depth > 0 and self._body_may_break_or_continue_to_enclosing_loop( node.body ):
 			self.lowering.discovery.fail(
 				'with-statement (context manager) is not allowed inside a loop when its body can break/continue out '
-				'of that loop - call another function and use the with-statement inside that instead: '
-				f'{ast.unparse(node)}', node,
+				'of that loop - call another function and use the with-statement inside that instead', node,
 			)
 		if self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
-				f'with-statement (context manager) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+				'with-statement (context manager) is not supported inside a generator body yet', node,
 			)
 
 		index = self._with_ctx_id
@@ -4624,7 +5056,7 @@ class FunctionLowering:
 		if self.lowering._find_method( ctx_type, '__enter__' ) is None or self.lowering._find_method( ctx_type, '__exit__' ) is None:
 			type_name = ctx_type.qualname if ctx_type is not None else '?'
 			self.lowering.discovery.fail(
-				f'with-statement requires {type_name} to define both __enter__(self) and __exit__(self): {ast.unparse(node)}', node,
+				f'with-statement requires {type_name} to define both __enter__(self) and __exit__(self): {ast.unparse(context_expr)}', node,
 			)
 
 		def _ctx_read() -> ast.Name:
@@ -4713,8 +5145,9 @@ class FunctionLowering:
 		function ever truly ends - defer/errdefer's own "single armed slot,
 		replayed once" contract can't represent more than one such visit.
 		match statements are already desugared to chained ast.If by the
-		time lowering.py runs (mirroring _stmt_diverges's own assumption),
-		and this compiler has no try/except, so those aren't handled here. '''
+		time lowering.py runs (mirroring _stmt_diverges's own assumption).
+		try/except (ast.Try) is handled by _stmt_may_break_or_continue
+		itself, below. '''
 		return any( self._stmt_may_break_or_continue( stmt, in_nested_loop = False ) for stmt in body )
 
 	def _stmt_may_break_or_continue( self, stmt: ast.stmt, in_nested_loop: bool ) -> bool:
@@ -4724,7 +5157,516 @@ class FunctionLowering:
 			return any( self._stmt_may_break_or_continue( s, in_nested_loop = True ) for s in stmt.body )
 		if isinstance( stmt, ( ast.If, ast.With )):
 			return any( self._stmt_may_break_or_continue( s, in_nested_loop ) for s in stmt.body )
+		if isinstance( stmt, ast.Try ):
+			# a break/continue anywhere in body/orelse/finalbody/any handler's
+			# own body still belongs to the SAME enclosing loop - mirrors
+			# _loop_has_reachable_break's own already-existing ast.Try walk
+			lists = [ stmt.body, stmt.orelse, stmt.finalbody ] + [ h.body for h in stmt.handlers ]
+			return any( self._stmt_may_break_or_continue( s, in_nested_loop ) for lst in lists for s in lst )
 		return False
+
+	def _body_contains_return( self, body: list[ast.stmt] ) -> bool:
+		''' true if `return` appears anywhere in `body` (recursively, through
+		nested if/while/for/with/try - match is already desugared to chained
+		ast.If by the time lowering.py runs). Used to reject `return` inside a
+		try-statement's own `finally:` body: `finally` is captured ONCE
+		(_register_defer_block) and replayed via goto at every early-exit
+		path the try/except construct has, PLUS inlined directly at its own
+        normal-fallthrough point - a real `return` baked into that captured
+		replay would fire from whichever of those unrelated call sites
+		happens to replay it, discarding that path's own actual return value
+		(Python's own well-known finally-return footgun, made structurally
+		worse here since one `return` would silently execute at multiple,
+		textually-unrelated points instead of just shadowing the one
+		enclosing try/except it lexically appears in). '''
+		return any( self._stmt_contains_return( stmt ) for stmt in body )
+
+	def _stmt_contains_return( self, stmt: ast.stmt ) -> bool:
+		if isinstance( stmt, ast.Return ):
+			return True
+		if isinstance( stmt, ast.With ):
+			return any( self._stmt_contains_return( s ) for s in stmt.body )
+		if isinstance( stmt, ( ast.For, ast.While, ast.If )):
+			return any( self._stmt_contains_return( s ) for s in stmt.body + stmt.orelse )
+		if isinstance( stmt, ast.Try ):
+			lists = [ stmt.body, stmt.orelse, stmt.finalbody ] + [ h.body for h in stmt.handlers ]
+			return any( self._stmt_contains_return( s ) for lst in lists for s in lst )
+		return False
+
+	def _stmt_TryStar( self, node: ast.stmt ) -> None:
+		# ast.TryStar (`try: ... except* T:`) reuses ast.ExceptHandler for
+		# its own handlers, so it isn't distinguishable from ast.Try by
+		# shape alone - dispatched here separately (by class name, see
+		# _lower_stmt) purely to reject it with a clear, dedicated message
+		# rather than whatever _stmt_Try's own except-clause validation
+		# would happen to say about it
+		self.lowering.discovery.fail( f'except* (exception groups) is not supported: {ast.unparse(node)}', node )
+
+	def _stmt_Try( self, node: ast.Try ) -> None:
+		''' limited try/except/else/finally - not real unwinding: control
+		reaches an except handler only via `.or_throw()` (_lower_or_throw)
+		or a `raise EXPR` statement (_stmt_Raise), each textually inside
+		this try's own body, in this SAME function (self._try_stack,
+		pushed/popped around the body's own lowering). Mirrors
+		_lower_with_context_manager's own already-debugged shape for
+		`finally` - see that method's docstring for the full "why no new
+		lexical scope, why register-then-disarm-and-inline" story; `as
+		NAME` binds an ordinary, function-scoped local exactly like with's
+		own NAME does, just built directly here (there's no AST-level
+		expression for "the narrowed Err payload of this already-lowered
+		or_throw()/raise dispatch" for an ast.Assign to reference - see the
+		Variable construction below).
+
+		Nested try: an uncovered leaf walks the WHOLE enclosing try stack,
+		innermost first (_dispatch_leaves_against_try_stack, shared by
+		or_throw() and raise) - an inner try's own uncovered leaf DOES
+		search every outer try's own handlers before falling back to the
+		function-return propagation path. This is sound without any new CFG
+		machinery: _stmt_Try is Python-call-stack-recursive, so an outer
+		TryContext's own `handlers` list is still live/mutable while an
+		inner try's body is being lowered, and every handler (inner or
+		outer) is already modeled as diverging from its OWN try's entry
+		snapshot (below) - a goto from anywhere inside an inner try's body
+		is textually still inside the outer try's own body too, already
+		covered by that same conservative model. Labels are function-flat
+		and globally unique (_new_label), so a goto reaching an outer
+		label works exactly like reaching an inner one.
+
+		Dead-except check (after the try_stack pop, below): an except
+		clause whose TryHandler.matched never got set True by any
+		or_throw()/raise dispatch anywhere in this try's own body is
+		unreachable - a compile error. '''
+		# none of the messages below unparse `node`/`h` themselves - each is
+		# a compound statement with its own BODY (the whole try block, or
+		# a whole except handler), which would dump that entire block into
+		# the error message (a real repro: a multi-statement try/except
+		# produced a multi-line error that buried the actual problem); the
+		# node passed as the location (node/h/te) already pinpoints the
+		# right line precisely enough on its own
+		if self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				'try-statement is not supported inside a generator body yet', node,
+			)
+		if self._loop_depth > 0 and (
+			self._body_may_break_or_continue_to_enclosing_loop( node.body )
+			or self._body_may_break_or_continue_to_enclosing_loop( node.orelse )
+			or any( self._body_may_break_or_continue_to_enclosing_loop( h.body ) for h in node.handlers )
+		):
+			self.lowering.discovery.fail(
+				'try-statement is not allowed inside a loop when its body/else/except-handlers can break/continue out '
+				'of that loop - call another function and use try/except inside that instead', node,
+			)
+
+		handlers: list[TryHandler] = []
+		for h in node.handlers:
+			if h.type is None:
+				self.lowering.discovery.fail( 'bare `except:` is not supported - name the specific error class(es)', h )
+			type_exprs = h.type.elts if isinstance( h.type, ast.Tuple ) else [ h.type ]
+			leaves: list[Type] = []
+			for te in type_exprs:
+				resolved = self.lowering._type_resolver._try_resolve_namespace( te )
+				if resolved is None or not isinstance( resolved, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+					self.lowering.discovery.fail( f'except clause must name a class: {ast.unparse(te)}', te )
+				if getattr( resolved, 'stem', None ) == 'Exception':
+					self.lowering.discovery.fail(
+						'bare `except Exception:` is not supported - name the specific error class(es)', h,
+					)
+				leaves.append( resolved )
+			label = self._new_label( 'except' )
+			bind_type = leaves[0] if len( leaves ) == 1 else self.lowering.discovery._get_or_create_union( leaves )
+			if len( leaves ) > 1:
+				self.lowering._union_storage.get( bind_type ) # ensures bind_type's own tag/data storage exists by emit time
+			self.lowering.schedule( bind_type )
+			fn = self._current_fn
+			bind_var: Variable|None = None
+			if h.name is not None:
+				needs_uid_suffix = self._mark_fresh_local_declared( h.name )
+				bind_var = Variable(
+					stem = h.name, qualname = f'{fn.qualname}.{h.name}', file = fn.file, line = getattr( h, 'lineno', None ),
+					type = bind_type, needs_uid_suffix = needs_uid_suffix,
+				)
+				fn.add_name( bind_var.stem, bind_var )
+				raise_value_var = bind_var
+			else:
+				# hidden, not user-facing - only bare `raise` inside this
+				# handler's own body ever references it (_stmt_Raise), so no
+				# uid-suffix collision tracking is needed: `label` is already
+				# unique per handler within this function (_new_label).
+				hidden_stem = f'__except_value_{label}'
+				raise_value_var = Variable(
+					stem = hidden_stem, qualname = f'{fn.qualname}.{hidden_stem}', file = fn.file, line = getattr( h, 'lineno', None ),
+					type = bind_type, needs_uid_suffix = False,
+				)
+				fn.add_name( raise_value_var.stem, raise_value_var )
+			handlers.append( TryHandler( leaves = leaves, label = label, bind = bind_var, raise_value_var = raise_value_var ))
+		end_label = self._new_label( 'try_end' )
+
+		if node.finalbody and self._body_contains_return( node.finalbody ):
+			self.lowering.discovery.fail(
+				'finally: return statements are not allowed inside a finally block - a return here would silently '
+				'discard whatever the try/except was actually about to return', node,
+			)
+
+		exit_flag: Variable|None = None
+		if node.finalbody:
+			# registered BEFORE the body is lowered, exactly like
+			# _lower_with_context_manager's own __exit__ - covers every
+			# early-exit path reached from inside body/else/any handler
+			# (return, or an uncovered or_throw() leaf propagating out)
+			self._register_defer_block( is_err_only = False, body = node.finalbody, node = node, allow_inside_loop = True )
+			exit_flag = self._defer_flags[-1]
+
+		# Handlers are mutually-exclusive alternatives - structurally like
+		# if/elif arms - and get the same enter_branch/snapshot/restore/
+		# merge_if treatment _stmt_If gives its own branches (see this
+		# method's own module-level design notes in the task that produced
+		# this code). The try body/else stay UNCONFINED (matching `with`'s
+		# own precedent - they always execute exactly once when reached,
+		# unlike a handler, which may or may not run at all).
+		#
+		# Wrinkle: a single handler can be the goto target of multiple
+		# .or_throw() call sites scattered through the try body, each with
+		# potentially different live/owned/narrowed state. Real per-
+		# dispatch-site predecessor merging would need a proper multi-
+		# predecessor CFG join - out of scope. Conservative approximation
+		# instead: every handler is modeled as diverging from the try's own
+		# ENTRY snapshot, never from wherever a specific dispatch site sits.
+		# This can only ever be MORE conservative than reality, never
+		# unsound.
+		entry_snapshot = self._cfg.snapshot()
+		outer_instructions = self._instructions
+		self._instructions = []
+		self._try_stack.append( TryContext( handlers = handlers, end_label = end_label, entry_stack_depth = entry_snapshot.stack_depth ))
+		# every entry that SURVIVES this try (index < entry_snapshot.stack_
+		# depth) needs protecting for the whole body-through-handlers window
+		# below, not just torn down via _try_stack's own narrower try/
+		# finally: the try body and each handler are independently restore()
+		#'d back to this SAME entry_snapshot, but restore() only reverts
+		# STACK MEMBERSHIP, never an already-mutated Epilogue object's own
+		# .cancelled flag (shared by reference, not copied per snapshot) -
+		# an ordinary `compiler.decref(g)` on the try body's own fall-
+		# through path would otherwise permanently cancel g's SHARED entry,
+		# silently making every handler restored to entry_snapshot afterward
+		# see g as already-released even on paths that never touched it -
+		# confirmed by a real repro (an ordinary local declared before the
+		# try, decref'd only on the non-raising fall-through, leaked on the
+		# raising path instead - the handler's own `return` walked right
+		# past it). protect_try_entries()/cfg.py's own _neutralize() is the
+		# fix: any cancellation of a protected entry during this window goes
+		# through the SAME runtime-flag mechanism an already-captured
+		# entry's own cancellation already uses, rather than a static
+		# .cancelled that would silently corrupt every OTHER path sharing
+		# it.
+		self._cfg.enter_diverging_paths( entry_snapshot.stack_depth )
+		try:
+			try:
+				for stmt in node.body:
+					try:
+						self._lower_stmt( stmt )
+					except CompileError:
+						continue
+			finally:
+				self._try_stack.pop()
+
+			for handler, h in zip( handlers, node.handlers ):
+				if not handler.matched:
+					self.lowering.discovery.fail(
+						f'except {ast.unparse(h.type)}: is unreachable - nothing in this try block ever throws it',
+						h,
+					)
+
+			for stmt in node.orelse:
+				try:
+					self._lower_stmt( stmt )
+				except CompileError:
+					continue
+	
+			body_captured = self._instructions
+			body_end = self._cfg.snapshot()
+	
+			tail = node.orelse if node.orelse else node.body
+			combined_terminates = bool( tail ) and self._stmt_diverges( tail[-1] )
+	
+			combined_groups: list[list[ir.Instruction]] = [ body_captured ]
+			combined_end = body_end
+	
+			for handler, h in zip( handlers, node.handlers ):
+				self._cfg.restore( entry_snapshot )
+				self._instructions = []
+				self._cfg.enter_branch( entry_snapshot.stack_depth )
+				try:
+					# the emitter unconditionally assigns handler.raise_value_var's
+					# own payload before jumping to this exact label (ir.OrThrow's/
+					# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
+					# definitely assigned on entry here, same reasoning
+					# _declare_hidden_local/@inline's own parameter binding
+					# already rely on mark_live() for (see its own docstring).
+					# Must happen INSIDE this branch-confined window (moved
+					# from the old unconfined lowering) so restore() below
+					# correctly tears it back down before the next handler. Always
+					# runs now (not just `as NAME` clauses) - a hidden hand-off
+					# variable exists for every handler, see TryHandler's own
+					# docstring.
+					self._cfg.mark_live( handler.raise_value_var.stem )
+					self._active_raise_values.append( handler.raise_value_var )
+					try:
+						for stmt in h.body:
+							try:
+								self._lower_stmt( stmt )
+							except CompileError:
+								continue
+					finally:
+						self._active_raise_values.pop()
+				finally:
+					self._cfg.exit_branch()
+				handler_captured = self._instructions
+				handler_end = self._cfg.snapshot()
+				# same sense as _stmt_If's own true_terminates: last stmt
+				# diverges (return/break/continue) -> this branch never reaches
+				# the join point at all.
+				handler_terminates = bool( h.body ) and self._stmt_diverges( h.body[-1] )
+	
+				# restore to the TRY's own entry snapshot (not combined_end) -
+				# merge_if's own docstring documents its precondition as
+				# "self.bindings is clean of whatever either branch
+				# speculatively pushed" (i.e. exactly entry state); combined_end/
+				# handler_end are passed through as plain DATA parameters
+				# (true_end/false_end) below, entirely independent of whatever
+				# self.bindings currently holds. Restoring to combined_end
+				# instead (tried first) left a stale binding in self.bindings
+				# for any name merge_if's own "fresh on exactly one branch"
+				# path drops (it only ever WRITES self.bindings for a name it
+				# reestablishes - it never deletes one that was already there
+				# but isn't a survivor) - confirmed as a real double-
+				# release_object()/uninitialized-read bug via a real MSVC
+				# compile+run repro (C4700 "uninitialized local variable 'w'
+				# used", then a heap-corruption crash at runtime).
+				self._cfg.restore( entry_snapshot )
+				# merge_if() below can mint fresh temps (a name dropped on only
+				# one side needs its own decref computed here - see its own
+				# "fresh on exactly one branch" case) - _new_temp()'s DeclareTemp
+				# side effect lands in whatever self._instructions currently is,
+				# which must be the real, live outer list (matching _stmt_If's
+				# own identical merge_if() call site), NOT handler_captured
+				# (still assigned from the just-lowered handler body above) -
+				# otherwise the DeclareTemp ends up spliced into the handler's
+				# own block while the matching compute/use instructions
+				# (returned as plain data, appended into combined_groups/
+				# handler_captured below) end up somewhere else entirely -
+				# confirmed by a real repro ("use of undeclared identifier
+				# '$tN'": a named Result local declared directly inside a try
+				# body, dropped by the handler-loop's own restore() above).
+				self._instructions = outer_instructions
+				try:
+					combined_extra, handler_extra, removed = self._cfg.merge_if(
+						entry_snapshot.bindings, combined_end.bindings, handler_end.bindings, self._current_fn.qualname,
+						entry_results = entry_snapshot.results, true_end_results = combined_end.results, false_end_results = handler_end.results,
+						true_terminates = combined_terminates, false_terminates = handler_terminates,
+						true_end_narrowed = combined_end.narrowed, false_end_narrowed = handler_end.narrowed,
+						true_end_live = combined_end.live, false_end_live = handler_end.live,
+					)
+				except CompileError as e:
+					self.lowering.discovery.fail( str( e ), node )
+				# `removed` only drives Decref instructions already spliced into
+				# combined_extra/handler_extra above - see _stmt_If's own
+				# identical comment on why fn.names must NOT also be touched.
+	
+				# combined_extra must land on EVERY physical block folded into
+				# the "combined" side so far - either could be the real runtime
+				# path (a name confined to just ONE prior handler still needs
+				# its own teardown spliced into THAT handler's own block, not
+				# just the most recently merged one).
+				for group in combined_groups:
+					group.extend( combined_extra )
+				handler_captured.extend( handler_extra )
+				combined_groups.append( handler_captured )
+	
+				combined_terminates = combined_terminates and handler_terminates
+				combined_end = self._cfg.snapshot()
+	
+			self._cfg.restore( combined_end )
+		finally:
+			self._cfg.exit_diverging_paths()
+		self._instructions = outer_instructions
+		reachable = not combined_terminates
+
+		for instr in combined_groups[0]:
+			self._emit_captured( instr )
+		if reachable:
+			self._emit( ir.Jump( target = end_label ))
+
+		for handler_idx, ( handler, h ) in enumerate( zip( handlers, node.handlers )):
+			self._emit( ir.Label( name = handler.label ))
+			for instr in combined_groups[handler_idx + 1]:
+				self._emit_captured( instr )
+			if not h.body or not self._stmt_diverges( h.body[-1] ):
+				reachable = True
+				self._emit( ir.Jump( target = end_label ))
+
+		if reachable:
+			self._emit( ir.Label( name = end_label ))
+			if node.finalbody:
+				# disarm the registered defer and inline finalbody directly
+				# here - the SAME already-debugged shape
+				# _lower_with_context_manager uses for its own __exit__,
+				# just at this construct's own (possibly multi-path)
+				# fallthrough merge point instead of a single body's own end
+				bool_cls = self.lowering.discovery.find_name( 'bool', node )
+				assert exit_flag is not None
+				self._emit( ir.Assign( dest = exit_flag, src = ir.Const( type = bool_cls, value = False )))
+				for stmt in node.finalbody:
+					try:
+						self._lower_stmt( stmt )
+					except CompileError:
+						continue
+
+	def _stmt_Raise( self, node: ast.Raise ) -> None:
+		''' raise EXPR - a bare goto into a matching except handler of any
+		enclosing try (walked innermost-first via
+		_dispatch_leaves_against_try_stack, the same helper .or_throw() (
+		_emit_or_throw) uses), no Result ever built for that covered case -
+		it's a jump, not a value. A leaf uncovered by every enclosing try
+		propagates via a REAL function return instead, built from the
+		enclosing function's own declared Result[T,E] return type (same
+		coverage requirement .or_throw() already enforces via
+		_require_or_throw_return) - see ir.Raise's own docstring for the
+		emitted shape, which reuses _emit_leaf_dispatch_case's existing
+		uncovered-leaf machinery in emitter_c.py.
+
+		Bare `raise` (re-raise) inside an except handler re-raises THAT
+		handler's own currently-caught value - reuses this exact same
+		dispatch/emission path, just sourced from
+		FunctionLowering._active_raise_values's top (the innermost
+		enclosing handler's own TryHandler.raise_value_var) instead of a
+		freshly-lowered node.exc; a plain `ast.Name` read off it, fed back
+		through the ordinary expression pipeline (_lower_expr), gets the
+		usual aliasing incref for free - see TryHandler's own docstring.
+		Because _stmt_Try pops the current try's own TryContext off
+		_try_stack before lowering ANY handler body, this dispatch can
+		never re-match a sibling except of the SAME try - it only ever
+		walks OUTER enclosing tries, same as it would for a real re-raised
+		value written out by hand. Bare `raise` with nothing on
+		_active_raise_values (not textually inside a handler's own body at
+		all) is a compile error. No `raise ... from ...` (exception
+		chaining). Same generator-body rejection as .or_throw()
+		(_lower_or_throw) - see its own comment for why. The @inline-
+		splice-prelude case is now generalized (ir.Raise.inline_exit)
+		rather than rejected - same carve-out _emit_or_throw's own
+		uncovered-leaf branch applies, and same PLAN_RETURN_INFERENCE.md
+		sentinel-state rejection as _consume_checked_result/
+		_emit_or_throw's own. '''
+		if node.cause is not None:
+			self.lowering.discovery.fail( f'raise ... from ... (exception chaining) is not supported: {ast.unparse(node)}', node )
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'raise is not supported inside a generator body yet - a generator body is a state machine re-entered '
+				f'across multiple send()/next() resumptions, not called once like an ordinary function, so what an '
+				f'uncaught error should even mean here (fail just this resumption vs. end the generator entirely) '
+				f'needs real design first: {ast.unparse(node)}', node,
+			)
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
+			self.lowering.discovery.fail(
+				f'@inline: or_throw()/raise that could propagate an error is not yet supported before the '
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
+				node,
+			)
+
+		if node.exc is None:
+			if not self._active_raise_values:
+				self.lowering.discovery.fail(
+					f'bare raise (re-raise) is only valid inside an except handler: {ast.unparse(node)}', node,
+				)
+			raise_var = self._active_raise_values[-1]
+			exc_node = ast.Name( id = raise_var.stem, ctx = ast.Load())
+			ast.fix_missing_locations( ast.copy_location( exc_node, node ))
+		else:
+			exc_node = node.exc
+		value = self._lower_expr( exc_node, None )
+		self._raise_value( value, node )
+
+	def _raise_value( self, value: ir.Operand, node: ast.AST ) -> None:
+		''' the dispatch/emission half of _stmt_Raise, split out so
+		or_throw(mapper) (_lower_or_throw_with_mapper) can raise an
+		ALREADY-COMPUTED operand directly - it needs the mapped error's
+		own value settled (mapper called, its argument decreffed) BEFORE
+		dispatch, which means the raised expression can't be a fresh
+		ast.Raise(exc=<call>) re-lowered from scratch here (that would
+		call the mapper a second time, or read the argument after it's
+		already been decreffed - see the caller's own comment). Keeping
+		`value` a bare, never-named ir.Temp (returned directly from
+		_lower_expr, never bound via ast.Assign) is what lets untrack_temp()
+		below correctly hand its ownership off with no separate unwind
+		needed - a NAMED Variable raised from inside a confined branch has
+		no such automatic path (see _lower_or_throw_with_mapper's own
+		manually_decreffed()-was-a-no-op history for why that alternative
+		doesn't work). '''
+		error_cls = value.type
+		if error_cls is None or not isinstance( error_cls, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
+			self.lowering.discovery.fail(
+				f'raise EXPR must be a class instance, got {error_cls.qualname if error_cls else "?"}: {ast.unparse(node)}', node,
+			)
+
+		all_leaves = self.lowering._type_resolver._atomic_leaves( error_cls )
+		# a bare Temp's own exclusion is handled below (untrack_temp) - only
+		# a NAMED Variable raised directly (`raise x`) needs excluding HERE
+		# too, so unwind_confined() doesn't release it out from under the
+		# handler's own bind assignment just below it
+		dispatch, covered_leaves = self._dispatch_leaves_against_try_stack(
+			all_leaves, exclude = value if isinstance( value, Variable ) else None,
+		)
+
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+		self.lowering._type_resolver._require_or_throw_return(
+			node, result_cls, error_cls, covered_leaves, self.lowering._RAISE_ALTERNATIVES, fn = self._current_fn,
+		)
+
+		try:
+			self._cfg.check_unchecked_results( value )
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+
+		# `value`'s own reference always transfers out through the dispatch
+		# below - into the handler's raise_value_var (every handler has one,
+		# `as NAME` or not - TryHandler's own docstring; its own lifetime is
+		# the same manual-decref idiom as any other extracted RC element,
+		# e.g. list.__del__/dict's _release_key) or widened into a
+		# propagated Result - never simply dropped here, so it must never be
+		# released by the ordinary end-of-statement temp flush either.
+		# Confirmed by a real repro: `raise Boom(code=5)` / `except Boom as
+		# e: ...e.code...` previously read freed memory (release_object($t0)
+		# emitted before `e = $t0`) - the flush was unconditionally
+		# releasing `value` regardless of whether anything downstream still
+		# needed it.
+		self._cfg.untrack_temp( value )
+
+		all_covered = len( covered_leaves ) == len( all_leaves )
+		if all_covered:
+			# every leaf dispatches straight into a handler - no propagation
+			# path exists at all, mirrors _emit_or_throw's own identical
+			# all_covered short-circuit
+			self._flush_pending_temps() # see _stmt_Return's own identical comment: before the terminator, not after
+			self._emit( ir.Raise( value = value, dispatch = dispatch ))
+			return
+
+		tracked_operand = value if isinstance( value, Variable ) else None
+		# see _emit_or_throw's own identical inline_scope carve-out/comment
+		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
+		if inline_scope is not None:
+			replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+			self._flush_pending_temps()
+			self._cfg.mark_inline_scope_captured()
+			self._emit( ir.Raise( value = value, dispatch = dispatch, epilogue = replay, inline_exit = inline_scope ))
+			return
+		label = self._cfg.current_epilogue_label( tracked_operand )
+		if label is not None:
+			self._flush_pending_temps()
+			self._emit( ir.Raise(
+				value = value, dispatch = dispatch, target = label, return_slot = self._return_value_var,
+			))
+		else:
+			replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+			self._flush_pending_temps()
+			self._emit( ir.Raise( value = value, dispatch = dispatch, epilogue = replay ))
 
 	def _static_type_of_value_expr( self, node: ast.expr ) -> Type|None:
 		# compile-time-only: the static type of a value-shaped expression
@@ -4907,6 +5849,27 @@ class FunctionLowering:
 			)
 		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
 		return ir.Const( type = expected_type or bool_cls, value = self.lowering._type_resolver._is_RC( target_type ))
+
+	def _lower_compiler_error( self, node: ast.Call, expected_type: Type|None ) -> NoReturn:
+		# compiler.error(msg) - a real compile-time diagnostic library code
+		# can raise itself, e.g. a generic container guarding against a type
+		# parameter binding it deliberately doesn't support (see
+		# PLAN_NONETYPE_GENERIC_VALUE.md - UnsafeDict's own type(V) is None
+		# guard is the motivating case). Before this, library code wanting a
+		# custom compile-time message had no real mechanism - lib/ssl.py's
+		# own comment on _MACOS_SSL_NOT_YET_IMPLEMENTED documents the
+		# workaround (an intentionally undefined name, relying on the
+		# generic "name is not defined" error) this replaces with a real,
+		# purpose-written message. msg must be a literal string constant -
+		# same "no runtime computation, compile-time only" posture every
+		# other compiler.* intrinsic already has; a non-constant argument
+		# would need actual VALUE evaluation to read a message that then
+		# only matters if this call is even reachable, which is needlessly
+		# more machinery than any real caller needs (every call site wants
+		# a fixed, authored message, not a computed one).
+		if len( node.args ) != 1 or node.keywords or not isinstance( node.args[0], ast.Constant ) or not isinstance( node.args[0].value, str ):
+			self.lowering.discovery.fail( f'compiler.error(...) takes exactly one string-literal argument: {ast.unparse(node)}', node )
+		self.lowering.discovery.fail( node.args[0].value, node )
 
 	def _lower_compiler_refcount( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.refcount(x) - unlike compiler.sizeof(T), x is a real
@@ -5262,6 +6225,7 @@ class FunctionLowering:
 				)
 			root = self._lower_expr( arg_node.value, None )
 			attr_var = self.lowering._attr_lookup( root.type, arg_node.attr, arg_node )
+			self._check_field_visibility( root.type, attr_var, arg_node.attr, arg_node )
 			ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
 			if isinstance( attr_var.type, FixedArrayType ):
 				# compiler.addrof(x.field) where field is ElemType[N] ->
@@ -5513,6 +6477,53 @@ class FunctionLowering:
 		dest = self._new_temp( expected_type or intrinsics['f64'] )
 		self._emit( ir.ParseFloat( dest = dest, buf = buf ))
 		return dest
+
+	# --- debug-mode alloc-site tracking (dump_live_objects) - see
+	# i-want-to-investigate-kind-garden.md. lib/sys.py's alloc[T]/free call
+	# these directly, always inside a `if compiler.target.debug:` guard (same
+	# dead-branch-elimination pattern mempoison already uses - see
+	# compile_time_transformer), so a release build's lowering never reaches
+	# any of these at all; emitter_c.py's own codegen for the matching ir
+	# instructions can assume _target_debug is always True there. ---
+
+	def _lower_compiler_debug_raw_track( self, node: ast.Call ) -> None:
+		# compiler.__debug_raw_track__(ptr, size) -> None - statement-only
+		# (mirrors compiler.incref/decref/atomic_store); see ir.DebugRawTrack.
+		# ptr's own declared type is whatever the caller already has (Ptr[u8]
+		# from sys.alloc[T]'s own _alloc call) - no fresh Ptr[u8] type object
+		# needed here, this never returns a value of its own.
+		if len( node.args ) != 2 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__debug_raw_track__(...) takes exactly two arguments (ptr, size): {ast.unparse(node)}', node )
+		intrinsics = self.lowering.discovery.get_intrinsics()
+		ptr = self._lower_expr( node.args[0], None )
+		size = self._lower_expr( node.args[1], intrinsics['usize'] )
+		self._emit( ir.DebugRawTrack( ptr = ptr, size = size ))
+
+	def _lower_compiler_debug_raw_untrack( self, node: ast.Call ) -> None:
+		# compiler.__debug_raw_untrack__(ptr) -> None - statement-only,
+		# inverse of __debug_raw_track__; see ir.DebugRawUntrack
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__debug_raw_untrack__(...) takes exactly one argument (ptr): {ast.unparse(node)}', node )
+		ptr = self._lower_expr( node.args[0], None )
+		self._emit( ir.DebugRawUntrack( ptr = ptr ))
+
+	def _lower_compiler_dump_live_objects( self, node: ast.Call ) -> None:
+		# compiler.dump_live_objects() - statement-only (mirrors compiler.
+		# incref/decref/atomic_store), see ir.DumpLiveObjects. A real compile
+		# error outside a debug build (matching the plan's own "compile error
+		# if called from a release build" note) - lib/sys.py's own
+		# dump_live_objects() is the intended entry point and always guards
+		# this behind `if compiler.target.debug:` itself, so reaching here in
+		# a release build means user code called the compiler.* intrinsic
+		# directly, bypassing that guard.
+		if node.args or node.keywords:
+			self.lowering.discovery.fail( f'compiler.dump_live_objects() takes no arguments: {ast.unparse(node)}', node )
+		if not self.lowering.discovery.active_target['debug']:
+			self.lowering.discovery.fail(
+				'compiler.dump_live_objects() is only available in a debug build (compiler.target.debug) - '
+				'no allocation-site tracking exists in a release build to dump', node,
+			)
+		self._emit( ir.DumpLiveObjects() )
 
 	def _lower_compiler_atomic_store( self, node: ast.Call ) -> None:
 		# statement-only (see _stmt_Expr's own dispatch) - mirrors
@@ -5852,7 +6863,60 @@ class FunctionLowering:
 		# rather than an unconditional failure.
 		if len( node.args ) != 1 or node.keywords:
 			self.lowering.discovery.fail( f'compiler.decref(...) takes exactly one argument: {ast.unparse(node)}', node )
-		operand = self._lower_expr( node.args[0], None )
+		arg_node = node.args[0]
+		if isinstance( arg_node, ast.Attribute ):
+			# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: compiler.decref(obj.
+			# field) - the synthesized destructor's own field-teardown shape
+			# (type_resolver.py's _build_field_teardown_ast, RCClass branch) -
+			# means to transfer the FIELD's own single reference directly
+			# into this decref. Lowering obj.field through the ordinary
+			# _expr_Attribute path (this function's normal `operand =
+			# self._lower_expr(...)` below) would go through Part B's own
+			# retain-on-read (B.3) first, creating a SEPARATE, independently-
+			# owned COPY - decref'ing that copy right back only cancels the
+			# extra retain, leaving the field's TRUE original reference
+			# permanently unreleased. Confirmed as a real leak, not a
+			# theoretical one: compiler.refcount() showed a Box captured by
+			# a closure environment gaining one extra reference after the
+			# closure's own teardown ran, every single time. A single
+			# atomic critical section here instead - acquire, a BARE
+			# (unretained) read, decref, release - both fixes the leak and
+			# is cheaper than the generic retain-then-immediately-undo
+			# roundtrip would have been. Only short-circuits the exact
+			# `compiler.decref(<attribute>)` shape - the OTHER established
+			# idiom this intrinsic also serves (`val: T = <read>;
+			# compiler.decref(val)`, list/dict's own element teardown,
+			# manually_decreffed's own docstring) passes an ast.Name, never
+			# reaches here, and is unaffected.
+			field_obj = self._lower_expr( arg_node.value, None )
+			field_var = self.lowering._attr_lookup( field_obj.type, arg_node.attr, arg_node )
+			is_real_field = self._is_real_field_receiver( field_obj.type )
+			if is_real_field:
+				self._check_field_visibility( field_obj.type, field_var, arg_node.attr, arg_node )
+			if is_real_field and cfg.rc_leaves( field_var.type ):
+				self._emit( ir.AcquireFieldLock( obj = field_obj ))
+				raw = self._new_temp( field_var.type )
+				self._emit( ir.GetAttr( dest = raw, obj = field_obj, attr = arg_node.attr ))
+				for instr in self._cfg.decref( field_var.type, raw ):
+					self._emit( instr )
+				self._emit( ir.ReleaseFieldLock( obj = field_obj ))
+				self._cfg.untrack_temp( raw )
+				return
+			# either a non-RC field (nothing to decref - falls into the
+			# generic-method/fail handling below unchanged) or not a real
+			# user field at all (e.g. field_obj.type is a TaggedUnion's own
+			# .tag/.data, no locking concept applies there either) - a bare,
+			# unretained read straight off the ALREADY-LOWERED field_obj,
+			# matching this function's own pre-Part-B behavior exactly,
+			# rather than re-lowering arg_node.value a second time (which
+			# would double any side effects a non-trivial receiver
+			# expression has - confirmed as the right call by _lower_expr's
+			# own general "never re-evaluate an already-lowered operand"
+			# discipline used throughout this file).
+			operand = self._new_temp( field_var.type )
+			self._emit( ir.GetAttr( dest = operand, obj = field_obj, attr = arg_node.attr ))
+		else:
+			operand = self._lower_expr( arg_node, None )
 		if operand.type is not None and cfg.rc_leaves( operand.type ):
 			for instr in self._cfg.decref( operand.type, operand ):
 				self._emit( instr )
@@ -5907,6 +6971,16 @@ class FunctionLowering:
 				f'{operand.type.qualname if operand.type else "?"}: {ast.unparse(node)}',
 				node,
 			)
+		if self.lowering.discovery.active_target['debug']:
+			# debug-mode alloc-site tracking (dump_live_objects) - this
+			# object's own ir.Allocate already tracked it into the global RC
+			# list; sys.free() below frees its storage directly, WITHOUT
+			# going through release_object (that's the whole point - see
+			# this function's own comment on why the real destructor must
+			# never run here), so nothing else will ever untrack it. Must
+			# happen before sys.free() runs, not after - see ir.DebugUntrackRC's
+			# own comment (a real MSVC-only crash, root-caused via bisection).
+			self._emit( ir.DebugUntrackRC( value = operand ))
 		sys_module = self.lowering.discovery.modules['sys']
 		free_overload = sys_module.get_local( 'free' )
 		free_fn = free_overload.implementations[0] if isinstance( free_overload, Overload ) else free_overload
@@ -6173,9 +7247,34 @@ class FunctionLowering:
 		self._emit( ir.Label( name = end_label ))
 		return dest
 
+	def _lower_branch_condition( self, test: ast.expr ) -> ir.Operand:
+		''' shared by _stmt_If/_stmt_While: lowers a statement-level branch
+		condition, then immediately flushes any temps retained while
+		evaluating it (PLAN_THREAD_SAFE_SHARED_STATE.md Part B - e.g. a
+		chained field receiver, `self.a.b`) - BEFORE the caller emits its
+		own JumpIfFalse/branches, not after. Both callers' own branches can
+		diverge early (a while loop's body re-enters this same test every
+		iteration; an if's own branch can return/break/continue, skipping
+		the enclosing statement's normal once-per-statement flush entirely
+		for that path) - either way, deferring the flush past the branch
+		point leaves it as dead code on any path that doesn't fall through
+		to the shared join point, permanently over-retaining whatever the
+		condition retained. Safe to flush even though `test` itself is one
+		of the flushed temps: ir.DeleteTemp is a pure bookkeeping no-op at
+		emission time ("C block scoping already handles temp lifetime" -
+		emitter_c.py's own comment), so `test`'s C variable stays perfectly
+		readable immediately after. Not used by _expr_IfExp - a ternary's
+		own condition can never contain a return/break/continue (it's an
+		expression, not a statement), so its already-existing once-per-
+		statement flush never has an early-exit path to go missing on. '''
+		cond = self._lower_truth_test( test )
+		self._flush_pending_temps()
+		return cond
+
 	def _stmt_While( self, node: ast.While ) -> None:
 		if node.orelse:
 			self.lowering.discovery.fail( 'while/else is not supported', node )
+		pre_loop_mark = len( self._instructions ) # see _lower_loop_body_with_ownership_retry's own docstring - a promoted name's one-time incref splices in here, strictly before start_label
 		start_label = self._new_label( 'while_start' )
 		end_label = self._new_label( 'while_end' )
 		# the test is positioned right after start_label (re-lowered here
@@ -6183,20 +7282,15 @@ class FunctionLowering:
 		# repeated block, same as _stmt_If's test) so it's genuinely
 		# re-evaluated every time the bottom Jump loops back
 		self._emit( ir.Label( name = start_label ))
-		test = self._lower_truth_test( node.test )
+		test = self._lower_branch_condition( node.test )
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
 		# continue_captured unused here - start_label (this loop's own
 		# continue target) is always jumped to by the back edge below
 		# regardless of whether the body itself ever uses `continue`
-		break_narrowed, break_live, _ = self._lower_loop_body( node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
+		break_narrowed, break_live, _ = self._lower_loop_body_with_ownership_retry(
+			node, node.body, continue_label = start_label, break_label = end_label, loop_snapshot = loop_snapshot, pre_loop_mark = pre_loop_mark,
+		)
 		# Phase 7/8: reconcile every way execution can actually reach
 		# end_label - the loop's own natural (condition-false) exit, PLUS
 		# every break_narrowed record_break_narrowed() collected while
@@ -6234,6 +7328,74 @@ class FunctionLowering:
 		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed, natural_exit_live, break_live )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
+
+	def _lower_loop_body_with_ownership_retry(
+		self, node: ast.AST, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object, pre_loop_mark: int,
+	) -> tuple[list[dict[str,list[Variable]]],list[set[str]],bool]:
+		''' _lower_loop_body() + loop_back_edge() (+ emitting the back-edge
+		instructions and restore()'ing), run up to twice. A loop body is
+		lowered exactly ONCE and reused via the back edge, so a reassignment
+		like `path = file` (borrowed) / `path = os.path.join(...)` (owned) -
+		already reconciled by merge_if() into a single OWNED-with-flag state
+		for the REST of one iteration - still leaves the loop's own ENTRY
+		state (whatever `path` was before the loop, e.g. a borrowed
+		parameter) disagreeing with that back edge: BORROWED vs OWNED,
+		cfg.py's loop_back_edge() own hard error. Unlike merge_if's two
+		independently-lowered branches, there's no reconciling this after
+		the fact - the reassignment sites inside were already compiled
+		assuming the ENTRY state (BORROWED), so neither of them emitted the
+		decref-before-overwrite an OWNED entry would need on iteration 2+; a
+		bare "promote and hope" would leak one reference per iteration.
+
+		So: on the first CompileError from loop_back_edge, check whether
+		it's exactly that safe shape (cfg.py's find_promotable_loop_
+		mismatches - the same BORROWED-vs-OWNED case merge_if() reconciles
+		for if/else). If so, every side effect of that attempt is
+		rolled back - emitted instructions, cfg bindings/epilogue/cancel-flag
+		state (via hard_restore(), NOT the ordinary restore() lowering.py
+		uses on success - a defer registered while lowering the doomed
+		attempt gets fully discarded, not kept alive for a function epilogue
+		that will never see that code again, since the retried body below
+		re-registers a fresh one), defer-flag registrations, pending temps -
+		the mismatched names are then promoted to OWNED via promote_
+		borrowed_for_loop() - a ONE-TIME incref spliced in at pre_loop_mark,
+		strictly before this loop's own start label so the back-edge jump
+		(which targets that label directly) never re-runs it - and the body
+		is lowered again, this time with every reassignment site seeing the
+		true steady-state entry ownership up front. Any other CompileError,
+		or a mismatch still unresolved after that one retry, is reported for
+		real via discovery.fail(). '''
+		for attempt_number in ( 1, 2 ):
+			body_snapshot = self._cfg.snapshot()
+			instructions_mark = len( self._instructions )
+			defer_flags_mark = len( self._defer_flags )
+			cancel_flags_mark = self._cfg.cancel_flag_count
+			pending_temps_mark = len( self._pending_temps )
+			try:
+				break_narrowed, break_live, continue_captured = self._lower_loop_body(
+					body, continue_label = continue_label, break_label = break_label, loop_snapshot = loop_snapshot,
+				)
+				back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
+			except CompileError as e:
+				promotable = self._cfg.find_promotable_loop_mismatches( loop_snapshot.bindings ) if attempt_number == 1 else set()
+				if not promotable:
+					self.lowering.discovery.fail( str( e ), node )
+				del self._instructions[instructions_mark:]
+				del self._defer_flags[defer_flags_mark:]
+				self._cfg.truncate_cancel_flags( cancel_flags_mark )
+				del self._pending_temps[pending_temps_mark:]
+				self._cfg.hard_restore( body_snapshot )
+				promo_instructions: list[ir.Instruction] = []
+				for promoted_name in sorted( promotable ):
+					promo_instructions += self._cfg.promote_borrowed_for_loop( promoted_name )
+					loop_snapshot.bindings[promoted_name] = self._cfg.bindings[promoted_name]
+				self._instructions[pre_loop_mark:pre_loop_mark] = promo_instructions
+				continue
+			for instr in back_edge_instructions:
+				self._emit( instr )
+			self._cfg.restore( loop_snapshot )
+			return break_narrowed, break_live, continue_captured
+		assert False, 'unreachable' # the attempt_number==2 branch above always either returns or calls discovery.fail (NoReturn)
 
 	def _lower_loop_body( self, body: list[ast.stmt], continue_label: str, break_label: str, loop_snapshot: object ) -> tuple[list[dict[str,list[Variable]]],list[set[str]],bool]:
 		self._loop_depth += 1
@@ -6331,45 +7493,34 @@ class FunctionLowering:
 		return var
 
 	def _maybe_consume_result( self, node: ast.AST, value: ir.Temp, alternatives: str ) -> ir.Operand:
-		# if `value` is itself a Result[T,E], auto-consume it via the same
-		# OrReturn/OrJump propagation or_return()/checked arithmetic use -
-		# unlike _lower_or_return, a non-Result value is passed through
-		# unchanged rather than rejected, since not every method this is
-		# used for (__getitem__, __len__) is necessarily fallible. Uses
-		# find_name_or_none (not find_name) - unlike every other Result
-		# lookup in this file, this one runs speculatively for ANY value,
-		# so a program that never defines Result at all (or hasn't
-		# imported builtins) must not hard-fail here just because this
-		# particular value happens not to be Result-shaped
-		shape = self.lowering._type_resolver._result_shape( value.type )
-		if shape is None:
-			return value
-		result_type, error_cls = shape
-		# find_name, not value.type.base - value.type may already be the
-		# real, monomorphized Result object itself (not a Specialization
-		# wrapper) by the time _result_shape above succeeds - see
-		# Monomorphizer.origin_of's own docstring. Safe to use the raising
-		# lookup here (unlike _result_shape's own find_name_or_none) since
-		# shape being non-None already proves Result is defined
-		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		self.lowering._type_resolver._require_result_return( node, result_cls, error_cls, alternatives, fn = self._current_fn )
-		return self._consume_checked_result( node, value, result_type, extra = None )
+		# if `value` is itself a Result[T,E], auto-consume it - unlike
+		# _lower_or_return, a non-Result value is passed through unchanged
+		# rather than rejected, since not every method this is used for
+		# (__getitem__, __len__) is necessarily fallible. The old panic_errmsg
+		# carve-out (Unwrap-panic instead of or_throw(), for a for-loop's own
+		# compiler-proven-safe bounds-checked element read) was removed along
+		# with the indexable for-loop lowering path it was the only caller of
+		# - see b1fc7f9 "Unify for-loop dispatch to strict IteratorProtocol[T]/
+		# Iterable[T] conformance"; for-loops no longer synthesize a raw
+		# __getitem__ call needing this, so nothing calls this with a panic
+		# message anymore
+		result = self._auto_or_throw( node, value, alternatives, want_result = True )
+		assert result is not None # want_result=True above guarantees this
+		return result
 
-	def _reject_unconsumed_result_operand( self, node: ast.AST, operand: ir.Operand ) -> None:
+	def _reject_unconsumed_result_operand( self, node: ast.AST, operand: ir.Operand ) -> ir.Operand:
 		# an unconsumed Result[T,E] used directly as a binop/comparison
-		# operand is (unlike __len__/__getitem__ above) never legitimate -
-		# Result is itself a @union, so left unchecked it would silently
-		# fall into the ordinary union leaf-pair dispatch and get decomposed
-		# into per-leaf (T, E) arithmetic/comparison instead of erroring
-		shape = self.lowering._type_resolver._result_shape( operand.type )
-		if shape is None:
-			return
-		result_type, error_cls = shape
-		self.lowering.discovery.fail(
-			f'operand is a Result[{result_type.qualname},{error_cls.qualname}] - consume it first '
-			f'via .unwrap()/.or_return()/match: {ast.unparse(node)}',
-			node,
-		)
+		# operand is (unlike __len__/__getitem__ above) never legitimate as-
+		# is - Result is itself a @union, so left unchecked it would
+		# silently fall into the ordinary union leaf-pair dispatch and get
+		# decomposed into per-leaf (T, E) arithmetic/comparison instead of
+		# erroring. Auto-.or_throw()s it instead of hard-rejecting - the
+		# general case-1/case-2 rule (see _auto_or_throw) applies here too:
+		# `(a + b) + c` needs a + b's own leftover Result auto-consumed
+		# before it can become the outer +'s own left operand.
+		result = self._auto_or_throw( node, operand, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = True )
+		assert result is not None # want_result=True above guarantees this
+		return result
 
 	def _bind_loop_target( self, target: ast.Name, default_type: Type, value_expr: ast.expr, node: ast.AST ) -> Variable:
 		# mirrors _stmt_Assign's Name-target "reuse existing, else infer/
@@ -6381,6 +7532,7 @@ class FunctionLowering:
 		# (range()'s implicit start=0) with no type of its own to infer from
 		existing = self._existing_local_or_none( target.id, node, 'cannot use it as a for loop target' )
 		if existing is not None:
+			self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 			operand = self._lower_expr( value_expr, existing.type )
 			self._emit( ir.Assign( dest = existing, src = operand ))
 			self._cfg.mark_live( existing.stem ) # this bypasses _cfg_assign like the rest of this function does (pre-existing, not touched here) - liveness alone still needs marking, since it's unconditionally assigned right here regardless
@@ -6392,7 +7544,15 @@ class FunctionLowering:
 
 	def _stmt_For( self, node: ast.For ) -> None:
 		if not isinstance( node.target, ast.Name ):
-			self.lowering.discovery.fail( f'for loop target must be a plain name: {ast.unparse(node)}', node )
+			# a Tuple target (`for a, b in EXPR:`) is desugared away by
+			# type_resolver.py's _ReferenceResolver.visit_For long before
+			# this ever runs - reaching here with one would mean that pass
+			# was skipped somehow, so this stays a hard failure rather than
+			# silently re-attempting the same desugar. NOT ast.unparse(node)
+			# - that would dump this for-loop's entire BODY into the message
+			# (a real repro: a multi-statement for-body produced a
+			# multi-line error that buried the actual problem)
+			self.lowering.discovery.fail( f'for loop target must be a plain name: {ast.unparse(node.target)}', node )
 		if node.orelse:
 			self.lowering.discovery.fail( 'for/else is not supported', node )
 		if self.lowering._is_range_call( node.iter ) is not None:
@@ -6402,15 +7562,84 @@ class FunctionLowering:
 		# (not once per candidate path) and the resulting operand handed to
 		# whichever real consumption path applies, so an iterable expression
 		# with a side effect (most commonly: a generator CONSTRUCTOR call)
-		# is never evaluated twice - _lower_for_over_indexable used to lower
-		# node.iter itself; it now takes the already-lowered operand instead,
-		# the same way _lower_for_over_iterator does
+		# is never evaluated twice - _lower_for_over_iterator's own obj
+		# parameter is always this already-lowered operand, never re-derived
+		# from node.iter itself.
+		#
+		# Strict IteratorProtocol[T]/Iterable[T] protocol dispatch, no
+		# structural duck-typing (confirmed with the user - a for-loop
+		# subject must DECLARE conformance, not merely happen to have
+		# matching method names): an object that's ALREADY an iterator (a
+		# real generator, or any hand-written IteratorProtocol[T] conformer)
+		# drives its own __next__() directly, unchanged from before. An
+		# Iterable[T] conformer (list/
+		# set/tuple/VariadicTuple/dict/...) gets its __iter__() called ONCE
+		# here to obtain a real iterator, which then drives the exact same
+		# __next__()-consumption path - "iter() on an iterator returns
+		# itself" is subsumed by the FIRST branch already handling a
+		# self-iterating object without ever needing to call __iter__() on
+		# it at all, rather than needing every IteratorProtocol[T] conformer
+		# to also separately implement Iterable[T].__iter__ returning self.
+		#
+		# This is a real, confirmed correctness fix, not just stricter
+		# typing: the old __len__/__getitem__(usize) duck-typing this
+		# replaced would have silently misused dict[K,V]'s own __getitem__
+		# (key: K) as if it were positional 0..len indexing for `for k in
+		# some_dict:` whenever K happened to be usize-compatible - dict
+		# never declares __next__ directly, so it always fell to that path.
 		obj = self._lower_expr( node.iter, None )
-		next_fn = self.lowering._find_iterator_next_method( obj.type )
-		if next_fn is not None:
+		iterator_protocol = self.lowering.discovery.find_name( 'IteratorProtocol', node )
+		iterable_protocol = self.lowering.discovery.find_name( 'Iterable', node )
+		if self.lowering._type_conforms_to_protocol( obj.type, iterator_protocol ):
+			next_fn = self.lowering._find_iterator_next_method( obj.type )
+			assert next_fn is not None, 'internal compiler error: IteratorProtocol[T] conformance declared without a real __next__'
 			self._lower_for_over_iterator( node, obj, next_fn )
+		elif self.lowering._type_conforms_to_protocol( obj.type, iterable_protocol ):
+			iter_fn = self.lowering._find_method( obj.type, '__iter__' )
+			assert iter_fn is not None, 'internal compiler error: Iterable[T] conformance declared without a real __iter__'
+			self.lowering._ensure_resolved( iter_fn )
+			# __iter__'s own declared return type (Generator[T,StopIteration])
+			# is still the bare, unresolved GeneratorType annotation until
+			# its own passthrough body ("return _sequence_iter(self)"-shaped)
+			# gets synthesized - mirrors lower_function's own identical
+			# safety-net call for an ordinary generator reached with no
+			# earlier caller (PLAN_GENERATORS.md).
+			self.lowering._type_resolver.ensure_generator_synthesized( iter_fn )
+			self.lowering.schedule( iter_fn.return_type )
+			iterator_dest = self._new_temp( iter_fn.return_type )
+			self._emit( ir.Call( dest = iterator_dest, target = iter_fn, receiver = obj, args = [], kwargs = {} ))
+			# obj's own receiver use ends right here - __iter__() built its
+			# own independently-retained iterator (e.g. Part B's own retain-
+			# on-read for a chained field receiver, `self.a.b`, or a fresh
+			# Call/Allocate result), so if obj was itself a genuinely fresh/
+			# owned temp, it needs releasing NOW, not deferred to the natural
+			# end of this statement (see _lower_for_over_iterator's own
+			# identical reasoning for iterator_dest below) - the loop body
+			# below can return/break early, well before this statement's own
+			# generic end-of-statement flush would ever run. A bare aliasing
+			# read (obj already borrowed from an existing binding, e.g. `for
+			# x in some_local_iterable:`) is unaffected: is_fresh_temp is
+			# False there, so this is a no-op, matching its existing (already
+			# correct) behavior of never releasing a borrowed reference.
+			if self._cfg.is_fresh_temp( obj ):
+				for instr in self._cfg.delete_temp( obj ):
+					self._emit( instr )
+				self._emit( ir.DeleteTemp( temp = obj ))
+			next_fn = self.lowering._find_iterator_next_method( iterator_dest.type )
+			if next_fn is None:
+				self.lowering.discovery.fail(
+					f'{obj.type.qualname if obj.type else "?"}.__iter__() returned '
+					f'{iterator_dest.type.qualname if iterator_dest.type else "?"}, which does not conform to '
+					f'IteratorProtocol[T] (missing __next__): {ast.unparse(node.iter)}',
+					node,
+				)
+			self._lower_for_over_iterator( node, iterator_dest, next_fn )
 		else:
-			self._lower_for_over_indexable( node, obj )
+			self.lowering.discovery.fail(
+				f'for loop requires an IteratorProtocol[T] or Iterable[T] conformer, got '
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node.iter)}',
+				node,
+			)
 
 	def _lower_for_range( self, node: ast.For ) -> None:
 		call = node.iter
@@ -6434,6 +7663,7 @@ class FunctionLowering:
 		stop_var = self._declare_hidden_local( f'__for_stop_{self._label_id}', usize_cls, node )
 		self._emit( ir.Assign( dest = stop_var, src = stop_operand ))
 
+		pre_loop_mark = len( self._instructions ) # see _lower_loop_body_with_ownership_retry's own docstring - a promoted name's one-time incref splices in here, strictly before start_label
 		start_label = self._new_label( 'for_start' )
 		continue_label = self._new_label( 'for_continue' )
 		end_label = self._new_label( 'for_end' )
@@ -6445,14 +7675,9 @@ class FunctionLowering:
 		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
 
 		loop_snapshot = self._cfg.snapshot()
-		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body_with_ownership_retry(
+			node, node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot, pre_loop_mark = pre_loop_mark,
+		)
 		# Phase 8: a for-loop has no type(x) is T condition of its own to
 		# narrow FROM, but its natural exit (the range simply exhausted,
 		# including never having run the body at all - always reachable
@@ -6476,96 +7701,6 @@ class FunctionLowering:
 		incr = self._new_temp( usize_cls )
 		self._emit( ir.AddWrap( dest = incr, left = target_var, right = ir.Const( type = usize_cls, value = 1 ) ))
 		self._emit( ir.Assign( dest = target_var, src = incr ))
-		self._emit( ir.Jump( target = start_label ))
-		self._emit( ir.Label( name = end_label ))
-
-	def _lower_for_over_indexable( self, node: ast.For, obj: ir.Operand ) -> None:
-		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-
-		len_fn = self.lowering._find_method( obj.type, '__len__' )
-		getitem_fn = self._find_indexlike_getitem( obj.type )
-		missing = [ name for name, fn in (( '__len__', len_fn ), ( '__getitem__', getitem_fn )) if fn is None ]
-		if missing:
-			self.lowering.discovery.fail(
-				f'for loop needs {" and ".join(missing)} (or a __next__() returning T|None) on '
-				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
-				node,
-			)
-
-		unique = self._label_id
-		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
-		self._emit( ir.Assign( dest = obj_var, src = obj ))
-
-		self.lowering._ensure_resolved( len_fn )
-		if self.lowering._type_resolver._result_shape( len_fn.return_type ) is not None:
-			self.lowering.discovery.fail(
-				f'for loop iteration requires an infallible __len__() - '
-				f'{obj.type.qualname if obj.type else "?"}.__len__() returns '
-				f'{len_fn.return_type.qualname}, which can fail - this __len__() call is '
-				f'compiler-synthesized (no source position exists to attach .unwrap()/'
-				f'.or_return() to); iterate manually via while+__getitem__ instead: {ast.unparse(node)}',
-				node,
-			)
-		self.lowering.schedule( len_fn.return_type )
-		len_dest = self._new_temp( len_fn.return_type )
-		self._emit( ir.Call( dest = len_dest, target = len_fn, receiver = obj_var, args = [], kwargs = {} ))
-		len_var = self._declare_hidden_local( f'__for_len_{unique}', len_dest.type, node )
-		self._emit( ir.Assign( dest = len_var, src = len_dest ))
-
-		index_var = self._declare_hidden_local( f'__for_index_{unique}', usize_cls, node )
-		self._emit( ir.Assign( dest = index_var, src = ir.Const( type = usize_cls, value = 0 ) ))
-
-		start_label = self._new_label( 'for_start' )
-		continue_label = self._new_label( 'for_continue' )
-		end_label = self._new_label( 'for_end' )
-
-		self._emit( ir.Label( name = start_label ))
-		test = ast.Compare( left = self.lowering._synth_name( index_var.stem, node ), ops = [ ast.Lt() ], comparators = [ self.lowering._synth_name( len_var.stem, node ) ] )
-		ast.copy_location( test, node )
-		cond = self._lower_expr( test, bool_cls )
-		self._emit( ir.JumpIfFalse( cond = cond, target = end_label ))
-
-		# the snapshot is taken here, BEFORE the loop target's own binding -
-		# that binding (e.g. `s2 = obj[index]`) happens fresh every
-		# iteration, exactly like any other loop-body statement (matches
-		# foo4: a value reassigned each iteration is expected to be stable
-		# across the back edge, not confined-and-torn-down)
-		loop_snapshot = self._cfg.snapshot()
-		subscript = ast.Subscript(
-			value = self.lowering._synth_name( obj_var.stem, node ),
-			slice = self.lowering._synth_name( index_var.stem, node ),
-			ctx = ast.Load(),
-		)
-		ast.copy_location( subscript, node )
-		# __getitem__ is expected to always be fallible in practice (it must
-		# be able to report IndexError/KeyError) - this read is compiler-
-		# synthesized (no source position for the user to attach .unwrap()/
-		# .or_return() to), so it keeps auto-consuming a Result exactly like
-		# _expr_Subscript used to unconditionally do, unlike ordinary
-		# user-written `x[i]` (see _expr_Subscript's own comment)
-		subscript.is_for_loop_element_read = True
-		bind = ast.Assign( targets = [ node.target ], value = subscript )
-		ast.copy_location( bind, node )
-		self._stmt_Assign( bind )
-
-		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
-		# Phase 8 - see _lower_for_range's own identical call/comment
-		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
-
-		# see _lower_for_range's own identical comment on continue_captured
-		if continue_captured:
-			self._emit( ir.Label( name = continue_label ))
-		incr = self._new_temp( usize_cls )
-		self._emit( ir.AddWrap( dest = incr, left = index_var, right = ir.Const( type = usize_cls, value = 1 ) ))
-		self._emit( ir.Assign( dest = index_var, src = incr ))
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 
@@ -6595,58 +7730,70 @@ class FunctionLowering:
 		entry_snapshot = self._cfg.snapshot()
 		outer_instructions = self._instructions
 		self._instructions = []
-		self._cfg.enter_branch( entry_snapshot.stack_depth )
-		true_temps_start = len( self._pending_temps )
+		# same entry_snapshot/restore() shape _stmt_If/_stmt_Try use for
+		# their own sibling branches - a thunk that manually decrefs an
+		# entry declared BEFORE this call (e.g. or_throw(mapper)'s own
+		# err_thunk explicitly compiler.decref()ing the receiver, since a
+		# GOTO-based ir.Raise never unwinds anything on its own) needs the
+		# SAME protection, or the OTHER thunk - restored back to this same
+		# entry snapshot - would walk right past that entry on ITS own
+		# path. See cfg.py's enter_diverging_paths() docstring.
+		self._cfg.enter_diverging_paths( entry_snapshot.stack_depth )
 		try:
-			true_terminates = true_thunk()
+			self._cfg.enter_branch( entry_snapshot.stack_depth )
+			true_temps_start = len( self._pending_temps )
+			try:
+				true_terminates = true_thunk()
+			finally:
+				self._cfg.exit_branch()
+			# each thunk's own PURELY INTERMEDIATE temps (e.g. leaf_bind_thunk's
+			# E'-union coercion wrapper, built to pass a narrowed leaf value into
+			# Result.Err(e: E')) must be flushed HERE, still inside this branch's
+			# own captured instruction list - _flush_branch_temps' own comment
+			# documents the exact same crash class this recreates otherwise:
+			# left pending, they'd survive into the ENCLOSING statement's single
+			# unconditional end-of-statement flush (this method builds raw IR,
+			# never routes a thunk's own statements through _lower_stmt, so nothing
+			# else ever flushes them) and get decref'd there even for whichever
+			# branch never ran at runtime - reading tag/payload data off an
+			# uninitialized C local (confirmed via a real crash: multi_leaf-style
+			# two-leaf error dispatch, MSVC access violation)
+			self._flush_branch_temps( true_temps_start )
+			true_captured = self._instructions
+			true_end = dict( self._cfg.bindings )
+			true_end_results = self._cfg.unchecked_results()
+			true_end_narrowed = self._cfg.narrowed_snapshot()
+			true_end_live = self._cfg.live_snapshot()
+	
+			self._cfg.restore( entry_snapshot )
+			self._instructions = []
+			self._cfg.enter_branch( entry_snapshot.stack_depth )
+			false_temps_start = len( self._pending_temps )
+			try:
+				false_terminates = false_thunk()
+			finally:
+				self._cfg.exit_branch()
+			self._flush_branch_temps( false_temps_start )
+			false_captured = self._instructions
+			false_end = dict( self._cfg.bindings )
+			false_end_results = self._cfg.unchecked_results()
+			false_end_narrowed = self._cfg.narrowed_snapshot()
+			false_end_live = self._cfg.live_snapshot()
+	
+			self._cfg.restore( entry_snapshot )
+			self._instructions = outer_instructions
+			try:
+				true_extra, false_extra, removed = self._cfg.merge_if(
+					entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
+					entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
+					true_terminates = true_terminates, false_terminates = false_terminates,
+					true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
+					true_end_live = true_end_live, false_end_live = false_end_live,
+				)
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
 		finally:
-			self._cfg.exit_branch()
-		# each thunk's own PURELY INTERMEDIATE temps (e.g. leaf_bind_thunk's
-		# E'-union coercion wrapper, built to pass a narrowed leaf value into
-		# Result.Err(e: E')) must be flushed HERE, still inside this branch's
-		# own captured instruction list - _flush_branch_temps' own comment
-		# documents the exact same crash class this recreates otherwise:
-		# left pending, they'd survive into the ENCLOSING statement's single
-		# unconditional end-of-statement flush (this method builds raw IR,
-		# never routes a thunk's own statements through _lower_stmt, so nothing
-		# else ever flushes them) and get decref'd there even for whichever
-		# branch never ran at runtime - reading tag/payload data off an
-		# uninitialized C local (confirmed via a real crash: multi_leaf-style
-		# two-leaf error dispatch, MSVC access violation)
-		self._flush_branch_temps( true_temps_start )
-		true_captured = self._instructions
-		true_end = dict( self._cfg.bindings )
-		true_end_results = self._cfg.unchecked_results()
-		true_end_narrowed = self._cfg.narrowed_snapshot()
-		true_end_live = self._cfg.live_snapshot()
-
-		self._cfg.restore( entry_snapshot )
-		self._instructions = []
-		self._cfg.enter_branch( entry_snapshot.stack_depth )
-		false_temps_start = len( self._pending_temps )
-		try:
-			false_terminates = false_thunk()
-		finally:
-			self._cfg.exit_branch()
-		self._flush_branch_temps( false_temps_start )
-		false_captured = self._instructions
-		false_end = dict( self._cfg.bindings )
-		false_end_results = self._cfg.unchecked_results()
-		false_end_narrowed = self._cfg.narrowed_snapshot()
-		false_end_live = self._cfg.live_snapshot()
-
-		self._cfg.restore( entry_snapshot )
-		self._instructions = outer_instructions
-		try:
-			true_extra, false_extra, removed = self._cfg.merge_if(
-				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
-				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
-				true_terminates = true_terminates, false_terminates = false_terminates,
-				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
-				true_end_live = true_end_live, false_end_live = false_end_live,
-			)
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
+			self._cfg.exit_diverging_paths()
 
 		for instr in true_captured:
 			self._emit_captured( instr )
@@ -6719,7 +7866,7 @@ class FunctionLowering:
 		if shape is None or stop_iteration_cls is None or stop_iteration_cls not in self.lowering._type_resolver._atomic_leaves( shape[1] ):
 			self.lowering.discovery.fail(
 				f'for loop needs __next__() to return Result[T,E] (E including StopIteration) on '
-				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node.iter)}',
 				node,
 			)
 		elem_type, full_error_type = shape
@@ -6752,6 +7899,47 @@ class FunctionLowering:
 		unique = self._label_id
 		obj_var = self._declare_hidden_local( f'__for_obj_{unique}', obj.type, node )
 		self._emit( ir.Assign( dest = obj_var, src = obj ))
+		# obj_var holds the iterator this loop drives via __next__() for its
+		# ENTIRE body, unlike _stmt_If/_stmt_While's own condition temps
+		# (needed only up to the branch point) - it can't be released the
+		# instant it's bound, only once the loop truly ends, on EVERY exit
+		# path: normal exhaustion, break (both converge at end_label below),
+		# and an early return/continue-out-of-an-enclosing-construct reached
+		# from inside the loop body, which skips end_label entirely. Only a
+		# genuinely fresh/owned obj (a real Call/Allocate result, or Part B's
+		# own retain-on-read for a chained field receiver, `self.a.b`) needs
+		# this at all - a bare aliasing read (`for x in some_local_iterator:`)
+		# never took an extra reference in the first place, so obj_var stays
+		# a plain, unreleased borrow, matching this function's existing
+		# (correct) behavior for that case. untrack_temp here hands the
+		# release responsibility to the registered defer below instead of
+		# leaving it as an ordinary pending temp - this statement's own
+		# generic end-of-statement flush would otherwise still try to
+		# release it too, once the defer already has (a double-free) or,
+		# worse, only ever release it there at all, which is unreachable
+		# dead code on any early-return exit (the exact bug this mirrors
+		# from _stmt_If's own identical fix).
+		def _make_obj_decref_stmt() -> ast.stmt:
+			# a FRESH node every call, never reused across the two sites this
+			# is called from (defer registration below, and the disarm-and-
+			# call-directly site right after end_label) - mirrors
+			# _lower_with_context_manager's own identical _make_exit_stmt()
+			# and its own comment on why
+			call = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+				args = [ self.lowering._synth_name( obj_var.stem, node ) ], keywords = [],
+			)
+			ast.fix_missing_locations( ast.copy_location( call, node ))
+			stmt = ast.Expr( value = call )
+			ast.fix_missing_locations( ast.copy_location( stmt, node ))
+			return stmt
+
+		obj_needs_release = self._cfg.is_fresh_temp( obj )
+		obj_release_flag: Variable|None = None
+		if obj_needs_release:
+			self._cfg.untrack_temp( obj )
+			self._register_defer_block( is_err_only = False, body = [ _make_obj_decref_stmt() ], node = node, allow_inside_loop = True )
+			obj_release_flag = self._defer_flags[-1] # the one push_defer above just armed
 		next_var = self._declare_hidden_local( f'__for_next_{unique}', result_type, node )
 
 		if remaining_error_type is not None:
@@ -6771,6 +7959,7 @@ class FunctionLowering:
 			target_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ elem_type, remaining_error_type ] )
 			self._declare_hidden_local( node.target.id, target_type, node, user_facing = True )
 
+		pre_loop_mark = len( self._instructions ) # see _lower_loop_body_with_ownership_retry's own docstring - a promoted name's one-time incref splices in here, strictly before start_label
 		start_label = self._new_label( 'for_start' )
 		continue_label = self._new_label( 'for_continue' )
 		end_label = self._new_label( 'for_end' )
@@ -6778,9 +7967,8 @@ class FunctionLowering:
 		self._emit( ir.Label( name = start_label ))
 		# snapshot at the VERY TOP of the loop, before next_var's own
 		# per-iteration rebind AND before the loop target's own binding -
-		# same reasoning _lower_for_over_indexable's identical comment gives
-		# (both bindings are fresh every iteration, not confined-and-torn-
-		# down across it) - taken here, before ANY of that, so loop_back_
+		# both bindings are fresh every iteration, not confined-and-torn-
+		# down across it - taken here, before ANY of that, so loop_back_
 		# edge()'s later reconciliation sees next_var (like the target) as
 		# absent from entry/present at the back edge and decrefs its stale
 		# value right before jumping back to start_label. A raw ir.Assign
@@ -6813,8 +8001,14 @@ class FunctionLowering:
 		ast.copy_location( is_err_test, node )
 		is_err_cond = self._lower_expr( is_err_test, bool_cls )
 
+		# only set (and only reachable) in the remaining_error_type is None
+		# branch below - see its own comment at the bottom of this method
+		# for why this exit needs its own dedicated label rather than
+		# jumping straight to end_label the way it used to
+		stop_label: str|None = None
 		if remaining_error_type is None:
-			self._emit( ir.JumpIfTrue( cond = is_err_cond, target = end_label ))
+			stop_label = self._new_label( 'for_stop' )
+			self._emit( ir.JumpIfTrue( cond = is_err_cond, target = stop_label ))
 			self._cfg.narrow( next_var.stem, ok_member )
 			bind = ast.Assign( targets = [ node.target ], value = self.lowering._synth_name( next_var.stem, node ))
 			ast.copy_location( bind, node )
@@ -6825,14 +8019,9 @@ class FunctionLowering:
 				remaining_leaves, remaining_error_type, stop_iteration_cls, end_label, unique,
 			)
 
-		break_narrowed, break_live, continue_captured = self._lower_loop_body( node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot )
-		try:
-			back_edge_instructions = self._cfg.loop_back_edge( loop_snapshot.bindings, self._current_fn.qualname, entry_results = loop_snapshot.results )
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
-		for instr in back_edge_instructions:
-			self._emit( instr )
-		self._cfg.restore( loop_snapshot )
+		break_narrowed, break_live, continue_captured = self._lower_loop_body_with_ownership_retry(
+			node, node.body, continue_label = continue_label, break_label = end_label, loop_snapshot = loop_snapshot, pre_loop_mark = pre_loop_mark,
+		)
 		# Phase 8 - see _lower_for_range's own identical call/comment
 		self._cfg.merge_loop_exits( dict( loop_snapshot.narrowed ), break_narrowed, set( loop_snapshot.live ), break_live )
 
@@ -6840,7 +8029,76 @@ class FunctionLowering:
 		if continue_captured:
 			self._emit( ir.Label( name = continue_label ))
 		self._emit( ir.Jump( target = start_label ))
+		if stop_label is not None:
+			self._emit( ir.Label( name = stop_label ))
+			# next_var holds the Err/StopIteration payload __next__() just
+			# returned - unlike `break` (which already releases next_var's
+			# CURRENT payload itself, via its own existing branch-confined-
+			# binding cleanup - see _stmt_Break) this JumpIfTrue above is a
+			# bare, hand-emitted jump with none of that machinery behind it,
+			# so nothing else ever releases it. The ORDINARY per-iteration
+			# release (right before looping back to start_label, paired with
+			# next_var's own assignment above) only runs on the NORMAL
+			# continuation path - this exit skips straight past it. next_var's
+			# own cfg-tracked binding (from cfg.assign() above) is no help
+			# either: restore(loop_snapshot) below already drops it back to
+			# its pre-loop (nonexistent) state, same as any other loop-
+			# confined binding - so this can't reuse that tracking, it has to
+			# be a bare, tag-dispatched release keyed on next_var's OWN
+			# declared type, exactly like compiler.decref(x)'s own "bare
+			# Name" path. A dedicated label (not just falling into end_label,
+			# which break ALSO targets) is required specifically so this
+			# release never runs on break's own path too - it already has
+			# its own, and this would double-release the SAME payload
+			# otherwise (confirmed via a real repro: an RC-typed element
+			# still `for`-in-progress when `break` fires came back under-
+			# counted, not over, until this was scoped to just this label).
+			# Confirmed as a real leak via AddressSanitizer for the
+			# StopIteration case: a fresh StopIteration object allocated
+			# every time a for-loop's iterator is exhausted, permanently
+			# unreachable afterward - found only once the pending-temp
+			# fixes elsewhere in this method stopped masking it.
+			#
+			# A NARROWED extraction (GetAttr(data)+GetAttr(v_<Err member>)),
+			# not a general cfg.decref(result_type, next_var) - stop_label is
+			# ONLY reached via is_err_cond being true, so the tag is
+			# statically known Err here; a general tag-dispatched decref
+			# would still emit a genuinely dead v_Ok GetAttr+Decref pair
+			# alongside the real v_Err one (unreachable at runtime, since
+			# this label's only predecessor already proved the tag isn't Ok -
+			# but still emitted, unconditionally, as part of decref()'s own
+			# generic per-leaf dispatch). That dead pair collided with
+			# lowering_test.py's own test_for_over_indexable_rc_element_
+			# decref_stays_inside_loop_body, which (rightly) asserts every
+			# v_Ok Decref appears before the loop's back-edge Jump, to guard
+			# against a DIFFERENT, previously-fixed bug (the per-iteration
+			# element decref only firing once, after the whole loop, instead
+			# of every iteration) - this narrowed version simply never emits
+			# a v_Ok arm at all, so there's nothing to collide with, and it's
+			# less code besides.
+			data_dest = self._new_temp( _payload_cls )
+			self._emit( ir.GetAttr( dest = data_dest, obj = next_var, attr = _data_attr.stem ))
+			err_dest = self._new_temp( err_member.type )
+			self._emit( ir.GetAttr( dest = err_dest, obj = data_dest, attr = f'v_{err_member.stem}' ))
+			for instr in self._cfg.decref( err_member.type, err_dest ):
+				self._emit( instr )
 		self._emit( ir.Label( name = end_label ))
+		if obj_needs_release:
+			# every non-early-return exit converges here (normal exhaustion
+			# via stop_label above, and break via break_label=end_label) -
+			# obj_var's own lexical extent ends exactly at this label, so
+			# disarm the registered defer and release it directly, right
+			# here, matching _lower_with_context_manager's own identical
+			# "disarm + direct call" pattern (see its own comment for why:
+			# without this, obj_var would leak past the for-statement's own
+			# end and only ever get released later, at the function's own
+			# eventual return/epilogue - too broad, not "when this loop
+			# ends"). An early return reached from inside the loop body
+			# never reaches this point at all - that path is exactly what
+			# the still-armed defer itself covers, replayed by _stmt_Return.
+			assert obj_release_flag is not None
+			self._emit( ir.Assign( dest = obj_release_flag, src = ir.Const( type = bool_cls, value = False )))
+			self._lower_stmt( _make_obj_decref_stmt() )
 
 	def _lower_for_over_iterator_fallible_bind(
 		self, node: ast.For, next_var: Variable, err_member: Variable, ok_member: Variable, is_err_cond: ir.Operand,
@@ -7012,6 +8270,26 @@ class FunctionLowering:
 						return True
 		return False
 
+	def _try_diverges( self, node: ast.Try ) -> bool:
+		''' 3-way generalization of _stmt_diverges's own ast.If case, for a
+		try statement: true iff EVERY reachable path out of body/else/
+		handlers already diverges - i.e. nothing can fall through to the
+		try statement's own natural end. Does NOT factor in finalbody's own
+		divergence - _stmt_diverges' own ast.Try branch checks that
+		separately (finally runs on every path, including the ones this
+		already counts as diverging, so it can't change the answer here
+		either way); _stmt_Try's own fallthrough-inline decision (whether to
+		disarm and inline finalbody directly, vs. leave it to fire once from
+		the function's real epilogue on every path already diverging) reuses
+		this same computation. '''
+		tail = node.orelse if node.orelse else node.body
+		if not tail or not self._stmt_diverges( tail[-1] ):
+			return False
+		for h in node.handlers:
+			if not h.body or not self._stmt_diverges( h.body[-1] ):
+				return False
+		return True
+
 	def _stmt_diverges( self, stmt: ast.stmt ) -> bool:
 		''' true if `stmt` never falls through to the statement after it -
 		either structurally (return/break/continue) or because it's a bare
@@ -7029,7 +8307,7 @@ class FunctionLowering:
 		recognized here - NoReturn is overwhelmingly a free-function/sys.*
 		shape (sys.panic, sys.exit, ...), and misses just fall back to
 		today's existing (safe, if incomplete) behavior. '''
-		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue )):
+		if isinstance( stmt, ( ast.Return, ast.Break, ast.Continue, ast.Raise )):
 			return True
 		if isinstance( stmt, ast.With ):
 			# a with-block's own exit (__exit__) doesn't change whether
@@ -7056,6 +8334,15 @@ class FunctionLowering:
 				bool( stmt.body ) and self._stmt_diverges( stmt.body[-1] )
 				and bool( stmt.orelse ) and self._stmt_diverges( stmt.orelse[-1] )
 			)
+		if isinstance( stmt, ast.Try ):
+			# finalbody itself diverging (a bare `return`/panic in a
+			# `finally:` block) makes the WHOLE construct diverge
+			# regardless of body/else/handlers - it runs unconditionally on
+			# every exit path, so nothing downstream is ever reachable
+			# either way. Otherwise: see _try_diverges's own docstring
+			if stmt.finalbody and self._stmt_diverges( stmt.finalbody[-1] ):
+				return True
+			return self._try_diverges( stmt )
 		if (
 			isinstance( stmt, ast.While ) and isinstance( stmt.test, ast.Constant ) and stmt.test.value is True
 			and not self._loop_has_reachable_break( stmt.body )
@@ -7111,7 +8398,7 @@ class FunctionLowering:
 		return isinstance( fn.return_type, Scalar ) and fn.return_type.stem == 'NoReturn'
 
 	def _stmt_If( self, node: ast.If ) -> None:
-		test = self._lower_truth_test( node.test )
+		test = self._lower_branch_condition( node.test )
 		else_label = self._new_label( 'if_else' )
 		self._emit( ir.JumpIfFalse( cond = test, target = else_label ))
 
@@ -7127,72 +8414,89 @@ class FunctionLowering:
 		entry_snapshot = self._cfg.snapshot()
 		outer_instructions = self._instructions
 		self._instructions = []
-		# see cfg.py's CFGState.enter_branch's own docstring: lets
-		# current_epilogue_label() recognize an RC entry pushed while
-		# lowering THIS branch (e.g. a match arm's own payload binding) as
-		# branch-confined - restore(), called once this branch's fully
-		# lowered, silently drops it, so a `return` inside here must never
-		# be handed that entry's own label as a shared jump target
-		self._cfg.enter_branch( entry_snapshot.stack_depth )
+		# every entry that SURVIVES this if (index < entry_snapshot.stack_
+		# depth) needs protecting across BOTH branches below, same reason
+		# _stmt_Try's own identical entry_snapshot/restore() pattern needs
+		# it (see cfg.py's enter_diverging_paths() docstring) - a plain
+		# `if bad: compiler.decref(g); return -1` with no try/except or
+		# loop involved at all leaked g on the OTHER (bad=False) path
+		# without this: restore() below only ever reverts STACK
+		# MEMBERSHIP, never an already-mutated Epilogue's own .cancelled
+		# (shared by reference, never copied per snapshot) - the true
+		# branch's own compiler.decref(g) permanently cancelled g's
+		# SHARED entry, so the false branch's own `return 0`, restored
+		# back to the SAME entry snapshot, walked right past an entry it
+		# never actually released on its own path.
+		self._cfg.enter_diverging_paths( entry_snapshot.stack_depth )
 		try:
-			for stmt in node.body:
-				try:
-					self._lower_stmt( stmt )
-				except CompileError:
-					continue
-		finally:
-			self._cfg.exit_branch()
-		true_captured = self._instructions
-		true_end = dict( self._cfg.bindings )
-		true_end_results = self._cfg.unchecked_results()
-		true_end_narrowed = self._cfg.narrowed_snapshot()
-		true_end_live = self._cfg.live_snapshot()
-		# return/break/continue as a branch's own last statement means
-		# that branch never reaches the if's join point at all - see
-		# merge_if()'s own comment on why that has to be treated
-		# differently from an ordinary falling-through branch (full
-		# terminator/dead-code analysis for anything deeper - nested ifs
-		# that both terminate, etc - is future work, not attempted here)
-		true_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
-
-		if node.orelse:
-			self._cfg.restore( entry_snapshot )
-			self._instructions = []
+			# see cfg.py's CFGState.enter_branch's own docstring: lets
+			# current_epilogue_label() recognize an RC entry pushed while
+			# lowering THIS branch (e.g. a match arm's own payload binding) as
+			# branch-confined - restore(), called once this branch's fully
+			# lowered, silently drops it, so a `return` inside here must never
+			# be handed that entry's own label as a shared jump target
 			self._cfg.enter_branch( entry_snapshot.stack_depth )
 			try:
-				for stmt in node.orelse:
+				for stmt in node.body:
 					try:
 						self._lower_stmt( stmt )
 					except CompileError:
 						continue
 			finally:
 				self._cfg.exit_branch()
-			false_captured = self._instructions
-			false_end = dict( self._cfg.bindings )
-			false_end_results = self._cfg.unchecked_results()
-			false_end_narrowed = self._cfg.narrowed_snapshot()
-			false_end_live = self._cfg.live_snapshot()
-			false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
-		else:
-			false_captured = []
-			false_end = dict( entry_snapshot.bindings )
-			false_end_results = set( entry_snapshot.results )
-			false_end_narrowed = dict( entry_snapshot.narrowed )
-			false_end_live = set( entry_snapshot.live )
-			false_terminates = False
+			true_captured = self._instructions
+			true_end = dict( self._cfg.bindings )
+			true_end_results = self._cfg.unchecked_results()
+			true_end_narrowed = self._cfg.narrowed_snapshot()
+			true_end_live = self._cfg.live_snapshot()
+			# return/break/continue as a branch's own last statement means
+			# that branch never reaches the if's join point at all - see
+			# merge_if()'s own comment on why that has to be treated
+			# differently from an ordinary falling-through branch (full
+			# terminator/dead-code analysis for anything deeper - nested ifs
+			# that both terminate, etc - is future work, not attempted here)
+			true_terminates = bool( node.body ) and self._stmt_diverges( node.body[-1] )
 
-		self._cfg.restore( entry_snapshot )
-		self._instructions = outer_instructions
-		try:
-			true_extra, false_extra, removed = self._cfg.merge_if(
-				entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
-				entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
-				true_terminates = true_terminates, false_terminates = false_terminates,
-				true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
-				true_end_live = true_end_live, false_end_live = false_end_live,
-			)
-		except CompileError as e:
-			self.lowering.discovery.fail( str( e ), node )
+			if node.orelse:
+				self._cfg.restore( entry_snapshot )
+				self._instructions = []
+				self._cfg.enter_branch( entry_snapshot.stack_depth )
+				try:
+					for stmt in node.orelse:
+						try:
+							self._lower_stmt( stmt )
+						except CompileError:
+							continue
+				finally:
+					self._cfg.exit_branch()
+				false_captured = self._instructions
+				false_end = dict( self._cfg.bindings )
+				false_end_results = self._cfg.unchecked_results()
+				false_end_narrowed = self._cfg.narrowed_snapshot()
+				false_end_live = self._cfg.live_snapshot()
+				false_terminates = bool( node.orelse ) and self._stmt_diverges( node.orelse[-1] )
+			else:
+				false_captured = []
+				false_end = dict( entry_snapshot.bindings )
+				false_end_results = set( entry_snapshot.results )
+				false_end_narrowed = dict( entry_snapshot.narrowed )
+				false_end_live = set( entry_snapshot.live )
+				false_terminates = False
+
+			self._cfg.restore( entry_snapshot )
+			self._instructions = outer_instructions
+			try:
+				true_extra, false_extra, removed = self._cfg.merge_if(
+					entry_snapshot.bindings, true_end, false_end, self._current_fn.qualname,
+					entry_results = entry_snapshot.results, true_end_results = true_end_results, false_end_results = false_end_results,
+					true_terminates = true_terminates, false_terminates = false_terminates,
+					true_end_narrowed = true_end_narrowed, false_end_narrowed = false_end_narrowed,
+					true_end_live = true_end_live, false_end_live = false_end_live,
+				)
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
+		finally:
+			self._cfg.exit_diverging_paths()
 		# `removed` only drives the RC Decref instructions above (already
 		# spliced into true_extra/false_extra) - it must NOT also remove
 		# these names from fn.names. This language has no block scoping (see
@@ -7255,6 +8559,7 @@ class FunctionLowering:
 		that needs it, to name the REAL cause (a reused binding name, not an
 		ordinary value mismatch) instead of a message that never explains
 		where the "expected" type even came from. '''
+		self._current_lineno = getattr( node, 'lineno', self._current_lineno )
 		method = getattr( self, f'_expr_{node.__class__.__name__}', None )
 		if method is None:
 			self.lowering.discovery.fail( f'unsupported expression: {ast.unparse(node)}', node )
@@ -7434,6 +8739,21 @@ class FunctionLowering:
 		# _lower_binop_values' own float-same-type check) is responsible for
 		# validating the ACTUAL requirement itself in that case.
 		if strict:
+			# case 2 of the general auto-or_throw() rule (see _auto_or_throw's
+			# own docstring): a Result[T,E]-shaped operand flowing into a
+			# context that wants T directly (not the whole Result) gets
+			# implicitly .or_throw()'d, then the UNWRAPPED T is re-run
+			# through this same coercion pipeline (it may still need e.g.
+			# scalar widening against expected_type, now that its type is T
+			# instead of Result[T,E]). Guarded (inside the shared probe) on
+			# expected_type itself NOT also being Result-shaped - mirrors
+			# _maybe_widen_return_result's own "op_shape/fn_shape both
+			# Result" guard - so an explicit `x: Result[T,E] = a + b` (or a
+			# Result-typed argument/return) keeps capturing the raw,
+			# unconsumed Result exactly as written.
+			consumed = self._maybe_auto_consume_result( node, operand, expected_type, self.lowering._AUTO_CONSUME_ALTERNATIVES, context = context )
+			if consumed is not None:
+				return consumed
 			self._check_assignable( operand, expected_type, node, context = context )
 		return operand
 
@@ -7734,6 +9054,20 @@ class FunctionLowering:
 
 	def _expr_Name( self, node: ast.Name, expected_type: Type|None ) -> ir.Operand:
 		name = self.lowering.discovery.find_name( node.id, node )
+		# module-level `_x`/`__x` privacy (SYNTAX.md) - covers a bare-name
+		# VALUE read (not a call - _resolve_callee's own hook covers that)
+		# whose binding reached local scope WITHOUT ever going through
+		# visit_ImportFrom's own check (discovery.py): a LOCAL, function-
+		# body `from X import _y` (as opposed to a module-level one) is
+		# bound directly into fn.names during LOWERING itself, never
+		# visiting discovery.py's visit_ImportFrom at all - confirmed via a
+		# real repro, lib/sys.py's own exit()'s `from crt import _exit;
+		# _exit(code)`. Harmless (not double-erroring) for the ordinary
+		# module-level-import case too - same pass/fail result either way,
+		# since both checks compare the identical (defining, accessing)
+		# module pair.
+		if id( name ) not in self._inline_param_alias_ids:
+			self.lowering.discovery.check_module_visibility( name, node, self._owning_module )
 		if isinstance( name, Function ):
 			return self._lower_function_ref( name, node )
 		if not isinstance( name, Variable ):
@@ -7850,6 +9184,7 @@ class FunctionLowering:
 		assert isinstance( target, ast.Name )
 		existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 		if existing is not None:
+			self.lowering._ensure_resolved( existing ) # see _stmt_Assign's identical call for why
 			self._cfg.unnarrow( target.id )
 			operand = self._lower_expr( node.value, existing.type )
 			self._cfg_assign( existing, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand ), node = node )
@@ -8040,10 +9375,20 @@ class FunctionLowering:
 		# no IR - a def only binds a name, same as Python
 		enclosing = self._current_fn
 		if enclosing is None:
-			self.lowering.discovery.fail( f'nested function def outside any function: {ast.unparse(node)}', node )
+			# neither message here unparses `node` itself - that would dump
+			# this nested function's entire BODY into the error (a real
+			# repro: a multi-statement nested def produced a multi-line
+			# error that buried the actual problem); node.name already
+			# identifies which def, and node's own lineno (the location
+			# passed to fail) already pinpoints it
+			self.lowering.discovery.fail( f'nested function def outside any function: {node.name}', node )
 		self.lowering._reject_generic_enclosing_scope( enclosing, node, 'nested function defs' )
 		if node.decorator_list:
-			self.lowering.discovery.fail( f'{node.name}: decorators are not supported on a nested function def: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail(
+				f'{node.name}: decorators are not supported on a nested function def: '
+				f'{", ".join( "@" + ast.unparse(d) for d in node.decorator_list )}',
+				node,
+			)
 
 		qualname = f'{enclosing.qualname}$$nested_{node.name}'
 		synthetic = Function(
@@ -8058,7 +9403,10 @@ class FunctionLowering:
 		parameters: list[Parameter] = []
 		def add_param( arg: ast.arg, default: ast.expr|None, **kind: bool ) -> None:
 			if arg.annotation is None:
-				self.lowering.discovery.fail( f'{qualname} parameter {arg.arg!r} has no type annotation: {ast.unparse(node)}', node )
+				# not ast.unparse(node) - qualname + the parameter name
+				# already identify this exactly; unparsing the whole nested
+				# function would dump its entire body into the message
+				self.lowering.discovery.fail( f'{qualname} parameter {arg.arg!r} has no type annotation', node )
 			param_type = self.lowering.discovery.visit( arg.annotation )
 			self.lowering.discovery._reject_bare_interface_value_type( param_type, arg, f'{qualname} parameter {arg.arg!r}' )
 			param = Parameter(
@@ -8312,6 +9660,53 @@ class FunctionLowering:
 				f'write an explicit cast (e.g. {expected_type.stem}(...)) or use an integer literal: {ast.unparse(node)}',
 				node,
 			)
+		# builtins.int (arbitrary-precision) is the one RCClass a bare int
+		# literal sugars into directly - `x: int = 0`/`count: int = 0`
+		# (a class attribute default)/`return 0` (a function declared
+		# -> int) are all extremely ordinary code, and int's own single-
+		# i32-parameter __init__ makes "construct int from this literal"
+		# unambiguous - unlike the general "b: Box = 0" RCClass case this
+		# method deliberately keeps rejecting below (see the generator_
+		# zero_rc_field comment), so this is scoped to int specifically,
+		# not a blanket literal-into-any-RCClass relaxation. Rewrites to
+		# an ordinary `int(literal)` construction call and re-dispatches
+		# through the general Call path - the SAME thing a user would
+		# have to write by hand today, just implicit here. The nested
+		# literal argument's own expected_type is i32 (int.__init__'s
+		# declared parameter type, a Scalar), not this method's own
+		# int-RCClass expected_type, so it falls through the ordinary
+		# scalar-literal path below unaffected on its own re-entry - no
+		# risk of this branch firing twice for the same value.
+		if type( node.value ) is int:
+			int_type = self.lowering.discovery.find_name_or_none( 'int' )
+			if int_type is not None and expected_type is int_type:
+				# int.__init__ only takes an i32 - fine for the common case
+				# (int(literal)), but there's no reason a genuinely bigger
+				# literal shouldn't just work too, this being arbitrary-
+				# precision int, not a fixed-width scalar with a real range
+				# limit. A literal outside i32's own range instead goes
+				# through int.from_str(...) on the literal's own decimal
+				# text - always succeeds (a Python int's own str() is always
+				# a valid decimal string from_str accepts), hence the plain
+				# .unwrap() rather than surfacing a Result.
+				i32_type = self.lowering.discovery.get_intrinsics()['i32']
+				lo, hi = int_stem_range( i32_type )
+				if lo <= node.value <= hi:
+					call_node = ast.Call( func = ast.Name( id = 'int', ctx = ast.Load() ), args = [ ast.Constant( value = node.value ) ], keywords = [] )
+				else:
+					call_node = ast.Call(
+						func = ast.Attribute(
+							value = ast.Call(
+								func = ast.Attribute( value = ast.Name( id = 'int', ctx = ast.Load() ), attr = 'from_str', ctx = ast.Load() ),
+								args = [ ast.Constant( value = str( node.value )) ], keywords = [],
+							),
+							attr = 'unwrap', ctx = ast.Load(),
+						),
+						args = [ ast.Constant( value = 'a compile-time int literal is always well-formed' ) ], keywords = [],
+					)
+				ast.copy_location( call_node, node )
+				ast.fix_missing_locations( call_node )
+				return self._lower_expr( call_node, expected_type )
 		# a literal being lowered against a CONCRETE, non-union expected type -
 		# verify the literal's own Python value kind could plausibly represent
 		# it at all (the same coarse stem-compatibility _LITERAL_COMPATIBLE_
@@ -8578,19 +9973,19 @@ class FunctionLowering:
 			return self._lower_dispatch_format_spec( operand, parsed_spec, str_type, node )
 
 		# conversion 114 == '!r' or 97 == '!a' (ascii wants a repr-shaped
-		# text, ascii-escaped below via _lower_ascii_escape - see its own
-		# comment on why this does NOT add surrounding quotes, unlike
-		# Python's real ascii(): str has no __repr__() of its own here for
-		# !a to match the quoting behavior of either, so !a just escapes
-		# whatever !r's own resolution already produces) both want
+		# text, ascii-escaped below via _lower_ascii_escape) both want
 		# __repr__; -1 (none) and 115 ('!s') want __str__ - just an ordinary
 		# method lookup, same as any other type: every fixed-width int
 		# scalar (i8/u8/.../isize/usize) has a real __str__/__repr__
 		# (lib/builtins/__scalar_dunders.py's i_str_signed/i_str_unsigned),
 		# same mechanism f64/f32's own __str__/__repr__ use (__float.py) -
 		# a scalar WITHOUT one (bool, currently) still fails cleanly here
-		# with a plain "method not found" error rather than being auto-boxed
-		if operand.type is str_type:
+		# with a plain "method not found" error rather than being auto-boxed.
+		# str itself only short-circuits to identity for !s/no-conversion
+		# (str.__str__ is itself an identity - see __init__.py); !r/!a on a
+		# str operand must still go through str.__repr__() for real quoting/
+		# escaping, so they're excluded from the identity shortcut here.
+		if operand.type is str_type and node.conversion not in ( 114, 97 ):
 			value_as_str = operand
 		else:
 			method_name = '__repr__' if node.conversion in ( 114, 97 ) else '__str__'
@@ -8608,10 +10003,13 @@ class FunctionLowering:
 		return value_as_str
 
 	def _lower_ascii_escape( self, operand: ir.Operand, str_type: Type, node: ast.AST ) -> ir.Operand:
-		# f-string !a conversion's second half - operand is already str-
-		# typed (whatever the !r-equivalent resolution above produced);
-		# this just calls str._ascii_escape() (lib/builtins/__init__.py)
-		# on it.
+		# f-string !a conversion's second half - operand is already the
+		# result of __repr__() (called above, same as !r): real quoting/
+		# escaping already happened there, so this just needs to escape
+		# any printable non-ASCII codepoints __repr__ left as literal
+		# UTF-8 - str._ascii_escape() (lib/builtins/__init__.py) does
+		# exactly that, leaving every ASCII byte (including the quotes/
+		# backslashes __repr__ inserted) untouched.
 		return self._lower_method_call( operand, '_ascii_escape', [], str_type, node )
 
 	def _lower_dispatch_format_spec( self, operand: ir.Operand, spec: FStringFormatSpec, str_type: Type, node: ast.AST ) -> ir.Operand:
@@ -8862,33 +10260,18 @@ class FunctionLowering:
 			#)
 			self._emit( ir.Call( dest = None, target = append, receiver = buf, args = [ part ], kwargs = {} ))
 
-		# UnsafeList[str].as_slice() - a real slice[str] view over the WHOLE
-		# buffer, exactly n elements (the buffer is pre-sized to exactly
-		# len(node.values) and never appended to more than that many times -
-		# same "provably always Ok" reasoning append's own unwrap above
-		# relies on). Used to be a hand-rolled get_ptr(0)+CastWrap+direct
-		# ir.Allocate sequence, written before as_slice() existed at all
-		# (as_slice() was added later, for lib/bisect.py's own wiring, and
-		# nobody circled back to simplify this) - as_slice() already does
-		# the identical thing (buf.__raw._slot_ptr(0), cast to ConstPtr
-		# [None], wrapped in a slice[T]) as one real library call, the same
-		# "look up method by name, emit one ir.Call" pattern init/append
-		# above already use, not a special one-off.
-		as_slice = concrete_cls.get_local_or_raise( 'as_slice' )
-		self.lowering._ensure_resolved( as_slice ) # see init's own comment on why this is needed
-		self.lowering.schedule( as_slice.return_type )
-		for p in ( as_slice.parameters or [] ):
-			self.lowering.schedule( p.type )
-		view = self._new_temp( as_slice.return_type )
-		self._emit( ir.Call( dest = view, target = as_slice, receiver = buf, args = [], kwargs = {} ))
-
+		# str.concat( buf ) directly - concat's own parameter type is
+		# UnsafeList[str] (matches buf exactly), so no bridging step is
+		# needed here at all (this used to build a slice[str] view over buf
+		# first, back when concat took slice[str] - that view type is gone
+		# now, see PLAN_STR_FORMAT.md/list.__getitem__(slice) history).
 		concat = self.lowering._find_method( str_type, 'concat' )
 		self.lowering._ensure_resolved( concat )
 		self.lowering.schedule( concat.return_type )
 		for p in ( concat.parameters or [] ):
 			self.lowering.schedule( p.type )
 		dest = self._new_temp( str_type )
-		self._emit( ir.Call( dest = dest, target = concat, receiver = None, args = [ view ], kwargs = {} ))
+		self._emit( ir.Call( dest = dest, target = concat, receiver = None, args = [ buf ], kwargs = {} ))
 		return dest
 
 	def _lower_bound_method_closure( self, node: ast.Attribute, obj: ir.Operand, method: Function, expected_type: Type|None ) -> ir.Operand:
@@ -9095,6 +10478,13 @@ class FunctionLowering:
 			if isinstance( names, dict ):
 				name_obj = names.get( attr )
 				if isinstance( name_obj, Variable ):
+					# module-level `_x`/`__x` privacy (SYNTAX.md) - a safe
+					# no-op unless name_obj is a genuine module-level global
+					# (is_global) - see check_module_visibility's own
+					# docstring. A class attribute reached this same way
+					# (obj a ClassLike, not a Module) is unaffected.
+					if id( name_obj ) not in self._inline_param_alias_ids:
+						self.lowering.discovery.check_module_visibility( name_obj, node, self._owning_module )
 					self.lowering._ensure_resolved( name_obj )
 					return name_obj
 		obj = self._lower_expr( node.value, None )
@@ -9152,6 +10542,7 @@ class FunctionLowering:
 				return self._lower_method_call( obj, node.attr, [], expected_type or method.return_type, node )
 			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
+		self._check_field_visibility( obj.type, attr_var, node.attr, node )
 		if isinstance( attr_var.type, FixedArrayType ):
 			# a bare C array member isn't assignable via `=` at all (only a
 			# whole containing struct/union is, or an explicit memcpy) - see
@@ -9168,30 +10559,47 @@ class FunctionLowering:
 				node,
 			)
 		dest = self._new_temp( attr_var.type )
-		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
+		# mirrors _expr_Name's own narrowed-read rewrite exactly (see its
+		# comment for the full reasoning) - checks THIS node's own full
+		# chain key (any depth, `self.a.b.c`), not just a single hop; a
+		# chain that ISN'T itself narrowed but rests on a narrowed PREFIX
+		# (`self.a` narrowed, `.b.c` chained on top) was already resolved
+		# correctly by the recursive `obj = self._lower_expr(node.value,
+		# ...)` call above, which narrows at whatever shallower level
+		# actually matched.
 		chain_key = self._attribute_chain_key( node )
-		if chain_key is not None:
-			# mirrors _expr_Name's own narrowed-read rewrite exactly (see its
-			# comment for the full reasoning), just sourced from this field's
-			# freshly-read union VALUE (`dest`, a Temp) instead of a Variable
-			# binding directly - a struct-by-value Temp is an equally valid
-			# ir.GetAttr `obj` source. Checks THIS node's own full chain key
-			# (any depth, `self.a.b.c`), not just a single hop - a chain
-			# narrowed as its own subject is found directly here; a chain
-			# that ISN'T itself narrowed but rests on a narrowed PREFIX
-			# (`self.a` narrowed, `.b.c` chained on top) was already
-			# resolved correctly by the recursive `obj = self._lower_expr(
-			# node.value, ...)` call above, which narrows at whatever
-			# shallower level actually matched.
-			member = self._cfg.narrowed_member( chain_key )
-			if member is not None and not self.lowering._type_resolver._same_type( expected_type, attr_var.type ):
-				base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
-				_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
-				payload_dest = self._new_temp( payload_cls )
-				self._emit( ir.GetAttr( dest = payload_dest, obj = dest, attr = data_attr.stem ))
-				leaf_dest = self._new_temp( member.type )
-				self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
-				return leaf_dest
+		member = self._cfg.narrowed_member( chain_key ) if chain_key is not None else None
+		is_narrowed = member is not None and not self.lowering._type_resolver._same_type( expected_type, attr_var.type )
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: an RC-typed field read
+		# (narrowed or not) needs the SAME "acquire / read+retain / release"
+		# protection Part A already gives a global - a bare, unretained
+		# GetAttr here is the exact "reader loads a pointer, gets preempted
+		# before its own incref, a concurrent writer frees it" race A.3
+		# describes, just for a field's OWN storage (obj->field) instead of
+		# a global's. `obj` itself is never at risk (this thread already
+		# holds its own live reference to obj, unlike a global's slot, which
+		# nothing here owns) - only obj's FIELD needs protecting.
+		attr_is_rc = bool( cfg.rc_leaves( attr_var.type )) and self._is_real_field_receiver( obj.type )
+		if attr_is_rc:
+			self._emit( ir.AcquireFieldLock( obj = obj ))
+		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
+		if is_narrowed:
+			base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
+			_tag_attr, data_attr, payload_cls, _tags = self.lowering._union_storage.get( base )
+			payload_dest = self._new_temp( payload_cls )
+			self._emit( ir.GetAttr( dest = payload_dest, obj = dest, attr = data_attr.stem ))
+			leaf_dest = self._new_temp( member.type )
+			self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
+			if attr_is_rc:
+				self._emit( ir.Incref( value = leaf_dest ))
+				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._cfg.fresh_temp( leaf_dest, member.type )
+			return leaf_dest
+		if attr_is_rc:
+			for instr in self._cfg.incref( attr_var.type, dest ):
+				self._emit( instr )
+			self._emit( ir.ReleaseFieldLock( obj = obj ))
+			self._cfg.fresh_temp( dest, attr_var.type )
 		# a pointer-typed field passed into a differently-typed pointer parameter
 		# (e.g. sys.memcpy( ..., self.__metadata, ... ) where src is ConstPtr[u8])
 		# needs the same CastWrap coercion _expr_Name does for bare locals.
@@ -9208,13 +10616,13 @@ class FunctionLowering:
 		# class that doesn't declare one, and the same direct-Allocate shape
 		# _lower_bound_method_closure already uses to build a ClosureType
 		# value with no __init__ of its own either.
-		if len( node.elts ) < 2:
-			# arity 0/1 is a real Python ast.Tuple parsing ambiguity (a
-			# 1-tuple LITERAL needs a trailing comma to disambiguate from a
-			# plain parenthesized expression) - deferred rather than
-			# guessed at, see PLAN_TUPLE.md's own "Deferred" list. An empty
-			# `()` reaches here too (len 0) - same deferral.
-			self.lowering.discovery.fail( f'tuple literals need at least 2 elements: {ast.unparse(node)}', node )
+		# arity 0 (`()`) and arity 1 (`(x,)`) are both unambiguous at the AST
+		# level - Python's own parser never confuses either with a plain
+		# parenthesized expression (`(x)` never becomes an ast.Tuple at all;
+		# only a genuine trailing comma or empty parens do) - so both are
+		# handled the same way as any other arity here, no special-casing
+		# needed past this point.
+		#
 		# per-element expected types, threaded down the same way
 		# _lower_allocate_fields threads field.type into each field's own
 		# _lower_expr call - without this, a leaf value destined for a
@@ -9321,6 +10729,24 @@ class FunctionLowering:
 		resolved_cls = self.lowering._ensure_resolved( target_cls )
 		assert isinstance( resolved_cls, ClassLike ), f'internal compiler error: {resolved_cls} is not constructible'
 		init = resolved_cls.get_local_or_raise( '__init__' )
+		if isinstance( init, Overload ):
+			# an overloaded __init__ (e.g. list[T]'s own capacity/iterator/
+			# iterable overloads) - this call site only ever constructs
+			# ZERO-argument (see this method's own docstring), so resolve_
+			# call naturally narrows to whichever ONE candidate accepts no
+			# arguments at all (every other candidate's own sole parameter
+			# has no default, so _translate_indices excludes it outright) -
+			# no move()/kwargs/literal-typing concern here, unlike the
+			# general ClassName(...) construction path, since there are
+			# never any real arguments to lower in the first place
+			try:
+				branches, init = overload_resolution.resolve_call(
+					init.stubs, init.implementations, [], {},
+					qualname = f'{resolved_cls.qualname}.__init__', same_type = self.lowering._type_resolver._same_type,
+				)
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
+			assert not branches, f'internal compiler error: {resolved_cls.qualname}.__init__() (zero-arg) resolved to a runtime dispatch, not a single candidate'
 		assert isinstance( init, Function ), f'internal compiler error: {resolved_cls.qualname} has no usable __init__'
 		self.lowering.schedule( resolved_cls )
 		self.lowering._ensure_resolved( init )
@@ -9418,40 +10844,11 @@ class FunctionLowering:
 		assert append_fn is not None, 'internal compiler error: list[T] has no append method'
 		self.lowering._ensure_resolved( append_fn )
 		self.lowering.schedule( append_fn.return_type )
-		# _find_method only ever returns a plain Function (deliberately
-		# None for an Overload group - see its own docstring), but
-		# Result.unwrap is one now (a str/Ptr[Callable[[E],str]] overload) -
-		# mirror _find_method's own lookup (chain_lookup for a CStruct/
-		# RCClass, else the raw .names dict - Result itself is a
-		# TaggedUnion, neither) and take the group's own (single, real)
-		# implementation, same idiom _lower_call's compiler.__raw_free__
-		# handling already uses for sys.free
-		resolved_result_type = self.lowering._ensure_resolved( append_fn.return_type )
-		if isinstance( resolved_result_type, ( CStruct, RCClass )):
-			raw_unwrap = resolved_result_type.chain_lookup( 'unwrap' )
-		else:
-			names = getattr( resolved_result_type, 'names', None )
-			raw_unwrap = names.get( 'unwrap' ) if isinstance( names, dict ) else None
-		raw_unwrap = self.lowering._resolve_scalar_name( raw_unwrap )
-		unwrap_fn = raw_unwrap.implementations[0] if isinstance( raw_unwrap, Overload ) else raw_unwrap
-		assert isinstance( unwrap_fn, Function ), 'internal compiler error: list[T].append does not return a Result with unwrap()'
-		self.lowering._ensure_resolved( unwrap_fn )
-		self.lowering.schedule( unwrap_fn.return_type )
-		errmsg_node = ast.Constant( value = 'list literal: append failed' )
-		ast.copy_location( errmsg_node, node )
 		for elt in node.elts:
 			operand = self._lower_expr( elt, elem_type )
-			append_dest = self._new_temp( append_fn.return_type )
-			self._emit( ir.Call( dest = append_dest, target = append_fn, receiver = dest, args = [ operand ], kwargs = {} ))
-			errmsg = self._lower_expr( errmsg_node, unwrap_fn.parameters[0].type )
-			# unwrap()'s own return value (T=None here, list[T].append's own
-			# Result[None,OverflowError]) is never read - only its side
-			# effect (panic on Err) matters, so no destination temp: T=None
-			# compiles to a real C `void` return, and a real ir.Call dest
-			# expects an actual value to assign, not void - same "dest=None
-			# for a call whose result isn't used" convention _stmt_Expr's
-			# own bare-call-statement handling already relies on
-			self._emit( ir.Call( dest = None, target = unwrap_fn, receiver = append_dest, args = [ errmsg ], kwargs = {} ))
+			# dest=None: append()'s return value (None) is never read, only
+			# its side effect - mirrors _expr_Set's own add() handling below
+			self._emit( ir.Call( dest = None, target = append_fn, receiver = dest, args = [ operand ], kwargs = {} ))
 		return dest
 
 	def _expr_Set( self, node: ast.Set, expected_type: Type|None ) -> ir.Operand:
@@ -9502,19 +10899,19 @@ class FunctionLowering:
 
 	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
 		''' x[a:b] / x[:b] / x[a:] - dispatches through an ordinary
-		__getitem__(PySlice) overload (PySlice: a start/stop range
+		__getitem__(slice) overload (slice: a start/stop range
 		descriptor, lib/builtins/__init__.py), resolved via
 		_find_dunder_for_arg - the caller here already knows the exact arg
-		type (PySlice), exactly that helper's designed use case, unlike the
+		type (slice), exactly that helper's designed use case, unlike the
 		plain-index path's _find_indexlike_getitem. Replaces the old
 		hardcoded 3-type (str/bytearray/memoryview) own _byte_slice/
 		_SLICE_LENGTH_METHOD dispatch - any type declaring a
-		__getitem__(PySlice) overload now supports slice syntax generically
+		__getitem__(slice) overload now supports slice syntax generically
 		(str/bytearray/memoryview keep byte-offset semantics via their own
-		overload bodies; list[T]/UnsafeList[T] return a borrowed slice[T]
-		view instead of a copy - see their own __getitem__(PySlice)).
+		overload bodies; list[T] returns a fresh copy, UnsafeList[T] a
+		borrowed slice[T] view - see their own __getitem__(slice)).
 		stop's default (omitted upper bound) is left for the CALLEE's own
-		overload body to resolve (PySlice.stop is nullable) rather than
+		overload body to resolve (slice.stop is nullable) rather than
 		hardcoded here per type, since only the callee knows the right unit
 		(str's real __len__() is a codepoint count, wrong for its own
 		byte-offset slicing - see str.byte_len() vs str.__len__()). No
@@ -9526,20 +10923,20 @@ class FunctionLowering:
 		assert isinstance( node_slice, ast.Slice )
 		if node_slice.step is not None:
 			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
-		pyslice_cls = self.lowering._ensure_resolved( self.lowering.discovery.find_name( 'PySlice', node ))
-		getitem_fn = self._find_dunder_for_arg( obj.type, '__getitem__', pyslice_cls )
+		slice_cls = self.lowering._ensure_resolved( self.lowering.discovery.find_name( 'slice', node ))
+		getitem_fn = self._find_dunder_for_arg( obj.type, '__getitem__', slice_cls )
 		if getitem_fn is None:
 			self.lowering.discovery.fail(
 				f'slicing is not supported for {obj.type.qualname if obj.type else "?"} '
-				f'(no __getitem__(PySlice) overload): {ast.unparse(node)}',
+				f'(no __getitem__(slice) overload): {ast.unparse(node)}',
 				node,
 			)
 		self.lowering._ensure_resolved( getitem_fn )
 		self.lowering.schedule( getitem_fn.return_type )
 		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
-		start_field = self.lowering._find_field( pyslice_cls, 'start' )
-		stop_field = self.lowering._find_field( pyslice_cls, 'stop' )
-		assert start_field is not None and stop_field is not None, 'internal compiler error: PySlice missing start/stop fields'
+		start_field = self.lowering._find_field( slice_cls, 'start' )
+		stop_field = self.lowering._find_field( slice_cls, 'stop' )
+		assert start_field is not None and stop_field is not None, 'internal compiler error: slice missing start/stop fields'
 		if node_slice.lower is not None:
 			start = self._lower_expr( node_slice.lower, start_field.type )
 		else:
@@ -9554,19 +10951,78 @@ class FunctionLowering:
 			stop_value = self._lower_expr( node_slice.upper, usize_cls )
 			stop = self._coerce_or_check_operand( stop_value, stop_field.type, node_slice.upper )
 		else:
-			# no upper bound given - PySlice.stop is nullable specifically
+			# no upper bound given - slice.stop is nullable specifically
 			# so this "unbounded" state survives all the way into the
 			# callee's own overload body, rather than being resolved here
 			# against a hardcoded per-type length method
 			none_node = ast.Constant( value = None )
 			ast.copy_location( none_node, node )
 			stop = self._lower_expr( none_node, stop_field.type )
-		pyslice_dest = self._new_temp( pyslice_cls )
-		self._emit( ir.Allocate( dest = pyslice_dest, cls = pyslice_cls, fields = { 'start': start, 'stop': stop } ))
+		slice_dest = self._new_temp( slice_cls )
+		self._emit( ir.Allocate( dest = slice_dest, cls = slice_cls, fields = { 'start': start, 'stop': stop } ))
 		dest = self._new_temp( getitem_fn.return_type )
-		self._emit( ir.Call( dest = dest, target = getitem_fn, receiver = obj, args = [ pyslice_dest ], kwargs = {} ))
+		self._emit( ir.Call( dest = dest, target = getitem_fn, receiver = obj, args = [ slice_dest ], kwargs = {} ))
 		# plain sugar for obj.__getitem__(slice) - see _expr_Subscript's own
 		# comment for why this doesn't auto-consume a fallible result
+		return dest
+
+	def _lower_tuple_slice( self, node: ast.Subscript, obj: ir.Operand, tuple_type: TupleType ) -> ir.Operand:
+		''' t[a:b] on a homogeneous tuple[T,...] - unlike every other slice
+		target (_lower_slice_subscript's generic __getitem__(slice) dispatch
+		to a runtime method), a tuple's slice RESULT TYPE depends on the
+		slice's own bounds (a DIFFERENT fixed-arity tuple[T,...] per distinct
+		(start,stop) pair) - no ordinary method could express that with one
+		fixed return type, so this requires compile-time-constant bounds and
+		builds the result directly via field copies instead, the same "no
+		real __init__, just field=value sugar" construction _expr_Tuple's own
+		tuple-LITERAL handling already uses for its Allocate. Bounds are
+		clamped exactly like every other slice's own out-of-range tolerance
+		(_resolve_slice_bounds, lib/builtins/__init__.py) - never a compile
+		error, an out-of-range/inverted bound just yields a shorter (possibly
+		empty) result, same as real Python; negative literal bounds aren't
+		reachable here at all (`-1` parses as ast.UnaryOp(USub,...), not
+		ast.Constant, so it's rejected below as "not constant" - consistent
+		with usize-only slice.start/stop everywhere else in this codebase,
+		which has no negative-index support anywhere to match). '''
+		node_slice = node.slice
+		assert isinstance( node_slice, ast.Slice )
+		if node_slice.step is not None:
+			self.lowering.discovery.fail( f'slice step is not supported: {ast.unparse(node)}', node )
+		n = len( tuple_type.elem_types )
+		def const_bound( expr: ast.expr|None, default: int ) -> int:
+			if expr is None:
+				return default
+			if not ( isinstance( expr, ast.Constant ) and isinstance( expr.value, int ) and not isinstance( expr.value, bool )):
+				self.lowering.discovery.fail(
+					f'tuple slicing requires compile-time-constant integer bounds: {ast.unparse(node)}', node,
+				)
+				return default
+			return expr.value
+		start = max( 0, min( const_bound( node_slice.lower, 0 ), n ))
+		stop = max( 0, min( const_bound( node_slice.upper, n ), n ))
+		if start > stop:
+			stop = start
+		elem_types = tuple_type.elem_types[ start:stop ]
+		# arity 0/1 results are real, valid tuple types now (0/1-arity
+		# tuple[...] annotations and literals both exist - see discovery.py's
+		# visit_Subscript/_expr_Tuple) - no special-casing needed here either
+		result_tt = self.lowering.discovery._get_or_create_tuple_type( elem_types )
+		backing_cls = self.lowering._ensure_resolved( result_tt )
+		self.lowering._schedule_rcclass_construction( backing_cls, backing_cls )
+		resolved_obj_type = self.lowering._ensure_resolved( obj.type )
+		fields: dict[str,ir.Operand] = {}
+		for i, elem_type in enumerate( elem_types ):
+			src_field = self.lowering._attr_lookup( resolved_obj_type, f'_{start + i}', node )
+			elem_dest = self._new_temp( src_field.type )
+			self._emit( ir.GetAttr( dest = elem_dest, obj = obj, attr = f'_{start + i}' ))
+			# a GetAttr borrow of the source tuple's own field - genuinely
+			# aliasing, same as _expr_Tuple's own per-element field_value call
+			# for an aliasing Name/Attribute element
+			for instr in self._cfg.field_value( src_field.type, elem_dest, is_alias = True ):
+				self._emit( instr )
+			fields[ f'_{i}' ] = elem_dest
+		dest = self._new_temp( backing_cls )
+		self._emit( ir.Allocate( dest = dest, cls = backing_cls, fields = fields ))
 		return dest
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
@@ -9579,6 +11035,16 @@ class FunctionLowering:
 				return self._maybe_castwrap_pointer( dest, expected_type )
 		obj = self._lower_expr( node.value, None )
 		if isinstance( node.slice, ast.Slice ):
+			# a tuple's own slice needs its OWN handling (_lower_tuple_slice),
+			# not the generic __getitem__(slice) dispatch below - the result
+			# type is a DIFFERENT fixed-arity tuple[...] depending on the
+			# slice's own compile-time bounds, which no ordinary runtime
+			# __getitem__(slice) method could express (its return type is
+			# fixed at declaration time) - see _lower_tuple_slice's own
+			# docstring
+			tuple_type = self.lowering._tuple_storage.tuple_type_for( self.lowering._ensure_resolved( obj.type ))
+			if tuple_type is not None:
+				return self._lower_tuple_slice( node, obj, tuple_type )
 			return self._lower_slice_subscript( node, obj )
 		# tuple_type_for checked BEFORE _find_indexlike_getitem, not after:
 		# a HOMOGENEOUS tuple's backing class now also declares a real,
@@ -9673,12 +11139,6 @@ class FunctionLowering:
 		index = self._lower_expr( node.slice, getitem_fn.parameters[0].type )
 		call_dest = self._new_temp( getitem_fn.return_type )
 		self._emit( ir.Call( dest = call_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
-		if getattr( node, 'is_for_loop_element_read', False ):
-			# a for-loop's own per-iteration bind (_lower_for_over_indexable) -
-			# compiler-synthesized, no source position to attach .unwrap()/
-			# .or_return() to, and __getitem__ is expected to always be
-			# fallible in practice - keep auto-consuming here specifically
-			return self._maybe_consume_result( node, call_dest, self.lowering._SUBSCRIPT_ALTERNATIVES )
 		return call_dest
 
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
@@ -9825,8 +11285,8 @@ class FunctionLowering:
 		# decomposed into per-leaf (T, E) arithmetic instead of erroring -
 		# an unconsumed Result operand here almost always means the user
 		# forgot to .unwrap()/.or_return() a fallible x[i]/x.method() first
-		self._reject_unconsumed_result_operand( node, left )
-		self._reject_unconsumed_result_operand( node, right )
+		left = self._reject_unconsumed_result_operand( node, left )
+		right = self._reject_unconsumed_result_operand( node, right )
 
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
 		right_shape = self.lowering._type_resolver._tagged_union_shape( right.type )
@@ -9898,8 +11358,14 @@ class FunctionLowering:
 		# in _BINOP_DUNDER above (dispatched through it, or through the float
 		# checks just above, before ever reaching here) - what's left is a
 		# genuinely unsupported operator (`/` on an int - only `//` exists;
-		# `**`/`@`, never mapped to anything at all)
-		self.lowering.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
+		# `**`/`@`, never mapped to anything at all), OR a supported operator
+		# with no dunder registered for THIS particular pair of operand types
+		# (e.g. `int + str`) - name both sides' types so it's clear which
+		self.lowering.discovery.fail(
+			f'unsupported binary operator between {left.type.qualname if left.type else "?"} and '
+			f'{right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _mode_qualified_dunder_names( self, base_name: str ) -> list[str]:
 		# see _MODE_DUNDER_PREFIX's own module-level comment for the full
@@ -9985,22 +11451,22 @@ class FunctionLowering:
 		shape = self.lowering._type_resolver._tagged_union_shape( method.return_type )
 		assert shape is not None and len( shape[1] ) == 2, f'@fallible_arithmetic {method.qualname} must declare a Result[T,E] return type'
 		success_type = shape[1][0].type
-		error_type = shape[1][1].type
 		mode = self._arithmetic_mode[-1]
 		extra = mode.extra if isinstance( mode, arithmetic_mode.ArithmeticPanic ) else None
 		if extra is None:
-			# same requirement _lower_arithmetic_op's own Check-mode opcodes
-			# already enforce before emitting OrReturn/OrJump - missing here
-			# let an @fallible_arithmetic dunder call (int.__floordiv__/
-			# __mod__ via `//`/`%`, or a Scalar-registered arithmetic dunder)
-			# silently emit an OrReturn/OrJump into a function whose return
-			# type can't represent the error at all, crashing at C emission
-			# time instead of failing to compile cleanly - confirmed via a
-			# real repro (`r: int = a // b` inside a function declared -> i32)
-			result_cls = self.lowering.discovery.find_name( 'Result', node )
-			self.lowering._type_resolver._require_result_return(
-				node, result_cls, error_type, self.lowering._FALLIBLE_METHOD_ALTERNATIVES, fn = self._current_fn,
-			)
+			# Check mode (the default): `result` just flows out here, raw and
+			# unconsumed - the general case-1 (discarded statement)/case-2
+			# (flowing into a T-typed context) auto-or_throw() rule picks it
+			# up downstream, exactly like checked arithmetic's own Check-mode
+			# opcodes now do (see _lower_arithmetic_op). This is how //, %,
+			# and fallible comparison dunders gained or_throw()/try-except
+			# support, not just or_return()'s old unconditional-propagate
+			# behavior.
+			return result
+		# Panic mode (explicit user opt-in via `with compiler.
+		# panic_arithmetic(...):`) - unaffected by this whole file's auto-
+		# or_throw() generalization: still an immediate Unwrap-panic, still
+		# consumed eagerly right here, never left for a downstream hook.
 		return self._consume_checked_result( node, result, success_type, extra )
 
 	def _lower_arithmetic_op( self, node: ast.AST, opcode: type|None, extra: ir.Operand|None, result_type: Type, operand_kwargs: dict, kind: str ) -> ir.Operand:
@@ -10023,19 +11489,17 @@ class FunctionLowering:
 		# produces Result[result_type,<error_type>], where <error_type> is a
 		# single marker class (most ops) or the anonymous UNION of several
 		# (signed Div/Mod -> ZeroDivisionError|OverflowError; checked float / ->
-		# ZeroDivisionError|FloatingPointError). How that Result gets consumed
-		# depends on `extra`: the default (extra is None) uses OrReturn,
-		# mirroring Result.or_return()'s own semantics, and needs somewhere for
-		# the error to propagate to; `with compiler.panic_arithmetic(msg):`
-		# (extra is the lowered msg operand) uses Unwrap instead, which panics
-		# immediately and so has no such requirement
+		# ZeroDivisionError|FloatingPointError). `with compiler.panic_
+		# arithmetic(msg):` (extra is the lowered msg operand) still consumes
+		# eagerly via Unwrap, which panics immediately and needs nowhere to
+		# propagate to. The default (extra is None) does NOT eagerly consume
+		# here anymore - the raw Result just flows out, picked up downstream
+		# by the general case-1 (discarded statement)/case-2 (flowing into a
+		# T-typed context) auto-or_throw() rule, exactly the same mechanism
+		# .or_throw()/or_return() already use - see _auto_or_throw's own
+		# docstring for why this is now the ONE place that logic lives.
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
-		error_type, alternatives = self._resolve_checked_error( node, opcode, result_type )
-		if extra is None:
-			# validated before anything gets emitted - a mid-statement
-			# failure here must not leave partial instructions behind for
-			# the per-statement recovery boundary to silently keep
-			self.lowering._type_resolver._require_result_return( node, result_cls, error_type, alternatives, fn = self._current_fn )
+		error_type, _alternatives = self._resolve_checked_error( node, opcode, result_type )
 		return self._emit_checked_op( node, opcode, operand_kwargs, result_type, result_cls, error_type, extra )
 
 	def _resolve_checked_error( self, node: ast.AST, opcode: type, result_type: Type ) -> tuple[ClassLike,str]:
@@ -10073,13 +11537,21 @@ class FunctionLowering:
 		# its operand(s) (left/right for a binop, operand for USub/cast)
 		check_type = self.lowering.discovery._get_or_create_specialization( result_cls, [ result_type, error_cls ] )
 		# the emitter declares a local variable of this Result type; the
-		# struct definition must exist even though the Check op's result
-		# is consumed inline (OrReturn/OrJump/Unwrap) — schedule it now
-		# so monomorphize_class emits it into compiler.tagged_unions
+		# struct definition must exist even though the Check op's result is
+		# often consumed inline (Unwrap in panic mode, or_throw() downstream
+		# otherwise) — schedule it now so monomorphize_class emits it into
+		# compiler.tagged_unions
 		self.lowering.schedule( check_type )
 		check_dest = self._new_temp( check_type )
 		self._emit( opcode( dest = check_dest, **operand_kwargs ))
-		return self._consume_checked_result( node, check_dest, result_type, extra )
+		if extra is not None:
+			# panic mode - still consumes eagerly, unaffected by the general
+			# auto-or_throw() rule (see _lower_arithmetic_op's own comment)
+			return self._consume_checked_result( node, check_dest, result_type, extra )
+		# Check mode (the default) - the raw, unconsumed Result[result_type,
+		# error_cls] flows straight out; case-1/case-2 auto-or_throw() picks
+		# it up downstream (see _auto_or_throw)
+		return check_dest
 
 	def _build_generator_error_defer_replay( self ) -> list[ir.Instruction]:
 		''' PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - lowers
@@ -10196,7 +11668,9 @@ class FunctionLowering:
 			self._instructions = outer_instructions
 		return captured
 
-	def _consume_checked_result( self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None ) -> ir.Temp:
+	def _consume_checked_result(
+		self, node: ast.AST, check_dest: ir.Temp, result_type: Type, extra: ir.Operand|None, *, receiver_pending_start: int|None = None,
+	) -> ir.Temp:
 		# shared by both binop (AddCheck/.../Div/Mod) and unary (NegCheck)
 		# Check-mode ops, _maybe_consume_result's __len__/__getitem__ auto-
 		# unwrap, and _lower_or_return's own <result_expr>.or_return() - see
@@ -10236,6 +11710,23 @@ class FunctionLowering:
 				node,
 			)
 		inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
+		# see _flush_new_pending_temps's own docstring: check_dest/extra are
+		# the only operands still needed below (by OrReturn/OrJump/Unwrap
+		# themselves) - anything else pending SINCE receiver_pending_start
+		# (i.e. only from building up check_dest's own receiver expression,
+		# e.g. a chained field receiver's own Part B retain - NOT from
+		# whatever outer expression check_dest itself is only part of) must
+		# be released now, before the Err leg's own early exit can skip
+		# right past it. Only the explicit .or_return() syntax currently
+		# passes a real receiver_pending_start (see _lower_or_return) -
+		# every other caller (checked arithmetic, __len__/__getitem__'s
+		# auto-unwrap) leaves it None, unaffected, since their own operands
+		# don't go through Part B's field-receiver retain shape in the same
+		# way and haven't been confirmed to need this. Placed before
+		# unwrapped's own creation so this never touches unwrapped itself
+		# (nothing is written into it yet).
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, check_dest, extra )
 		unwrapped = self._new_temp( result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
@@ -11133,7 +12624,7 @@ class FunctionLowering:
 		''' like self.lowering._find_method(owner_type, '__getitem__'), but
 		Overload-aware for the ordinary x[i] (non-slice) subscript path -
 		once a type gains a second __getitem__ overload for slice syntax
-		(a compound range-descriptor argument, e.g. PySlice), this picks the
+		(a compound range-descriptor argument, e.g. slice), this picks the
 		leaf whose single parameter is a plain Scalar rather than silently
 		treating the whole Overload group as "no such method" the way a bare
 		_find_method does (same real gap _find_dunder_for_arg's own docstring
@@ -11233,7 +12724,7 @@ class FunctionLowering:
 		# on both operands, before either can reach the union-leaf dispatch
 		# below and get silently decomposed into a per-leaf (T, E) compare
 		# (see _lower_binop_values' own identical guard/comment)
-		self._reject_unconsumed_result_operand( node, left )
+		left = self._reject_unconsumed_result_operand( node, left )
 
 		method = self._find_dunder_for_arg( left.type, method_name, left.type )
 		left_shape = self.lowering._type_resolver._tagged_union_shape( left.type )
@@ -11259,7 +12750,7 @@ class FunctionLowering:
 		# silently widening) blind - both are reinstated manually below in
 		# the same order _coerce_or_check_operand itself would try them.
 		right = self._lower_expr( node.comparators[0], right_hint, strict = False )
-		self._reject_unconsumed_result_operand( node, right )
+		right = self._reject_unconsumed_result_operand( node, right )
 		if right.type is not left.type:
 			if self._is_safe_scalar_widening( right.type, left.type ):
 				widened = self._new_temp( left.type )
@@ -12165,6 +13656,18 @@ class FunctionLowering:
 	def _resolve_callee( self, func_node: ast.expr ) -> tuple[Function|Overload|Specialization|_ReceiverDispatch,ir.Operand|None]:
 		target = self.lowering._type_resolver._resolve_callee_target( func_node )
 		if target is not None:
+			# module-level `_x`/`__x` privacy (SYNTAX.md) - THIS is the one
+			# real "about to actually call this" resolution site (unlike
+			# _stmt_diverges's own unrelated re-probe of the identical
+			# _resolve_callee_target/_try_resolve_namespace chain, purely to
+			# ask "is this NoReturn-shaped" - see _try_resolve_namespace's
+			# own comment on why enforcing THERE was a real false positive).
+			# Unwrap a Specialization the same way _stmt_diverges does - a
+			# private GENERIC function reached this way is still a Function
+			# underneath, just monomorphization-wrapped.
+			fn_target = target.base if isinstance( target, Specialization ) else target
+			if id( fn_target ) not in self._inline_param_alias_ids:
+				self.lowering.discovery.check_module_visibility( fn_target, func_node, self._owning_module )
 			return target, None
 
 		if not isinstance( func_node, ast.Attribute ):
@@ -12749,6 +14252,80 @@ class FunctionLowering:
 			return None
 		return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
 
+	def _is_real_field_receiver( self, owner_type: Type|None ) -> bool:
+		''' PLAN_THREAD_SAFE_SHARED_STATE.md Part B locking gate: true only
+		when owner_type is a genuine, heap-allocated RCClass instance - the
+		only kind of receiver that HAS a $header (and therefore a lock) at
+		all. Deliberately narrower than _check_field_visibility's own
+		InheritanceChainMixin check (RCClass OR CStruct): a CStruct is
+		always either embedded BY VALUE inside its own containing object (no
+		separate identity/pointer of its own - protected by the CONTAINING
+		RCClass's lock, not one of its own) or, for an @interface CStruct,
+		heap-allocated WITHOUT an ObjectHeader at all (see emit_c's own
+		ir.Allocate codegen: "NO ObjectHeader/refcount init" for that case) -
+		neither shape has a $header.lock to acquire. Confirmed as a real bug,
+		not a theoretical one: a nested CStruct field's own teardown
+		(compiler.decref recursing into a by-value-embedded CStruct's own
+		attributes, type_resolver.py's _build_field_teardown_ast) tried to
+		reinterpret-cast a whole `struct Wrapper` VALUE (not a pointer) to
+		ObjectHeader*, rejected outright by clang. `.tag`/`.data`/
+		`.v_<member>` (TaggedUnion's own compiler-SYNTHESIZED storage-view
+		accessors - UnionStorage.get()) are excluded for the same underlying
+		reason (no ObjectHeader of their own either) and were the first
+		confirmed instance of this class of bug. '''
+		resolved = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
+		return isinstance( resolved, RCClass )
+
+	def _check_field_visibility( self, owner_type: Type|None, attr_var: Variable, attr_name: str, ctx: ast.AST ) -> None:
+		''' PLAN_THREAD_SAFE_SHARED_STATE.md's field-visibility-enforcement
+		prerequisite: called from every genuine user-facing `obj.field`
+		read/write chokepoint (never from an internal synthesized-name
+		lookup like a tuple element's `_N` field or a narrowing probe -
+		those go through _attr_lookup directly, bypassing this). Resolves
+		which class actually DECLARES attr_name (InheritanceChainMixin.
+		field_owner - not necessarily owner_type itself, which may be a
+		subclass reached through the concrete receiver) and defers the
+		actual `_`/`__` check to discovery.check_field_visibility, the same
+		accessing-class source of truth (_current_fn.cls) _try_lower_
+		allocate_call's own private-access check just below already uses.
+		A safe no-op for anything that isn't an RCClass/CStruct field at all
+		(CUnion/TaggedUnion/CEnum members, Ptr pointees, ...) - none of
+		those have SYNTAX.md's field-privacy concept in the first place. '''
+		# unwrap to the abstract TEMPLATE, not _ensure_resolved's monomorphized
+		# concrete instantiation - field_owner/in_private_scope/in_protected_
+		# scope all compare by object IDENTITY, and _ensure_resolved hands
+		# back a fresh, per-instantiation RCClass object for a generic class
+		# (confirmed via a real false positive: monomorphized `builtins.
+		# list[i32]` methods rejected as unable to access their OWN class's
+		# `__inner`/`__lock` fields, because the receiver's and the accessing
+		# method's own .cls each independently monomorphized to a
+		# DIFFERENT-but-equal-looking object) - the abstract template is the
+		# one stable object every instantiation shares, exactly the
+		# "whichever template self/scope are each an instance of" contract
+		# in_private_scope's own docstring already documents for its `scope`
+		# side (see _try_lower_allocate_call's identical target_cls unwrap
+		# just below, which resolves this the same way for __allocate__).
+		resolved = owner_type.base if isinstance( owner_type, Specialization ) else owner_type
+		if not isinstance( resolved, InheritanceChainMixin ):
+			return
+		defining_cls = resolved.field_owner( attr_name )
+		if defining_cls is None:
+			return
+		if self._current_fn is not None and self._current_fn.is_destructor:
+			# $$__destructor__ (type_resolver.py's _synthesize_rcclass_
+			# destructor) is built with cls=None (confirmed directly: its own
+			# Function(...) construction passes cls=None explicitly) even
+			# though it's logically "inside" its own class - its whole job is
+			# decref'ing every field, public or private, so it's exempt by
+			# construction rather than something accessing_cls=None should
+			# reject. Every other compiler-synthesized field toucher
+			# (construction/$$__new__) goes through ir.Allocate, never
+			# GetAttr/SetAttr, so this is the only synthesized-function case
+			# that reaches this check at all.
+			return
+		accessing_cls = self._current_fn.cls if self._current_fn is not None else None
+		self.lowering.discovery.check_field_visibility( attr_var, defining_cls, ctx, accessing_cls )
+
 	def _try_lower_allocate_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Temp|None:
 		# Class.__allocate__(field=value, ...) - a compiler-synthesized
 		# pseudo-method (SYNTAX.md: "strictly private... can only be called
@@ -12822,6 +14399,26 @@ class FunctionLowering:
 		# non-generic class
 		if isinstance( target_cls, Specialization ) and isinstance( target_cls.base, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			target_cls = self.lowering._ensure_resolved( target_cls )
+
+		# module-level `_x`/`__x` privacy (SYNTAX.md, extended to cover
+		# classes too) - checked HERE, not inside the shared _try_resolve_
+		# namespace utility itself (self.lowering._try_resolve_namespace is
+		# a thin delegate to TypeResolver._try_resolve_namespace, which is
+		# ALSO reached by _stmt_diverges's own unrelated NoReturn re-probe -
+		# see check_module_visibility's own comment on why enforcing
+		# inside that shared utility produced a real false positive for
+		# functions). Gated on target_cls actually being a ClassLike -
+		# confirmed necessary via a SECOND real false positive, the same
+		# shape as _stmt_diverges's: this recognizer is tried against
+		# EVERY call node (construction_recognizers, _lower_call's own
+		# tuple), including calls to ordinary FUNCTIONS that _try_resolve_
+		# namespace happily resolves before this recognizer declines and
+		# falls through - checking unconditionally there flagged lib/
+		# builtins's own use of sys._assert (a Function, not a class)
+		# purely because THIS probe touched it, not because anything
+		# actually constructed it.
+		if isinstance( target_cls, ClassLike ):
+			self.lowering.discovery.check_module_visibility( target_cls, node.func, self._owning_module )
 
 		# T(...) where T defines a static __call__ dispatches to
 		# T.__call__(...) instead of construction - rewrite node.func to
@@ -13032,6 +14629,44 @@ class FunctionLowering:
 				# RCCLASS ATTRIBUTE LIFETIME.md's own title) - falls through to
 				# the normal call path, same "not callable" as always
 				return None
+			if isinstance( init, Overload ):
+				# resolve to a single winning Function BEFORE everything
+				# below (fallibility detection, field=value sugar, RC
+				# attribute-lifetime tracking) - none of that needs to
+				# change, it just needs a concrete Function instead of an
+				# Overload group. Arguments are lowered TWICE for a generic
+				# target_cls (once here, probe-only, again inside _lower_
+				# generic_construction_args against the winning candidate's
+				# real declared types) - same "probe first, lower for real
+				# once the target is fixed" split the ordinary overloaded-
+				# call path (_lower_call, below) already uses, just not
+				# reusing its lowered operands directly (construction's own
+				# downstream generic-inference pass needs to re-lower
+				# against the WINNING candidate's parameter types anyway,
+				# unlike an ordinary call - see _lower_generic_construction_
+				# args). A runtime-dispatched winner (2+ candidates still
+				# tied after resolve_call) isn't supported here - construct-
+				# ion has no ConditionalDispatch machinery of its own.
+				candidates = [ *init.stubs, *init.implementations ]
+				if any( kw.arg is None for kw in node.keywords ):
+					self.lowering.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )
+				probe_args = [ self._lower_overload_arg( e, i, None, candidates, node ) for i, e in enumerate( node.args ) ]
+				probe_kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
+				try:
+					branches, resolved_init = overload_resolution.resolve_call(
+						init.stubs, init.implementations,
+						[ op.type for op in probe_args ], { name: op.type for name, op in probe_kwargs.items() },
+						qualname = f'{target_cls.qualname}.__init__', same_type = self.lowering._type_resolver._same_type,
+						protocol_conforms = self.lowering._type_conforms_to_protocol,
+					)
+				except CompileError as e:
+					self.lowering.discovery.fail( str( e ), node )
+				if branches:
+					self.lowering.discovery.fail(
+						f'{target_cls.qualname}.__init__: a runtime-dispatched overloaded constructor is not supported yet: {ast.unparse(node)}',
+						node,
+					)
+				init = resolved_init
 			if not isinstance( init, Function ):
 				self.lowering.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
 			# init may be target_cls's OWN __init__ or an INHERITED one
@@ -13126,6 +14761,27 @@ class FunctionLowering:
 			param.stem: self._lower_expr( expr, self.lowering._substitute_type_params( param.type, type_params, partial_args ), strict = False )
 			for param, expr in keyword
 		}
+		# strict=False above deliberately skips _coerce_or_check_operand's own
+		# case-2 auto-or_throw() hook (a HINT-only lowering, not a real
+		# requirement yet - see this method's own comment above) - same as
+		# _lower_binary_operands' own identical strict=False lowering, this
+		# reinstates it manually right here: an unconsumed Result[T,E]
+		# argument (e.g. `Result.Ok(c)` where `c = a + b` left c as a raw
+		# Result[u32,OverflowError]) would otherwise reach _unify_type_param
+		# below still Result-shaped and get "inferred as both u32 and
+		# Result[u32,OverflowError]" instead of just binding T=u32. Skipped
+		# whenever the param's own (possibly still-abstract/unbound)
+		# declared type is ITSELF Result-shaped - a genuinely nested
+		# Result-typed argument (rare, but legal) must keep flowing through
+		# raw, exactly like every other case-2 site's identical guard
+		args = [
+			self._auto_consume_hint_arg( node, operand, param.type )
+			for ( param, _expr ), operand in zip( positional, args )
+		]
+		kwargs = {
+			param.stem: self._auto_consume_hint_arg( node, kwargs[param.stem], param.type )
+			for param, _expr in keyword
+		}
 		for ( param, _expr ), operand in zip( positional, args ):
 			self._apply_move_hook( param, operand, qualname )
 		for param, _expr in keyword:
@@ -13135,6 +14791,22 @@ class FunctionLowering:
 		for param, _expr in keyword:
 			self.lowering._unify_type_param( type_params, param.type, kwargs[param.stem].type, bindings, node, qualname )
 		return args, kwargs
+
+	def _auto_consume_hint_arg( self, node: ast.AST, operand: ir.Operand, declared_param_type: Type|None ) -> ir.Operand:
+		''' see _lower_and_infer_call_args' own comment on why this exists -
+		reinstates case 2 of the general auto-or_throw() rule for a
+		strict=False, hint-only generic-argument lowering, gated on the
+		PARAM's own still-abstract declared type (not a substituted/bound
+		one - a not-yet-bound bare TypeVar reads as "not Result-shaped"
+		here, same as everywhere else, so the common case (inferring T from
+		an incidentally-Result-shaped argument) auto-consumes) rather than
+		being Result-shaped itself. '''
+		if ( self.lowering._type_resolver._result_shape( operand.type ) is None
+				or self.lowering._type_resolver._result_shape( declared_param_type ) is not None ):
+			return operand
+		consumed = self._auto_or_throw( node, operand, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = True )
+		assert consumed is not None # want_result=True above guarantees this
+		return consumed
 
 	def _lower_generic_construction_args( self, node: ast.Call, target_cls: RCClass, init: Function, expected_type: Type|None ) -> tuple[RCClass|Specialization,Function,list[ir.Operand],dict[str,ir.Operand]]:
 		# Box(...) where Box is generic: target_cls's own concrete type args
@@ -13150,6 +14822,21 @@ class FunctionLowering:
 		# body (parameters/return_type) was already resolved by the caller.
 		assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 		class_type_params = target_cls.type_params or []
+		# __init__ may declare its OWN extra type param(s) on top of
+		# target_cls's (e.g. list[T].__init__[S: IteratorProtocol[T]]) - S
+		# and T have to be inferred TOGETHER, in one combined pass, not two
+		# separate ones: T never appears directly in init's own (abstract)
+		# parameter list at all when init has its own S (only inside S's
+		# bound, e.g. IteratorProtocol[T]) - a class-type-params-ONLY unify
+		# pass never binds T in that shape, only _unify_type_param's own
+		# reverse-bound-unification (through S's parametrized protocol
+		# bound) ever does, and that only fires when T is in the SAME
+		# type_params list being unified as S itself. Same combined-list
+		# technique a free generic function with this identical shape
+		# already relies on (max[T, S: Iterable[T]]) - just extended here
+		# to cover a class's own type params too, not only a function's.
+		own_type_params = init.type_params or []
+		type_params = [ *class_type_params, *own_type_params ]
 		bindings: dict[int,Type] = {}
 		# expected_type pins target_cls's own args directly for a non-
 		# fallible __init__ (b: Box[i32] = Box(1)) - but for a FALLIBLE one,
@@ -13167,20 +14854,41 @@ class FunctionLowering:
 			for tv, arg in zip( class_type_params, pinning_type.args ):
 				bindings[ id( tv ) ] = arg
 
-		args, kwargs = self._lower_and_infer_call_args( node, init, class_type_params, bindings, target_cls.qualname )
+		args, kwargs = self._lower_and_infer_call_args( node, init, type_params, bindings, target_cls.qualname )
 
-		missing = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
+		missing = [ tv.stem for tv in type_params if id( tv ) not in bindings ]
 		if missing:
 			self.lowering.discovery.fail(
 				f'{target_cls.qualname}(...): cannot infer type parameter(s) {", ".join(missing)} from these arguments or the surrounding expected type: {ast.unparse(node)}',
 				node,
 			)
 		concrete_args = [ bindings[id(tv)] for tv in class_type_params ]
-		self.lowering._check_type_param_bounds( node, class_type_params, concrete_args, target_cls.qualname )
+		own_concrete_args = [ bindings[id(tv)] for tv in own_type_params ]
+		self.lowering._check_type_param_bounds( node, type_params, [ *concrete_args, *own_concrete_args ], target_cls.qualname )
 		cls_spec = self.lowering.discovery._get_or_create_specialization( target_cls, concrete_args )
+		self.lowering._ensure_resolved( cls_spec )
+
+		if own_type_params:
+			# build the fully-concrete __init__ directly, substituting BOTH
+			# class and own args in one shot (_build_monomorphized_function
+			# zips type_params/args positionally, and doesn't care which
+			# came from the class vs the method itself) - mirrors
+			# Monomorphizer._partial_class_substituted_method's own
+			# substitution call, just skipping its "stay generic in S"
+			# half (result_type_params stays None/default here): S is
+			# already concrete by this point, unlike THAT method's own
+			# use case (an ordinary receiver-based method call, where S is
+			# only ever known later, at its own separate call site -
+			# construction has no such second call site, S is resolved
+			# right here from the SAME arguments T is)
+			qualname = f'{cls_spec.qualname}.{init.stem}'
+			monomorphized_init = self.lowering._monomorphizer._build_monomorphized_function(
+				init, type_params, [ *concrete_args, *own_concrete_args ], qualname, cls_spec,
+			)
+			return cls_spec, monomorphized_init, args, kwargs
+
 		init_spec = self.lowering.discovery._get_or_create_specialization( init, concrete_args )
-		self.lowering._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
-		monomorphized_init = self.lowering._ensure_resolved( init_spec )
+		monomorphized_init = self.lowering._ensure_resolved( init_spec ) # concrete_cls's own build above (monomorphize_class's method-substitution loop) already populated init_spec.monomorphized as a side effect - same (init, concrete_args) key
 		return cls_spec, monomorphized_init, args, kwargs
 
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
@@ -13206,20 +14914,30 @@ class FunctionLowering:
 			return self._lower_scalar_cast( target_cls, operand, node )
 		# a non-Scalar source (e.g. an RCClass) - this is where library-
 		# authored extensibility (Scalar.names, see discovery.py's
-		# visit_Assign) actually earns its keep: a future
-		# `SomeClass.__u32__(self) -> u32: ...` is dispatched here exactly
-		# like any other method call
-		dunder = self.lowering._find_method( operand.type, f'__{target_cls.stem}__' )
-		if dunder is None:
-			self.lowering.discovery.fail(
-				f'{operand.type.qualname if operand.type else "?"} has no __{target_cls.stem}__ method - cannot convert to {target_cls.qualname}: {ast.unparse(node)}',
-				node,
-			)
-		self.lowering._ensure_resolved( dunder )
-		self.lowering.schedule( dunder.return_type )
-		dest = self._new_temp( expected_type or dunder.return_type )
-		self._emit( ir.Call( dest = dest, target = dunder, receiver = operand, args = [], kwargs = {} ))
-		return dest
+		# visit_Assign) actually earns its keep: a `SomeClass.__u32__(self)
+		# -> u32: ...` is dispatched here exactly like any other method
+		# call - same _mode_qualified_dunder_names/_emit_fallible_method_
+		# call pair binop dispatch already uses for __add__/__wrapped_add__/
+		# __saturated_add__ (see _MODE_DUNDER_PREFIX's own module-level
+		# comment), reused here rather than reimplemented: __i32__'s own
+		# value-range check is genuinely mode-INDEPENDENT (SYNTAX.md's
+		# .to_T() contract - "no meaningful wrapped/saturated value-range
+		# check"), so under wrap/saturate mode the qualified name is tried
+		# first and, if the class declares one (e.g. int.__saturated_i32__,
+		# infallible - clamps rather than erring, mirroring the compiler's
+		# OWN intrinsic cast picking a different, infallible opcode
+		# (CastSaturate) under this exact mode), wins; otherwise this falls
+		# through to the base name exactly like binop dispatch's identical
+		# miss does, so a class with nothing registered under the qualified
+		# name needs no special-casing at all.
+		for candidate in self._mode_qualified_dunder_names( f'__{target_cls.stem}__' ):
+			dunder = self.lowering._find_method( operand.type, candidate )
+			if dunder is not None:
+				return self._emit_fallible_method_call( node, dunder, operand, [], expected_type )
+		self.lowering.discovery.fail(
+			f'{operand.type.qualname if operand.type else "?"} has no __{target_cls.stem}__ method - cannot convert to {target_cls.qualname}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _narrowed_type_of_name( self, var_id: str, declared_type: Type ) -> Type:
 		''' declared_type, unless var_id is currently narrowed (cfg.py's
@@ -13425,7 +15143,9 @@ class FunctionLowering:
 
 		return self._emit_call_indirect( fn_cast, [ self_operand, *args ], closure_type.return_type, expected_type )
 
-	def _lower_or_return( self, node: ast.Call, receiver: ir.Operand, want_result: bool ) -> ir.Operand|None:
+	def _lower_or_return(
+		self, node: ast.Call, receiver: ir.Operand, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
 		# <result_expr>.or_return() is recognized textually here rather than
 		# ever actually calling Result.or_return's own declared body
 		# (`if self.is_err(): compiler.early_return(self.data.v_Err)` /
@@ -13440,8 +15160,14 @@ class FunctionLowering:
 		# the error to the enclosing function, continue with the unwrapped
 		# value" shape - no new IR needed, and Result.or_return is never
 		# scheduled/lowered as a real function as a result.
+		#
+		# or_return(mapper): a single positional argument is a whole
+		# separate shape (see _lower_or_return_with_mapper) - dispatched
+		# here, before any of the no-arg-specific validation below runs.
+		if len( node.args ) == 1 and not node.keywords:
+			return self._lower_or_return_with_mapper( node, receiver, node.args[0], want_result, receiver_pending_start = receiver_pending_start )
 		if node.args or node.keywords:
-			self.lowering.discovery.fail( f'or_return() takes no arguments: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail( f'or_return() takes no arguments, or a single error-mapping callable: {ast.unparse(node)}', node )
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		if shape is None:
 			self.lowering.discovery.fail( f'or_return() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
@@ -13455,7 +15181,7 @@ class FunctionLowering:
 		# live in _consume_checked_result itself, shared with checked-
 		# arithmetic's own identical OrReturn/OrJump early-exit - see its
 		# own comment
-		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None )
+		unwrapped = self._consume_checked_result( node, receiver, result_type, extra = None, receiver_pending_start = receiver_pending_start )
 		if not want_result:
 			# unwrapped's own extraction is bundled into OrReturn/OrJump's IR
 			# shape (see _consume_checked_result) - can't be skipped even
@@ -13468,26 +15194,6 @@ class FunctionLowering:
 			self._emit( ir.MarkUsed( operand = unwrapped ))
 			return None
 		return unwrapped
-
-	def _lower_parameter_default( self, target: Function, param: Parameter, node: ast.Call ) -> ir.Operand:
-		# shared by every call-lowering path that fills in an omitted-but-
-		# defaulted argument (_lower_call_args, _fill_generic_call_defaults,
-		# and the resolved-Overload-candidate branch in _lower_call) - node
-		# is the real CALL SITE (e.g. logger.debug("hi")), needed so
-		# compiler.caller_line()/caller_file() can capture ITS location
-		# rather than param.default's own (which is wherever the default
-		# expression happens to be written, i.e. target's own definition)
-		self.lowering._type_resolver.resolve_parameter_default( target, param )
-		intrinsic = self.lowering._is_compiler_call( param.default )
-		if intrinsic in ( 'caller_line', 'caller_file' ):
-			return self._fold_caller_location( intrinsic, param, node )
-		# lowered in the CALLEE's own module/scope, not the caller's - a
-		# default expression can reference names visible where the
-		# function/class was DEFINED, and errors inside it should be
-		# located there too
-		with self.lowering.discovery.module_context( self.lowering._find_module_for( target )):
-			with self.lowering.discovery.scope_context( target ):
-				return self._lower_expr( param.default, param.type )
 
 	def _fold_caller_location( self, intrinsic: str, param: Parameter, node: ast.Call ) -> ir.Operand:
 		call = param.default
@@ -13503,6 +15209,657 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'compiler.caller_file() can only default a str parameter, not {param.type.qualname}', call )
 		caller_file = self.lowering.discovery.module_stack[-1].file if self.lowering.discovery.module_stack else None
 		return ir.Const( type = str_cls, value = str( caller_file ) if caller_file is not None else '<unknown>' )
+
+	def _lower_or_return_with_mapper(
+		self, node: ast.Call, receiver: ir.Operand, mapper_node: ast.expr, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
+		''' <result_expr>.or_return(mapper) - like the no-arg or_return()
+		above, but the Err leg calls `mapper(err)` first and propagates
+		ITS result instead of the receiver's own error payload unchanged
+		(converting one error type into another, e.g. `IndexError` ->
+		`StopIteration`, without a full match/if-is_err() block).
+
+		Unlike the no-arg form (a single flat OrReturn/OrJump instruction,
+		since it only ever moves the SAME payload through unmodified),
+		this needs a real conditional: the mapper call must run ONLY on
+		the Err path, and needs a genuine Operand for the receiver's own
+		error payload to pass it - built here as an ordinary binary branch
+		(_lower_binary_branch, the same primitive _lower_for_over_iterator
+		already uses for its own Ok/Err dispatch) rather than a new IR
+		shape. The Err arm ends in a real `return Result.Err(mapper(err))`
+		statement (_stmt_Return), deliberately reusing its ALREADY-correct
+		widening/defer/errdefer/inline-splice/generator-pessimistic-done
+		handling rather than re-implementing any of it for a second time -
+		mapper(err)'s own call goes through the ordinary _lower_call
+		dispatch too (via a synthesized ast.Call, not hand-built IR),
+		which is what makes a real capturing closure work here for free,
+		the same as a plain function/non-capturing lambda.
+
+		Deliberately NOT supported yet inside a generator body
+		(self._current_fn.is_generator_next) - a generator's own body is
+		desugared into its yield/resume state machine by an EARLIER,
+		separate pass (type_resolver.py, before lowering.py ever runs),
+		which never sees this method's own synthesized branch/return at
+		all (it's built directly as IR, here, after that pass has already
+		finished) - untested interaction, rejected outright rather than
+		risking a silent miscompile. '''
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'or_return(mapper) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		if shape is None:
+			self.lowering.discovery.fail( f'or_return(mapper) receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		result_ok_type, error_cls = shape
+		tagged_shape = self.lowering._type_resolver._tagged_union_shape( receiver.type )
+		assert tagged_shape is not None, 'internal compiler error: _result_shape succeeded but _tagged_union_shape did not'
+		_result_base, result_members = tagged_shape
+		err_member = next( a for a in result_members if a.stem == 'Err' )
+		ok_member = next( a for a in result_members if a.stem == 'Ok' )
+		concrete_result_union = self.lowering.monomorphize_class( receiver.type ) if isinstance( receiver.type, Specialization ) else receiver.type
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( concrete_result_union )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+
+		is_alias = self.lowering._is_aliasing_expr( node.func.value, receiver )
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, receiver )
+		unique = self._label_id
+		self._label_id += 1
+		recv_var = self._declare_hidden_local( f'__or_recv_{unique}', receiver.type, node )
+		# track_result=False: recv_var's own Result-ness is scaffolding
+		# inspected via the raw .tag comparison below, not is_ok()/is_err()/
+		# match - same reasoning as _lower_for_over_iterator's own next_var
+		self._cfg_assign( recv_var, receiver, is_alias = is_alias, node = node, track_result = False )
+
+		# mapper is lowered here, ONCE, unconditionally (matching ordinary
+		# Python call-argument evaluation semantics - a Call's own callee
+		# expression is always evaluated regardless of what its result is
+		# later used for), then bound into its own hidden local so err_
+		# thunk below (which only runs conditionally) can reference it by
+		# a bare Name - required for TWO reasons, not just consistency:
+		# (1) _try_lower_indirect_call/_try_lower_closure_call's own callee
+		# dispatch needs a real Name/Attribute AST shape to statically
+		# resolve HOW to call it (raw fn ptr vs closure), which an
+		# already-computed Operand alone can't provide; (2) an inline
+		# lambda (`or_return(lambda e: StopIteration())`) needs a real
+		# expected Callable[...] type to infer its own parameter types
+		# from (confirmed via a real repro: without this, lowering the raw
+		# mapper_node directly as err_thunk's own ast.Call.func failed with
+		# "cannot infer lambda parameter types - no expected Callable[...]
+		# context") - built here as Ptr[Callable[[error_cls],<TypeVar>]],
+		# the SAME provisional-TypeVar-return shape any other generic call
+		# site accepting a lambda argument already uses (_expr_Lambda's own
+		# return_type_provisional branch infers the real return type
+		# eagerly from the lambda's own body either way).
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		mapper_ret_placeholder = TypeVar( stem = '_MapperRet', qualname = f'{self._current_fn.qualname}._MapperRet_{unique}', file = None, line = None )
+		mapper_callable_type = self.lowering.discovery._get_or_create_callable_type( [ error_cls ], mapper_ret_placeholder )
+		mapper_expected_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ mapper_callable_type ] )
+		# strict=False: mapper_expected_type carries a PROVISIONAL return
+		# type (an unbound TypeVar, needed only so _expr_Lambda has
+		# somewhere to infer parameter types from) - the operand actually
+		# produced legitimately has a narrower, fully concrete return type
+		# once a lambda's own body resolves it, which the ordinary strict
+		# _check_assignable tail would otherwise reject as a mismatch
+		# against the placeholder type it was never meant to literally match
+		mapper_operand = self._lower_expr( mapper_node, mapper_expected_type, strict = False )
+		mapper_var = self._declare_hidden_local( f'__or_mapper_{unique}', mapper_operand.type, node )
+		mapper_is_alias = self.lowering._is_aliasing_expr( mapper_node, mapper_operand )
+		self._cfg_assign( mapper_var, mapper_operand, is_alias = mapper_is_alias, node = node )
+
+		tag_expr = ast.Attribute( value = self.lowering._synth_name( recv_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		is_err_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ err_member.stem ] ) ] )
+		ast.copy_location( is_err_test, node )
+		is_err_cond = self._lower_expr( is_err_test, bool_cls )
+
+		ok_var_holder: list[Variable] = []
+
+		def err_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, err_member )
+			err_bind_name = f'__or_err_{unique}'
+			self._declare_hidden_local( err_bind_name, error_cls, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			mapped_call = ast.Call(
+				func = self.lowering._synth_name( mapper_var.stem, node ), args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( mapped_call, node )
+			wrap_err = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+				args = [ mapped_call ], keywords = [],
+			)
+			ast.copy_location( wrap_err, node ); ast.copy_location( wrap_err.func, node ); ast.copy_location( wrap_err.func.value, node )
+			ret = ast.Return( value = wrap_err )
+			ast.copy_location( ret, node )
+			self._lower_stmt( ret )
+			return True
+
+		def ok_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, ok_member )
+			ok_bind_name = f'__or_ok_{unique}'
+			ok_var = self._declare_hidden_local( ok_bind_name, result_ok_type, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = ok_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			ok_var_holder.append( ok_var )
+			return False
+
+		self._lower_binary_branch( is_err_cond, node, err_thunk, ok_thunk )
+		# err_thunk always terminates (a real `return`, never falls through
+		# to here) - ok_var is therefore always live whenever control
+		# actually reaches this point, exactly like a local declared in a
+		# non-terminating if-branch when the other branch returns.
+		ok_operand = ok_var_holder[0]
+		if not want_result:
+			self._emit( ir.MarkUsed( operand = ok_operand ))
+			return None
+		return ok_operand
+
+	def _lower_or_throw(
+		self, node: ast.Call, receiver: ir.Operand, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
+		''' <result_expr>.or_throw() - like or_return() above (same "no real
+		method, recognized by AST shape alone" story - see _lower_or_return's
+		own comment). The real per-leaf dispatch/emission logic is shared
+		with every AUTO-inserted or_throw() site (checked arithmetic,
+		__setitem__/AugAssign, a discarded Result statement, a Result
+		flowing into a T-typed context) via _emit_or_throw - see its own
+		docstring. Only the checks specific to the explicit `.or_throw()`
+		SYNTAX (no-args, generator-body rejection) live here - the @inline-
+		splice-prelude case is now generalized (ir.OrThrow.inline_exit),
+		same carve-out _emit_or_throw's own uncovered-leaf branch applies.
+		or_throw(mapper): a single positional argument is a whole separate
+		shape (see _lower_or_throw_with_mapper) - dispatched here, before
+		any of the no-arg-specific validation below runs. '''
+		if len( node.args ) == 1 and not node.keywords:
+			return self._lower_or_throw_with_mapper( node, receiver, node.args[0], want_result, receiver_pending_start = receiver_pending_start )
+		if node.args or node.keywords:
+			self.lowering.discovery.fail( f'or_throw() takes no arguments, or a single error-mapping callable: {ast.unparse(node)}', node )
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'or_throw() is not supported inside a generator body yet - a generator body is a state machine '
+				f're-entered across multiple send()/next() resumptions, not called once like an ordinary function, so '
+				f'what an uncaught error should even mean here (fail just this resumption vs. end the generator '
+				f'entirely) needs real design first: {ast.unparse(node)}', node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		if shape is None:
+			self.lowering.discovery.fail( f'or_throw() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		return self._emit_or_throw(
+			node, receiver, want_result, alternatives = self.lowering._OR_THROW_ALTERNATIVES, receiver_pending_start = receiver_pending_start,
+		)
+
+	def _lower_or_throw_with_mapper(
+		self, node: ast.Call, receiver: ir.Operand, mapper_node: ast.expr, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
+		''' <result_expr>.or_throw(mapper) - like or_return(mapper) above
+		(see its own docstring for the general shape: a real conditional
+		branch via _lower_binary_branch, the mapper call going through the
+		ordinary _lower_call dispatch via a synthesized ast.Call so a real
+		capturing closure works for free), but the Err arm ends in a real
+		`raise mapper(err)` statement (_stmt_Raise) instead of `return
+		Result.Err(mapper(err))` - dispatching the MAPPED error's own
+		leaves against any enclosing try's own handlers (innermost first),
+		falling back to or_return(mapper)'s own propagate-to-caller
+		behavior for any leaf left uncovered, exactly like a hand-written
+		`raise` already does. This is why the mapping happens BEFORE
+		dispatch, not after: `.or_throw(mapper)` means "convert this error,
+		THEN handle/propagate the converted one" - an enclosing `except
+		StopIteration:` next to `seq[i].or_throw(to_stop_iteration)` catches
+		the MAPPED type, never the receiver's own original error type,
+		which is never visible outside this call at all.
+
+		Same generator-body rejection as the no-arg form above (see its own
+		comment) - `raise` itself is independently rejected inside a
+		generator body too (_stmt_Raise's own identical check), so this
+		only needs its own explicit check to give a clearer, or_throw(mapper)-
+		specific message rather than surfacing _stmt_Raise's generic one
+		for a call site the user never wrote a literal `raise` at. '''
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'or_throw(mapper) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		if shape is None:
+			self.lowering.discovery.fail( f'or_throw(mapper) receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		result_ok_type, error_cls = shape
+		tagged_shape = self.lowering._type_resolver._tagged_union_shape( receiver.type )
+		assert tagged_shape is not None, 'internal compiler error: _result_shape succeeded but _tagged_union_shape did not'
+		_result_base, result_members = tagged_shape
+		err_member = next( a for a in result_members if a.stem == 'Err' )
+		ok_member = next( a for a in result_members if a.stem == 'Ok' )
+		concrete_result_union = self.lowering.monomorphize_class( receiver.type ) if isinstance( receiver.type, Specialization ) else receiver.type
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( concrete_result_union )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+
+		is_alias = self.lowering._is_aliasing_expr( node.func.value, receiver )
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, receiver )
+		unique = self._label_id
+		self._label_id += 1
+		recv_var = self._declare_hidden_local( f'__ot_recv_{unique}', receiver.type, node )
+		self._cfg_assign( recv_var, receiver, is_alias = is_alias, node = node, track_result = False )
+
+		# see or_return_with_mapper's own identical comment on why the
+		# mapper is lowered here, once, into its own hidden local, rather
+		# than embedded directly in err_thunk's own synthesized ast.Call
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		mapper_ret_placeholder = TypeVar( stem = '_MapperRet', qualname = f'{self._current_fn.qualname}._MapperRet_{unique}', file = None, line = None )
+		mapper_callable_type = self.lowering.discovery._get_or_create_callable_type( [ error_cls ], mapper_ret_placeholder )
+		mapper_expected_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ mapper_callable_type ] )
+		mapper_operand = self._lower_expr( mapper_node, mapper_expected_type, strict = False )
+		mapper_var = self._declare_hidden_local( f'__ot_mapper_{unique}', mapper_operand.type, node )
+		mapper_is_alias = self.lowering._is_aliasing_expr( mapper_node, mapper_operand )
+		self._cfg_assign( mapper_var, mapper_operand, is_alias = mapper_is_alias, node = node )
+
+		tag_expr = ast.Attribute( value = self.lowering._synth_name( recv_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		is_err_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ err_member.stem ] ) ] )
+		ast.copy_location( is_err_test, node )
+		is_err_cond = self._lower_expr( is_err_test, bool_cls )
+
+		ok_var_holder: list[Variable] = []
+
+		def err_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, err_member )
+			err_bind_name = f'__ot_err_{unique}'
+			self._declare_hidden_local( err_bind_name, error_cls, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			mapped_call = ast.Call(
+				func = self.lowering._synth_name( mapper_var.stem, node ), args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( mapped_call, node )
+			# a GOTO-based ir.Raise (the all_covered case - every leaf
+			# dispatches straight into a handler, see _stmt_Raise's own
+			# short-circuit) never unwinds anything - unlike a real
+			# function-level return/propagation, which walks and replays
+			# the ENTIRE pending stack (cfg.return_()), a jump into a
+			# handler INSIDE the same function correctly leaves that to
+			# whatever scope it lands in. Every hidden local THIS call
+			# introduced (err_bind_name below, and recv_var itself - an
+			# OUTER local, but one this specific call is the only reason
+			# it's still holding a reference by this point) would then
+			# never get released on this specific path at all - confirmed
+			# via a real repro (both leaked, "-- live RC objects (2) --").
+			# recv_var's own payload is already safely aliased into err_
+			# bind_name by this point, so releasing recv_var here (its
+			# extraction already done, nothing else in err_thunk touches
+			# it again) is correct, not premature.
+			if receiver.type.is_rc():
+				recv_decref = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ self.lowering._synth_name( recv_var.stem, node ) ], keywords = [],
+				))
+				ast.copy_location( recv_decref, node ); ast.copy_location( recv_decref.value, node )
+				ast.copy_location( recv_decref.value.func, node ); ast.copy_location( recv_decref.value.func.value, node )
+				self._lower_stmt( recv_decref )
+			# the mapper call is lowered directly here (never embedded
+			# unevaluated inside a fresh ast.Raise, unlike a plain hand-
+			# written `raise mapper(err)`) - both err_bind_name and mapper_var
+			# themselves need explicit teardown BETWEEN the call and the
+			# raise (see below), and _stmt_Raise's own all_covered dispatch
+			# is an unconditional goto with no reachable code after it, so
+			# anything still needing to run has to happen BEFORE it, not
+			# after. Kept mapped_value a bare, never-named operand (never
+			# bound via ast.Assign - see _raise_value's own docstring)
+			# rather than a hidden Variable: a NAMED local raised from
+			# inside this confined Err branch has no natural unwind at all
+			# (a GOTO-based ir.Raise never walks back through
+			# _lower_binary_branch's own confinement - confirmed via a real
+			# repro, the mapper's own result permanently leaking even after
+			# trying cfg.manually_decreffed() on it, which only cancels an
+			# ALREADY-firing release, not one that would never fire to
+			# begin with). untrack_temp() inside _raise_value is what
+			# correctly hands a bare temp's ownership off instead.
+			#
+			# mapper_var.type is EITHER Ptr[Callable[...]] (a plain
+			# function/non-capturing lambda) or a bare ClosureType (a real
+			# capturing closure) - mirrors _expr_Lambda's own identical
+			# two-shape fallback for resolving fn_type
+			mapper_callable_type_resolved = self.lowering._type_resolver._callable_type_of( mapper_var.type )
+			if mapper_callable_type_resolved is None and isinstance( mapper_var.type, ClosureType ):
+				mapper_callable_type_resolved = mapper_var.type
+			mapped_value = self._lower_expr( mapped_call, mapper_callable_type_resolved.return_type )
+			if error_cls.is_rc():
+				# fully consumed as the mapper's own argument - same "read a
+				# container-owned value into a local, explicitly decref it"
+				# idiom list.__del__/dict's own _release_key/_release_value
+				# already use elsewhere in this stdlib
+				err_decref = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+				))
+				ast.copy_location( err_decref, node ); ast.copy_location( err_decref.value, node )
+				ast.copy_location( err_decref.value.func, node ); ast.copy_location( err_decref.value.func.value, node )
+				self._lower_stmt( err_decref )
+			if mapper_var.type.is_rc():
+				# a real capturing closure (ClosureType is_rc()) - declared
+				# in the try body (before this branch even starts), so its
+				# own OWNED epilogue entry would normally survive to be
+				# released wherever the enclosing function actually returns
+				# (return_()'s own whole-stack walk). But _stmt_Try's own
+				# handler lowering restores the CFG back to the try's ENTRY
+				# snapshot before running ANY handler body (see _stmt_Try's
+				# own comment) - silently dropping, not releasing, every
+				# entry the try body itself pushed, mapper_var included.
+				# Confirmed via a real repro: OrThrowMapperTests.
+				# test_capturing_closure_mapper_rc_correct leaked exactly
+				# the closure + its own captured-env allocation, on the Err
+				# path only (the Ok path's own real function-level `return`
+				# still correctly walks and releases it, since it never
+				# goes through a handler dispatch at all).
+				mapper_decref = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ self.lowering._synth_name( mapper_var.stem, node ) ], keywords = [],
+				))
+				ast.copy_location( mapper_decref, node ); ast.copy_location( mapper_decref.value, node )
+				ast.copy_location( mapper_decref.value.func, node ); ast.copy_location( mapper_decref.value.func.value, node )
+				self._lower_stmt( mapper_decref )
+			self._raise_value( mapped_value, node )
+			return True
+
+		def ok_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, ok_member )
+			ok_bind_name = f'__ot_ok_{unique}'
+			ok_var = self._declare_hidden_local( ok_bind_name, result_ok_type, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = ok_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			ok_var_holder.append( ok_var )
+			return False
+
+		self._lower_binary_branch( is_err_cond, node, err_thunk, ok_thunk )
+		# err_thunk always terminates (a real `raise` - either a goto into
+		# a handler, or a real `return` when uncovered - never falls
+		# through to here) - ok_var is therefore always live whenever
+		# control actually reaches this point, exactly like or_return_
+		# with_mapper's own identical reasoning.
+		ok_operand = ok_var_holder[0]
+		if not want_result:
+			self._emit( ir.MarkUsed( operand = ok_operand ))
+			return None
+		return ok_operand
+
+	def _dispatch_leaves_against_try_stack(
+		self, all_leaves: list[Type], *, exclude: 'ir.Operand | None' = None,
+	) -> tuple[list[ir.ThrowLeaf],list[Type]]:
+		''' matches each of `all_leaves` against every enclosing try's own
+		handlers, innermost first (self._try_stack - see TryContext's own
+		docstring) - the first handler found across ANY try context on the
+		stack wins, not just the innermost try's own handlers; a leaf
+		matching nothing anywhere on the stack is left uncovered, for the
+		caller (_emit_or_throw / _stmt_Raise) to propagate to the function's
+		own return type instead. Shared by BOTH .or_throw() and `raise` so
+		this walk - and the matched-handler bookkeeping below (Change 3's
+		dead-except check, see TryHandler's own docstring) - lives in
+		exactly one place. Sound without any new CFG machinery: see
+		_stmt_Try's own docstring for why an outer TryContext is still safe
+		to mutate mid-recursion, and why an inner try's goto reaching an
+		outer handler's label needs no extra confinement.
+
+		`exclude` is `raise EXPR`'s own raised value, when it's a plain
+		Variable (_stmt_Raise's own tracked_operand - None for or_throw(),
+		whose payload is a struct field of the receiver, never an
+		independently-tracked entry to begin with) - passed straight
+		through to each matched leaf's own unwind_confined() call below, so
+		its ownership transfers into the handler's bind instead of being
+		released twice. Each matched leaf gets its OWN epilogue, bounded to
+		the SPECIFIC ctx that covered it (see ir.ThrowLeaf.epilogue's own
+		docstring) - a nested try's outer handler catching a leaf the inner
+		try doesn't needs a DEEPER unwind (back to the outer try's own
+		entry) than a leaf the inner try catches itself. '''
+		dispatch: list[ir.ThrowLeaf] = []
+		covered_leaves: list[Type] = []
+		for leaf in all_leaves:
+			handler = None
+			covering_ctx = None
+			for ctx in reversed( self._try_stack ):
+				handler = next( ( h for h in ctx.handlers if leaf in h.leaves ), None )
+				if handler is not None:
+					covering_ctx = ctx
+					break
+			if handler is not None:
+				handler.matched = True
+				epilogue = self._cfg.unwind_confined( covering_ctx.entry_stack_depth, exclude )
+				dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.raise_value_var, label = handler.label, epilogue = epilogue ))
+				covered_leaves.append( leaf )
+		return dispatch, covered_leaves
+
+	def _emit_or_throw(
+		self, node: ast.AST, receiver: ir.Operand, want_result: bool, *,
+		alternatives: str, pre_checked: bool = False, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
+		''' The real body of .or_throw() (explicit or auto-inserted alike) -
+		extracted from _lower_or_throw so every auto-insertion site (see its
+		own docstring) can reuse the exact same per-leaf dispatch/emission,
+		not just the literal `.or_throw()` call syntax. Each leaf of the Err
+		branch is matched against every enclosing try's own handlers,
+		innermost first (_dispatch_leaves_against_try_stack), falling back
+		to EXACTLY or_return()'s own propagate-to-the-caller behavior for
+		any leaf left uncovered by every enclosing try (or every leaf, when
+		there's no enclosing try at all - self._try_stack empty).
+
+		`pre_checked`, when True, skips this method's own
+		_require_or_throw_return coverage call - for a caller (AugAssign's
+		combined get+set subscript chain) that already validated coverage
+		up front via _require_chained_result_return, so the same gap isn't
+		reported twice under two different messages.
+
+		Assumes receiver.type is already known Result[_,_]-shaped (every
+		caller either recognized real `.or_throw()` syntax, which already
+		checked this, or is _auto_or_throw, which only reaches here after
+		its own _result_shape probe succeeded).
+
+		Can't just reuse _consume_checked_result (it always emits an
+		unconditional OrReturn/OrJump - there's no way to thread a per-leaf
+		dispatch table through it) - this replays its checked-result
+		bookkeeping (unchecked-result clearing, epilogue-label lookup) by
+		hand instead, then builds ir.OrThrow directly.
+
+		Uncovered-leaf propagation out of a multi-statement @inline splice's
+		pre-return statements mirrors _consume_checked_result's own
+		self._inline_scope_vars[-1] carve-out exactly (same PLAN_RETURN_
+		INFERENCE.md sentinel-state rejection too - see its own comment). '''
+		if self._in_inline_splice_prelude and not self._inline_scope_vars:
+			self.lowering.discovery.fail(
+				f'@inline: or_throw()/raise that could propagate an error is not yet supported before the '
+				f'final return of a multi-statement body whose own return type is still being inferred: {ast.unparse(node)}',
+				node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		assert shape is not None
+		result_type, error_cls = shape
+		result_cls = self.lowering.discovery.find_name( 'Result', node )
+
+		all_leaves = self.lowering._type_resolver._atomic_leaves( error_cls )
+		dispatch, covered_leaves = self._dispatch_leaves_against_try_stack( all_leaves )
+
+		if not pre_checked:
+			self.lowering._type_resolver._require_or_throw_return(
+				node, result_cls, error_cls, covered_leaves, alternatives, fn = self._current_fn,
+			)
+
+		# same bookkeeping _consume_checked_result runs for or_return() -
+		# see its own comment on why both are needed
+		if isinstance( receiver, Variable ):
+			self._cfg.clear_result( receiver.stem )
+		try:
+			self._cfg.check_unchecked_results( None )
+		except CompileError as e:
+			self.lowering.discovery.fail( str( e ), node )
+
+		# see _consume_checked_result's own identical call/comment - same
+		# construct (a checked-Result value with an early-exit Err leg),
+		# just a different emission path (ir.OrThrow instead of OrReturn/
+		# OrJump, since or_throw() needs a per-leaf dispatch table
+		# _consume_checked_result has no way to thread through)
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, receiver )
+		unwrapped = self._new_temp( result_type )
+		all_covered = len( covered_leaves ) == len( all_leaves )
+		if all_covered:
+			# every leaf dispatches straight into a handler - no
+			# propagation path exists at all, so the enclosing function's
+			# own epilogue/return-type machinery is never touched (also
+			# matches _require_or_throw_return's own "no requirement at
+			# all" contract above)
+			self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch ))
+		else:
+			tracked_operand = receiver if isinstance( receiver, Variable ) else None
+			# see _consume_checked_result's own identical inline_scope carve-
+			# out/comment - reached from inside a multi-statement @inline
+			# splice's pre-return statements, the uncovered-leaf propagation
+			# must land in the SPLICE's own result_var/exited_flag/merge_label,
+			# never the caller's real return_slot/epilogue - always via the
+			# direct return_()-replay shape (mirrors OrReturn's own inline_exit,
+			# never OrJump's shared-scope-label optimization - simpler, and
+			# just as correct, at the cost of not sharing ladder code across
+			# multiple early-exit sites within the same splice)
+			inline_scope = self._inline_scope_vars[-1] if self._in_inline_splice_prelude and self._inline_scope_vars else None
+			if inline_scope is not None:
+				replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+				self._cfg.mark_inline_scope_captured()
+				self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch, epilogue = replay, inline_exit = inline_scope ))
+			else:
+				label = self._cfg.current_epilogue_label( tracked_operand )
+				if label is not None:
+					self._emit( ir.OrThrow(
+						dest = unwrapped, value = receiver, dispatch = dispatch, target = label, return_slot = self._return_value_var,
+					))
+				else:
+					replay = self._cfg.return_( tracked_operand, lambda: self._build_is_err_check( node ))
+					self._emit( ir.OrThrow( dest = unwrapped, value = receiver, dispatch = dispatch, epilogue = replay ))
+
+		# same borrow-then-incref rationale as _consume_checked_result's own
+		# identical tail (see its own comment) - a no-op for a non-RC
+		# result_type
+		for instr in self._cfg.incref( unwrapped.type, unwrapped ):
+			self._emit( instr )
+
+		if not want_result:
+			self._emit( ir.MarkUsed( operand = unwrapped ))
+			return None
+		return unwrapped
+
+	def _auto_or_throw( self, node: ast.AST, value: ir.Operand, alternatives: str, *, want_result: bool = True, pre_checked: bool = False ) -> ir.Operand|None:
+		''' The ONE general rule this whole file's auto-consumption story
+		now boils down to: whenever a Result[T,E]-shaped value is (1) a
+		discarded statement (want_result=False) or (2) flowing into a
+		context that wants T directly rather than the whole Result (see
+		_coerce_or_check_operand's own case-2 hook) - insert an implicit
+		.or_throw() (NOT .or_return()) exactly as if the user had written
+		it. Since or_throw() degrades to or_return()'s own unconditional-
+		propagate behavior whenever there's no enclosing try (self.
+		_try_stack empty, or every leaf uncovered), this is the single
+		mechanism that now backs checked arithmetic, __setitem__/AugAssign,
+		a bare discarded fallible call, AND `x: i32 = arr[0]` alike - see
+		PLAN_CHECKED_ARITHMETIC_GAP.md (now closed) for the gap this
+		unifies away.
+
+		A non-Result `value` passes straight through unchanged - not every
+		caller's value is necessarily fallible (mirrors _maybe_consume_
+		result's own identical "pass through, don't reject" contract).
+
+		Reached from inside a multi-statement @inline splice's pre-return
+		statements exactly like any other call site now (ir.OrThrow.
+		inline_exit) - no separate carve-out needed any more; _emit_or_throw
+		itself routes the uncovered-leaf fallback into the splice's own
+		result_var/exited_flag/merge_label. '''
+		shape = self.lowering._type_resolver._result_shape( value.type )
+		if shape is None:
+			return value if want_result else None
+		return self._emit_or_throw( node, value, want_result, alternatives = alternatives, pre_checked = pre_checked )
+
+	def _maybe_auto_consume_result( self, node: ast.AST, operand: ir.Operand, expected_type: Type|None, alternatives: str, *, context: str|None = None ) -> ir.Operand|None:
+		''' case 2 of the general auto-or_throw() rule (see _auto_or_throw's
+		own docstring) as a probe, not an unconditional coercion: returns the
+		freshly unwrapped-and-re-coerced operand when `operand` is
+		Result[T,E]-shaped AND `expected_type` is NOT itself Result-shaped,
+		else None (not applicable - the caller keeps its OWN existing
+		operand/mismatch handling unchanged). _coerce_or_check_operand uses
+		this directly (its ordinary strict=True path); _stmt_Return needs its
+		own separate call to the same probe since it deliberately lowers
+		with strict=False (see its own comment on why) and so never reaches
+		_coerce_or_check_operand's own hook - both must agree on the exact
+		same guard, hence one shared helper instead of two copies of it. '''
+		if ( expected_type is None
+				or self.lowering._type_resolver._result_shape( operand.type ) is None
+				or self.lowering._type_resolver._result_shape( expected_type ) is not None ):
+			return None
+		consumed = self._auto_or_throw( node, operand, alternatives, want_result = True )
+		assert consumed is not None # want_result=True above guarantees this
+		return self._coerce_or_check_operand( consumed, expected_type, node, context = context )
+
+	def _finish_call_result( self, node: ast.AST, result: ir.Operand|None, want_result: bool ) -> ir.Operand|None:
+		''' shared tail for every call-lowering path (_lower_inline_call,
+		_infer_return_only_type_params_inline, _emit_generic_call, and
+		_lower_call's own shared tail) once the call's real result operand
+		is already computed/emitted, regardless of want_result. Case 1 of
+		the general auto-or_throw() rule (see _auto_or_throw's own
+		docstring): a discarded (want_result=False) Result gets implicitly
+		.or_throw()'d instead of the old hard "returns a Result that is
+		discarded here" compile error. A non-Result, or an already-wanted,
+		result passes straight through unchanged. '''
+		if want_result or result is None:
+			return result
+		self._auto_or_throw( node, result, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = False )
+		return None
+
+	def _lower_parameter_default( self, target: Function, param: Parameter, node: ast.Call ) -> ir.Operand:
+		''' an omitted argument's default VALUE, lowered in the DEFINING
+		function/class's own module/scope - not the caller's: a default
+		expression can reference names visible where the function was
+		DEFINED (matching _lower_allocate_fields's identical field-default
+		pattern), and errors inside it should be located there too. Shared
+		by every "fill in an omitted argument" call site (_lower_call_args,
+		_fill_generic_call_defaults, the resolved-Overload-candidate tail)
+		so they can't drift out of sync on this - confirmed as a real,
+		pre-existing gap before this helper existed: the Overload-candidate
+		tail was missing the module_context/scope_context switch entirely
+		(only the other two had it), silently resolving a default value
+		against the CALLER's own scope instead.
+
+		Also updates self._owning_module for the duration - module_context
+		is a genuine, correct switch to the callee's own module, but
+		self._owning_module (what check_module_visibility's callers pass as
+		the "who's really accessing this" module - see its own comment) is
+		otherwise fixed for this WHOLE FunctionLowering pass and would
+		still read as the CALLER's module here without this override.
+		Confirmed as a real false positive: lib/pathlib.py's own `flavor:
+		PathFlavor = _NATIVE_FLAVOR` parameter default, filled in at a
+		call site living in a completely different module, got flagged as
+		that OTHER module illegally reaching pathlib's own package-private
+		constant - same bug shape as _lower_inline_call's own identical
+		fix, just for default-argument filling instead of @inline
+		splicing.
+
+		node is the real CALL SITE (e.g. logger.debug("hi")) - needed so
+		compiler.caller_line()/caller_file() (see _fold_caller_location) can
+		capture ITS location rather than param.default's own. '''
+		self.lowering._type_resolver.resolve_parameter_default( target, param )
+		intrinsic = self.lowering._is_compiler_call( param.default )
+		if intrinsic in ( 'caller_line', 'caller_file' ):
+			return self._fold_caller_location( intrinsic, param, node )
+		saved_owning_module = self._owning_module
+		self._owning_module = self.lowering._find_module_for( target )
+		try:
+			with self.lowering.discovery.module_context( self._owning_module ):
+				with self.lowering.discovery.scope_context( target ):
+					return self._lower_expr( param.default, param.type )
+		finally:
+			self._owning_module = saved_owning_module
 
 	def _lower_call_args( self, target: Function, node: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
 		# shared by the plain call path (_lower_call's own else branch) and
@@ -13535,6 +15892,13 @@ class FunctionLowering:
 		given.update( kwargs.keys() )
 		for param in target.parameters or []:
 			if param.stem not in given and param.default is not None:
+				# a construction call embedded in the default (`x: Foo =
+				# Foo()`) needs the same eager __init__ pre-resolution an
+				# ordinary body statement gets from _ReferenceResolver -
+				# defaults live on fn.node.args, never walked by resolve_
+				# function_body's fn.node.body loop, and are lowered here,
+				# often before target's own turn on the compile queue ever
+				# comes up - see _lower_parameter_default's own docstring
 				kwargs[param.stem] = self._lower_parameter_default( target, param, node )
 		return args, kwargs
 
@@ -13554,16 +15918,12 @@ class FunctionLowering:
 				f'@inline {target.qualname}: recursive inlining (directly or through another @inline function) is not supported: {ast.unparse(node)}',
 				node,
 			)
-		if not want_result and cfg.is_result_type( target.return_type ):
-			# same discard check the ordinary call tails already apply -
-			# discovery.py's _is_inline_eligible_body already guarantees
-			# target.node.body ends in exactly one `return <expr>`, so this
-			# can't be sidestepped by inlining instead of calling for real
-			self.lowering.discovery.fail(
-				f'{target.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
+		# a discarded Result return (want_result=False, target.return_type
+		# Result-shaped) is no longer rejected here - case 1 of the general
+		# auto-or_throw() rule (see _auto_or_throw's own docstring) picks it
+		# up at each of this method's own return points below instead
+		# (_finish_call_result), same as the ordinary (non-inline) call
+		# tails now do
 		stmts = target.node.body
 		if stmts and isinstance( stmts[0], ast.Expr ) and isinstance( stmts[0].value, ast.Constant ) and isinstance( stmts[0].value.value, str ):
 			stmts = stmts[1:] # strip a leading docstring, same shape discovery.py's _is_inline_eligible_body already validated
@@ -13572,6 +15932,22 @@ class FunctionLowering:
 		# so a recursive @inline call reached from a pre-return statement
 		# in the multi-statement path is caught identically
 		self._inlining_stack.append( id( target ))
+		# splicing target's own body statements directly into THIS
+		# FunctionLowering instance's own pass (no separate FunctionLowering
+		# instance/module_context push for target itself - that's the whole
+		# point of @inline) means self._owning_module would otherwise still
+		# read as the CALLER's own module for code lexically written in
+		# target's module - wrong for check_module_visibility specifically:
+		# inlining is a pure optimization and must stay transparent to
+		# access control, exactly like a private method inlined into a
+		# caller in any other language doesn't retroactively become public.
+		# Confirmed as a real false positive, not just theory: Ptr.__str__
+		# (an @inline dunder living in builtins) reaches builtins' own
+		# _ptr_hex_digits from its spliced body - without this save/
+		# restore, that got attributed to whatever unrelated module
+		# happened to be calling str(ptr), e.g. __main__.
+		saved_owning_module = self._owning_module
+		self._owning_module = target.module
 		try:
 			if len( stmts ) > 1:
 				# the splice's own pre-return statements bind self/params
@@ -13668,6 +16044,7 @@ class FunctionLowering:
 				saved_live[stem] = self._cfg.is_live( stem )
 				self._cfg.mark_live( stem )
 
+			self._inline_param_alias_ids.update( bound_ids )
 			return_expr = stmts[-1].value
 			module = self.lowering._find_module_for( target )
 			try:
@@ -13676,6 +16053,7 @@ class FunctionLowering:
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
 						self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids )
 			finally:
+				self._inline_param_alias_ids.difference_update( bound_ids )
 				for stem, was_live in saved_live.items():
 					if not was_live:
 						self._cfg.unmark_live( stem )
@@ -13684,9 +16062,10 @@ class FunctionLowering:
 						target.names.pop( stem, None )
 					else:
 						target.names[stem] = old
-			return result if want_result else None
+			return self._finish_call_result( node, result, want_result )
 		finally:
 			self._inlining_stack.pop()
+			self._owning_module = saved_owning_module
 
 	def _splice_multi_statement_inline_body( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, stmts: list[ast.stmt] ) -> ir.Operand|None:
 		# PLAN_INLINE.md multi-statement generalization - target's own
@@ -13806,6 +16185,7 @@ class FunctionLowering:
 			# this whole splice returns, so no per-stem save/restore is
 			# needed here, unlike provisional.names/that other path
 			self._cfg.mark_live( stem )
+		self._inline_param_alias_ids.update( bound_ids ) # see _lower_inline_call's own identical comment - removed again once this whole splice returns, in the try/finally around its own module_context below
 
 		# early/nested-return + defer/errdefer/.or_return() generalization -
 		# a splice-local "epilogue" scope for the pre-return statements: an
@@ -13862,147 +16242,150 @@ class FunctionLowering:
 			merge_label = self._new_label( 'inline_merge' )
 
 		module = self.lowering._find_module_for( target )
-		with self.lowering.discovery.module_context( module ):
-			with self.lowering.discovery.scope_context( provisional ):
-				# the ONE place self._current_fn is ever reassigned in this
-				# file - narrowly scoped to this window, restored in a
-				# finally. Needed because _stmt_AnnAssign/_stmt_Assign's
-				# fresh-declaration branch registers a new local into
-				# self._current_fn (see their own code) while their
-				# "already exists?" check instead goes through discovery.
-				# find_name_or_none (walking discovery.scope_stack, which
-				# module_context/scope_context above already point at
-				# `provisional`) - without this reassignment those two
-				# would disagree: a pre-return local would silently
-				# register into the CALLER's own namespace (self._current_
-				# fn, unless reassigned, stays whatever the caller's own
-				# top-level function is - confirmed by grep, it's assigned
-				# exactly once, in __init__, and never touched anywhere
-				# else in this file), corrupting any later caller-side
-				# reference to a same-named local; and reassigning that
-				# same pre-return local a second time within the SAME
-				# spliced body would fail to find its own first
-				# registration, creating a second, independent binding
-				# instead of a replace (a silent decref/leak, not just a
-				# cosmetic issue - cfg.py's own fresh-vs-replace machinery
-				# depends on finding the SAME Variable object both times).
-				# Making self._current_fn and the active scope_context
-				# point at the same `provisional` object for this whole
-				# window fixes both at once.
-				#
-				# result_var/exited_flag are both given a real, flat,
-				# unconditional declaration/init RIGHT HERE - before the
-				# pre-return statements (and therefore before any .or_
-				# return()/checked-arithmetic early exit nested inside
-				# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
-				# DeclareLocal's own docstring) could otherwise become
-				# result_var's first, block-scoped-and-therefore-unsafe
-				# write. exited_flag has a trivial default (False) an
-				# ordinary ir.Assign already declares safely; result_var's
-				# type has no generic default, hence DeclareLocal
-				scope_label: str|None = None
-				if supports_early_exit:
-					assert exited_flag is not None and bool_cls is not None and merge_label is not None
+		try:
+			with self.lowering.discovery.module_context( module ):
+				with self.lowering.discovery.scope_context( provisional ):
+					# the ONE place self._current_fn is ever reassigned in this
+					# file - narrowly scoped to this window, restored in a
+					# finally. Needed because _stmt_AnnAssign/_stmt_Assign's
+					# fresh-declaration branch registers a new local into
+					# self._current_fn (see their own code) while their
+					# "already exists?" check instead goes through discovery.
+					# find_name_or_none (walking discovery.scope_stack, which
+					# module_context/scope_context above already point at
+					# `provisional`) - without this reassignment those two
+					# would disagree: a pre-return local would silently
+					# register into the CALLER's own namespace (self._current_
+					# fn, unless reassigned, stays whatever the caller's own
+					# top-level function is - confirmed by grep, it's assigned
+					# exactly once, in __init__, and never touched anywhere
+					# else in this file), corrupting any later caller-side
+					# reference to a same-named local; and reassigning that
+					# same pre-return local a second time within the SAME
+					# spliced body would fail to find its own first
+					# registration, creating a second, independent binding
+					# instead of a replace (a silent decref/leak, not just a
+					# cosmetic issue - cfg.py's own fresh-vs-replace machinery
+					# depends on finding the SAME Variable object both times).
+					# Making self._current_fn and the active scope_context
+					# point at the same `provisional` object for this whole
+					# window fixes both at once.
+					#
+					# result_var/exited_flag are both given a real, flat,
+					# unconditional declaration/init RIGHT HERE - before the
+					# pre-return statements (and therefore before any .or_
+					# return()/checked-arithmetic early exit nested inside
+					# emitter_c.py's own hand-emitted C `{ }` blocks - see ir.
+					# DeclareLocal's own docstring) could otherwise become
+					# result_var's first, block-scoped-and-therefore-unsafe
+					# write. exited_flag has a trivial default (False) an
+					# ordinary ir.Assign already declares safely; result_var's
+					# type has no generic default, hence DeclareLocal
+					scope_label: str|None = None
+					if supports_early_exit:
+						assert exited_flag is not None and bool_cls is not None and merge_label is not None
+						if result_var is not None:
+							self._emit( ir.DeclareLocal( variable = result_var ))
+						self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
+						scope_label = self._cfg.push_inline_scope()
+						self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
+					outer_fn = self._current_fn
+					outer_prelude = self._in_inline_splice_prelude
+					self._current_fn = provisional
+					self._in_inline_splice_prelude = True
+					try:
+						for stmt in pre_return_stmts:
+							# mirrors FunctionLowering.run()'s own identical
+							# per-statement recovery boundary - one bad
+							# statement doesn't stop the rest of this splice
+							# from being lowered (and error-collected)
+							try:
+								self._lower_stmt( stmt )
+							except CompileError:
+								continue
+					finally:
+						self._current_fn = outer_fn
+						self._in_inline_splice_prelude = outer_prelude
+
+					if not supports_early_exit:
+						# PLAN_RETURN_INFERENCE.md's own @inline variant - see
+						# this method's own top-of-function comment. No scope
+						# was pushed, nothing to merge - the trailing return-
+						# expression's own natural type IS the answer being
+						# discovered here, exactly as the pre-existing
+						# single-statement/original multi-statement code always
+						# computed it
+						result = self._lower_expr( return_stmt.value, expected_type )
+						self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
+						return self._finish_call_result( node, result, want_result )
+
+					assert scope_label is not None and exited_flag is not None and merge_label is not None
+					# current_epilogue_label()'s own fallback target once
+					# nothing shallower within THIS splice qualified (push_
+					# inline_scope()'s own label) - an inline-unwind return_()
+					# call reached during the splice already replayed
+					# everything itself and jumps straight past this, to
+					# merge_label below (see _stmt_Return/_consume_checked_
+					# result's own splice branches). Neither label is a real
+					# jump target unless the splice body actually contained an
+					# early exit reaching one of those two branches (a plain
+					# multi-statement @inline body with none, e.g. Ptr.__str__,
+					# never goes near either) - gated on InlineScope.captured,
+					# same "don't declare a label nothing goto's" reasoning
+					# build_epilogue_ladder() already uses for a real function's
+					# own shared epilogue (a real, confirmed -Wunused-label
+					# otherwise, suite-wide)
+					if self._cfg.inline_scope_captured():
+						self._emit( ir.Label( name = scope_label ))
+					for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
+						self._emit( instr )
+					was_captured = self._cfg.pop_inline_scope()
+					self._inline_scope_vars.pop()
+
+					# early exit vs normal fallthrough - both converge into ONE
+					# result operand from here, same "shared dest temp, two
+					# Assign sites, converge at one label" shape _expr_IfExp
+					# already uses for Python's own ternary. self._current_fn/
+					# _in_inline_splice_prelude are already restored to the
+					# REAL caller above, before this point - the trailing
+					# return-expression's own .or_return()/checked-arithmetic
+					# behavior is therefore unchanged from the single-statement
+					# case (validates and jumps against the CALLER's own
+					# epilogue/return type, exactly as already tested), while
+					# scope_context(provisional) stays active so it can still
+					# resolve pre-return-declared locals it references
+					if was_captured:
+						self._emit( ir.Label( name = merge_label ))
+					result = self._new_temp( target.return_type )
+					normal_label = self._new_label( 'inline_normal' )
+					converge_label = self._new_label( 'inline_converge' )
+					self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
 					if result_var is not None:
-						self._emit( ir.DeclareLocal( variable = result_var ))
-					self._emit( ir.Assign( dest = exited_flag, src = ir.Const( type = bool_cls, value = False )))
-					scope_label = self._cfg.push_inline_scope()
-					self._inline_scope_vars.append(( result_var, exited_flag, merge_label ))
-				outer_fn = self._current_fn
-				outer_prelude = self._in_inline_splice_prelude
-				self._current_fn = provisional
-				self._in_inline_splice_prelude = True
-				try:
-					for stmt in pre_return_stmts:
-						# mirrors FunctionLowering.run()'s own identical
-						# per-statement recovery boundary - one bad
-						# statement doesn't stop the rest of this splice
-						# from being lowered (and error-collected)
-						try:
-							self._lower_stmt( stmt )
-						except CompileError:
-							continue
-				finally:
-					self._current_fn = outer_fn
-					self._in_inline_splice_prelude = outer_prelude
-
-				if not supports_early_exit:
-					# PLAN_RETURN_INFERENCE.md's own @inline variant - see
-					# this method's own top-of-function comment. No scope
-					# was pushed, nothing to merge - the trailing return-
-					# expression's own natural type IS the answer being
-					# discovered here, exactly as the pre-existing
-					# single-statement/original multi-statement code always
-					# computed it
-					result = self._lower_expr( return_stmt.value, expected_type )
-					self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
-					return result if want_result else None
-
-				assert scope_label is not None and exited_flag is not None and merge_label is not None
-				# current_epilogue_label()'s own fallback target once
-				# nothing shallower within THIS splice qualified (push_
-				# inline_scope()'s own label) - an inline-unwind return_()
-				# call reached during the splice already replayed
-				# everything itself and jumps straight past this, to
-				# merge_label below (see _stmt_Return/_consume_checked_
-				# result's own splice branches). Neither label is a real
-				# jump target unless the splice body actually contained an
-				# early exit reaching one of those two branches (a plain
-				# multi-statement @inline body with none, e.g. Ptr.__str__,
-				# never goes near either) - gated on InlineScope.captured,
-				# same "don't declare a label nothing goto's" reasoning
-				# build_epilogue_ladder() already uses for a real function's
-				# own shared epilogue (a real, confirmed -Wunused-label
-				# otherwise, suite-wide)
-				if self._cfg.inline_scope_captured():
-					self._emit( ir.Label( name = scope_label ))
-				for instr in self._cfg.build_inline_scope_ladder( lambda: self._build_is_err_check( node )):
-					self._emit( instr )
-				was_captured = self._cfg.pop_inline_scope()
-				self._inline_scope_vars.pop()
-
-				# early exit vs normal fallthrough - both converge into ONE
-				# result operand from here, same "shared dest temp, two
-				# Assign sites, converge at one label" shape _expr_IfExp
-				# already uses for Python's own ternary. self._current_fn/
-				# _in_inline_splice_prelude are already restored to the
-				# REAL caller above, before this point - the trailing
-				# return-expression's own .or_return()/checked-arithmetic
-				# behavior is therefore unchanged from the single-statement
-				# case (validates and jumps against the CALLER's own
-				# epilogue/return type, exactly as already tested), while
-				# scope_context(provisional) stays active so it can still
-				# resolve pre-return-declared locals it references
-				if was_captured:
-					self._emit( ir.Label( name = merge_label ))
-				result = self._new_temp( target.return_type )
-				normal_label = self._new_label( 'inline_normal' )
-				converge_label = self._new_label( 'inline_converge' )
-				self._emit( ir.JumpIfFalse( cond = exited_flag, target = normal_label ))
-				if result_var is not None:
-					self._emit( ir.Assign( dest = result, src = result_var ))
-				self._emit( ir.Jump( target = converge_label ))
-				self._emit( ir.Label( name = normal_label ))
-				trailing_value = self._lower_expr( return_stmt.value, target.return_type )
-				self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
-				self._emit( ir.Assign( dest = result, src = trailing_value ))
-				# trailing_value's own ownership (if it's a bare temp - e.g.
-				# the Result.Ok(x) construction temp a trailing `return
-				# Result.Ok(x)` produces) just transferred into `result`
-				# above via the plain ir.Assign - untrack it, or whatever
-				# later cleans up STILL-pending temps (_flush_pending_temps,
-				# called by _lower_stmt's own post-statement wrapper once
-				# this whole splice call returns) would emit a SECOND,
-				# unconditional RC-check for it outside the "normal" arm's
-				# own guard - reading trailing_value's memory even on the
-				# early-exit path, where it was never assigned at all (a
-				# real uninitialized-read bug, not just a redundant decref -
-				# confirmed by a real repro under MSVC's /RTC1). Exactly the
-				# same concern _stmt_Return's own identical transfer already
-				# guards against via this same call
-				self._cfg.untrack_temp( trailing_value )
-				self._emit( ir.Label( name = converge_label ))
-		return result if want_result else None
+						self._emit( ir.Assign( dest = result, src = result_var ))
+					self._emit( ir.Jump( target = converge_label ))
+					self._emit( ir.Label( name = normal_label ))
+					trailing_value = self._lower_expr( return_stmt.value, target.return_type )
+					self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
+					self._emit( ir.Assign( dest = result, src = trailing_value ))
+					# trailing_value's own ownership (if it's a bare temp - e.g.
+					# the Result.Ok(x) construction temp a trailing `return
+					# Result.Ok(x)` produces) just transferred into `result`
+					# above via the plain ir.Assign - untrack it, or whatever
+					# later cleans up STILL-pending temps (_flush_pending_temps,
+					# called by _lower_stmt's own post-statement wrapper once
+					# this whole splice call returns) would emit a SECOND,
+					# unconditional RC-check for it outside the "normal" arm's
+					# own guard - reading trailing_value's memory even on the
+					# early-exit path, where it was never assigned at all (a
+					# real uninitialized-read bug, not just a redundant decref -
+					# confirmed by a real repro under MSVC's /RTC1). Exactly the
+					# same concern _stmt_Return's own identical transfer already
+					# guards against via this same call
+					self._cfg.untrack_temp( trailing_value )
+					self._emit( ir.Label( name = converge_label ))
+		finally:
+			self._inline_param_alias_ids.difference_update( bound_ids )
+		return self._finish_call_result( node, result, want_result )
 
 	def _lower_generic_function_call( self, node: ast.Call, spec: Specialization, receiver: ir.Operand|None, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# sys.alloc[u8](...) - explicit generic instantiation. Matches call
@@ -14068,6 +16451,13 @@ class FunctionLowering:
 			# REAL validation/binding is _unify_type_param below, not
 			# _lower_expr's own general assignability check
 			operand = self._lower_expr( expr, hint, strict = False )
+			# strict=False above skips _coerce_or_check_operand's own case-2
+			# auto-or_throw() hook - reinstated here, same as _lower_and_
+			# infer_call_args' own identical fix, so an unconsumed Result[T,E]
+			# argument (e.g. an unannotated `c = a + b` passed to a generic
+			# function expecting plain T) unifies against its UNWRAPPED type
+			# instead of conflicting with an already/still-inferring binding
+			operand = self._auto_consume_hint_arg( node, operand, param.type )
 			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, target.qualname )
 			return operand
 
@@ -14107,6 +16497,9 @@ class FunctionLowering:
 		given.update( kwargs.keys() )
 		for param in monomorphized.parameters or []:
 			if param.stem not in given and param.default is not None:
+				# see _lower_parameter_default's own docstring for why this
+				# is needed - a construction call embedded in the default
+				# otherwise never gets its __init__ eagerly pre-resolved
 				kwargs[param.stem] = self._lower_parameter_default( monomorphized, param, node )
 
 	def _finish_generic_call( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -14542,16 +16935,12 @@ class FunctionLowering:
 		real_spec.monomorphized = provisional # caches the PROVISIONAL BODY for reuse by _lower_inline_call at a future call site - provisional is never independently scheduled/appended to compiler.functions by this variant, matching PLAN_INLINE.md's invariant
 		pending_spec.monomorphized = provisional
 
-		if not want_result and cfg.is_result_type( provisional.return_type ):
-			# same discard check _lower_inline_call itself applies - done
-			# here instead since target.return_type wasn't known yet when
-			# _lower_inline_call ran above (want_result was forced True)
-			self.lowering.discovery.fail(
-				f'{target.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
-		return result if want_result else None
+		# a discarded Result return is auto-consumed here (case 1 of the
+		# general auto-or_throw() rule - _finish_call_result), done here
+		# instead of inside the _lower_inline_call call above since target.
+		# return_type wasn't known yet at that point (want_result was
+		# forced True there specifically to skip its own identical check)
+		return self._finish_call_result( node, result, want_result )
 
 	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, *, already_compiled: bool = False ) -> ir.Operand|None:
 		# schedules the Specialization itself as the compile unit (see
@@ -14584,16 +16973,15 @@ class FunctionLowering:
 		self.lowering.schedule( monomorphized.return_type )
 		for param in monomorphized.parameters or []:
 			self.lowering.schedule( param.type )
-		if not want_result and cfg.is_result_type( monomorphized.return_type ):
-			self.lowering.discovery.fail(
-				f'{monomorphized.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
-		if want_result:
+		# a discarded Result return is no longer hard-rejected here - case 1
+		# of the general auto-or_throw() rule (_finish_call_result, below)
+		# picks it up instead, so this call still needs a real dest to
+		# consume even though the CALLER's own want_result is False
+		force_result = not want_result and cfg.is_result_type( monomorphized.return_type )
+		if want_result or force_result:
 			dest = self._new_temp( expected_type or monomorphized.return_type )
 			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
-			return dest
+			return self._finish_call_result( node, dest, want_result )
 		self._emit( ir.Call( dest = None, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 		return None
 
@@ -14669,6 +17057,9 @@ class FunctionLowering:
 			case 'refcount':
 				result = self._lower_compiler_refcount( node, expected_type )
 				return result if want_result else None
+
+			case 'error':
+				self._lower_compiler_error( node, expected_type )
 
 			case 'checked_add' | 'wrapped_add' | 'saturated_add' | 'checked_sub' | 'wrapped_sub' | 'saturated_sub' | \
 				'checked_mul' | 'wrapped_mul' | 'saturated_mul' | 'checked_floordiv' | 'wrapped_floordiv' | 'saturated_floordiv' | \
@@ -14779,6 +17170,7 @@ class FunctionLowering:
 				result = self._lower_compiler_parse_f64( node, expected_type )
 				return result if want_result else None
 
+
 		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_return':
 			# <result_expr>.or_return() - recognized by AST shape alone,
 			# BEFORE _resolve_callee/_attr_lookup_callable ever look for a
@@ -14796,8 +17188,26 @@ class FunctionLowering:
 			# receiver is actually Result[_,_]-shaped (and that no
 			# arguments were given) - a non-Result receiver correctly still
 			# fails there, with the same message as before.
+			# snapshotted BEFORE lowering the receiver expression, not after -
+			# _flush_new_pending_temps needs to know exactly which pending
+			# temps belong to the RECEIVER's own build-up (from here onward)
+			# versus an OUTER, still-in-progress expression this whole
+			# `.or_return()` call is only PART of (e.g. the first half of a
+			# chained `k + str(':') + v.or_return()` concatenation, whose own
+			# still-needed pending temp must never be touched - see that
+			# helper's own docstring for the real bug this guards against)
+			receiver_pending_start = len( self._pending_temps )
 			receiver = self._lower_expr( node.func.value, None )
-			return self._lower_or_return( node, receiver, want_result )
+			return self._lower_or_return( node, receiver, want_result, receiver_pending_start = receiver_pending_start )
+
+		if isinstance( node.func, ast.Attribute ) and node.func.attr == 'or_throw':
+			# <result_expr>.or_throw() - same recognition shape as or_return()
+			# just above (see its own comment) - discovery.py rejects a
+			# user-written `def or_throw(...)` outright, on any class, the
+			# same way
+			receiver_pending_start = len( self._pending_temps )
+			receiver = self._lower_expr( node.func.value, None )
+			return self._lower_or_throw( node, receiver, want_result, receiver_pending_start = receiver_pending_start )
 
 		# each recognizer returns None (not an error) when this call doesn't
 		# match its own construction-sugar shape at all, falling through to
@@ -14861,7 +17271,7 @@ class FunctionLowering:
 			# CALLER's own binding, which still got an ordinary Decref at
 			# scope exit on top of that - two teardown paths for one struct).
 			# Also correctly rejects calling an @move method through a merely
-			# BORROWED receiver (move()'s own OWNED/COPY precondition), which
+			# BORROWED receiver (move()'s own OWNED precondition), which
 			# was never checked before either.
 			for instr in self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' ):
 				self._emit( instr )
@@ -15074,6 +17484,7 @@ class FunctionLowering:
 				branches, resolved = overload_resolution.resolve_call(
 				target.stubs, target.implementations, arg_types, kwarg_types,
 				qualname = target.qualname, same_type = self.lowering._type_resolver._same_type,
+				protocol_conforms = self.lowering._type_conforms_to_protocol,
 			)
 			except CompileError as e:
 				# resolve_call is a pure function of types with no
@@ -15287,6 +17698,16 @@ class FunctionLowering:
 			given.update( kwargs.keys() )
 			for param in target.parameters or []:
 				if param.stem not in given and param.default is not None:
+					# see _lower_parameter_default's own docstring for why
+					# this is needed - a construction call embedded in this
+					# default otherwise never gets its __init__ eagerly
+					# pre-resolved. This call site used to lower the default
+					# expression directly, with no module_context/scope_
+					# context switch at all (unlike its own "mirrors _lower_
+					# call_args's identical tail" comment claimed) - a real,
+					# pre-existing bug, not just missing the later privacy-
+					# check fix: it silently resolved a default value against
+					# the CALLER's own scope instead of the callee's.
 					kwargs[param.stem] = self._lower_parameter_default( target, param, node )
 		else:
 			self.lowering._resolve_call_target( target )
@@ -15333,26 +17754,27 @@ class FunctionLowering:
 		for param in target.parameters or []:
 			self.lowering.schedule( param.type )
 
-		if not want_result and cfg.is_result_type( target.return_type ):
-			# a bare `foo()` statement whose return value is a Result -
-			# _stmt_Expr is the only caller that ever passes want_result=
-			# False for a call used as a full statement (every other
-			# _lower_call caller threads want_result through from ITS OWN
-			# caller instead), so this is the "value produced, immediately
-			# discarded, never even bound to a name" case from the plan's
-			# validation table. v1 gap: this only covers calls that reach
-			# this shared tail (plain Function targets, and Overload targets
-			# that resolve to one unambiguous implementation without needing
-			# _lower_conditional_dispatch) - a bare-statement call to a
-			# GENERIC Result-returning function/method, or one requiring
-			# runtime union-argument dispatch, isn't covered
-			self.lowering.discovery.fail(
-				f'{target.qualname}(...) returns a Result that is discarded here - '
-				f'assign it to a name and use .is_ok(), .is_err(), .or_return(), .unwrap(msg), or match: {ast.unparse(node)}',
-				node,
-			)
+		# a bare `foo()` statement whose return value is a Result - _stmt_
+		# Expr is the only caller that ever passes want_result=False for a
+		# call used as a full statement (every other _lower_call caller
+		# threads want_result through from ITS OWN caller instead), so this
+		# is the "value produced, immediately discarded, never even bound to
+		# a name" case from the plan's validation table - case 1 of the
+		# general auto-or_throw() rule (_finish_call_result, below) now
+		# picks it up instead of hard-rejecting; force_result routes this
+		# call through the SAME dest-producing machinery `want_result=True`
+		# already uses below, purely so there's something to auto-consume.
+		# every other call-emission tail that can produce a Result from a
+		# bare statement carries this same force_result copy:
+		# _emit_generic_call (generic calls), _infer_return_only_type_params_
+		# inline (return-only-inferred generics), _lower_inline_call/
+		# _finish_call_result (@inline splices), and _lower_conditional_
+		# dispatch/_lower_union_receiver_call (runtime union-argument/
+		# receiver dispatch) - so this is no longer a gap, just this tail's
+		# own copy of a check every call-lowering path shares
+		force_result = not want_result and cfg.is_result_type( target.return_type )
 
-		if want_result:
+		if want_result or force_result:
 			target_return_type = target.return_type
 			# a Specialization of a TaggedUnion base (e.g. an unmonomorphized
 			# Result[usize,IndexError]) is just as "already the expected
@@ -15381,7 +17803,7 @@ class FunctionLowering:
 				# call's arguments can never produce the other member)
 				dest = self._new_temp( target_return_type )
 				self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
-				return self._maybe_unwrap_union_arg( dest, narrowed_return_type, owning = True )
+				return self._finish_call_result( node, self._maybe_unwrap_union_arg( dest, narrowed_return_type, owning = True ), want_result )
 			if isinstance( expected_type, TaggedUnion ) and target_return_type is not None and not isinstance( target_return_type_base, ( TaggedUnion, TypeVar )):
 				# a call whose own return type is a plain leaf (e.g. str)
 				# flowing into a T|None-typed slot - dest must be typed as
@@ -15444,7 +17866,7 @@ class FunctionLowering:
 				else:
 					dest = self._new_temp( expected_type or target_return_type )
 			self._emit( ir.Call( dest = dest, target = target, receiver = receiver, args = args, kwargs = kwargs ))
-			return dest
+			return self._finish_call_result( node, dest, want_result )
 		else:
 			self._emit( ir.Call( dest = None, target = target, receiver = receiver, args = args, kwargs = kwargs ))
 			return None
@@ -15467,17 +17889,24 @@ class FunctionLowering:
 		for branch in branches:
 			self.lowering._ensure_resolved( branch.function )
 
-		dest = self._new_temp( expected_type or default.return_type ) if want_result else None
+		# case 1 of the general auto-or_throw() rule (_finish_call_result,
+		# below) - this is its own call-emission tail (union-argument
+		# runtime dispatch), never reaches _lower_call's shared tail, so
+		# needs the identical force_result copy _emit_generic_call already
+		# carries for the generic-call tail
+		force_result = not want_result and cfg.is_result_type( default.return_type )
+		produce_result = want_result or force_result
+		dest = self._new_temp( expected_type or default.return_type ) if produce_result else None
 		end_label = self._new_label( 'dispatch_end' )
 		for branch in branches:
 			next_label = self._new_label( 'dispatch_next' )
 			self._lower_dispatch_tests( node, branch.function, branch.conditions, args, kwargs, next_label )
-			self._emit_dispatch_call( branch.function, receiver, args, kwargs, dest, want_result )
+			self._emit_dispatch_call( branch.function, receiver, args, kwargs, dest, produce_result )
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = next_label ))
-		self._emit_dispatch_call( default, receiver, args, kwargs, dest, want_result )
+		self._emit_dispatch_call( default, receiver, args, kwargs, dest, produce_result )
 		self._emit( ir.Label( name = end_label ))
-		return dest
+		return self._finish_call_result( node, dest, want_result )
 
 	def _lower_dispatch_tests( self, node: ast.AST, target: Function, conditions: list[tuple[Parameter,Type]], args: list[ir.Operand], kwargs: dict[str,ir.Operand], next_label: str ) -> None:
 		# a branch's conditions are ANDed together - emits one Cmp +
@@ -15595,7 +18024,12 @@ class FunctionLowering:
 
 		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( dispatch.union )
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		dest = self._new_temp( expected_type or reference.return_type ) if want_result else None
+		# case 1 of the general auto-or_throw() rule - same force_result
+		# copy _lower_conditional_dispatch's own identical fix needs, for
+		# the union-RECEIVER dispatch tail
+		force_result = not want_result and cfg.is_result_type( reference.return_type )
+		produce_result = want_result or force_result
+		dest = self._new_temp( expected_type or reference.return_type ) if produce_result else None
 		end_label = self._new_label( 'recv_dispatch_end' )
 		for i, ( member, fn ) in enumerate( dispatch.per_leaf ):
 			is_last = i == len( dispatch.per_leaf ) - 1
@@ -15662,7 +18096,7 @@ class FunctionLowering:
 				self._emit( ir.Jump( target = end_label ))
 				self._emit( ir.Label( name = next_label ))
 		self._emit( ir.Label( name = end_label ))
-		return dest
+		return self._finish_call_result( node, dest, want_result )
 
 	def _corresponding_leaf_param( self, reference: Function, fn: Function, ref_param: Parameter ) -> Parameter:
 		''' the Parameter in `fn`'s own parameter list at the SAME POSITION

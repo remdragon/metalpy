@@ -33,9 +33,52 @@ class Name:
 	# error - the real one was already recorded at the point of failure.
 	broken: bool = False
 
+	def __deepcopy__( self, memo: dict ) -> 'Name':
+		''' Name/Type/Function/Variable/Module/... instances are identity-
+		based, process-wide-shared singletons (interned via Discovery.
+		_get_or_create_specialization and friends, or simply constructed
+		once at their own definition site) - a bare copy.deepcopy() call
+		elsewhere in the compiler that happens to reach one of these
+		(typically via an AST node's own cached resolved-reference tag,
+		e.g. node.resolved_callee) must never clone it: doing so silently
+		produces a SECOND, non-identical object with the same qualname,
+		corrupting every identity-keyed cache downstream. Confirmed via a
+		real repro: compiling two generic instantiations of one generator
+		sharing a match-subject promoted RC-typed field crashed with a
+		RecursionError inside TaggedUnion's own dataclass __eq__, comparing
+		two non-interned but qualname-identical Result[i32,IndexError]
+		objects - traced to type_resolver.py's _apply_live_flag_guards,
+		whose own copy.deepcopy(s) on the promoted field's assignment
+		statement swept along a resolved_callee-tagged Function reference
+		and deep-cloned its entire return-type graph (recursively
+		duplicating i32/IndexError themselves in the process). Returning
+		self unchanged is exactly the correct semantics for a value this
+		codebase already treats as immutable/interned everywhere else -
+		every AST node itself still deep-copies normally; only a Name (or
+		subclass) reached FROM one is short-circuited here. '''
+		return self
+
 @dataclass( kw_only = True, repr = False )
 class Type( Name ):
 	''' maybe only use this to distinguish types from values '''
+
+	# the module this type was DEFINED in - set only for a genuine
+	# module-level, user-defined class (RCClass/CStruct/CUnion/CEnum/
+	# TaggedUnion parsed from real source, via discovery.py's own
+	# _parse_ClassDef_* family) - mirrors Function.module/Variable.module
+	# (see either's own comment for the motivating cross-module-
+	# resolution use case). Left None for every other Type kind (Scalar,
+	# Specialization, CallableType, a synthesized anonymous union, ...) -
+	# none of those have a real "defining module" of their own. Used by
+	# name/import-visibility enforcement (SYNTAX.md's `_x`/`__x` module/
+	# package-privacy rules, extended to cover classes too) to compare the
+	# DEFINING module against whichever module is doing the accessing.
+	# repr=False/compare=False for the identical reason Variable.module's
+	# own field is: two independently-constructed Discovery passes'
+	# Module objects for "the same" module differ in identity/content, so
+	# including this in dataclass equality/repr would make every Type-
+	# comparing pass in this codebase (there are many) spuriously fragile.
+	module: 'Module|None' = field( default = None, repr = False, compare = False )
 
 	def __repr__( self ) -> str:
 		# every Type subclass below opts out of the dataclass-generated repr
@@ -199,6 +242,24 @@ class ScopeMixin:
 		base = scope.base if isinstance( scope, Specialization ) else scope
 		return base is self # type: ignore
 
+	def in_protected_scope( self, scope: 'Type|None' ) -> bool:
+		''' the `_protected` counterpart of in_private_scope: true if `scope`
+		IS this class, or a (possibly indirect) subclass of it -
+		SYNTAX.md's single-underscore field/method tier, visible to the
+		defining class and every subclass (any depth). Only RCClass/CStruct
+		(InheritanceChainMixin) have a real base chain to walk; every other
+		ScopeMixin kind (TaggedUnion, Protocol, CUnion, CEnum - none support
+		inheritance) degrades to the identical identity check in_private_
+		scope already does, via the loop simply never starting and falling
+		through to the plain `base is self` check below. '''
+		base = scope.base if isinstance( scope, Specialization ) else scope
+		node: 'InheritanceChainMixin|None' = base if isinstance( base, InheritanceChainMixin ) else None
+		while node is not None:
+			if node is self:
+				return True
+			node = _next_chain_node( node.base )
+		return base is self # type: ignore
+
 @dataclass( kw_only = True, repr = False )
 class Scalar( Type, ScopeMixin ):
 	'''
@@ -292,41 +353,6 @@ class TypeVar( Type ):
 			# conformance (for homogeneous tuples) lives on its lazily-
 			# synthesized backing RCClass instead (see tuple_storage.py)
 			base = base.backing
-		if (
-			isinstance( concrete, Specialization ) and isinstance( base, RCClass ) and resolver is not None
-			and id( concrete ) not in resolver.monomorphizer._building
-		):
-			# `concrete` may still be a bare, not-yet-monomorphized
-			# Specialization (e.g. an explicit type argument like Box[T]
-			# written inside another generic call's own subscript, never
-			# separately eagerly resolved) - unwrapping to .base alone would
-			# read the ABSTRACT class's own unsubstituted .protocols
-			# (confirmed by a real repro: Box[i32] via an explicit `_helper
-			# [T, Box[T]](...)` call site read back `Sequence[Box.T]`,
-			# never `Sequence[i32]`). monomorphize_class is idempotent
-			# (spec.monomorphized short-circuits) and is the single place
-			# .protocols actually gets substituted - same "force it, don't
-			# duplicate the substitution" posture the rest of this method
-			# already takes for base.protocols itself.
-			#
-			# _building guard: monomorphize_class's OWN top-of-function
-			# short-circuit (`if spec.monomorphized is not None: return`)
-			# only catches an ALREADY-FINISHED spec - re-entering THIS SAME
-			# spec while it's still mid-construction (concrete's own class
-			# building its own methods, one of which - e.g. a Sequence-
-			# conforming class's own __iter__ - reaches back here to check
-			# ITS OWN class's conformance) would otherwise rebuild it from
-			# scratch, unboundedly, confirmed by a real repro (RecursionError
-			# via monomorphize_class -> monomorphized_function ->
-			# ensure_generator_synthesized -> resolve_function_body ->
-			# another generic call -> back into THIS check -> monomorphize_
-			# class again, same still-building spec). Skipping in that rare
-			# reentrant case falls back to the abstract base's own
-			# unsubstituted .protocols below - a possibly-imprecise bound
-			# check for that one call, not a crash; every non-reentrant call
-			# (the overwhelming majority) still gets the fully-substituted
-			# version.
-			base = resolver.monomorphizer.monomorphize_class( concrete )
 		if not isinstance( base, RCClass ):
 			return False
 		if not isinstance( self.bound, Specialization ):
@@ -336,19 +362,36 @@ class TypeVar( Type ):
 			f'(type_params, args, resolver) - see bound_satisfied_by\'s own docstring'
 		)
 		concrete_bound = resolver.monomorphizer.substitute_type_params( self.bound, type_params, args )
-		# base.protocols is already fully substituted/concrete here - a
-		# generic RCClass's OWN declared protocol conformance is substituted
-		# by Monomorphizer.monomorphize_class at the same point/via the same
-		# mechanism .attributes/.methods are (see its own comment) - `base`
-		# is already the monomorphized class by the time bound-checking
-		# runs (every real caller resolves `concrete` first), never the
-		# still-abstract template, so there is no second substitution to do
-		# here at all - just compare structurally.
+		# when `concrete` is a Specialization, `base` above is still the
+		# ABSTRACT class template (concrete.base) - its own .protocols are
+		# still unsubstituted (e.g. Sequence[set.T], not Sequence[i32]).
+		# Substitute each candidate entry's own args against concrete.args
+		# directly here, rather than going through monomorphize_class(concrete)
+		# first to get an already-substituted base (the old approach): that
+		# needed a _building reentrancy guard (concrete's own class building
+		# its own methods, one of which - e.g. a Sequence-conforming class's
+		# own __iter__ - reaches back here to check ITS OWN class's
+		# conformance, re-entering monomorphize_class for the same
+		# still-mid-construction spec), which fell back to comparing against
+		# the UNSUBSTITUTED abstract .protocols and silently failed the bound
+		# check for that one call (confirmed by a real repro: builtins.set/
+		# tuple's own __iter__ delegating to a shared, protocol-bound generic
+		# generator never got past this once reached from within its own
+		# class's build). A protocol entry's own .base is always the
+		# Protocol, never `concrete`'s class, so substituting just its args
+		# can't re-enter monomorphize_class for `concrete` at all - no guard
+		# needed, and no eager full build of `concrete` needed either.
 		for entry in base.protocols:
 			if not isinstance( entry, Specialization ) or entry.base is not concrete_bound.base:
 				continue
-			if len( entry.args ) == len( concrete_bound.args ) and all(
-				resolver._same_type( a, b ) for a, b in zip( entry.args, concrete_bound.args )
+			entry_args = entry.args
+			if isinstance( concrete, Specialization ) and resolver is not None:
+				entry_args = [
+					resolver.monomorphizer.substitute_type_params( a, base.type_params or [], concrete.args )
+					for a in entry_args
+				]
+			if len( entry_args ) == len( concrete_bound.args ) and all(
+				resolver._same_type( a, b ) for a, b in zip( entry_args, concrete_bound.args )
 			):
 				return True
 		return False
@@ -465,6 +508,21 @@ class Variable( Name ):
 	# local variables, neither of which is a standalone compile unit; this is
 	# what lets Compiler._enqueue tell them apart without a separate lookup
 	is_global: bool = False
+	# the module this Variable was DEFINED in - set from Discovery.module_
+	# stack at parse time, mirroring Function.module (see that field's own
+	# comment for the motivating cross-module-resolution use case). Only
+	# meaningful (and only ever set) for a genuine module-level global
+	# (is_global=True); a class attribute or lowering-built local has no
+	# owning Module of its own. Used by name/import-visibility enforcement
+	# (SYNTAX.md's `_x`/`__x` module/package-privacy rules) to compare the
+	# DEFINING module against whichever module is doing the accessing.
+	# repr=False/compare=False for the identical reason `uid` below is:
+	# Module.names accumulates differently across separately-constructed
+	# Discovery passes even for "the same" module, so including it in
+	# dataclass equality would make lowering_test.py's exact-IR structural
+	# comparisons spuriously fragile - this field is read directly by
+	# enforcement logic, never compared/printed.
+	module: 'Module|None' = field( default = None, repr = False, compare = False )
 	# set by cfg.py's assign() the moment this global is genuinely
 	# reassigned from inside a function body (`global X; X = ...`) - never
 	# set for a global's own module-level initializer, since lower_global()
@@ -852,6 +910,23 @@ class InheritanceChainMixin( ScopeMixin ):
 			found = node.get_local_or_raise( name ) # every real InheritanceChainMixin (RCClass/CStruct) is also a ScopeMixin
 			if found is not None:
 				return found
+			node = _next_chain_node( node.base )
+		return None
+
+	def field_owner( self, name: str ) -> 'InheritanceChainMixin|None':
+		''' the class in this chain whose OWN .names directly declares
+		`name` (not merely inherits it) - the "defining class" field-
+		visibility enforcement (Discovery.check_field_visibility) checks
+		against, since chain_lookup finds a field for any receiver in the
+		chain but a `_`/`__` field's privacy is scoped to where it was
+		actually DECLARED, not the concrete receiver type it's read
+		through. Same walk as chain_lookup, minus the resolved Variable. '''
+		node: 'InheritanceChainMixin|None' = self
+		while node is not None:
+			if node.resolve is not None:
+				node.resolve()
+			if node.get_local( name ) is not None:
+				return node
 			node = _next_chain_node( node.base )
 		return None
 

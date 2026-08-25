@@ -38,6 +38,7 @@ from compiler import Compiler
 from discovery import Discovery
 
 _CC = linker_c.detect_cc()
+_HAS_I128 = linker_c.has_i128( _CC )
 
 
 @unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping real-compile int tests' )
@@ -342,6 +343,79 @@ def main() -> i32:
 
 	# --- from_str parsing, incl. edge cases -----------------------------
 
+	def test_bare_literal_sugars_into_int_construction( self ) -> None:
+		# a bare int literal where `int` (the arbitrary-precision RCClass,
+		# not any fixed-width scalar) is the expected type used to hard-fail
+		# ("an int literal cannot be used where builtins.int is expected")
+		# in every one of these ordinary contexts - _expr_Constant now
+		# rewrites it into an explicit int(literal) construction call
+		# instead, the same thing a user would otherwise have to spell out
+		# by hand.
+		checks = [
+			'local annotated assignment: x: int = 5',
+			'class attribute default: count: int = 42',
+			'return statement: a function declared -> int',
+			'function-call argument: take_int(99)',
+			'a negative literal',
+		]
+		self._assert_program_succeeds( '''
+class Foo:
+	count: int = 42
+
+def make_int() -> int:
+	return -17
+
+def take_int( x: int ) -> i32:
+	return x.to_i32().unwrap( 'a' )
+
+def main() -> i32:
+	x: int = 5
+	if x.to_i32().unwrap('b') != 5:
+		return 1
+	f = Foo()
+	if f.count.to_i32().unwrap('c') != 42:
+		return 2
+	if make_int().to_i32().unwrap('d') != -17:
+		return 3
+	if take_int( 99 ) != 99:
+		return 4
+	return 0
+''', checks )
+
+	def test_arbitrary_size_literal_into_int( self ) -> None:
+		# a bare literal too large for builtins.int's own single-i32-
+		# parameter __init__ must still just work - this IS arbitrary-
+		# precision int, not a fixed-width scalar with a real range limit,
+		# so a literal's own size should never be a compile error here.
+		# _expr_Constant routes a too-big-for-i32 literal through
+		# int.from_str(...) on the literal's own decimal text instead of
+		# int(literal) - covers a value past i64::MAX and past even
+		# i128/u128::MAX (this compiler's own widest native scalars),
+		# where from_str's bignum parsing is the only way to represent it
+		# at all, plus a large NEGATIVE literal (sign handling).
+		checks = [
+			'a literal past i32::MAX but within i64 range',
+			'a literal past i128/u128::MAX (wider than any native scalar this compiler has)',
+			'a large negative literal',
+			'arithmetic on two arbitrary-size literals still round-trips correctly',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	a: int = 999999999999999999
+	if a.to_i64().unwrap('x') != 999999999999999999:
+		return 1
+	b: int = 99999999999999999999999999999999999999999999999999
+	if b.to_i64().is_err() != True:
+		return 2
+	c: int = -99999999999999999999999999999999999999999999999999
+	if not c.is_negative():
+		return 3
+	total = ( b + c ).unwrap('y')
+	if total != int(0):
+		return 4
+	return 0
+''', checks )
+
 	def test_from_str( self ) -> None:
 		checks = [
 			'"98765" parses to 98765',
@@ -417,6 +491,132 @@ def main() -> i32:
 		return 7
 	if not int.from_str('bad').is_err():
 		return 8
+	return 0
+''', checks )
+
+	def test_scalar_conversions( self ) -> None:
+		checks = [
+			'to_i8/to_u8 round-trip MIN/MAX, overflow one past either end',
+			'to_i64 correctly overflows a 19-digit value that exceeds i64::MAX (pre-existing accumulator-overflow bug fixed here)',
+			'a negative int overflows any unsigned target',
+			'i32(some_int) construct-cast syntax dispatches through __i32__ and yields a plain i32 (not a Result) under panic_arithmetic on success',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	if int.from_str('-128').unwrap('a').to_i8().unwrap('b') != -128:
+		return 1
+	if int.from_str('127').unwrap('a').to_i8().unwrap('b') != 127:
+		return 2
+	if not int.from_str('128').unwrap('a').to_i8().is_err():
+		return 3
+	if not int.from_str('-129').unwrap('a').to_i8().is_err():
+		return 4
+	if int.from_str('255').unwrap('a').to_u8().unwrap('b') != 255:
+		return 5
+	if not int.from_str('256').unwrap('a').to_u8().is_err():
+		return 6
+
+	# 19 digits, exceeds i64::MAX (9223372036854775807) - digit-count-only
+	# bounding used to accumulator-overflow (panic) here instead of
+	# cleanly returning Err
+	if not int.from_str('9999999999999999999').unwrap('a').to_i64().is_err():
+		return 7
+
+	if not int.from_str('-1').unwrap('a').to_u32().is_err():
+		return 8
+
+	small: int = int.from_i32(42).unwrap('a')
+	with compiler.panic_arithmetic('should not overflow'):
+		if i32(small) != 42:
+			return 9
+
+	return 0
+''', checks )
+
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
+	def test_scalar_conversions_i128_u128( self ) -> None:
+		# separate from test_scalar_conversions above: i128/u128 themselves
+		# (unlike every narrower target, which _to_i64/_to_u64 deliberately
+		# avoid routing through i128/u128 for exactly this reason - see
+		# int._to_i64's own comment) inherit the same pre-existing MSVC-
+		# only 64-bit fallback every other i128/u128 feature in this
+		# compiler already has, so this needs the same skip every other
+		# real-i128-range test in this codebase already uses.
+		checks = [
+			'to_u128 round-trips u128::MAX, overflows one past it',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	u128_max: int = int.from_str('340282366920938463463374607431768211455').unwrap('a')
+	if u128_max.to_u128().unwrap('b') != 340282366920938463463374607431768211455:
+		return 1
+	one_past: int = int.from_str('340282366920938463463374607431768211456').unwrap('a')
+	if not one_past.to_u128().is_err():
+		return 2
+	return 0
+''', checks )
+
+	def test_scalar_conversion_construct_cast_panics_on_overflow( self ) -> None:
+		# i32(x) (x: int) dispatches through __i32__ (@fallible_arithmetic),
+		# so a real overflow under panic_arithmetic auto-panics - a nonzero,
+		# crashed exit, not a returned Err the caller could inspect. Checked
+		# via the raw process exit code (like _run_program), not _assert_
+		# program_succeeds, since the whole point here is that it does NOT
+		# exit cleanly.
+		result = self._run_program( '''
+def main() -> i32:
+	big: int = int.from_str('99999999999999999999').unwrap('a')
+	with compiler.panic_arithmetic('deliberate overflow'):
+		return i32(big)
+''' )
+		self.assertNotEqual( result.returncode, 0, 'i32(x) overflow under panic_arithmetic should panic, not exit 0' )
+
+	def test_scalar_conversion_construct_cast_saturates( self ) -> None:
+		# i32(x) (x: int) under saturate_arithmetic redirects to
+		# __saturated_i32__ (infallible, clamps) instead of __i32__
+		# (@fallible_arithmetic, would otherwise require the enclosing
+		# function to return a Result to propagate into, same as .to_T()
+		# already does) - mirrors the compiler's own intrinsic Scalar-to-
+		# Scalar narrowing cast picking a different, infallible opcode
+		# under this exact mode.
+		checks = [
+			'in-range value passes through saturate_arithmetic unchanged',
+			'a value past i32::MAX clamps to i32::MAX, not an error/panic',
+			'a value past i32::MIN clamps to i32::MIN',
+			'a negative int clamps to 0 for an unsigned target',
+			'a value past u32::MAX clamps to u32::MAX',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.saturate_arithmetic:
+		small: int = int.from_i32(5).unwrap('a')
+		if i32(small) != 5:
+			return 1
+		big: int = int.from_str('99999999999999999999').unwrap('a')
+		if i32(big) != 2147483647:
+			return 2
+		neg_big: int = int.from_str('-99999999999999999999').unwrap('a')
+		if i32(neg_big) != -2147483648:
+			return 3
+		neg: int = int.from_str('-5').unwrap('a')
+		if u32(neg) != 0:
+			return 4
+		if u32(big) != 4294967295:
+			return 5
+	return 0
+''', checks )
+
+	@unittest.skipUnless( _HAS_I128, "MSVC's i128/u128 64-bit fallback doesn't have true 128-bit range - see emitter_c.py's __metalpy_wideint" )
+	def test_scalar_conversion_construct_cast_saturates_u128( self ) -> None:
+		checks = [
+			'u128(x) saturating cast round-trips a value that fits',
+		]
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	with compiler.saturate_arithmetic:
+		big: int = int.from_str('99999999999999999999').unwrap('a')
+		if u128(big) != 99999999999999999999:
+			return 1
 	return 0
 ''', checks )
 

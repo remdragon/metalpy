@@ -89,4 +89,21 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			( 'binascii_error_str_and_repr', '''
+import binascii
+
+def main() -> i32:
+	odd: bytes = 'abc'.encode().unwrap( 'x' )
+	match binascii.unhexlify( odd ):
+		case Result.Err( e ):
+			if str( e ) != 'Odd-length string':
+				return 1
+			if f'{e}' != 'Odd-length string':
+				return 2
+			if e.__repr__() != "BinasciiError('Odd-length string')":
+				return 3
+			return 0
+		case Result.Ok( _ ):
+			return 4
+''' ),
 		] )

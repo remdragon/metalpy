@@ -134,6 +134,26 @@ def ExitProcess(
 def GetLastError() -> u32:
 	...
 
+# LPWSTR GetCommandLineW(void) - the process' own command line, as the OS
+# loader set it (Unicode, unlike the CRT's own possibly-mangled main(argc,
+# argv)). Available regardless of whether the CRT is linked - see sys.py's
+# own _build_argv comment on why that matters for a freestanding build.
+# Process-owned memory, never freed by the caller.
+@extern( 'kernel32', 'GetCommandLineW' )
+def GetCommandLineW() -> ConstPtr[u16]:
+	...
+
+# HLOCAL LocalFree(HLOCAL hMem) - frees a block the LocalAlloc family (or,
+# per its own docs, shell32's CommandLineToArgvW) returned. Returns NULL on
+# success, the same handle back on failure - callers here treat it as
+# best-effort and don't check it, matching every other cleanup-only call in
+# this file (e.g. CloseHandle's own callers).
+@extern( 'kernel32', 'LocalFree' )
+def LocalFree(
+	hMem: Ptr[None],
+) -> Ptr[None]:
+	...
+
 # void GetSystemTime(LPSYSTEMTIME lpSystemTime) - current UTC time; used by
 # windows/zoneinfo_rules.py purely to read off the current YEAR (a rough
 # "now" for choosing which years to build DST transitions for) - no
@@ -276,6 +296,53 @@ def GetCurrentDirectoryA(
 ) -> u32:
 	...
 
+@extern( 'kernel32', 'CreateDirectoryA' )
+def CreateDirectoryA(
+	lpPathName: ConstPtr[u8],
+	lpSecurityAttributes: Ptr[None],
+) -> bool:
+	...
+
+@extern( 'kernel32', 'RemoveDirectoryA' )
+def RemoveDirectoryA(
+	lpPathName: ConstPtr[u8],
+) -> bool:
+	...
+
+@extern( 'kernel32', 'DeleteFileA' )
+def DeleteFileA(
+	lpFileName: ConstPtr[u8],
+) -> bool:
+	...
+
+# MoveFileW/MoveFileExW, not the *A entry points - *A goes through the
+# process' ANSI codepage (CP_ACP), not UTF-8, so it mangles any path
+# outside it.
+@extern( 'kernel32', 'MoveFileW' )
+def MoveFileW(
+	lpExistingFileName: ConstPtr[u16],
+	lpNewFileName: ConstPtr[u16],
+) -> bool:
+	...
+
+MOVEFILE_REPLACE_EXISTING: u32 = 0x1
+
+@extern( 'kernel32', 'MoveFileExW' )
+def MoveFileExW(
+	lpExistingFileName: ConstPtr[u16],
+	lpNewFileName: ConstPtr[u16],
+	dwFlags: u32,
+) -> bool:
+	...
+
+@extern( 'kernel32', 'GetEnvironmentVariableA' )
+def GetEnvironmentVariableA(
+	lpName: ConstPtr[u8],
+	lpBuffer: Ptr[u8],
+	nSize: u32,
+) -> u32:
+	...
+
 @extern('kernel32', 'WaitForSingleObject')
 def WaitForSingleObject(
 	hHandle: HANDLE,
@@ -343,25 +410,25 @@ def GetSystemTimePreciseAsFileTime(
 # ---------------------------------------------------------------------------
 
 @cstruct
-class _SRWLOCK:
+class SRWLOCK:
 	_opaque: Ptr[None]  # SRWLOCK is a single pointer-sized opaque struct
 
 
 @extern('kernel32', 'AcquireSRWLockExclusive')
 def AcquireSRWLockExclusive(
-	SRWLock: Ptr[_SRWLOCK],
+	SRWLock: Ptr[SRWLOCK],
 ) -> None:
 	...
 
 @extern('kernel32', 'TryAcquireSRWLockExclusive')
 def TryAcquireSRWLockExclusive(
-	SRWLock: Ptr[_SRWLOCK],
+	SRWLock: Ptr[SRWLOCK],
 ) -> bool:
 	...
 
 @extern('kernel32', 'ReleaseSRWLockExclusive')
 def ReleaseSRWLockExclusive(
-	SRWLock: Ptr[_SRWLOCK],
+	SRWLock: Ptr[SRWLOCK],
 ) -> None:
 	...
 

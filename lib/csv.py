@@ -49,6 +49,12 @@ class CsvError:
 	def __init__( self, message: str ) -> None:
 		self.message = message
 
+	def __str__( self ) -> str:
+		return self.message
+
+	def __repr__( self ) -> str:
+		return f"CsvError({self.message!r})"
+
 
 class MaybeRow:
 	''' row-or-end-of-input carrier - see the module docstring's point 2 on
@@ -68,7 +74,7 @@ class MaybeLine:
 	str|None value narrows fine for a direct comparison/method call on the
 	same expression (confirmed working), but not when reassigned into
 	another variable or passed as a function argument (confirmed failing,
-	real compile errors either way) - and _LineReader.next_line()'s result
+	real compile errors either way) - and LineReader.next_line()'s result
 	needs to be passed on to RowParser.feed_line(), so the carrier class
 	sidesteps the whole question. line is only meaningful when has_line is
 	True; an empty str otherwise. '''
@@ -140,7 +146,7 @@ class RowParser:
 		self.__current_field = ''
 
 	def _finish_field( self ) -> None:
-		self.__fields.append( self.__current_field ).unwrap( 'RowParser: field append failed' )
+		self.__fields.append( self.__current_field )
 		self.__current_field = ''
 
 	def feed_line( self, line: str ) -> Result[MaybeRow, CsvError]:
@@ -291,19 +297,21 @@ def format_row( row: list[str], delimiter: str = ',', quotechar: str = '"' ) -> 
 
 
 # ---------------------------------------------------------------------------
-# _LineReader - chunked, buffered line reading over a BinaryReader. No
+# LineReader - chunked, buffered line reading over a BinaryReader. No
 # text-mode file abstraction exists anywhere in lib/ today (only raw byte
 # reads) - this builds line-splitting + UTF-8 decode from scratch. An
 # ordinary class, not a generator (see the module docstring's point 1).
 # Accepts bare "\n" or "\r\n" as a line ending; strips it from the returned
-# line either way.
+# line either way. Public (not module-private) - this module's own
+# csv_linereader_test.py constructs it directly to test the chunked-
+# buffered reading logic in isolation from RowParser/Reader.
 # ---------------------------------------------------------------------------
 
 _LF: u8 = 0x0A
 _CR: u8 = 0x0D
 _LINE_READER_INITIAL_CAP: usize = 4096
 
-class _LineReader:
+class LineReader:
 	__src: BinaryReader
 	__buf: Ptr[u8]
 	__cap: usize
@@ -362,7 +370,7 @@ class _LineReader:
 						self.__fill += n
 				return Result.Ok( None )
 			case Result.Err( e ):
-				return Result.Err( CsvError( 'csv._LineReader: read failed' ))
+				return Result.Err( CsvError( 'csv.LineReader: read failed' ))
 
 	def _decode_range( self, start: usize, end: usize ) -> Result[str, CsvError]:
 		# NOT `defer( sys.free( out ))`: this function has two return points
@@ -398,7 +406,7 @@ class _LineReader:
 		sys.free( out )
 		if ok:
 			return Result.Ok( decoded )
-		return Result.Err( CsvError( 'csv._LineReader: invalid UTF-8 in input' ))
+		return Result.Err( CsvError( 'csv.LineReader: invalid UTF-8 in input' ))
 
 	def next_line( self ) -> Result[MaybeLine, CsvError]:
 		''' Ok(MaybeLine(True, line)) with one line, its own trailing
@@ -435,18 +443,18 @@ class _LineReader:
 
 
 # ---------------------------------------------------------------------------
-# Reader - combines _LineReader + RowParser into row-at-a-time reading over
+# Reader - combines LineReader + RowParser into row-at-a-time reading over
 # a real BinaryReader. Consumers drive it with an explicit loop, per the
 # module docstring's point 1 (Result-returning __next__ is never for-loop
 # compatible in this language).
 # ---------------------------------------------------------------------------
 
 class Reader:
-	__lines: _LineReader
+	__lines: LineReader
 	__parser: RowParser
 
 	def __init__( self, src: BinaryReader, delimiter: str = ',', quotechar: str = '"' ) -> None:
-		self.__lines = _LineReader( src )
+		self.__lines = LineReader( src )
 		self.__parser = RowParser( delimiter, quotechar )
 
 	def __next__( self ) -> Result[MaybeRow, CsvError]:
@@ -557,7 +565,7 @@ class DictReader:
 	def __init__( self, rows: Reader, fieldnames: list[str] ) -> None:
 		''' takes an ALREADY-CONSTRUCTED Reader (not a raw path/BinaryReader)
 		so dict_reader() below can consume the header row itself first and
-		hand over the SAME Reader (and its already-buffered _LineReader
+		hand over the SAME Reader (and its already-buffered LineReader
 		state) rather than opening a second, independent Reader over the
 		same file that would silently skip whatever the first one had
 		already buffered past the header line. '''
@@ -642,7 +650,7 @@ class DictWriter:
 					value = v
 				case Result.Err( e ):
 					pass # key missing from row - value stays ''
-			values.append( value ).unwrap( 'DictWriter: value append failed' )
+			values.append( value )
 			with compiler.wrap_arithmetic:
 				i += 1
 		return self.__rows.writerow( values )

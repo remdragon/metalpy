@@ -49,16 +49,16 @@ def main() -> i32:
 
 	# arithmetic
 	summed = td2 + td3
-	if summed._total_us != 93784000000 + 7384500000:
+	if summed.total_us != 93784000000 + 7384500000:
 		return 8
 	diffed = td2 - td3
-	if diffed._total_us != 93784000000 - 7384500000:
+	if diffed.total_us != 93784000000 - 7384500000:
 		return 9
 	negated = -td1
-	if negated._total_us != 1000000:
+	if negated.total_us != 1000000:
 		return 10
 	multiplied = timedelta( microseconds = 1 ) * i32( 5 )
-	if multiplied._total_us != 5:
+	if multiplied.total_us != 5:
 		return 11
 
 	# comparisons
@@ -440,7 +440,7 @@ def main() -> i32:
 	i: i32 = 0
 	while i < n:
 		w: Worker = Worker()
-		workers.append( w ).unwrap( 'worker append failed' )
+		workers.append( w )
 		with compiler.wrap_arithmetic:
 			i += 1
 
@@ -453,7 +453,7 @@ def main() -> i32:
 	nw: usize = workers.__len__()
 	while j < nw:
 		w2: Worker = workers.__getitem__( j ).unwrap( 'index in bounds by construction' )
-		threads.append( threading.Thread( w2.run ) ).unwrap( 'thread append failed' )
+		threads.append( threading.Thread( w2.run ) )
 		with compiler.wrap_arithmetic:
 			j += 1
 

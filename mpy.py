@@ -62,6 +62,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'force CRT linking even if the program itself never uses a \'c\' extern (normally: no_crt = \'c\' not in compiler.extern_libs) - e.g. to get __chkstk/other CRT-only support routines without adding a throwaway extern call' )
 	p.add_argument( '--hide-warnings', action = 'store_true',
 		help = 'suppress compiler warnings on an otherwise-successful build (shown by default)' )
+	p.add_argument( '--no-leak-check', action = 'store_true',
+		help = 'disable the automatic debug-build leak-check epilogue (decref globals + dump_live_objects at exit) - no effect in release builds' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
@@ -199,7 +201,7 @@ def main() -> None:
 		print( 'WARNING - --asan requires the C runtime - forcing CRT linking (no_crt=True request ignored)', file = sys.stderr )
 		no_crt = False
 	try:
-		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt, leak_check = not args.no_leak_check )
 	except CompileError:
 		pass # errors already in disco.errors - e.g. _topologically_sort_globals' own circular-dependency fail_loc
 

@@ -83,7 +83,7 @@ class HTTPHeaders:
 		''' appends a new entry, keeping any existing entry with the same
 		(case-insensitive) name - matches HTTP's own "repeated headers are
 		combined, not overwritten" semantics for headers like Set-Cookie. '''
-		self.__entries.append( ( name, value )).unwrap( 'HTTPHeaders.add: append failed' )
+		self.__entries.append( ( name, value ))
 
 	def set( self, name: str, value: str ) -> None:
 		''' replaces every existing entry with a matching (case-insensitive)
@@ -100,12 +100,12 @@ class HTTPHeaders:
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( 'HTTPHeaders.set: index in bounds by construction' )
 			if _header_name_eq( entry[0], name ):
 				if not replaced:
-					rebuilt.append( ( name, value )).unwrap( 'HTTPHeaders.set: append failed' )
+					rebuilt.append( ( name, value ))
 					replaced = True
 			else:
-				rebuilt.append( entry ).unwrap( 'HTTPHeaders.set: append failed' )
+				rebuilt.append( entry )
 		if not replaced:
-			rebuilt.append( ( name, value )).unwrap( 'HTTPHeaders.set: append failed' )
+			rebuilt.append( ( name, value ))
 		self.__entries = rebuilt
 
 	def get( self, name: str ) -> str|None:
@@ -126,7 +126,7 @@ class HTTPHeaders:
 		for i in range( n ):
 			entry: tuple[str,str] = self.__entries.__getitem__( i ).unwrap( 'HTTPHeaders.get_all: index in bounds by construction' )
 			if _header_name_eq( entry[0], name ):
-				result.append( entry[1] ).unwrap( 'HTTPHeaders.get_all: append failed' )
+				result.append( entry[1] )
 		return result
 
 	def name_at( self, index: usize ) -> Result[str, IndexError]:
@@ -342,7 +342,7 @@ def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
 
 # ---------------------------------------------------------------------------
 # transport - a plain Socket or a TLS-wrapped ssl.SSLSocket, so
-# _Connection[T]/_GrowableBuffer/the request-sending helpers below have one
+# Connection[T]/_GrowableBuffer/the request-sending helpers below have one
 # thing to call send()/recv()/close() on regardless of http:// vs https://.
 #
 # A GENERIC type parameter T (monomorphized separately for T=Socket and
@@ -350,13 +350,13 @@ def _usize_from_str( s: str ) -> Result[usize, HTTPError]:
 # `@union class _Transport: Plain: Socket; Secure: ssl.SSLSocket`, which
 # worked but had a real cost a generic doesn't: every shared method call
 # (send/recv/close, in _send_all/_GrowableBuffer.fill_from/_read_*_body/
-# _Connection itself) needed its own runtime tag-dispatch `match`, sprinkled
+# Connection itself) needed its own runtime tag-dispatch `match`, sprinkled
 # through this whole file instead of a direct `transport.send(...)`-style
 # call - a generic function/method calling a named method directly on a
 # bare type parameter (no shared base class/interface needed between Socket
 # and ssl.SSLSocket) monomorphizes cleanly per instantiation, confirmed via
 # a real compile spike before committing to this design. Each
-# _Connection[T] instance is also sized exactly for whichever T it holds,
+# Connection[T] instance is also sized exactly for whichever T it holds,
 # not the union's own tag + larger-of-the-two-payloads layout.
 #
 # NOT a binary-size win, despite the name "monomorphization" suggesting one:
@@ -400,7 +400,7 @@ def _do_request_response[T]( transport: T, method: str, full_path: str, host: st
 	_perform_request_for_scheme below (the one place a runtime scheme check
 	picks which T to instantiate this with; everything downstream of that
 	one branch, including this function, is fully generic/dispatch-free). '''
-	conn: _Connection[T] = _Connection[T]._from_transport( transport, host, 0 )
+	conn: Connection[T] = Connection[T]._from_transport( transport, host, 0 )
 	conn.request( method, full_path, headers, body ).or_return()
 	response: Response = conn.getresponse().or_return()
 	conn.close()
@@ -679,28 +679,34 @@ def _read_until_close_body[T]( transport: T, buf: _GrowableBuffer, body_start: u
 	return Result.Ok( buf.slice_bytes( body_start, buf.len() ))
 
 # ---------------------------------------------------------------------------
-# _Connection[T] - one TCP connection, one request/response at a time,
+# Connection[T] - one TCP connection, one request/response at a time,
 # GENERIC over its own transport type T (Socket for plain HTTP,
 # ssl.SSLSocket for HTTPS - see this file's own "transport" header comment
 # above for why this is a generic, not the @union this file used to use).
 # Mirrors lib/builtins/__File.py's handle shape otherwise: an owned resource
 # field (T itself, already RC-managed with its own auto-closing __del__ - no
-# _Connection.__del__ needed, the field's own teardown cascades), a private
+# Connection.__del__ needed, the field's own teardown cascades), a private
 # constructor, ordinary Result-returning methods.
 #
 # HTTPConnection/HTTPSConnection (below) are thin, NON-generic entry-point
 # classes wrapping this - each `connect()` returns a specific instantiation
-# (_Connection[Socket] / _Connection[ssl.SSLSocket]), matching CPython's
+# (Connection[Socket] / Connection[ssl.SSLSocket]), matching CPython's
 # http.client naming without HTTPConnection/HTTPSConnection themselves
-# needing to be generic. They can't just be _Connection[T] with a generic
+# needing to be generic. They can't just be Connection[T] with a generic
 # connect() of their own: the plain-TCP and TLS-handshake connect steps
 # genuinely differ, and a single generic method can't have a different body
 # per instantiation - only the free functions above (_connect_or_http_err /
 # _connect_tls_or_http_err) differ per scheme; everything downstream of
 # "already have a live transport" is the identical generic code below.
+#
+# Public (not module-private _Connection) despite HTTPConnection/
+# HTTPSConnection being the intended ordinary entry points - this module's
+# own white-box test coverage (http_client_test.py) constructs/type-
+# annotates it directly to test the shared connection machinery in
+# isolation from either scheme's own connect() wrapper.
 # ---------------------------------------------------------------------------
 
-class _Connection[T]:
+class Connection[T]:
 	__transport: T
 	__host: str
 	__port: u16
@@ -710,8 +716,8 @@ class _Connection[T]:
 
 	@private
 	@staticmethod
-	def _from_transport( transport: T, host: str, port: u16 ) -> _Connection[T]:
-		return _Connection.__allocate__( __transport = transport, __host = host, __port = port )
+	def _from_transport( transport: T, host: str, port: u16 ) -> Connection[T]:
+		return Connection.__allocate__( __transport = transport, __host = host, __port = port )
 
 	def request( self, method: str, path: str, headers: HTTPHeaders|None = None, body: bytes|None = None ) -> Result[None, HTTPError]:
 		# NOT named `head` - a local variable shadowing a module-level
@@ -778,7 +784,7 @@ class _Connection[T]:
 				# no Content-Length, not chunked - read until the peer closes
 				content = _read_until_close_body( self.__transport, buf, body_start ).or_return()
 
-		# url left blank here - _Connection only knows host/port/path, not
+		# url left blank here - Connection only knows host/port/path, not
 		# the scheme a caller reached it through; Session.request() (the only
 		# caller that actually knows the full URL) fills this field in itself
 		# right after getresponse() returns.
@@ -786,24 +792,24 @@ class _Connection[T]:
 
 class HTTPConnection:
 	''' entry point for plain HTTP - connect() TCP-connects and returns a
-	_Connection[Socket] already carrying that live transport. '''
+	Connection[Socket] already carrying that live transport. '''
 
 	@staticmethod
-	def connect( host: str, port: u16 = 80 ) -> Result[_Connection[Socket], HTTPError]:
+	def connect( host: str, port: u16 = 80 ) -> Result[Connection[Socket], HTTPError]:
 		''' host may be a real hostname - lib/socket.py's own Socket.connect()
 		resolves it via getaddrinfo internally. '''
 		sock: Socket = _connect_or_http_err( host, port ).or_return()
-		return Result.Ok( _Connection[Socket]._from_transport( sock, host, port ))
+		return Result.Ok( Connection[Socket]._from_transport( sock, host, port ))
 
 class HTTPSConnection:
 	''' entry point for HTTPS - connect() TCP-connects, completes a TLS
-	handshake (lib/ssl.py), and returns a _Connection[ssl.SSLSocket] already
+	handshake (lib/ssl.py), and returns a Connection[ssl.SSLSocket] already
 	carrying that live transport. '''
 
 	@staticmethod
-	def connect( host: str, port: u16 = 443, verify: bool = True ) -> Result[_Connection[ssl.SSLSocket], HTTPError]:
+	def connect( host: str, port: u16 = 443, verify: bool = True ) -> Result[Connection[ssl.SSLSocket], HTTPError]:
 		tls: ssl.SSLSocket = _connect_tls_or_http_err( host, port, verify ).or_return()
-		return Result.Ok( _Connection[ssl.SSLSocket]._from_transport( tls, host, port ))
+		return Result.Ok( Connection[ssl.SSLSocket]._from_transport( tls, host, port ))
 
 # ---------------------------------------------------------------------------
 # URL parsing - http:// and https://, built on lib/urllib/parse.py's
@@ -871,7 +877,7 @@ def _dict_to_pairs( d: dict[str,str] ) -> list[tuple[str,str]]:
 	for i in range( n ):
 		key: str = d.key_at( i ).unwrap( '_dict_to_pairs: index in bounds by construction' )
 		value: str = d.value_at( i ).unwrap( '_dict_to_pairs: index in bounds by construction' )
-		pairs.append( ( key, value )).unwrap( '_dict_to_pairs: append failed' )
+		pairs.append( ( key, value ))
 	return pairs
 
 def _build_request_path( parsed: ParsedURL, params: dict[str,str]|None ) -> Result[str, HTTPError]:
@@ -891,7 +897,7 @@ def _build_request_path( parsed: ParsedURL, params: dict[str,str]|None ) -> Resu
 		en: usize = extra.__len__()
 		ei: usize = 0
 		for ei in range( en ):
-			pairs.append( extra.__getitem__( ei ).unwrap( '_build_request_path: index in bounds by construction' )).unwrap( '_build_request_path: append failed' )
+			pairs.append( extra.__getitem__( ei ).unwrap( '_build_request_path: index in bounds by construction' ))
 	if pairs.__len__() == 0:
 		return Result.Ok( parsed.path )
 	return Result.Ok( parsed.path + '?' + urlencode( pairs ))
@@ -1050,7 +1056,7 @@ def _redact( text: str, sensitive_values: list[str]|None ) -> str:
 	i: usize = 0
 	for i in range( n ):
 		v: str = source.__getitem__( i ).unwrap( '_redact: index in bounds by construction' )
-		values.append( v ).unwrap( '_redact: append failed' )
+		values.append( v )
 
 	with compiler.panic_arithmetic( 'n bounded by a real caller-supplied list, cannot overflow' ):
 		for i in range( n ):
@@ -1152,13 +1158,13 @@ class Session:
 		for i in range( n ):
 			name: str = self.__cookies.key_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
 			value: str = self.__cookies.value_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
-			parts.append( name + '=' + value ).unwrap( '_build_cookie_header: append failed' )
+			parts.append( name + '=' + value )
 		if extra is not None:
 			e2: dict[str,str] = extra
 			for i in range( extra_n ):
 				name = e2.key_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
 				value = e2.value_at( i ).unwrap( '_build_cookie_header: index in bounds by construction' )
-				parts.append( name + '=' + value ).unwrap( '_build_cookie_header: append failed' )
+				parts.append( name + '=' + value )
 		return '; '.join( parts )
 
 	def request( self, method: str, url: str,

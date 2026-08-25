@@ -29,6 +29,7 @@
 import ast
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -232,6 +233,24 @@ class RealCompileMixin:
 				return subprocess.run( argv, capture_output = True, timeout = timeout, cwd = tmp )
 			except subprocess.TimeoutExpired:
 				self.fail( f'exe did not finish within {timeout}s' )
+
+	_LIVE_RC_OBJECTS_RE = re.compile( rb'-- live RC objects \((\d+)\) --\n' )
+
+	def _split_off_leak_report( self, stdout: bytes ) -> bytes:
+		''' a debug build's own __metalpy_deinit() appends a
+		"-- live RC objects (N) --" leak-check report (emitter_c.py's
+		emit_c(..., leak_check=True), the default) after main()'s real
+		output - asserts N is 0 (a real, checkable "no RC bugs introduced"
+		result, not just tolerating whatever it prints) and returns
+		everything BEFORE that marker line, i.e. the program's own real
+		output. Only meaningful when the leak-check epilogue is actually
+		compiled in (emit_c.py's own deinit_enabled: debug build, default
+		leak_check, and a parameterless main - see its own comment) - a
+		program compiled without one has no such line to find at all. '''
+		m = self._LIVE_RC_OBJECTS_RE.search( stdout )
+		self.assertIsNotNone( m, f'expected a "-- live RC objects (N) --" leak-check line in stdout:\n{stdout!r}' )
+		self.assertEqual( m.group( 1 ), b'0', f'RC leak check reported live objects:\n{stdout.decode("utf-8", errors="replace")}' )
+		return stdout[ :m.start() ]
 
 	def _compile_source( self, source: str ) -> Compiler:
 		''' discover builtins, import + compile one MetalPy program, and assert

@@ -88,6 +88,12 @@ class PatternError:
 	def __init__( self, message: str ) -> None:
 		self.message = message
 
+	def __str__( self ) -> str:
+		return self.message
+
+	def __repr__( self ) -> str:
+		return f"PatternError({self.message!r})"
+
 
 @enum( i32 )
 class MatchError:
@@ -266,8 +272,8 @@ class CharClass:
 		self.negate = negate
 
 	def add_range( self, lo: u32, hi: u32 ) -> None:
-		self.lo.append( lo ).unwrap( 're: CharClass.add_range' )
-		self.hi.append( hi ).unwrap( 're: CharClass.add_range' )
+		self.lo.append( lo )
+		self.hi.append( hi )
 
 	def contains( self, cp: u32 ) -> bool:
 		found: bool = False
@@ -335,13 +341,13 @@ def _append_fragment( dest: list[Op], frag: list[Op] ) -> None:
 	n: usize = len( frag )
 	while i < n:
 		src_op: Op = frag.__getitem__( i ).unwrap( 're: fragment index' )
-		dest.append( _clone_op_at_offset( src_op, offset )).unwrap( 're: fragment append' )
+		dest.append( _clone_op_at_offset( src_op, offset ))
 		with compiler.wrap_arithmetic:
 			i += 1
 
 def _single_op_fragment( op: Op ) -> list[Op]:
 	out: list[Op] = list[Op]()
-	out.append( op ).unwrap( 're: single op fragment' )
+	out.append( op )
 	return out
 
 
@@ -542,11 +548,11 @@ class Parser:
 		if self._at_end() or self._peek_byte() != _BYTE_PIPE:
 			return Result.Ok( first )
 		branches: list[list[Op]] = list[list[Op]]()
-		branches.append( first ).unwrap( 're: parse_alt' )
+		branches.append( first )
 		while not self._at_end() and self._peek_byte() == _BYTE_PIPE:
 			self._advance_byte()
 			nxt: list[Op] = self.parse_concat().or_return()
-			branches.append( nxt ).unwrap( 're: parse_alt' )
+			branches.append( nxt )
 		return Result.Ok( self._build_alternation( branches ))
 
 	def _build_alternation( self, branches: list[list[Op]] ) -> list[Op]:
@@ -812,7 +818,7 @@ class Parser:
 			cc: CharClass = self._shorthand_class_for_byte( b )
 			self._advance_byte()
 			idx: usize = len( self.classes )
-			self.classes.append( cc ).unwrap( 're: register shorthand class' )
+			self.classes.append( cc )
 			return Result.Ok( _single_op_fragment( _op_in( idx )))
 		if b == 98:  # 'b' - zero-width word boundary (outside a class; \b
 			self._advance_byte()  # inside a class means backspace instead - see _class_member_cp)
@@ -943,7 +949,7 @@ class Parser:
 				cc.add_range( lo, lo )
 		self._advance_byte()  # consume ']'
 		idx: usize = len( self.classes )
-		self.classes.append( cc ).unwrap( 're: register class' )
+		self.classes.append( cc )
 		return Result.Ok( _single_op_fragment( _op_in( idx )))
 
 	def _class_has_range_after( self ) -> bool:
@@ -1157,7 +1163,7 @@ def _clone_usize_list( src: list[usize] ) -> list[usize]:
 	i: usize = 0
 	n: usize = len( src )
 	while i < n:
-		out.append( src.__getitem__( i ).unwrap( 're: clone usize list' )).unwrap( 're: clone usize list append' )
+		out.append( src.__getitem__( i ).unwrap( 're: clone usize list' ))
 		with compiler.wrap_arithmetic:
 			i += 1
 	return out
@@ -1167,7 +1173,7 @@ def _clone_bool_list( src: list[bool] ) -> list[bool]:
 	i: usize = 0
 	n: usize = len( src )
 	while i < n:
-		out.append( src.__getitem__( i ).unwrap( 're: clone bool list' )).unwrap( 're: clone bool list append' )
+		out.append( src.__getitem__( i ).unwrap( 're: clone bool list' ))
 		with compiler.wrap_arithmetic:
 			i += 1
 	return out
@@ -1273,8 +1279,8 @@ class Matcher:
 		slot_set: list[bool] = list[bool]()
 		i: usize = 0
 		while i < n_slots:
-			slot_values.append( 0 ).unwrap( 're: run_at init slots' )
-			slot_set.append( False ).unwrap( 're: run_at init slots' )
+			slot_values.append( 0 )
+			slot_set.append( False )
 			with compiler.wrap_arithmetic:
 				i += 1
 		return self._run_from( start_pos, slot_values, slot_set, 0, False )
@@ -1430,7 +1436,7 @@ class Matcher:
 					op.target_b, sp, _clone_usize_list( slot_values ), _clone_bool_list( slot_set ),
 					last_group, last_group_set,
 				)
-				stack.append( frame ).unwrap( 're: run_at push split frame' )
+				stack.append( frame )
 				pc = op.target_a
 				continue
 			elif op.kind == OpKind.JUMP:
@@ -1575,9 +1581,9 @@ class Match:
 		while i <= count:
 			g: str|None = self.group( i )
 			if g is None:
-				out.append( GroupResult( '', False )).unwrap( 're: Match.groups append' )
+				out.append( GroupResult( '', False ))
 			else:
-				out.append( GroupResult( g, True )).unwrap( 're: Match.groups append' )
+				out.append( GroupResult( g, True ))
 			with compiler.wrap_arithmetic:
 				i += 1
 		return out
@@ -1627,9 +1633,9 @@ class Match:
 				lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.regs slot' )
 				hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.regs slot' )
 				with compiler.panic_arithmetic( 're: Match.regs: offset does not fit in i32' ):
-					out.append(( i32( lo ), i32( hi ))).unwrap( 're: Match.regs append' )
+					out.append(( i32( lo ), i32( hi )))
 			else:
-				out.append(( i32( -1 ), i32( -1 ))).unwrap( 're: Match.regs append' )
+				out.append(( i32( -1 ), i32( -1 )))
 			with compiler.wrap_arithmetic:
 				i += 1
 		return out
@@ -1682,8 +1688,8 @@ class Pattern:
 		_append_fragment( prog, _single_op_fragment( _op_save( 0 )))
 		_append_fragment( prog, body )
 		tail: list[Op] = list[Op]()
-		tail.append( _op_save( 1 )).unwrap( 're: compile tail' )
-		tail.append( _op_match()).unwrap( 're: compile tail' )
+		tail.append( _op_save( 1 ))
+		tail.append( _op_match())
 		_append_fragment( prog, tail )
 		return Result.Ok( Pattern( prog, parser.classes, parser.next_slot, flags, parser.group_names, byte_mode ))
 
@@ -1806,11 +1812,61 @@ class Pattern:
 			case Result.Err( e ):
 				return Result.Err( e )
 
-	# No Pattern.finditer() METHOD - "a generator method is not supported
-	# yet" (confirmed directly). See the module-level finditer() function
-	# below for the free-function form and its own further limitation
-	# (confirmed unusable from any module other than this one - a general
-	# compiler bug, not specific to this API).
+	def finditer( self, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+		''' yields each successive non-overlapping match, scanning forward
+		from the end of the previous one (or by one codepoint, for a
+		zero-width match). Generator methods are now supported (self is
+		just another captured field on the generator's own backing class -
+		see PLAN_GENERATORS.md) - the module-level finditer(pattern, s)
+		free function below is now a thin `yield from` wrapper over this.
+
+		Same "yield as a direct, unnested statement of a single top-level
+		while loop" shape constraint as every other generator in this
+		file - see the module-level finditer()'s own docstring for why the
+		match itself is recomputed each iteration (pos/has_next as plain
+		scalar loop state) rather than carried across the yield. '''
+		slen: usize = s.byte_len()
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		while has_next:
+			m: Match = _require_next_match( self, s, pos, slen, max_steps )
+			pos = _advance_pos_after_match( m, s )
+			yield m
+			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		return
+
+	def finditer( self, s: bytes, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+		''' byte-mode sibling of the str finditer() above - same generator-
+		shape constraints, same accepted "recompute instead of carry across
+		yield" v1 inefficiency. Returned Match objects are byte-mode (their
+		own .group()/.groupdict()/.groups() panic if called - see Match's
+		own note); .span()/.start()/.end()/.regs/.lastindex all work
+		identically to the str case. '''
+		slen: usize = len( s )
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after_bytes( self, s, pos, slen, max_steps )
+		while has_next:
+			m: Match = _require_next_match_bytes( self, s, pos, slen, max_steps )
+			pos = _advance_pos_after_match_bytes( m, slen )
+			yield m
+			has_next = _has_match_at_or_after_bytes( self, s, pos, slen, max_steps )
+		return
+
+	def finditer( self, s: memoryview, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+		''' memoryview sibling of the str finditer() above - same generator-
+		shape constraints, same byte-mode Match caveats (see the bytes
+		sibling's own docstring). This is the exact shape grap.mpy's own
+		port needs: `for m in pattern.finditer( mv[a:b] ):` over a
+		memoryview slice. '''
+		slen: usize = len( s )
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after_memoryview( self, s, pos, slen, max_steps )
+		while has_next:
+			m: Match = _require_next_match_memoryview( self, s, pos, slen, max_steps )
+			pos = _advance_pos_after_match_bytes( m, slen )
+			yield m
+			has_next = _has_match_at_or_after_memoryview( self, s, pos, slen, max_steps )
+		return
 
 	def findall( self, s: str, max_steps: usize = 65536 ) -> list[str]:
 		''' the whole (group 0) text of every non-overlapping match, in
@@ -1835,7 +1891,7 @@ class Pattern:
 			g: str|None = mm.group()
 			if g is None:
 				sys.panic( 're: findall: whole match text unexpectedly unset' )
-			out.append( g ).unwrap( 're: findall append' )
+			out.append( g )
 			pos = _advance_pos_after_match( mm, s )
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
 		return out
@@ -1898,13 +1954,13 @@ class Pattern:
 			end: usize|None = mm.end()
 			if end is None:
 				sys.panic( 're: split: whole match end unexpectedly unset' )
-			out.append( _substr( s.get_cstr(), last_end, start )).unwrap( 're: split append' )
+			out.append( _substr( s.get_cstr(), last_end, start ))
 			last_end = end
 			with compiler.wrap_arithmetic:
 				n += 1
 			pos = _advance_pos_after_match( mm, s )
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
-		out.append( _substr( s.get_cstr(), last_end, s.byte_len())).unwrap( 're: split append' )
+		out.append( _substr( s.get_cstr(), last_end, s.byte_len()))
 		return out
 
 
@@ -2028,97 +2084,34 @@ def _require_next_match_memoryview( pattern: Pattern, s: memoryview, pos: usize,
 # overloads (str/bytes/memoryview) - see Pattern.search()'s own comment
 # above (task_85803192).
 def finditer( pattern: Pattern, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
-	''' yields each successive non-overlapping match, scanning forward
-	from the end of the previous one (or by one codepoint, for a
-	zero-width match). Externally consumable via a real for-loop as of
-	the compiler fix in 2cb18c4 ("Fix cross-module generator synthesis
-	resolving names in wrong module") - confirmed directly; previously
-	this only worked for same-module callers, which is why
-	findall/sub/subn/split below still don't call it internally (they
-	predate the fix and re-do the same scan-forward directly against
-	_find_next_match instead - no need to revisit now that it works,
-	but also no need to change working code just to share it).
-
-	A free function, not a Pattern method - confirmed directly that a
-	generator METHOD isn't supported yet, and separately that an
-	Iterator[T] value merely returned/passed through a non-generator
-	function (even a trivial `return other_generator(...)`, same
-	module) has no usable __next__ for the receiver - only a DIRECT
-	call to the actual generator function works as a for-loop's
-	iterable expression. There is also no module-level str-pattern
-	convenience overload here (unlike search/match/fullmatch/findall/
-	sub/subn/split below): a second `finditer(pattern: str, ...)`
-	generator that re-yields from this one via `for m in finditer(p,
-	...): yield m` was tried and produced nonsensical errors (undefined
-	names inside THIS function's own already-correct body) once two
-	same-named overloads were both generators - not investigated
-	further (this was before the cross-module fix landed; may be worth
-	retrying, but not revisited here since compile-then-call works
-	fine). Compile the pattern with re.compile() first, then call
-	finditer(pattern, s) with the result.
-
-	The generator body itself must also keep yield as a direct, unnested
-	statement of a single top-level while loop - nesting it inside an
-	if/else within the loop (the natural first-cut shape) is a separate,
-	unsupported combination from a bare top-level if/else containing
-	yield (confirmed directly), so the "is there a match" branching has
-	to live in the while loop's own CONDITION instead of its body. That
-	in turn means the loop can't carry a Match|None as its own persisted
-	state across the yield boundary either (confirmed directly -
-	promoting an Optional RC-typed local across a yield produces a type
-	mismatch in the synthesized state field, unlike a bare, non-Optional
-	RC-typed local, which Phase 9 of PLAN_GENERATORS.md's own generator
-	work does support) - so the loop state here is two plain scalars
-	(pos: usize, has_next: bool) instead, and the actual Match value is
-	recomputed fresh each iteration via _require_next_match rather than
-	carried across the yield. This costs an extra redundant _search_from
-	call per position (once to check has_next, once more to fetch the
-	value) - an accepted v1 inefficiency, not a correctness issue, since
-	matching is deterministic. '''
-	slen: usize = s.byte_len()
-	pos: usize = 0
-	has_next: bool = _has_match_at_or_after( pattern, s, pos, slen, max_steps )
-	while has_next:
-		m: Match = _require_next_match( pattern, s, pos, slen, max_steps )
-		pos = _advance_pos_after_match( m, s )
-		yield m
-		has_next = _has_match_at_or_after( pattern, s, pos, slen, max_steps )
-	return
+	''' free-function form, kept for callers that don't already have a
+	`match` binding named suggestively as a method receiver - a thin
+	`yield from` wrapper over the real implementation, now Pattern.
+	finditer() itself (generator methods are supported - see that
+	method's own docstring, PLAN_GENERATORS.md). `yield from` requires
+	an EXACT Result[T,E] shape match between the two generators, which
+	this trivially satisfies (both Iterator[Result[Match,StopIteration]]). '''
+	yield from pattern.finditer( s, max_steps )
 
 
 def finditer( pattern: Pattern, s: bytes, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
-	''' byte-mode sibling of finditer() above - same generator-shape
-	constraints apply (see that docstring), same accepted "recompute
-	instead of carry across yield" v1 inefficiency. Returned Match objects
-	are byte-mode (their own .group()/.groupdict()/.groups() panic if
-	called - see Match's own note); .span()/.start()/.end()/.regs/
+	''' byte-mode sibling of finditer() above - a thin `yield from` wrapper
+	over Pattern.finditer(bytes) itself, same as the str overload. Returned
+	Match objects are byte-mode (their own .group()/.groupdict()/.groups()
+	panic if called - see Match's own note); .span()/.start()/.end()/.regs/
 	.lastindex all work identically to the str case, which is everything
 	grap.mpy's own port needs from this. '''
-	slen: usize = len( s )
-	pos: usize = 0
-	has_next: bool = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
-	while has_next:
-		m: Match = _require_next_match_bytes( pattern, s, pos, slen, max_steps )
-		pos = _advance_pos_after_match_bytes( m, slen )
-		yield m
-		has_next = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
-	return
+	yield from pattern.finditer( s, max_steps )
 
 
 def finditer( pattern: Pattern, s: memoryview, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
-	''' memoryview sibling of finditer() above - same generator-shape
-	constraints, same byte-mode Match caveats (see the bytes sibling's own
-	docstring). This is the exact shape grap.mpy's own port needs:
-	`for m in re.finditer(pattern, mv[a:b]):` over a memoryview slice. '''
-	slen: usize = len( s )
-	pos: usize = 0
-	has_next: bool = _has_match_at_or_after_memoryview( pattern, s, pos, slen, max_steps )
-	while has_next:
-		m: Match = _require_next_match_memoryview( pattern, s, pos, slen, max_steps )
-		pos = _advance_pos_after_match_bytes( m, slen )
-		yield m
-		has_next = _has_match_at_or_after_memoryview( pattern, s, pos, slen, max_steps )
-	return
+	''' memoryview sibling of finditer() above - a thin `yield from` wrapper
+	over Pattern.finditer(memoryview) itself, same as the str overload.
+	This is the exact shape grap.mpy's own port needs: `for m in
+	re.finditer(pattern, mv[a:b]):` (or the equivalent
+	`pattern.finditer(mv[a:b])` method-call form) over a memoryview
+	slice. '''
+	yield from pattern.finditer( s, max_steps )
 
 
 def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:

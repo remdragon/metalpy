@@ -6,16 +6,16 @@ import threading
 
 # Sequence[T]/Iterable[T]: the two protocols min(seq)/max(seq)/iter/any/all/
 # enumerate/map/reduce/sum are all built on (defined here, before ANY other
-# name in this module, since list[T]/slice[T] below need to declare
-# conformance in their own class header, e.g. `class list[T](Sequence[T],
-# Iterable[T]):` - a base-class list is resolved EAGERLY, at the base-class
-# expression's own parse time, unlike an ordinary annotation reference
-# (Result[T,IndexError] below is fine forward-referenced, lazily resolved -
-# only a TypeVar's own bound and a class's own base list are eager. list[T]
-# itself is defined in a separate file, __list.py, reached via this file's
-# own `from .__list import list` below - list[T]'s own class statement is
-# parsed as a side effect of THAT import line, so Sequence/Iterable must
-# already be registered before it, not merely appear earlier in THIS file).
+# name in this module, since list[T] below needs to declare conformance in
+# its own class header, e.g. `class list[T](Sequence[T], Iterable[T]):` - a
+# base-class list is resolved EAGERLY, at the base-class expression's own
+# parse time, unlike an ordinary annotation reference (Result[T,IndexError]
+# below is fine forward-referenced, lazily resolved - only a TypeVar's own
+# bound and a class's own base list are eager. list[T] itself is defined in
+# a separate file, __list.py, reached via this file's own `from .__list
+# import list` below - list[T]'s own class statement is parsed as a side
+# effect of THAT import line, so Sequence/Iterable must already be
+# registered before it, not merely appear earlier in THIS file).
 # Kept as two separate protocols, not one (matching real Python: dict
 # conforms to Iterable via key-iteration but isn't a Sequence - __getitem__
 # isn't usize-keyed) - see each's own docstring below.
@@ -23,9 +23,9 @@ import threading
 class Sequence[T]:
 	# only __getitem__ is required, not __len__ - reaching the end is
 	# signaled by Err(IndexError) itself, so a conformer never needs to
-	# separately answer "how many". list[T]/slice[T]'s existing scalar
-	# __getitem__ already has exactly this shape - conforming needed no
-	# method changes there, only the base-class declaration.
+	# separately answer "how many". list[T]'s existing scalar __getitem__
+	# already has exactly this shape - conforming needed no method changes
+	# there, only the base-class declaration.
 	def __getitem__( self, i: usize ) -> Result[T, IndexError]: ...
 
 @protocol
@@ -35,40 +35,48 @@ class Iterable[T]:
 	# iterable, not just a random-access sequence.
 	def __iter__( self ) -> Generator[T, StopIteration]: ...
 
+@protocol
+class IteratorProtocol[T]:
+	# an ALREADY-in-progress iterator (a real generator object, or any
+	# hand-written class with its own __next__) - what for-loops (lowering.
+	# py's _stmt_For) actually drive once they have one, whether that came
+	# directly from a for-loop's own subject (IteratorProtocol[T]
+	# conformance) or via Iterable[T].__iter__() first. Named
+	# "IteratorProtocol", not the shorter "Iterator" its real Python
+	# namesake uses - "Iterator[...]" is already claimed, permanently, by
+	# an unrelated, pre-existing compiler special form (discovery.py's
+	# visit_Subscript textually recognizes `Iterator[Result[T,E]]` as
+	# sugar for a generator function's own return-type annotation - see
+	# Generator[T,E]'s identical treatment right below - long before this
+	# protocol existed), so `class Foo(Iterator[T]):` would silently
+	# misparse as THAT instead of a real protocol base. Declared
+	# conformance is a NAME-only check (discovery.py's _validate_protocol_
+	# conformance never inspects __next__'s own signature), so this stub's
+	# exact Result[T,StopIteration] shape below doesn't constrain a real
+	# generator's own wider error type in any way - __next__'s error type E
+	# may be anything AS LONG AS StopIteration is one of its leaves
+	# (PLAN_GENERATORS.md's StopIteration reversal - reaching the end is
+	# Err(StopIteration()), not a nullable None), which is what a for-
+	# loop's own consumption actually requires and already handles (E' = E
+	# minus StopIteration - see _lower_for_over_iterator_fallible_bind). A
+	# generator's own synthesized backing class (type_resolver.py's
+	# ensure_generator_synthesized) declares this conformance itself, the
+	# same way TupleStorage._declare_sequence_conformance already does for
+	# Sequence[T]/Iterable[T].
+	def __next__( self ) -> Result[T, StopIteration]: ...
+
 # the one place a Sequence[T]'s index-walk is written - every conformer's own
 # __iter__ just delegates here (a __iter__ method can never itself contain
 # yield - see type_resolver.py's ensure_generator_synthesized - so a
 # conformer always needs a thin delegating method like this one regardless).
 def _sequence_iter[T, S: Sequence[T]]( seq: S ) -> Generator[T, StopIteration]:
-	# if/is_err()/unwrap(), NOT match - a match statement whose Ok-arm
-	# contains the yield triggers a real, confirmed MSVC-only compiler bug:
-	# the generator state-machine split at the yield duplicates the match
-	# subject's own "release Err payload if any" RC-cleanup code onto the
-	# POST-YIELD RESUME path, where the match subject was never (re-)
-	# assigned in that call frame at all - a genuine uninitialized-memory
-	# read (confirmed via generated-C inspection: __match_subj_0 read at
-	# the merge point directly reachable from the resume label, which
-	# skips the match statement's own subject assignment entirely).
-	# Reported for a real fix (compiler bug, not a library one) - this
-	# rewrite just avoids the trigger shape here.
-	# __getitem__ called TWICE per element (once to check, once to unwrap)
-	# rather than held in one local: a bare (unannotated) generator local
-	# is rejected outright ("must be declared with an explicit type
-	# annotation"), and an EXPLICIT `r: Result[T,IndexError]` annotation
-	# hits the separate, pre-existing "generic generator body referencing
-	# its own type param T outside a parameter/return annotation" Phase 3
-	# rejection (PLAN_GENERATORS.md) - confirmed by real repros of both.
-	# __getitem__ is a plain, side-effect-free lookup for every conformer
-	# this ships with (list/slice/tuple), so the extra call is a minor
-	# inefficiency, not a correctness concern.
 	i: usize = 0
 	while True:
-		# not seq[i]: subscript sugar on a fallible __getitem__ auto-
-		# propagates Err via the enclosing function's OWN return type,
-		# which doesn't match here (IndexError vs StopIteration)
-		if seq.__getitem__( i ).is_err():
-			return
-		yield seq.__getitem__( i ).unwrap( 'Sequence.__getitem__: was just checked is_ok() above' )
+		match seq.__getitem__( i ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
 		with compiler.wrap_arithmetic:
 			i += 1
 
@@ -79,9 +87,10 @@ from .__int import int, IntError
 from .__scalar_dunders import i_add_checked
 from .__ptr_arith import ptr_add_checked
 from .__list import list, UnsafeList
+from .__vartuple import VariadicTuple, tuple
 from .__RawDict import RawDict, RawEntry
 from .__set import set
-from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one
+from .__str import decode_utf8_at, encode_utf8_at, utf8_encoded_len, case_map, case_map_one, is_alpha_cp, is_digit_cp, is_space_cp, is_upper_cp, is_lower_cp, is_alnum_cp, is_printable_cp, ascii_escape_width, ascii_escape_one, repr_escape_width, repr_escape_one, nonascii_escape_width, nonascii_escape_one
 
 # markers with no payload of their own - Check-mode arithmetic (AddCheck/
 # SubCheck/MulCheck/...) and Div/Mod produce Result[T,OverflowError]/
@@ -97,12 +106,6 @@ class ZeroDivisionError: pass
 class FloatingPointError: pass
 class IndexError: pass
 class KeyError: pass
-# list[T].append/insert/erase_at/pop refuse to mutate while a slice[T] view
-# (list[T][a:b], RAII-tracked) is outstanding (see __list.py's own
-# __getitem__(PySlice) comment) - the same "an outstanding export blocks a
-# resize" contract Python's own memoryview/buffer protocol enforces over
-# bytearray
-class BorrowError: pass
 # structural `==`/`!=` between two operands where at least one (left, right)
 # leaf-type pairing has no valid comparison (see lowering.py's
 # _lower_eq_dispatch/_classify_leaf_pair_eq) produces Result[bool,TypeError]
@@ -176,6 +179,21 @@ class Result[T,E]:
 	# lowering.py's _consume_checked_result, which every or_return() call
 	# actually goes through.
 
+	# or_throw() - same reserved-name/no-real-body/AST-shape-recognized
+	# story as or_return() just above (also rejected outright by
+	# discovery.py's _parse_function). Like or_return() on the Ok branch;
+	# on the Err branch, each leaf of E first checks the INNERMOST
+	# enclosing try's own except clauses (only valid textually inside a
+	# try body, in the SAME function) and jumps into a matching handler
+	# instead of propagating, when one covers that leaf - equivalent to:
+	#     if self.is_err():
+	#         match self.data.v_Err:                # conceptually - real
+	#             case <a covered leaf>: goto <that except clause>
+	#             case _: compiler.early_return( self.data.v_Err )  # uncovered leaves only
+	#     ok: T = self.data.v_Ok
+	#     return ok
+	# See lowering.py's _lower_or_throw/_stmt_Try and ir.OrThrow.
+
 	@overload
 	def unwrap( self, errmsg: str ) -> T:
 		...
@@ -213,9 +231,9 @@ class Result[T,E]:
 
 
 @cstruct
-class PySlice:
+class slice:
 	# range descriptor for container[a:b] slice syntax (lowering.py's
-	# _lower_slice_subscript) - the __getitem__(PySlice) overload argument
+	# _lower_slice_subscript) - the __getitem__(slice) overload argument
 	# every slice-syntax-supporting type (str, bytearray, memoryview,
 	# UnsafeList[T], list[T]) shares, replacing the old hardcoded
 	# per-type _byte_slice(start,end)/_SLICE_LENGTH_METHOD dispatch. stop is
@@ -229,7 +247,7 @@ class PySlice:
 	stop: usize|None
 
 
-# Resolves a PySlice against a container's own real length, matching real
+# Resolves a slice against a container's own real length, matching real
 # Python's own slice semantics EXACTLY: container[a:b] never raises -
 # out-of-range bounds silently clamp into [0, real_len], and start > stop
 # (after clamping) yields an empty range - rather than the stricter
@@ -237,11 +255,11 @@ class PySlice:
 # uses for single-element access (container[i] DOES raise/Result::Err on an
 # out-of-range i). Slicing is a deliberately forgiving idiom in real Python,
 # worth preserving faithfully rather than picking the stricter convention.
-# Shared by every __getitem__(PySlice) overload (str, bytearray, memoryview,
+# Shared by every __getitem__(slice) overload (str, bytearray, memoryview,
 # UnsafeList[T], list[T]) so the clamping math itself lives in exactly one
 # place. No negative-index support (s[-1:] etc) - matches every existing
 # __getitem__ in this codebase, none of which support negative indices.
-def _resolve_pyslice_bounds( s: PySlice, real_len: usize ) -> tuple[usize,usize]:
+def _resolve_slice_bounds( s: slice, real_len: usize ) -> tuple[usize,usize]:
 	stop_field: usize|None = s.stop
 	real_stop: usize = real_len
 	if stop_field is not None:
@@ -256,117 +274,6 @@ def _resolve_pyslice_bounds( s: PySlice, real_len: usize ) -> tuple[usize,usize]
 		clamped_stop = clamped_start
 	return ( clamped_start, clamped_stop )
 
-
-# slice[T]'s own delegate for __iter__ below - see lib/builtins/__list.py's
-# _list_iter for why this is a dedicated, type-specific helper rather than
-# the shared _sequence_iter[T,S:Sequence[T]].
-def _slice_iter[T]( seq: slice[T] ) -> Generator[T, StopIteration]:
-	# __getitem__ called TWICE per element, no intermediate local - see
-	# _sequence_iter's identical comment for the two separate, real
-	# compiler issues this avoids.
-	i: usize = 0
-	while True:
-		if seq.__getitem__( i ).is_err():
-			return
-		yield seq.__getitem__( i ).unwrap( 'slice.__getitem__: was just checked is_ok() above' )
-		with compiler.wrap_arithmetic:
-			i += 1
-
-class slice[T]( Sequence[T], Iterable[T] ):
-	# _ptr is a raw, untyped view into the backing buffer - NOT
-	# ConstPtr[T]. Ptr[Foo]/ConstPtr[Foo] for an RC class Foo compiles to
-	# the exact same C type as a bare Foo handle (struct Foo*, one star -
-	# see emitter_c.py's own _value_spelling comment: "Ptr[T]'s inner T
-	# must stay a single pointer even when T is an RCClass - sys.alloc
-	# [Foo]'s own real return type"), by design, for the "pointer to ONE
-	# freshly allocated object" use case - genuinely correct there, but
-	# incompatible with "pointer to an ARRAY of handles" (needs struct
-	# Foo**, two stars), which is what a slice over RC elements actually
-	# is. This is the exact same "an RC element's own slot holds its
-	# HANDLE, not its struct body" distinction UnsafeList's own RawList/
-	# _read_element/_write_element (lib/builtins/__list.py) already keep
-	# straight via an explicit compiler.is_rc(T) branch + Ptr[None] casts,
-	# rather than naive Ptr[T] array indexing - slice[T] mirrors that
-	# same pattern here (found + fixed together with str.concat/
-	# UnsafeList, its only real caller - PLAN_FSTRINGS.md).
-	#
-	# A plain (non-@cstruct) RCClass, not a value type, specifically so it
-	# gets a real __init__/__del__: __borrow_addr, when set, points at a
-	# source list[T]'s own atomic borrow counter (see list[T].__getitem__
-	# (PySlice)/UnsafeList[T]._slice_view, lib/builtins/__list.py) -
-	# __init__ atomically increments it, __del__ atomically decrements it,
-	# tying the borrow's lifetime to this object's own RC lifetime (RAII)
-	# instead of the old manual, unpaired-call-prone list[T].borrow_slice()/
-	# release_borrow(). None (UnsafeList[T]-sourced slices, which have no
-	# backing counter at all - UnsafeList stays unguarded, single-owner by
-	# construction) skips the atomic ops entirely. The VIEW itself (_ptr/
-	# __len) is still just a non-owning borrow over the backing buffer -
-	# only the borrow-COUNT bookkeeping is now automatic; a list[T] being
-	# destructed out from under a live borrow (as opposed to merely
-	# mutated) is still the caller's own responsibility to avoid, exactly
-	# as it always was.
-	_ptr: ConstPtr[None]
-	__len: usize
-	__borrow_addr: Ptr[usize]|None
-
-	def __init__( self, ptr: ConstPtr[None], length: usize, borrow_addr: Ptr[usize]|None ) -> None:
-		self._ptr = ptr
-		self.__len = length
-		self.__borrow_addr = borrow_addr
-		if borrow_addr is not None:
-			compiler.atomic_add( borrow_addr, 1 )
-
-	def __del__( self ) -> None:
-		# bound to a local first, not narrowed on a repeated self.__borrow_
-		# addr field read - re-reading a field twice (once for the `is not
-		# None` check, once inside the body) doesn't inherit the first
-		# read's own narrowing in this compiler; a local does
-		addr: Ptr[usize]|None = self.__borrow_addr
-		if addr is not None:
-			compiler.atomic_sub( addr, 1 )
-
-	def __len__( self ) -> usize:
-		return self.__len
-
-	def _element_size( self ) -> usize:
-		# same split RawList's own element_size computation uses (see
-		# UnsafeList.__init__'s own comment): an RC element's SLOT is
-		# always pointer-wide (it holds a handle, never the struct body),
-		# regardless of T's own real, possibly much larger, layout size
-		if compiler.is_rc( T ):
-			return compiler.sizeof( usize )
-		return compiler.sizeof( T )
-
-	def get_unchecked( self, index: usize ) -> T:
-		# Returns an owned value (incref'd if RC) - same "bare read +
-		# compiler.incref if RC" shape as UnsafeList.__getitem__. Callers
-		# never need their own compiler.incref/decref for the ELEMENT this
-		# returns; the view itself (_ptr/__len) stays a non-owning borrow
-		# over the backing buffer regardless (see the class comment above).
-		with compiler.panic_arithmetic( 'slice.get_unchecked: offset overflow' ):
-			slot: ConstPtr[None] = self._ptr + index * self._element_size()
-		if compiler.is_rc( T ):
-			handle_slot: ConstPtr[ConstPtr[None]] = compiler.cast( ConstPtr[ConstPtr[None]], slot )
-			val: T = compiler.cast( T, handle_slot[0] )
-			compiler.incref( val )
-			return val
-		else:
-			ptr: ConstPtr[T] = compiler.cast( ConstPtr[T], slot )
-			return ptr[0]
-
-	def __getitem__( self, index: usize ) -> Result[T,IndexError]:
-		if index >= self.__len:
-			return Result.Err( IndexError() )
-
-		return Result.Ok( self.get_unchecked( index ))
-
-	def __iter__( self ) -> Generator[T, StopIteration]:
-		return _slice_iter( self ) # not _sequence_iter - see lib/builtins/__list.py's _list_iter for why
-
-	def get_assert( self, index: usize ) -> T:
-		if index >= self.__len:
-			sys.panic( 'bad slice index' )
-		return self.get_unchecked( index )
 
 
 # shared byte-level helpers for bytes.find()/bytearray.find() (etc.) - pure
@@ -430,7 +337,7 @@ def _bytes_endswith( haystack: bytes|bytearray, suffix: bytes|bytearray ) -> boo
 	return sys.memcmp( candidate, suffix.get_const_ptr(), suffix_len ) == 0
 
 
-class bytes:
+class bytes( Sequence[u8], Iterable[u8] ):
 	__data: ConstPtr[u8]
 
 	__len: usize
@@ -440,7 +347,7 @@ class bytes:
 		data = sys.alloc[u8]( self.__len )
 		sys.memcpy( data, copy_from.get_const_ptr(), self.__len )
 		self.__data = data
-	
+
 	@staticmethod
 	def from_bytearray( src: move[bytearray] ) -> bytes:
 		length: usize = len( src )
@@ -452,13 +359,13 @@ class bytes:
 				)
 			case Result.Err( sys.OwnershipError.SharedReference( src2 )):
 				return bytes( src2 )
-	
+
 	def __len__( self ) -> usize:
 		return self.__len
-	
+
 	def __del__( self ) -> None:
 		sys.free( self.__data )
-	
+
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
 
@@ -473,6 +380,24 @@ class bytes:
 
 	def endswith( self, suffix: bytes|bytearray ) -> bool:
 		return _bytes_endswith( self, suffix )
+
+	@overload
+	def __getitem__( self, index: usize ) -> Result[u8,IndexError]:
+		if index >= self.__len:
+			return Result.Err( IndexError() )
+		return Result.Ok( self.__data[index] )
+
+	# s[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a new,
+	# independently-owned bytes, matching real Python's own slice semantics
+	# exactly (out-of-range bounds silently clamp - see
+	# _resolve_slice_bounds).
+	@overload
+	def __getitem__( self, s: slice ) -> bytes:
+		( start, stop ) = _resolve_slice_bounds( s, self.__len )
+		return self._byte_slice( start, stop )
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	@private
 	def _byte_slice( self, start: usize, end: usize ) -> bytes:
@@ -502,18 +427,18 @@ class bytes:
 		while True:
 			found: isize = self.find( sep, start )
 			if found == isize( -1 ):
-				result.append( self._byte_slice( start, self_len )).unwrap( 'bytes.split: append failed' )
+				result.append( self._byte_slice( start, self_len ))
 				break
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				match_start: usize = usize( found )
-			result.append( self._byte_slice( start, match_start )).unwrap( 'bytes.split: append failed' )
+			result.append( self._byte_slice( start, match_start ))
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
 		return result
 
 BYTEARRAY_INVALID: Ptr[u8] = 0 # this is a sentinel to indicate a bytearray was released - matches lib/windows/kernel32.py's own INVALID_HANDLE_VALUE convention (a literal assigned directly to its real pointer type, not a same-width integer alias needing its own cast at every comparison site)
 
-class bytearray:
+class bytearray( Sequence[u8], Iterable[u8] ):
 	__data: Ptr[u8]
 	__len: usize
 	__cap: usize
@@ -563,15 +488,15 @@ class bytearray:
 		return Result.Ok( self.__data[index] )
 
 	@overload
-	def __getitem__( self, s: PySlice ) -> bytearray:
+	def __getitem__( self, s: slice ) -> bytearray:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
 		infallible, matching real Python's own slice semantics exactly -
 		out-of-range bounds silently clamp rather than raising (see
-		_resolve_pyslice_bounds), unlike single-element s[i] above, which
+		_resolve_slice_bounds), unlike single-element s[i] above, which
 		DOES error on an out-of-range index. '''
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__getitem__() called after release()'
-		( start, stop ) = _resolve_pyslice_bounds( s, self.__len )
+		( start, stop ) = _resolve_slice_bounds( s, self.__len )
 		return self._byte_slice( start, stop )
 
 	def __setitem__( self, index: usize, value: u8 ) -> None:
@@ -579,6 +504,9 @@ class bytearray:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__setitem__() called after release()'
 			assert index < self.__len, 'bytearray.__setitem__() index out of range'
 		self.__data[index] = value
+
+	def __iter__( self ) -> Generator[u8, StopIteration]:
+		return _sequence_iter( self )
 
 	def resize( self, new_size: usize ) -> None:
 		''' grows or shrinks self to new_size bytes, zero-filling any newly
@@ -667,16 +595,16 @@ class bytearray:
 		while True:
 			found: isize = self.find( sep, start )
 			if found == isize( -1 ):
-				result.append( self._byte_slice( start, self_len )).unwrap( 'bytearray.split: append failed' )
+				result.append( self._byte_slice( start, self_len ))
 				break
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				match_start: usize = usize( found )
-			result.append( self._byte_slice( start, match_start )).unwrap( 'bytearray.split: append failed' )
+			result.append( self._byte_slice( start, match_start ))
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
 		return result
 
-class str:
+class str( Sequence[str], Iterable[str] ):
 	__data: ConstPtr[u8]
 
 	__byte_size: usize # the number of bytes (code units) include the zero-terminater
@@ -690,14 +618,75 @@ class str:
 	                     # codepoint takes >= 1 byte, so char_count <= byte_len <=
 	                     # byte_size, and idx >> 8 < entries for any valid idx.
 
+	__utf16: ConstPtr[u16] # lazily-computed null-terminated UTF-16LE cache
+	                       # (see to_utf16()) - None until first use.
+	                       # Published via a real atomic CAS (compiler.
+	                       # atomic_compare_exchange on this field's own
+	                       # address - see lowering.py's
+	                       # _atomic_pointee_type, which allows a raw
+	                       # Ptr[T]/ConstPtr[T] pointee same as a plain
+	                       # scalar): two threads racing the first
+	                       # to_utf16() call may both redundantly encode,
+	                       # but exactly one buffer is ever kept - the
+	                       # loser frees its own, so there's no leak.
+
 	def __del__( self ) -> None:
 		sys.free( self.__data )
 		sys.free( self.__index )
+		if self.__utf16 is not None:
+			sys.free( compiler.cast( Ptr[u8], self.__utf16 ))
 
 	@inline
 	def __str__( self ) -> str:
 		# str is immutable - str(x) is always just x itself, no copy.
 		return self
+
+	def __repr__( self ) -> str:
+		''' quotes and backslash-escapes self, matching Python's repr()
+		for str: single-quoted, unless self contains a "'" but no '"' (then
+		double-quoted instead). Printable non-ASCII codepoints are kept as
+		literal UTF-8, matching CPython - see __str.py's repr_escape_width/
+		repr_escape_one for the full per-codepoint escaping rule. Two
+		passes over the codepoints (first to pick the quote char, since its
+		own escape width depends on which one was picked, then the usual
+		size-then-fill pass every other string builder here uses). '''
+		self_len: usize = self.byte_len()
+		has_single: bool = False
+		has_double: bool = False
+		i: usize = 0
+		consumed: usize = 0
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				if cp == 0x27: # '
+					has_single = True
+				elif cp == 0x22: # "
+					has_double = True
+				i += consumed
+
+		quote: u8 = u8( 0x22 ) if ( has_single and not has_double ) else u8( 0x27 )
+
+		new_size: usize = 3 # opening + closing quote + zero terminator
+		i = 0
+		with compiler.panic_arithmetic( 'irrational string length' ):
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				new_size += repr_escape_width( cp, quote )
+				i += consumed
+
+		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
+		new_buf[0] = quote
+		out: usize = 1
+		i = 0
+		with compiler.wrap_arithmetic:
+			while i < self_len:
+				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
+				out += repr_escape_one( new_buf, out, cp, quote )
+				i += consumed
+			new_buf[out] = quote
+			out += 1
+			new_buf[out] = 0
+		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in __repr__' )
 
 	@inline
 	@staticmethod
@@ -724,17 +713,19 @@ class str:
 		return str._from_owned_cstr( new_buf, new_byte_size ).unwrap( 'invalid UTF-8 in str.__add__' )
 	
 	@staticmethod
-	def concat( parts: slice[str] ) -> str:
-		# get_unchecked(i) already returns an owned str (incref'd if RC -
-		# see its own comment), so binding it into a named local and letting
+	def concat( parts: UnsafeList[str] ) -> str:
+		# __getitem__(i)'s own Incref (bounds-checked, but every i here is
+		# < count by construction) plus .unwrap()'s bare extraction already
+		# return an owned str, so binding it into a named local and letting
 		# that local's normal scope-exit decref fire is the correct release
-		# of exactly the reference get_unchecked just gave us - no manual
-		# incref needed here.
+		# of exactly the reference __getitem__ just gave us - no manual
+		# incref needed here (same "bound-local, incref cancels scope-exit
+		# decref" idiom list[T].pop() already uses).
 		new_size: usize = 1 # for the zero terminator
 		i: usize = 0
 		count: usize = parts.__len__()
 		for i in range( count ):
-			part: str = parts.get_unchecked( i )
+			part: str = parts.__getitem__( i ).unwrap( 'str.concat: index in bounds by construction' )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				new_size += part.__byte_size - 1
 
@@ -744,7 +735,7 @@ class str:
 		for i in range( count ):
 			# distinct name from the sizing loop's own `part` above - a
 			# variable's type is only ever declared once per function
-			copy_part: str = parts.get_unchecked( i )
+			copy_part: str = parts.__getitem__( i ).unwrap( 'str.concat: index in bounds by construction' )
 			with compiler.panic_arithmetic( 'irrational string length' ):
 				part_len: usize = copy_part.__byte_size - 1
 			with compiler.wrap_arithmetic:
@@ -788,7 +779,60 @@ class str:
 				# but now the release failed and src isn't usable anymore because of @move
 				# e is a OwnershipError.SharedReference, which carries the object back to us
 				return str.from_cstr( src2.get_const_ptr(), byte_size )
-	
+
+	@staticmethod
+	def from_utf16( ptr: ConstPtr[u16], max_len: usize ) -> Result[str,CodecError]:
+		'''
+		build a str from a null-terminated UTF-16 (native-endianness) buffer
+		- e.g. a Win32 LPCWSTR. max_len bounds the terminator scan, in u16
+		units, not including it (mirrors sys.cstrlen's own max_length cap
+		for u8 C strings).
+		'''
+		from codecs.utf16 import utf16
+		n: usize = 0
+		with compiler.wrap_arithmetic:
+			while n < max_len and ptr[n] != 0:
+				n += 1
+		if n == max_len:
+			return Result.Err( CodecError( 'utf-16le', 'missing null terminator' ))
+		with compiler.panic_arithmetic( 'bounded by max_len, cannot overflow' ):
+			byte_len: usize = n * 2
+		buf = bytearray( byte_len )
+		sys.memcpy( buf.get_ptr(), compiler.cast( ConstPtr[u8], ptr ), byte_len )
+		return utf16.decode( buf )
+
+	def to_utf16( self ) -> ConstPtr[u16]:
+		'''
+		self encoded as null-terminated UTF-16LE - e.g. for a Win32 *W
+		call's LPCWSTR argument. Cached after the first call (see __utf16's
+		own field comment), so repeated calls against the same str don't
+		re-encode. Published with a real atomic CAS - see __utf16's own
+		field comment for why a race here is wasted work, never a leak.
+		'''
+		cached: ConstPtr[u16] = compiler.atomic_load( compiler.addrof( self.__utf16 ))
+		if cached is not None:
+			return cached
+		from codecs.utf16 import utf16
+		encoded: bytes = utf16.encode( self ).unwrap( 'str.to_utf16: invalid UTF-8 in str' )
+		byte_len: usize = len( encoded )
+		with compiler.panic_arithmetic( 'a real string can never be within 2 bytes of usize::MAX' ):
+			alloc_size: usize = byte_len + 2
+			last_index: usize = alloc_size - 1
+		raw: Ptr[u8] = sys.alloc[u8]( alloc_size )
+		sys.memcpy( raw, encoded.get_const_ptr(), byte_len )
+		raw[byte_len] = 0
+		raw[last_index] = 0
+		buf: ConstPtr[u16] = compiler.cast( ConstPtr[u16], raw )
+
+		expected: ConstPtr[u16] = None
+		if compiler.atomic_compare_exchange( compiler.addrof( self.__utf16 ), compiler.addrof( expected ), buf ):
+			return buf
+		# someone else already published first - free our redundant buffer
+		# and use theirs (CAS failure wrote the actual current value into
+		# `expected`)
+		sys.free( raw )
+		return expected
+
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__data
 	
@@ -812,6 +856,9 @@ class str:
 		# precomputed once by _from_owned_cstr during its mandatory UTF-8
 		# validation scan (see __char_count's own field comment).
 		return self.__char_count
+
+	def __iter__( self ) -> Generator[str, StopIteration]:
+		return _sequence_iter( self )
 
 	@overload
 	def __getitem__( self, idx: usize ) -> Result[str, IndexError]:
@@ -840,7 +887,7 @@ class str:
 		return Result.Ok( self._byte_slice( i, end ))
 
 	@overload
-	def __getitem__( self, s: PySlice ) -> str:
+	def __getitem__( self, s: slice ) -> str:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
 		BYTE offsets, not this class's own __len__/codepoint-indexed s[i]
 		above (deliberate, pre-existing split - see _byte_slice's own
@@ -848,13 +895,13 @@ class str:
 		target_path[idx+9:], slices from str.find()'s own byte offset).
 		Infallible, matching real Python's own slice semantics exactly -
 		out-of-range bounds silently clamp rather than raising (see
-		_resolve_pyslice_bounds) - unlike single-element s[i] above, which
+		_resolve_slice_bounds) - unlike single-element s[i] above, which
 		DOES error on an out-of-range index. This also closes what the old
 		hardcoded slice-syntax path never checked at all (stop > len() was
 		a silent out-of-bounds C-level read) and used to panic on (usize
 		underflow on start > stop) - clamping makes both cases well-defined
 		instead, on top of matching Python's own behavior. '''
-		( start, stop ) = _resolve_pyslice_bounds( s, self.byte_len() )
+		( start, stop ) = _resolve_slice_bounds( s, self.byte_len() )
 		return self._byte_slice( start, stop )
 
 	def __bool__( self ) -> bool:
@@ -968,16 +1015,18 @@ class str:
 
 	@private
 	def _ascii_escape( self ) -> str:
-		''' backslash-escapes every non-ASCII codepoint and every non-
-		printable ASCII byte in self, matching Python's own ascii()/
-		repr() escaping rules - the f-string !a conversion's own second
-		half (lowering.py calls this on whatever text the !r-equivalent
-		resolution already produced - see _lower_fstring_part's own
-		comment on why this does NOT add surrounding quotes or escape a
-		literal quote character, unlike Python's real ascii()). Two
-		passes over the codepoints, same size-then-fill shape str.concat/
-		case_map/etc. already use - __str.py's own ascii_escape_width/
-		ascii_escape_one do the actual per-codepoint work. '''
+		''' f-string !a conversion's second pass, run on whatever text
+		__repr__() already produced (_lower_fstring_part calls __repr__
+		then this, matching Python's own ascii() == escape(repr(x))).
+		self is already fully escaped/quoted ASCII except for any
+		printable non-ASCII codepoints __repr__ deliberately left as
+		literal UTF-8 - so this only escapes THOSE (codepoints >= 0x80),
+		leaving every ASCII byte (including the backslashes/quotes
+		__repr__ itself inserted) untouched, matching Python's ascii()
+		against an already-repr'd string. __str.py's own
+		nonascii_escape_width/nonascii_escape_one do the actual
+		per-codepoint work; same size-then-fill shape every string
+		builder here uses. '''
 		self_len: usize = self.byte_len()
 		new_size: usize = 1 # zero terminator
 		i: usize = 0
@@ -985,7 +1034,7 @@ class str:
 		with compiler.panic_arithmetic( 'irrational string length' ):
 			while i < self_len:
 				cp: u32 = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
-				new_size += ascii_escape_width( cp )
+				new_size += nonascii_escape_width( cp )
 				i += consumed
 
 		new_buf: Ptr[u8] = sys.alloc[u8]( new_size )
@@ -994,7 +1043,7 @@ class str:
 		with compiler.wrap_arithmetic:
 			while i < self_len:
 				cp = decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
-				out += ascii_escape_one( new_buf, out, cp )
+				out += nonascii_escape_one( new_buf, out, cp )
 				i += consumed
 		new_buf[out] = 0
 		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in _ascii_escape' )
@@ -1017,11 +1066,11 @@ class str:
 		while True:
 			found: isize = self.find( sep, start )
 			if found == isize( -1 ):
-				result.append( self._byte_slice( start, self_len )).unwrap( 'str.split: append failed' )
+				result.append( self._byte_slice( start, self_len ))
 				break
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				match_start: usize = usize( found )
-			result.append( self._byte_slice( start, match_start )).unwrap( 'str.split: append failed' )
+			result.append( self._byte_slice( start, match_start ))
 			with compiler.panic_arithmetic( 'bounded by self_len, cannot overflow' ):
 				start = match_start + sep_len
 		return result
@@ -1183,14 +1232,13 @@ class str:
 	def join( self, parts: list[str] ) -> str:
 		''' self inserted between each element of parts - str.concat's own
 		two-pass shape, plus self's own bytes between consecutive parts.
-		Takes list[str] rather than slice[str] (str.concat's own parameter
-		type) - list[str] is the container every caller already has a
-		piece of text collection in (e.g. split()'s own return type), and
-		list[T] (unlike UnsafeList[T], see its own as_slice()) deliberately
-		has no slice[T] view to hand over (a raw buffer view isn't safe to
-		hold once the lock that made it valid has been released - see
+		Takes list[str] rather than UnsafeList[str] (str.concat's own
+		parameter type) - list[str] is the container every caller already
+		has a piece of text collection in (e.g. split()'s own return type),
+		and list[T]'s own methods are all lock-guarded per call (see
 		__list.py's own header comment), so bridging to str.concat would
-		still need an explicit copy either way. '''
+		still need an explicit copy into an UnsafeList[str] either way -
+		not worth it just to share concat's own loop body. '''
 		count: usize = parts.__len__()
 		if count == 0:
 			return ''
@@ -1420,16 +1468,16 @@ class str:
 			while end > 3:
 				with compiler.panic_arithmetic( 'bounded by count, cannot overflow' ):
 					start: usize = end - 3
-				groups.append( self._byte_slice( start, end )).unwrap( '_insert_thousands_sep: append failed' )
+				groups.append( self._byte_slice( start, end ))
 				end = start
-			groups.append( self._byte_slice( 0, end )).unwrap( '_insert_thousands_sep: append failed' )
+			groups.append( self._byte_slice( 0, end ))
 			group_count: usize = groups.__len__()
 			ordered: list[str] = list[str]() # most-significant GROUP first
 			i: usize = group_count
 			with compiler.panic_arithmetic( 'bounded by group_count, cannot underflow' ):
 				while i > 0:
 					i -= 1
-					ordered.append( groups.__getitem__( i ).unwrap( '_insert_thousands_sep: index in bounds by construction' )).unwrap( '_insert_thousands_sep: append failed' )
+					ordered.append( groups.__getitem__( i ).unwrap( '_insert_thousands_sep: index in bounds by construction' ))
 		return sep.join( ordered )
 
 	@private
@@ -2133,6 +2181,7 @@ class str:
 			__byte_size = byte_size_including_zero_terminator,
 			__char_count = char_count,
 			__index = char_index,
+			__utf16 = None,
 		)
 		return Result.Ok( s )
 
@@ -2460,6 +2509,23 @@ class UnsafeDict[K, V]:
 	__raw: RawDict
 
 	def __init__( self ) -> None:
+		# V=NoneType is caught HERE, once, rather than in every method below
+		# that casts a borrowed Ptr[None] through Ptr[V] (_owned_value,
+		# _store_value, _release_value) - a dict/set can't be used at all
+		# without going through this constructor first, so a single guard
+		# here covers every one of those call sites for free. See
+		# PLAN_NONETYPE_GENERIC_VALUE.md: Ptr[None] is ALSO this codebase's
+		# own opaque/type-erased pointer spelling (RawDict's own key_ptr/
+		# value_ptr fields, right below), so Ptr[V] with V=NoneType collides
+		# with that meaning and compiles to real C void* - dereferencing it
+		# (every one of those three methods' non-RC branch) is a genuine C
+		# type error, not just a wrong answer. `if type(V) is None:` folds
+		# away entirely (dead branch never lowered - see _try_fold_type_is_if,
+		# type_resolver.py) for every OTHER V, so this costs nothing and
+		# changes nothing for dict[K, str]/dict[K, i32]/etc.
+		if type( V ) is None:
+			compiler.error( 'dict[K, None] (and set[None]) are not supported - None cannot be a '
+				'generic value-storage type (see PLAN_NONETYPE_GENERIC_VALUE.md); use dict[K, bool] instead' )
 		self.__raw = RawDict()
 
 	def __len__( self ) -> usize:

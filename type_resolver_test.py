@@ -449,6 +449,45 @@ class TypeResolutionTests( unittest.TestCase ):
 		src = ast.unparse( fn.node )
 		self.assertIn( 'type(x) is i32', src )
 
+	def test_type_is_none_on_ordinary_value_folds_correctly( self ) -> None:
+		# _try_resolve_namespace's own `None` special case (this file,
+		# ~line 5157) was missing before this fix - `type(x) is None`
+		# failed outright ("None does not name a type") for EVERY subject,
+		# not just the bare-TypeVar-subject shape below
+		mod = self._import( '\n'.join([
+			'def main( x: i32 | None ) -> bool:',
+			'	return type( x ) is None',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		src = ast.unparse( fn.node )
+		self.assertNotIn( 'type(', src )
+
+	def test_type_is_none_on_bare_typevar_subject_defers_while_abstract( self ) -> None:
+		# `type(V) is None`, V a generic class's own type parameter used
+		# bare (not an ordinary value) - PLAN_NONETYPE_GENERIC_VALUE.md's
+		# own motivating shape (UnsafeDict's type(V) is None guard). Same
+		# two-pass discipline as test_type_is_on_unbound_typevar_defers_
+		# the_fold above: nothing can fold yet against the shared, abstract
+		# body - the monomorphized copy's own independently deep-copied
+		# body gets a fresh, correct shot once V is concretely bound (see
+		# emitter_c_test.py's TypeIsGenericParamRealCompileTests for the
+		# real-compile confirmation that it actually folds - AND
+		# eliminates the untaken branch - once concrete)
+		mod = self._import( '\n'.join([
+			'class Box[V]:',
+			'	def check( self ) -> bool:',
+			'		return type( V ) is None',
+		]))
+		box_cls = mod.get_local( 'Box' )
+		if box_cls.resolve is not None:
+			box_cls.resolve()
+		fn = box_cls.names['check']
+		if fn.resolve is not None:
+			fn.resolve()
+		self.resolver.resolve_function_body( fn )
+		src = ast.unparse( fn.node )
+		self.assertIn( 'type(V) is None', src )
+
 	# --- match ------------------------------------------------------------
 
 	def test_match_union_rewrites_to_if_elif_chain( self ) -> None:

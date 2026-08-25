@@ -1,13 +1,14 @@
-# lib/atomic.py — Atomic[T]: lock-free access to a single scalar value
-# shared across threads, built on compiler.atomic_*(Ptr[T], ...).
+# lib/atomic.py — Atomic[T]: lock-free access to a single scalar-or-raw-
+# pointer value shared across threads, built on compiler.atomic_*(Ptr[T], ...).
 #
-# T must be a plain scalar (bool, i8-i64, u8-u64, usize) - the underlying
-# compiler.atomic_* intrinsics enforce this themselves (see lowering.py's
-# _atomic_pointee_type), so instantiating Atomic[SomeRCClass] fails to
-# compile with a clear error rather than silently doing the wrong thing.
-# Atomically swapping an RC pointer without incref/decref bookkeeping is a
-# real, separate problem (hazard pointers / epoch reclamation) - out of
-# scope here, deliberately.
+# T must be a plain scalar (bool, i8-i64, u8-u64, usize) or a raw Ptr[U]/
+# ConstPtr[U] - the underlying compiler.atomic_* intrinsics enforce this
+# themselves (see lowering.py's _atomic_pointee_type), so instantiating
+# Atomic[SomeRCClass] fails to compile with a clear error rather than
+# silently doing the wrong thing. Atomically swapping an RC pointer without
+# incref/decref bookkeeping is a real, separate problem (hazard pointers /
+# epoch reclamation) - out of scope here, deliberately. A raw Ptr[U]/
+# ConstPtr[U] carries no refcount, so that concern doesn't apply to it.
 #
 # Stores __ptr typed as a real Ptr[T] (not type-erased to Ptr[None] like
 # list[T]'s own buffer) since every method here needs T back immediately
