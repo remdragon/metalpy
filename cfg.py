@@ -1010,6 +1010,41 @@ class CFGState:
 						binding.entry is not None and any( e is binding.entry for e in self._epilogue_stack )
 					)
 					reestablish( name, binding, already_live )
+				# a name present in entry_bindings but ABSENT from survivor was
+				# explicitly del'd/moved on the surviving branch itself - but
+				# self.bindings/self._epilogue_stack right now still reflect
+				# the TERMINATING branch's own restore(entry_snapshot) (called
+				# by lowering.py right before this method, once per branch,
+				# unconditionally reverting to entry_bindings' own pristine,
+				# uncancelled entry - see restore()'s own docstring), which
+				# never even looked at what the OTHER, surviving branch did.
+				# The loop above only ever RE-establishes what survivor still
+				# has - it never visits a name survivor doesn't have at all,
+				# so without this, the terminating branch's stale, uncancelled
+				# entry leaks straight through untouched into the merged
+				# state, and build_epilogue_ladder() releases it a SECOND
+				# time (the surviving branch's own del/decref already emitted
+				# its own explicit release) - confirmed by a real repro (a
+				# local declared before a try, manually del'd on the try
+				# body's own non-raising fall-through, with a covered raise
+				# dispatching to a handler that unconditionally returns).
+				for name, prior_binding in entry_bindings.items():
+					if name in survivor or prior_binding.entry is None:
+						continue
+					current = self.bindings.get( name )
+					if current is None or current.entry is not prior_binding.entry:
+						continue
+					_, neutralize_instructions = self._neutralize( current.entry )
+					# any disarm instruction this needs must run on the
+					# SURVIVOR's own path - that's the path the deletion
+					# actually happened on; the terminating branch never
+					# touched this name at all, and never reaches the join
+					# to run anything anyway
+					if survivor is true_end:
+						true_instructions += neutralize_instructions
+					else:
+						false_instructions += neutralize_instructions
+					del self.bindings[name]
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
 			# safe choice; one terminates -> only the survivor's own results/
@@ -1313,30 +1348,45 @@ class CFGState:
 		would leave that stale entry referencing a flag lowering.py already
 		rolled out of _defer_flags - a dangling reference.
 
-		Also reverts every SURVIVING entry's (index < stack_depth, i.e.
-		declared BEFORE the loop) own .cancelled/.flag back to snap's own
-		recording. _neutralize()'s own static-cancel path never mutates a
-		shared entry in place (builds a REPLACEMENT instead - see its own
-		docstring), so an ordinary compiler.decref() on a pre-loop entry is
-		already harmless here for FREE, same as everywhere else. The one
-		case still needing an explicit revert is a CAPTURED entry (whole-
-		function, monotonic - see Epilogue's own docstring) that ALSO gets
-		manually decref'd within the SAME abandoned attempt: _neutralize()'s
-		flag branch mints/mutates entry.flag directly (no replacement,
-		since a captured entry is never meant to diverge across ordinary
-		sibling branches) - but a WHOLE abandoned loop-retry attempt is a
-		different kind of divergence, and that flag mutation still needs
-		undoing so the retried attempt mints its own. Confirmed by a real
-		repro: a loop whose body both captures a pre-loop local
-		via an early return and then compiler.decref()s it, combined with
-		an unrelated borrowed-to-owned promotion that triggers this exact
-		retry - "use of undeclared identifier __cancel_flag_0" from clang,
-		because the retried attempt reused attempt 1's own now-truncated-
-		out-of-_cancel_flags flag reference instead of minting its own.
-		Unlike restore() (which must NOT do this - a genuinely surviving
-		branch's own flag has to remain live), hard_restore()'s whole point
-		is discarding EVERYTHING about the abandoned attempt, entry-
-		internal state included.
+		Also swaps every SURVIVING entry (index < stack_depth, i.e. declared
+		BEFORE the loop) back to snap's own ORIGINAL object identity, exactly
+		like restore() does for its own non-flag-guarded case (see its own
+		docstring) - EXCEPT unconditionally, including flag-guarded/captured
+		ones restore() deliberately leaves alone. restore()'s carve-out
+		exists because a genuinely surviving sibling branch's own newly-
+		minted flag has to stay live; hard_restore()'s whole point is the
+		opposite - discarding EVERYTHING about the abandoned attempt,
+		entry-internal state included, so an abandoned attempt's own
+		.cancelled/.flag mutations must never survive either.
+
+		Merely resetting .cancelled/.flag FIELDS on whatever's CURRENTLY
+		sitting in each slot (a prior version of this) isn't enough:
+		_neutralize()'s own static-cancel path never mutates a shared entry
+		in place, it builds a REPLACEMENT and swaps it into
+		self._epilogue_stack's own live slot instead (see its own
+		docstring) - so a `del`/compiler.decref() on a pre-loop entry during
+		the abandoned attempt leaves that REPLACEMENT object sitting in the
+		stack, not snap's own original object. Field-only reset then leaves
+		self.bindings (reset to snap's own original object above) and
+		self._epilogue_stack pointing at two DIFFERENT objects for the same
+		logical entry - exactly restore()'s own "identity divergence"
+		hazard (see its own docstring). The retried attempt's own
+		_neutralize() call then searches self._epilogue_stack for `e is
+		entry` (entry = the bindings-side original) and never finds it, so
+		its own replacement swap silently fails to happen - a stale,
+		uid-suffixed-for-attempt-1 local from the abandoned attempt is left
+		referenced by a later instruction instead of the retried attempt's
+		own fresh one, a real "use of undeclared identifier" compile error -
+		confirmed by a real repro (a pre-loop local `del`'d inside a loop
+		body, early-returned past it too, combined with an unrelated
+		borrowed-to-owned promotion that triggers this exact retry). A full
+		identity swap sidesteps this for free - and, since it reverts the
+		WHOLE object (not just cancelled), also covers the flag-guarded case
+		that used to need its own separate field-by-field revert (a captured
+		entry manually decref'd within the same abandoned attempt, whose
+		.flag mutation must not survive either - the earlier "use of
+		undeclared identifier __cancel_flag_0" repro this fixed the first
+		time around).
 
 		No .captured to revert here either - CFGState._captured_labels is
 		whole-function and monotonic (see Epilogue's own docstring), never
@@ -1351,11 +1401,29 @@ class CFGState:
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
-		for e, cancelled, flag in zip(
-			self._epilogue_stack[:snap.stack_depth], snap.entry_cancelled, snap.entry_flag,
-		):
-			e.cancelled = cancelled
-			e.flag = flag
+		# entry_objects alone isn't enough to undo a flag mutation: unlike
+		# the static-cancel path (a REPLACEMENT object swapped in - see
+		# _neutralize()'s own docstring), the flag-guarded path mutates
+		# entry.flag directly IN PLACE on the very object entry_objects
+		# holds a live reference to - so if the abandoned attempt captured
+		# and then flag-guard-cancelled a pre-loop entry, entry_objects[i]
+		# is retroactively "poisoned" by that mutation too (it's the SAME
+		# object, not a snapshot of it). entry_cancelled/entry_flag were
+		# captured as plain VALUES at snapshot time instead, immune to this -
+		# resetting both the identity AND these fields together undoes both
+		# hazards at once. Confirmed by a real repro: a pre-loop local
+		# captured by an early return and `del`'d (minting a flag) during
+		# the abandoned attempt left that same flag sitting on the
+		# reverted entry, now referencing a Variable already truncated out
+		# of _cancel_flags - the retried attempt reused it instead of
+		# minting its own, producing a real, undeclared-at-prologue flag
+		# variable used before its own (never-emitted) declaration.
+		for i, ( orig_entry, cancelled, flag ) in enumerate( zip(
+			snap.entry_objects, snap.entry_cancelled, snap.entry_flag,
+		)):
+			orig_entry.cancelled = cancelled
+			orig_entry.flag = flag
+			self._epilogue_stack[i] = orig_entry
 		del self._epilogue_stack[snap.stack_depth:]
 
 	def unwind_to( self, snap: _Snapshot ) -> list[ir.Instruction]:
