@@ -15948,6 +15948,23 @@ class FunctionLowering:
 		# happened to be calling str(ptr), e.g. __main__.
 		saved_owning_module = self._owning_module
 		self._owning_module = target.module
+		# a failure while lowering target's own SPLICED body (below) is
+		# reported at THAT body's own source location (target.file/whatever
+		# node inside it failed) - correct for an ordinary function, but
+		# actively misleading for @inline: the body isn't a separate call
+		# frame, it's textually spliced in right here, so a caller has no
+		# way to tell "which of possibly many len(...) call sites in my own
+		# code triggered this" from the error alone (confirmed via a real
+		# repro: a type mismatch inside builtins.len[T]'s own `return t.
+		# __len__()` reported ONLY lib/builtins/__init__.py:<its own line>,
+		# never grap.mpy's own call site, nor which concrete T). Appends one
+		# extra, purely additive note (never replaces/edits the original
+		# diagnostic) pointing at THIS call's own real site plus each
+		# argument's own concrete type - the closest a generic @inline site
+		# can get to "here's what T actually was" without full type-param-
+		# binding plumbing, and enough to answer both complaints at once.
+		errors_before = len( self.lowering.discovery.errors.errors )
+		call_site_fn = self._current_fn
 		try:
 			if len( stmts ) > 1:
 				# the splice's own pre-return statements bind self/params
@@ -16063,9 +16080,36 @@ class FunctionLowering:
 					else:
 						target.names[stem] = old
 			return self._finish_call_result( node, result, want_result )
+		except CompileError:
+			if len( self.lowering.discovery.errors.errors ) > errors_before:
+				self.lowering.discovery.errors.error(
+					f'(the error above happened while inlining {target.qualname}({self._describe_inline_call_args( receiver, target, args, kwargs )}), '
+					f'spliced in from this call)',
+					call_site_fn.file if call_site_fn is not None else None, node.lineno,
+				)
+			raise
 		finally:
 			self._inlining_stack.pop()
 			self._owning_module = saved_owning_module
+
+	def _describe_inline_call_args( self, receiver: ir.Operand|None, target: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> str:
+		''' "self: SomeClass, t: SomeOtherClass" - each argument's own REAL,
+		already-lowered concrete type, in target's own declared parameter
+		order. For a generic target (e.g. builtins.len[T]) this is the
+		closest available stand-in for "what did T resolve to" without full
+		type-param-binding plumbing threaded all the way out here: T itself
+		is never named directly, but the argument bound to a T-typed
+		parameter shows its own concrete type, which is exactly what a
+		reader needs to answer that question by inspection. '''
+		parts: list[str] = []
+		if receiver is not None:
+			parts.append( f'self: {receiver.type.qualname if receiver.type else "?"}' )
+		for i, param in enumerate( target.parameters or [] ):
+			if i < len( args ):
+				parts.append( f'{param.stem}: {args[i].type.qualname if args[i].type else "?"}' )
+			elif param.stem in kwargs:
+				parts.append( f'{param.stem}: {kwargs[param.stem].type.qualname if kwargs[param.stem].type else "?"}' )
+		return ', '.join( parts )
 
 	def _splice_multi_statement_inline_body( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, stmts: list[ast.stmt] ) -> ir.Operand|None:
 		# PLAN_INLINE.md multi-statement generalization - target's own
