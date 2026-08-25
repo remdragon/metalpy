@@ -1842,7 +1842,16 @@ class Discovery( ast.NodeVisitor ):
 		# global variable or a class attribute with no annotation - its type
 		# defers to whatever self.visit() resolves the rvalue expression to
 		if len( node.targets ) != 1:
-			self.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
+			# `a = b = c = value` - a global/class-attribute declaration, not
+			# a sequenced runtime statement, so (unlike lowering.py's own
+			# _stmt_Assign, function-body case) there's no need for a
+			# once-only-evaluated temp: just re-declare each target against
+			# its own copy of the (already compile-time-folded) value node.
+			for target in node.targets:
+				split = ast.Assign( targets = [ target ], value = copy.deepcopy( node.value ))
+				ast.copy_location( split, node )
+				self.visit( split )
+			return None
 		target = node.targets[0]
 		if isinstance( target, ast.Attribute ):
 			base = self.visit( target.value )
