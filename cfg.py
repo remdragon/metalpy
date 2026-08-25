@@ -1,5 +1,5 @@
 # stdlib imports:
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from enum import Enum
 from typing import Callable
 
@@ -90,15 +90,29 @@ class Epilogue:
 	it from anywhere in the stack (not just the top) without disturbing the
 	list's order/length, which is what lets every block's own recorded
 	depth stay a stable, plain integer even though entries below the top
-	can be cancelled at arbitrary points - see move()/deleted(). '''
+	can be cancelled at arbitrary points - see move()/deleted().
+
+	Deliberately has NO `captured` field, unlike `cancelled`/`flag` - those
+	two are genuinely BRANCH-LOCAL (each independently-lowered sibling
+	branch needs its own private answer, which is exactly what made them a
+	real, repeated source of double-frees when this class's own instances
+	were shared by reference across branches instead of value-copied - see
+	CFGState._captured_labels' own docstring for the fix). "Has any
+	already-lowered code, anywhere in the function, committed a goto into
+	THIS label" is a whole-function, monotonic fact instead - true the
+	moment ANY branch's own return commits to it, staying true for the
+	rest of the function's lowering regardless of which branch that was,
+	and it needs to read the SAME way from every clone of this same
+	logical entry, not diverge per clone the way an ordinary field would.
+	Tracked in CFGState._captured_labels (keyed by `name`, which is a
+	plain, clone-invariant string) instead of on the entry itself. '''
 	instructions: list[ir.Instruction] # defer/errdefer entries only (flag is not None) - the already-lowered replay body, reused as-is (safe: _replay()'s flag-guarded path mints a fresh skip-label on every call). Plain RC entries leave this empty and use `type` below instead
-	name: str # this entry's own jump target - see current_epilogue_label()/build_epilogue_ladder()
+	name: str # this entry's own jump target - see current_epilogue_label()/build_epilogue_ladder(); also the stable key CFGState._captured_labels uses, see this class's own docstring
 	operand: Variable | None = None # the RC binding this entry decrefs - None for defer/errdefer entries. Lets return_() skip decref'ing whatever's actually being returned, by identity
 	type: Type | None = None # plain RC entries only - the type to decref `operand` as. Instructions are regenerated fresh from this on every replay (_replay()/unwind_to()) rather than cached: a loop-confined entry can be replayed at more than one emission point (an early return inside the loop while it's still the topmost active entry, or several break/continue in the same loop) before it's ever dropped by restore(), and a cached instruction list would bake in the same tag-gated-decref Label names at every one of those sites - confirmed by a real repro, "redefinition of label" from clang on a loop with two early-return Result checks in a row
 	flag: Variable | None = None
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
-	captured: bool = False # current_epilogue_label() has handed this entry's own .name out as a live jump target at least once - see manually_decreffed()/deleted()/move()'s shared _neutralize() helper for why this matters: a plain compile-time `cancelled = True` is only correct for an entry NO earlier return has already committed a goto into, since build_epilogue_ladder() bakes the entry's FINAL cancelled state into every jump site that shares it, not the state at each individual jump's own time
 	is_construction_attr: bool = False # a self.<attr> entry pushed by attr_assign()/complete_base_construction() during a fallible __init__ - see current_epilogue_label_for_construction_err()'s own docstring for why these can never share a label the way a defer/errdefer or plain local entry can
 
 	@property
@@ -151,21 +165,22 @@ class InlineScope:
 class _Snapshot:
 	''' captured by snapshot(), consumed by restore() - see the IF/loop
 	orchestration lowering.py performs around branches/loop bodies.
-	entry_cancelled/entry_captured/entry_flag record every SURVIVING
-	entry's (index < stack_depth) own Epilogue state as of snapshot time -
-	restore() itself never applies these (see its own docstring - a
-	branch's own captured/flag-guarded entries are meant to keep whatever
-	CURRENT state they have across an ordinary restore()); hard_restore()
-	is the one consumer, for the loop-ownership retry's own "discard this
-	WHOLE attempt, including anything it did to an entry declared before
-	the loop" rollback - see its own docstring. '''
+	entry_cancelled/entry_flag record every SURVIVING entry's (index <
+	stack_depth) own Epilogue state as of snapshot time - restore() itself
+	never applies these (see its own docstring - a branch's own flag-
+	guarded entries are meant to keep whatever CURRENT state they have
+	across an ordinary restore()); hard_restore() is the one consumer, for
+	the loop-ownership retry's own "discard this WHOLE attempt, including
+	anything it did to an entry declared before the loop" rollback - see
+	its own docstring. No entry_captured here - see Epilogue's own
+	docstring for why captured-ness isn't per-entry snapshotted state at
+	all. '''
 	bindings: Bindings
 	stack_depth: int
 	results: set[str]
 	narrowed: dict[str,Variable]
 	live: set[str]
 	entry_cancelled: list[bool]
-	entry_captured: list[bool]
 	entry_flag: list['Variable | None']
 
 class CFGState:
@@ -203,10 +218,19 @@ class CFGState:
 		self._new_label = new_label
 		self._union_storage = union_storage
 		self._epilogue_stack: list[Epilogue] = []
+		# whole-function, monotonic, name-keyed - see Epilogue's own
+		# docstring for why this lives here instead of as a field on
+		# Epilogue itself. Never reset/reverted by restore()/hard_restore()
+		# - once a label is captured, that stays true regardless of which
+		# branch/clone did it or whether that branch's own code even
+		# survives (a discarded loop-retry attempt's own capture is
+		# harmless dead data here: the retried attempt re-lowers the same
+		# source, so it independently re-captures under a FRESH name of
+		# its own - see hard_restore()'s own comment)
+		self._captured_labels: set[str] = set()
 		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
 		self._cancel_flags: list[Variable] = [] # see _neutralize()/cancel_flags() - minted lazily, only for an entry that turns out to need one
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
-		self._protected_entries: list[set[int]] = [] # see enter_diverging_paths()/exit_diverging_paths() - id()s of every entry a currently-lowering try's own body/handlers must NOT statically cancel
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self._break_live_stack: list[list[set[str]]] = [] # the definite-assignment analogue of _break_narrowed_stack above - one set[str] snapshot per break, see record_break_live()
@@ -370,7 +394,6 @@ class CFGState:
 			bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ),
 			narrowed = dict( self._narrowed ), live = set( self._live ),
 			entry_cancelled = [ e.cancelled for e in self._epilogue_stack ],
-			entry_captured = [ e.captured for e in self._epilogue_stack ],
 			entry_flag = [ e.flag for e in self._epilogue_stack ],
 		)
 
@@ -426,7 +449,7 @@ class CFGState:
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
-		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.captured ]
+		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.name in self._captured_labels ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
 
@@ -588,44 +611,6 @@ class CFGState:
 
 	def exit_branch( self ) -> None:
 		self._confinement_depths.pop()
-
-	def enter_diverging_paths( self, floor: int ) -> None:
-		''' any construct that lowers more than one MUTUALLY-EXCLUSIVE
-		sibling pass over its own body, each independently restore()'d
-		back to the SAME entry snapshot (_stmt_If's true/false branches,
-		_stmt_Try's try-body-fall-through/each-handler,
-		_lower_binary_branch's own true/false thunks - every one of them
-		shares this exact `entry_snapshot = snapshot(); ...; restore(
-		entry_snapshot)` shape). Every SURVIVING entry below `floor` -
-		index < floor, i.e. declared BEFORE this construct - has its own
-		Epilogue object shared by reference across every sibling pass,
-		never copied per restore() (see restore()'s own comment) - a
-		manually_decreffed()/move()/deleted() call on one, already-lowered
-		sibling (e.g. `compiler.decref(g)` on an if's own true branch, or
-		a try body's own fall-through) would otherwise permanently mutate
-		the SAME object an earlier-taken, mutually-exclusive sibling still
-		depends on. Confirmed by real repros in EVERY one of these
-		constructs, not just _stmt_Try: an ordinary local declared before
-		a PLAIN `if bad: compiler.decref(g); return -1` (no try/except,
-		no loop at all) leaked on the `bad=False` path, because that
-		branch's own `return 0` walked right past an entry the OTHER,
-		already-lowered branch had already (wrongly, from this branch's
-		own perspective) cancelled.
-
-		Recorded by id() (Epilogue is unhashable-by-default dataclass
-		identity, and entries can't be deep-copied - see Epilogue.type's
-		own docstring on why instructions are always regenerated fresh)
-		rather than by index: indices can still shift beneath a nested
-		construct's own narrower protection. A stack (not a single set),
-		same shape as _confinement_depths, so nesting composes - an entry
-		protected by an outer construct stays protected for the whole
-		time an inner one is ALSO being lowered, popped back to the outer
-		construct's own view once the inner one exits. See _neutralize()'s
-		own use of this. '''
-		self._protected_entries.append({ id( e ) for e in self._epilogue_stack[:floor] })
-
-	def exit_diverging_paths( self ) -> None:
-		self._protected_entries.pop()
 
 	# --- union narrowing (compile-time only - see _narrowed's own comment) -
 
@@ -1276,35 +1261,47 @@ class CFGState:
 		rolled out of _defer_flags - a dangling reference.
 
 		Also reverts every SURVIVING entry's (index < stack_depth, i.e.
-		declared BEFORE the loop) own .cancelled/.captured/.flag back to
-		snap's own recording - those Epilogue objects are shared by
-		reference and NOT freshly re-declared by the retried attempt (only
-		entries pushed AFTER the snapshot are, via the del below), so
-		anything the ABANDONED attempt did to one - e.g. compiler.decref()
-		on a name captured earlier in that SAME abandoned attempt, which
-		mints a cancel flag and stores it on entry.flag - would otherwise
-		leak into the retried attempt exactly like restore()'s own
-		identical problem for _stmt_Try (see enter_diverging_paths()'s docstring).
-		Confirmed by a real repro: a loop whose body both captures a pre-
-		loop local via an early return and then compiler.decref()s it,
-		combined with an unrelated borrowed-to-owned promotion that
-		triggers this exact retry - "use of undeclared identifier
-		__cancel_flag_0" from clang, because the retried attempt reused
-		attempt 1's own now-truncated-out-of-_cancel_flags flag reference
-		instead of minting its own. Unlike restore() (which must NOT do
-		this - a genuinely surviving branch's own capture/flag has to
-		remain live), hard_restore()'s whole point is discarding
-		EVERYTHING about the abandoned attempt, entry-internal state
-		included. '''
+		declared BEFORE the loop) own .cancelled/.flag back to snap's own
+		recording. _neutralize()'s own static-cancel path never mutates a
+		shared entry in place (builds a REPLACEMENT instead - see its own
+		docstring), so an ordinary compiler.decref() on a pre-loop entry is
+		already harmless here for FREE, same as everywhere else. The one
+		case still needing an explicit revert is a CAPTURED entry (whole-
+		function, monotonic - see Epilogue's own docstring) that ALSO gets
+		manually decref'd within the SAME abandoned attempt: _neutralize()'s
+		flag branch mints/mutates entry.flag directly (no replacement,
+		since a captured entry is never meant to diverge across ordinary
+		sibling branches) - but a WHOLE abandoned loop-retry attempt is a
+		different kind of divergence, and that flag mutation still needs
+		undoing so the retried attempt mints its own. Confirmed by a real
+		repro: a loop whose body both captures a pre-loop local
+		via an early return and then compiler.decref()s it, combined with
+		an unrelated borrowed-to-owned promotion that triggers this exact
+		retry - "use of undeclared identifier __cancel_flag_0" from clang,
+		because the retried attempt reused attempt 1's own now-truncated-
+		out-of-_cancel_flags flag reference instead of minting its own.
+		Unlike restore() (which must NOT do this - a genuinely surviving
+		branch's own flag has to remain live), hard_restore()'s whole point
+		is discarding EVERYTHING about the abandoned attempt, entry-
+		internal state included.
+
+		No .captured to revert here either - CFGState._captured_labels is
+		whole-function and monotonic (see Epilogue's own docstring), never
+		per-entry state to begin with, so there's nothing hard_restore()
+		needs to do about it: the retried attempt re-lowers the identical
+		source and, if it reaches the same capturing return, independently
+		re-captures under its OWN freshly-minted entry.name (entries pushed
+		after the snapshot are never reused - see the del below) - a stale
+		name left behind by the abandoned attempt is simply never matched
+		by any later live entry again. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
-		for e, cancelled, captured, flag in zip(
-			self._epilogue_stack[:snap.stack_depth], snap.entry_cancelled, snap.entry_captured, snap.entry_flag,
+		for e, cancelled, flag in zip(
+			self._epilogue_stack[:snap.stack_depth], snap.entry_cancelled, snap.entry_flag,
 		):
 			e.cancelled = cancelled
-			e.captured = captured
 			e.flag = flag
 		del self._epilogue_stack[snap.stack_depth:]
 
@@ -1497,13 +1494,13 @@ class CFGState:
 		the fall-off-the-end path need build_epilogue_ladder() at all"
 		probe, which relies on placing the ladder immediately after the
 		function's own body (pure fallthrough is already correct there, no
-		goto needed). The normal call already marks entry.captured=True
-		unconditionally on the assumption its caller is about to emit a
-		real jump to entry.name; a probe that never does that would
-		otherwise spuriously mark an entry captured with no goto anywhere
-		actually referencing it - a real, confirmed -Wunused-label/C4102
-		(build_epilogue_ladder() gates the Label itself on entry.captured -
-		see its own docstring). '''
+		goto needed). The normal call already marks entry.name captured
+		(self._captured_labels) unconditionally on the assumption its
+		caller is about to emit a real jump to entry.name; a probe that
+		never does that would otherwise spuriously mark an entry captured
+		with no goto anywhere actually referencing it - a real, confirmed
+		-Wunused-label/C4102 (build_epilogue_ladder() gates the Label
+		itself on entry.name's own captured-ness - see its own docstring). '''
 		if returned_operand is not None and any(
 			not entry.cancelled and entry.operand is returned_operand
 			for entry in self._epilogue_stack
@@ -1561,7 +1558,7 @@ class CFGState:
 				# deleted()/move() on this same entry must not silently turn
 				# this already-emitted goto into a no-op landing (see their
 				# shared _neutralize() helper)
-				entry.captured = True
+				self._captured_labels.add( entry.name )
 			return entry.name
 		if inline_scope is not None:
 			if mark_captured:
@@ -1660,7 +1657,7 @@ class CFGState:
 		entry = self._epilogue_stack[candidate_index]
 		if inline_scope is None:
 			self._any_shared_label_used = True
-		entry.captured = True
+		self._captured_labels.add( entry.name )
 		return entry.name, inline_instructions
 
 	def used_shared_epilogue_label( self ) -> bool:
@@ -1703,16 +1700,17 @@ class CFGState:
 	) -> list[ir.Instruction]:
 		''' the shared unwind sequence every return that used
 		current_epilogue_label() (and the function's own fall-off-the-end)
-		jumps into - one Label (only when entry.captured - see below) +
-		that entry's own still-live replay per pending entry (RC Decref, or
-		a flag-guarded defer/errdefer replay - see _replay()), deepest
-		(most-recently-pushed) first, each falling straight through into
-		the next with no Jump needed. Cancelled entries still get their own
-		Label whenever captured (current_epilogue_label() can still point
-		straight at one - see its own comment), just no instructions. An
-		entry current_epilogue_label() never actually handed out as a live
-		jump target (entry.captured stays False - no return anywhere in the
-		function needed to unwind from exactly that depth) gets NO Label
+		jumps into - one Label (only when entry.name is captured - see
+		below) + that entry's own still-live replay per pending entry (RC
+		Decref, or a flag-guarded defer/errdefer replay - see _replay()),
+		deepest (most-recently-pushed) first, each falling straight through
+		into the next with no Jump needed. Cancelled entries still get
+		their own Label whenever captured (current_epilogue_label() can
+		still point straight at one - see its own comment), just no
+		instructions. An entry current_epilogue_label() never actually
+		handed out as a live jump target (entry.name never added to
+		self._captured_labels - no return anywhere in the function needed
+		to unwind from exactly that depth) gets NO Label
 		either: every OTHER rung still reaches it purely by falling
 		through from the one above, so a Label with nothing branching to it
 		would be a real, always-on -Wunused-label/C4102 on every compiler.
@@ -1736,7 +1734,7 @@ class CFGState:
 		some earlier Err return already handled. '''
 		instructions: list[ir.Instruction] = []
 		for entry in reversed( self._epilogue_stack ):
-			if entry.captured: # see this method's own docstring
+			if entry.name in self._captured_labels: # see this method's own docstring
 				instructions.append( ir.Label( name = entry.name ))
 			if not entry.cancelled and not entry.is_construction_attr:
 				instructions += self._replay( entry, get_is_err_check )
@@ -1767,7 +1765,7 @@ class CFGState:
 		for entry in reversed( self._epilogue_stack[scope.boundary_depth:] ):
 			# see build_epilogue_ladder()'s own identical comment, including
 			# on why is_construction_attr is skipped unconditionally
-			if entry.captured:
+			if entry.name in self._captured_labels:
 				instructions.append( ir.Label( name = entry.name ))
 			if not entry.cancelled and not entry.is_construction_attr:
 				instructions += self._replay( entry, get_is_err_check )
@@ -2345,11 +2343,16 @@ class CFGState:
 					f'{target_qualname}: cannot move {operand.stem!r} into parameter {param_stem!r} - '
 					f'it is {binding.state.value}, not owned here'
 				)
-			instructions = self._neutralize( binding.entry ) if binding.entry is not None else []
+			if binding.entry is not None:
+				new_entry, instructions = self._neutralize( binding.entry )
+			else:
+				new_entry, instructions = None, []
 			# a fresh _Binding, never mutate the existing one in place - an
 			# earlier snapshot() may still hold a reference to it (see
-			# assign()'s own "always construct fresh" discipline)
-			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )
+			# assign()'s own "always construct fresh" discipline) - entry =
+			# new_entry (_neutralize()'s own possibly-replaced object), not
+			# binding.entry, for the identical reason
+			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = new_entry )
 			return instructions
 		if isinstance( operand, ir.Temp ):
 			self._temp_states.pop( operand.id, None )
@@ -2392,7 +2395,7 @@ class CFGState:
 		specific shape _neutralize() documents. '''
 		return list( self._cancel_flags )
 
-	def _neutralize( self, entry: Epilogue ) -> list[ir.Instruction]:
+	def _neutralize( self, entry: Epilogue ) -> tuple[Epilogue, list[ir.Instruction]]:
 		''' shared by move()/deleted()/manually_decreffed(): stop entry's own
 		pending Decref from firing a SECOND time via the scope's own shared
 		epilogue, now that the caller has already emitted (or is about to
@@ -2428,20 +2431,41 @@ class CFGState:
 		instructions" rule, cancelling it too would just silently drop the
 		flag check itself).
 
-		enter_diverging_paths()'s own protection is the SAME "must go through the flag
-		instead of a static cancel" situation, just without an actual
-		captured goto target - a try's own handler, restored back to this
-		SAME entry's snapshot, is a mutually-exclusive sibling path that
-		may independently still need this entry released, exactly like an
-		earlier captured return would. See enter_diverging_paths()'s own docstring for
-		the real repro this fixes. '''
-		protected = any( id( entry ) in prot for prot in self._protected_entries )
-		if not entry.captured and not protected:
-			entry.cancelled = True
-			return []
+		Returns (the entry going forward - possibly a NEW object, see
+		below - and whatever instructions need emitting). The static-cancel
+		branch never mutates `entry` in place - it builds a REPLACEMENT
+		(cancelled=True) and swaps it into self._epilogue_stack's own live
+		slot instead, exactly mirroring _Binding's own "always construct
+		fresh" discipline (see move()'s own comment) - `entry` itself may
+		still be referenced by an EARLIER snapshot() (e.g. an enclosing
+		if/try's own entry_bindings, or a sibling branch's own end-state
+		captured before this call), which must see it stay untouched. The
+		caller is responsible for using the RETURNED entry (not the
+		original `entry` argument) in whatever _Binding it constructs next
+		- see move()/deleted()/manually_decreffed()'s own call sites.
+
+		This replace-don't-mutate discipline is also why a manual
+		compiler.decref() on an entry declared before an if/try/or_throw()
+		dispatch's own sibling-branch split needs no special runtime-flag
+		protection at all (an earlier design here, enter_diverging_paths(),
+		minted a flag for exactly that case before this fix - removed once
+		this made it provably redundant, confirmed by the full test suite
+		staying green with that mechanism disabled entirely): the branch
+		that decref's it gets a fresh REPLACEMENT object, so the sibling
+		branch's own restore() - which just re-establishes entry_snapshot's
+		own bindings, never touched by the replacement - sees the original,
+		untouched entry exactly as if nothing had happened on the other
+		path. '''
+		if entry.name not in self._captured_labels:
+			new_entry = _dc_replace( entry, cancelled = True )
+			for i, e in enumerate( self._epilogue_stack ):
+				if e is entry:
+					self._epilogue_stack[i] = new_entry
+					break
+			return new_entry, []
 		if entry.flag is None:
 			entry.flag = self._mint_cancel_flag()
-		return [ ir.Assign( dest = entry.flag, src = ir.Const( type = entry.flag.type, value = False )) ]
+		return entry, [ ir.Assign( dest = entry.flag, src = ir.Const( type = entry.flag.type, value = False )) ]
 
 	# --- del x -------------------------------------------------------------
 
@@ -2479,7 +2503,8 @@ class CFGState:
 		instructions: list[ir.Instruction] = []
 		if binding.state == OwnState.OWNED:
 			instructions = self._decref_instructions( binding.type, variable )
-		instructions += self._neutralize( binding.entry )
+		_, neutralize_instructions = self._neutralize( binding.entry ) # `variable` is popped from self.bindings entirely - no new _Binding to update with the returned entry
+		instructions += neutralize_instructions
 		return instructions
 
 	# --- compiler.decref(x) -------------------------------------------------
@@ -2516,8 +2541,8 @@ class CFGState:
 				return []
 			if binding.state != OwnState.OWNED:
 				return []
-			instructions = self._neutralize( binding.entry )
-			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )
+			new_entry, instructions = self._neutralize( binding.entry )
+			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = new_entry )
 			return instructions
 		if isinstance( operand, ir.Temp ):
 			self._temp_states.pop( operand.id, None )

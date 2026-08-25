@@ -558,6 +558,79 @@ def foo() -> None:
 		self.assertEqual( false_instrs, [] )
 		self.assertEqual( removed, [] )
 
+# --- shared-epilogue-mutation bug class (see memory
+# shared_epilogue_mutation_bug_class.md/merge_if_fragility_audit.md) -
+# Epilogue entries are now replaced, not mutated in place (cfg.py's
+# _neutralize()), so a branch can never retroactively alter what a sibling
+# branch (or the pre-branch snapshot) sees for the same entry. -------------
+
+class MergeIfReplaceNotMutateTests( CFGTestBase ):
+
+	def setUp( self ) -> None:
+		super().setUp()
+		self._import( '''
+class Foo: pass
+
+def foo() -> None:
+	pass
+''' )
+		self.foo_cls = self._module.get_local( 'Foo' )
+		self.state = self._state( self._fn( 'foo' ))
+
+	def _local( self, stem: str ):
+		return Variable( stem = stem, qualname = f'foo.{stem}', file = None, line = None, type = self.foo_cls )
+
+	def test_survivor_path_reuses_entry_not_a_duplicate( self ) -> None:
+		# bug 3 (FIXED): x predates the snapshot merge_if() compares
+		# against. manually_decreffed() replaces x's entry in place (by
+		# identity) in _epilogue_stack rather than mutating the original,
+		# so restore() - which never touches stack slots below its own
+		# snapshot's stack_depth - sees the SAME replacement object
+		# reestablish() must recognize instead of duplicating.
+		x = self._local( 'x' )
+		self.state.assign( x, self._new_temp( self.foo_cls ), is_alias = False )
+		outer_entry = self.state.snapshot()
+		self.state.manually_decreffed( x )
+		true_entry = self.state.bindings['x'].entry
+		true_end = dict( self.state.bindings )
+		self.state.restore( outer_entry )
+		true_instrs, false_instrs, removed = self.state.merge_if(
+			outer_entry.bindings, true_end, dict( outer_entry.bindings ), 'foo', true_terminates = True,
+		)
+		survivors = [ e for e in self.state._epilogue_stack if e is true_entry ]
+		self.assertEqual( len( survivors ), 1, "x's entry must not be duplicated by reestablish()" )
+
+	def test_fresh_on_one_branch_yields_a_single_release( self ) -> None:
+		# bug 4: x is fresh relative to the OUTER if (declared inside the
+		# outer true branch). An INNER if inside that branch manually
+		# decref's x on one of its own two branches, then leaves x OWNED
+		# again either way (reassigned on one inner branch, untouched on
+		# the other). Under the old shared-mutable-state model this could
+		# leave a stale entry alongside a fresh one, double-releasing x
+		# (fresh_flag_via_manual_decref.py's real repro). Under
+		# replace-don't-mutate, restore(outer_entry) truncates everything
+		# above its own stack_depth - including any stale replacement -
+		# so the outer merge_if's "fresh on one branch" cleanup must emit
+		# exactly one release for x.
+		outer_entry = self.state.snapshot()
+		x = self._local( 'x' )
+		self.state.assign( x, self._new_temp( self.foo_cls ), is_alias = False )
+		inner_entry = self.state.snapshot()
+		self.state.manually_decreffed( x )
+		self.state.assign( x, self._new_temp( self.foo_cls ), is_alias = False )
+		inner_true_end = dict( self.state.bindings )
+		self.state.restore( inner_entry )
+		inner_false_end = dict( self.state.bindings ) # untouched
+		self.state.restore( inner_entry )
+		self.state.merge_if( inner_entry.bindings, inner_true_end, inner_false_end, 'foo' )
+		outer_true_end = dict( self.state.bindings )
+		self.state.restore( outer_entry )
+		outer_true_instrs, outer_false_instrs, outer_removed = self.state.merge_if(
+			outer_entry.bindings, outer_true_end, dict( outer_entry.bindings ), 'foo',
+		)
+		self.assertEqual( len( outer_true_instrs ), 1,
+			"merge_if()'s 'fresh on one branch' cleanup must emit exactly one release for x" )
+
 # --- unchecked Result tracking -------------------------------------------
 
 class ResultMergeTests( CFGTestBase ):
