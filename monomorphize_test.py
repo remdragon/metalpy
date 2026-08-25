@@ -5,7 +5,7 @@ import unittest
 # local imports:
 from discovery import Discovery
 from monomorphize import Monomorphizer
-from mpy_types import Overload, TaggedUnion, Variable
+from mpy_types import Overload, Specialization, TaggedUnion, Variable
 from tuple_storage import TupleStorage
 from union_storage import UnionStorage
 
@@ -120,6 +120,37 @@ class Choice[T,U]:
 		self.assertIsInstance( data_attr, Variable )
 		self.assertIs( tag_attr.type, u8_intrinsic )
 		self.assertNotEqual( data_attr.type.qualname, choice_cls.names['data'].type.qualname ) # substituted payload, not the shared abstract one
+
+	def test_monomorphize_class_substitutes_method_with_own_type_param( self ) -> None:
+		# regression test: a method declaring its OWN type param on top of
+		# its enclosing generic class's (e.g. list[T].__init__[S: Iterable
+		# [T]]'s shape) used to leave the CLASS's own type params entirely
+		# unsubstituted - monomorphized_function treated "own type params"
+		# and "class type params" as either/or, never both. self ended up
+		# typed against the abstract, unspecialized class, and S's own
+		# bound (parametrized over T) still referenced the abstract T,
+		# rejecting every real argument at the bound check.
+		mod = self._import( '''
+@protocol
+class Producer[T]:
+	def produce( self ) -> T: ...
+
+class Box[T]:
+	v: T
+	def load[S: Producer[T]]( self, src: S ) -> None:
+		self.v = src.produce()
+''' )
+		box_cls = self._cls( mod, 'Box' )
+		i32_cls = self.discovery.get_intrinsics()['i32']
+		spec = self.discovery._get_or_create_specialization( box_cls, [ i32_cls ] )
+		monomorphized = self.monomorphizer.monomorphize_class( spec )
+		load_fn = monomorphized.names['load']
+		self.assertIsNot( load_fn, box_cls.names['load'] ) # a real, distinct substituted copy
+		self.assertIs( load_fn.cls, spec ) # self typed against the CONCRETE Box[i32] specialization, not the abstract Box
+		self.assertIs( load_fn.parameters[0].type, load_fn.type_params[0] ) # src: S, still generic - only T is bound here
+		own_s = load_fn.type_params[0]
+		self.assertIsInstance( own_s.bound, Specialization )
+		self.assertIs( own_s.bound.args[0], i32_cls ) # S's own bound (Producer[T]) substituted to Producer[i32]
 
 if __name__ == '__main__':
 	unittest.main()
