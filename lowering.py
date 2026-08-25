@@ -6877,6 +6877,20 @@ class FunctionLowering:
 		# hand, never a bare .attr or a not-yet-monomorphized generic T.
 		assert len( node.args ) == 1 and isinstance( node.args[0], ast.Name ), f'compiler.__internal_decref__(...) is lowering-internal only, always exactly one ast.Name argument: {ast.unparse(node)}'
 		operand = self._lower_expr( node.args[0], None )
+		# unlike this intrinsic's older call sites (for-loop iterator,
+		# with-statement context manager, or_throw/or_return(mapper)'s own
+		# hidden locals - always genuinely OWNED by construction), a match
+		# statement's own __match_subj_N can be a BORROWED alias of an
+		# existing Name/Attribute (cfg.py's assign() gives it `borrow=True`,
+		# no entry - see lowering.py's _stmt_Assign) whenever the match
+		# subject is an existing variable/field rather than a fresh call
+		# result. Decreffing that unconditionally is a real over-release -
+		# the aliased original still owns the only reference, and its own
+		# natural epilogue already tears it down. Skip for anything already
+		# non-OWNED (covers this, plus a defensive no-op if already MOVED).
+		binding = self._cfg.bindings.get( node.args[0].id )
+		if binding is not None and binding.state != cfg.OwnState.OWNED:
+			return
 		for instr in self._cfg.decref( operand.type, operand ):
 			self._emit( instr )
 		for instr in self._cfg.manually_decreffed( operand ):

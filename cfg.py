@@ -1009,6 +1009,29 @@ class CFGState:
 					already_live = ( prior is not None and prior.entry is binding.entry ) or (
 						binding.entry is not None and any( e is binding.entry for e in self._epilogue_stack )
 					)
+					if (
+						not already_live and binding.state != OwnState.OWNED
+						and prior is not None and prior.state == OwnState.OWNED and prior.entry is not None
+						and any( e is prior.entry for e in self._epilogue_stack )
+					):
+						# same stale-entry hazard as the "both branches agree"
+						# case below, just reached via the survivor path
+						# instead: the SURVIVING branch alone (compiler.decref()/
+						# del/move on a pre-if OWNED local, e.g. a discarded
+						# match-arm's own subject release) already released
+						# prior.entry via its own _neutralize() replacement,
+						# never equal to it or to what restore() put back - the
+						# terminating branch's own exit never touches prior.entry
+						# at all (its own release, if any, runs through return_()/
+						# unwind_to() independently). Neutralize the still-live
+						# stack slot here, on the survivor's own path only - the
+						# terminating branch already took its own exit, it never
+						# reaches this join.
+						_, neutralize_instructions = self._neutralize( prior.entry )
+						if survivor is true_end:
+							true_instructions += neutralize_instructions
+						else:
+							false_instructions += neutralize_instructions
 					reestablish( name, binding, already_live )
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
@@ -1076,6 +1099,29 @@ class CFGState:
 					true_binding.entry is not None and true_binding.entry is false_binding.entry
 					and any( e is true_binding.entry for e in self._epilogue_stack )
 				)
+				if (
+					not already_live and true_binding.state != OwnState.OWNED
+					and prior is not None and prior.state == OwnState.OWNED and prior.entry is not None
+					and any( e is prior.entry for e in self._epilogue_stack )
+				):
+					# both branches independently released the SAME pre-if
+					# OWNED binding (e.g. compiler.decref()/del/move on both
+					# arms, reaching the same end state via two unrelated
+					# instruction sequences - true_binding.entry/false_binding.
+					# entry are each that branch's OWN _neutralize() replacement,
+					# never equal to each other or to prior.entry, so
+					# already_live's identity checks above can't see this).
+					# restore() (called before this method runs, and again
+					# between the two branches) always puts prior.entry itself
+					# back in self._epilogue_stack, pristine/uncancelled, since
+					# it's not flag-guarded - neither branch's own reestablish()
+					# ever touches THAT object, only self.bindings. Left alone,
+					# build_epilogue_ladder() walks the stack directly and
+					# double-releases it. Neutralize it once here, for both
+					# paths (either one may be the one that actually ran).
+					_, neutralize_instructions = self._neutralize( prior.entry )
+					true_instructions += neutralize_instructions
+					false_instructions += list( neutralize_instructions )
 				reestablish( name, true_binding, already_live )
 				continue
 			if name in entry_bindings:

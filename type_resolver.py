@@ -7794,6 +7794,24 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# exact same resolved member objects (identity matters - see
 		# _resolve_case_member's own comment on "owner is not base").
 		subj_type = self.locals.get( subj_name )
+		# release __match_subj_N's own reference once the match is done -
+		# every arm just reads/extracts it and moves on, otherwise leaving it
+		# to whatever the ENCLOSING FUNCTION's own epilogue eventually does
+		# (arbitrarily later - a real, confirmed leak-until-return). Skipped
+		# for a promoted subject (self.<attr>, not a plain local - ownership
+		# there is the generator field's, not this match's, to release) and
+		# for anything with no RC leaves (nothing to release).
+		release_subj = promoted_stem is None and subj_type is not None and subj_type.is_rc()
+		def _release_subj_stmts() -> list[ast.stmt]:
+			if not release_subj:
+				return []
+			call = ast.Call(
+				func = ast.Attribute( value = _id( 'compiler' ), attr = '__internal_decref__', ctx = ast.Load() ),
+				args = [ ast.Name( id = subj_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			stmt = _expr_stmt( call )
+			ast.copy_location( stmt, node )
+			return [ stmt ]
 		# _as_specialization, not a bare isinstance(subj_type, Specialization) -
 		# subj_type can now be an EAGERLY-MONOMORPHIZED concrete union (e.g.
 		# csv.reader()'s return type, once resolve_declared_types has run for
@@ -7920,7 +7938,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				case_infos.append( ( terminates, dict( self._narrowed )))
 			finally:
 				self._narrowed = case_entry_narrowed
-			flattened_body = [ *binds, *body ]
+			flattened_body = [ *binds, *_release_subj_stmts(), *body ]
 			if flatten_this_case:
 				# this case's own test is PROVABLY true whenever it's
 				# reached (a literal wildcard, or the last of an
@@ -7953,6 +7971,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# bindings default for a missing orelse - otherwise a
 			# non-exhaustive match would wipe out narrowing that had
 			# nothing to do with it
+			if tail is not None:
+				tail.orelse = _release_subj_stmts()
 			case_infos.append( ( False, entry_narrowed ))
 		self._narrowed = self._merge_case_narrowing( case_infos )
 		if singleton_body is not None:
