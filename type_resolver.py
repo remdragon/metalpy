@@ -5960,7 +5960,9 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._track_attr_target_type( node.target, self.discovery.visit( node.annotation ))
 		return node
 
-	def visit_Assign( self, node: ast.Assign ) -> ast.Assign:
+	def visit_Assign( self, node: ast.Assign ) -> ast.Assign|list[ast.stmt]:
+		if len( node.targets ) > 1:
+			return self._desugar_multi_assign( node )
 		self.generic_visit( node )
 		if len( node.targets ) == 1 and isinstance( node.targets[0], ast.Name ):
 			self.locals[node.targets[0].id] = self._type_of_expr( node.value )
@@ -5971,6 +5973,34 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._unnarrow_attr_target( node.targets[0] )
 			self._track_attr_target_type( node.targets[0], self._type_of_expr( node.value ))
 		return node
+
+	def _desugar_multi_assign( self, node: ast.Assign ) -> list[ast.stmt]:
+		''' `a = b = c = value` - lowering.py's own _stmt_Assign only ever
+		handles a single target. Unlike a module/class-level declaration
+		(discovery.py's own visit_Assign, which just re-declares each target
+		off its own copy of the value - no runtime statement, so nothing to
+		sequence), this is real, sequenced code: `value` must be evaluated
+		exactly ONCE, then assigned to every target left to right (Python's
+		own chained-assignment semantics - `obj.x = obj.y = call()`
+		re-evaluates `obj` once per target but `call()` exactly once). Same
+		synthetic-temp technique visit_Match's own __match_subj_N uses
+		above, generalized from one subject to an arbitrary target list. '''
+		unique = self._label_id
+		self._label_id += 1
+		tmp_name = f'__multi_assign_{unique}'
+		tmp_assign = ast.Assign( targets = [ ast.Name( id = tmp_name, ctx = ast.Store() ) ], value = node.value )
+		ast.copy_location( tmp_assign, node )
+		stmts: list[ast.stmt] = [ tmp_assign ]
+		for target in node.targets:
+			assign = ast.Assign( targets = [ target ], value = ast.Name( id = tmp_name, ctx = ast.Load() ))
+			ast.copy_location( assign, node )
+			stmts.append( assign )
+		# re-dispatch each synthesized statement through this same visitor
+		# (rather than hand-updating self.locals/narrowing here) so it sees
+		# them exactly like ordinary, hand-written statements - same reason
+		# visit_Match's own prologue/case.body splice relies on the parent
+		# NodeTransformer walk to re-visit its own spliced-in statements.
+		return [ self.visit( stmt ) for stmt in stmts ]
 
 	def _track_attr_target_type( self, target: ast.expr, value_type: Type|None ) -> None:
 		''' the field-target counterpart of self.locals[name.id] = ... above -
