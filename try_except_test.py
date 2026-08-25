@@ -619,7 +619,7 @@ def run( bad: bool ) -> i32:
 		g: Guard = Guard( tag = 111 )
 		if bad:
 			raise Boom( tag = 222 )
-		compiler.decref( g )
+		del g
 	except Boom as e:
 		compiler.decref( e )
 		return -1

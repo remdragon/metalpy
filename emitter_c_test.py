@@ -8850,7 +8850,7 @@ def main() -> i32:
 		helper( b )
 		if compiler.refcount( b ) != 1:
 			return 2
-		compiler.decref( b )
+		del b
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -8878,7 +8878,7 @@ def main() -> i32:
 		if compiler.refcount( b ) != 1:
 			return 1
 		helper( b )
-		compiler.decref( b )
+		del b
 		return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )
@@ -8916,7 +8916,7 @@ def leaky( b: copy[Box], trigger: i32 ) -> i32:
 	helper( b )
 	if trigger == 2:
 		return 2
-	compiler.decref( b )
+	del b
 	return 0
 
 def main() -> i32:
@@ -8938,7 +8938,7 @@ def main() -> i32:
 		return 6
 	if compiler.refcount( b ) != 1:
 		return 7
-	compiler.decref( b )
+	del b
 	return 0
 ''' )
 		self.assertEqual( self.discovery.errors.errors, [] )

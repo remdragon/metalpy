@@ -59,7 +59,7 @@ def main() -> i32:
 	a = Foo( 1 ) # same alloc_loc as make_three's loop - both must aggregate into ONE Foo group
 	items = make_three()
 	dropped = Foo( 2 ) # dropped before the dump, must not inflate the live count
-	compiler.decref( dropped )
+	del dropped
 	b = Bar( 1 ) # a DIFFERENT class - must report as its own separate group
 	sys.dump_live_objects()
 	# program exits immediately after - no need to clean up a/items/b for the
