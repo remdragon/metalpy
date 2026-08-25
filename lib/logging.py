@@ -13,7 +13,12 @@
 #     Handler.handleError - a handler's emit() failure is just a Result the
 #     caller (Logger._handle) discards, same as a destructor discarding
 #     close() (see lib/builtins/__File.py's own convention).
-#   - No call-stack introspection: LogRecord has no filename/lineno/funcName.
+#   - No runtime call-stack introspection: LogRecord.filename/lineno are
+#     captured at COMPILE time instead, via compiler.caller_line()/
+#     caller_file() used as each log method's own default argument value -
+#     capture stops at the nearest omitted-argument call site, with no
+#     stack-walking bubbling through wrapper functions (see Logger.debug's
+#     own comment). No funcName - nothing analogous exists to capture it.
 #   - No datetime/strftime: LogRecord.created is a raw time.time() epoch
 #     float; Formatter.format is a virtual method (not a % format string)
 #     precisely so callers CAN still get custom timestamp rendering by
@@ -81,12 +86,16 @@ class LogRecord:
 	level: i32
 	message: str
 	created: f64
+	filename: str
+	lineno: i32
 
-	def __init__( self, name: str, level: i32, message: str, created: f64 ) -> None:
+	def __init__( self, name: str, level: i32, message: str, created: f64, filename: str, lineno: i32 ) -> None:
 		self.name = name
 		self.level = level
 		self.message = message
 		self.created = created
+		self.filename = filename
+		self.lineno = lineno
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +106,7 @@ class LogRecord:
 class Formatter:
 	@virtual
 	def format( self, record: LogRecord ) -> str:
-		return f'{record.created} {record.name} {_level_name( record.level )} {record.message}'
+		return f'{record.created} {record.filename}:{record.lineno} {record.name} {_level_name( record.level )} {record.message}'
 
 
 # ---------------------------------------------------------------------------
@@ -247,26 +256,32 @@ class Logger:
 	def isEnabledFor( self, level: i32 ) -> bool:
 		return level >= self.getEffectiveLevel()
 
-	def log( self, level: i32, msg: str ) -> None:
+	def log( self, level: i32, msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
 		if not self.isEnabledFor( level ):
 			return
-		record: LogRecord = LogRecord( self.name, level, msg, time.time() )
+		record: LogRecord = LogRecord( self.name, level, msg, time.time(), _file, _line )
 		self._handle( record )
 
-	def debug( self, msg: str ) -> None:
-		self.log( DEBUG, msg )
+	# _line/_file capture the CALLER's own location via compiler.caller_line()/
+	# caller_file() - only when left at their default. A wrapper written around
+	# these (e.g. `def my_debug(msg: str) -> None: logger.debug(msg)`) captures
+	# ITS OWN body's location instead, since there's no runtime stack to walk -
+	# a wrapper that wants correct attribution must declare and forward the
+	# same _line/_file keyword-only params itself, exactly as done here.
+	def debug( self, msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+		self.log( DEBUG, msg, _line = _line, _file = _file )
 
-	def info( self, msg: str ) -> None:
-		self.log( INFO, msg )
+	def info( self, msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+		self.log( INFO, msg, _line = _line, _file = _file )
 
-	def warning( self, msg: str ) -> None:
-		self.log( WARNING, msg )
+	def warning( self, msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+		self.log( WARNING, msg, _line = _line, _file = _file )
 
-	def error( self, msg: str ) -> None:
-		self.log( ERROR, msg )
+	def error( self, msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+		self.log( ERROR, msg, _line = _line, _file = _file )
 
-	def critical( self, msg: str ) -> None:
-		self.log( CRITICAL, msg )
+	def critical( self, msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+		self.log( CRITICAL, msg, _line = _line, _file = _file )
 
 	def _handle( self, record: LogRecord ) -> None:
 		current: Logger = self
@@ -321,17 +336,17 @@ def basicConfig( level: i32 = WARNING ) -> None:
 	if len( r.handlers ) == 0:
 		r.addHandler( StreamHandler() )
 
-def debug( msg: str ) -> None:
-	root().debug( msg )
+def debug( msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+	root().debug( msg, _line = _line, _file = _file )
 
-def info( msg: str ) -> None:
-	root().info( msg )
+def info( msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+	root().info( msg, _line = _line, _file = _file )
 
-def warning( msg: str ) -> None:
-	root().warning( msg )
+def warning( msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+	root().warning( msg, _line = _line, _file = _file )
 
-def error( msg: str ) -> None:
-	root().error( msg )
+def error( msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+	root().error( msg, _line = _line, _file = _file )
 
-def critical( msg: str ) -> None:
-	root().critical( msg )
+def critical( msg: str, *, _line: i32 = compiler.caller_line(), _file: str = compiler.caller_file() ) -> None:
+	root().critical( msg, _line = _line, _file = _file )

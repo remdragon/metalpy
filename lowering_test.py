@@ -3676,6 +3676,185 @@ class Tests( unittest.TestCase ):
 		self.assertIn( 'argument must be a type or a value with a known type', self.discovery.errors.errors[0] )
 		self.assertEqual( [ i for i in fn.instructions if isinstance( i, ir.Call ) ], [] )
 
+	# --- compiler.caller_line() / compiler.caller_file() -----------------------
+
+	def test_compiler_caller_line_folds_to_const_with_callsite_lineno( self ) -> None:
+		code = '\n'.join([
+			'def f( x: i32 = compiler.caller_line() ) -> i32:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	a: i32 = f()',
+			'	b: i32 = f()',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'f' ]
+		self.assertEqual( [ c.kwargs['x'].value for c in calls ], [ 5, 6 ] ) # each call's OWN line in main(), not f's definition line (1)
+
+	def test_compiler_caller_file_folds_to_const_with_callsite_file( self ) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'def f( x: str = compiler.caller_file() ) -> str:',
+				'	return x',
+			]), encoding = 'utf-8' )
+			main_path = root / '__main__.py'
+			main_path.write_text( '\n'.join([
+				'from a import f',
+				'def main() -> None:',
+				'	s: str = f()',
+				'	return',
+			]), encoding = 'utf-8' )
+			disco = Discovery( paths = [ root, Path( discovery.__file__ ).parent / 'lib' ], import_builtins = True ) # str is a builtin, not an intrinsic
+			compiler = Compiler( disco )
+			compiler.import_file( main_path )
+			compiler.run()
+			self.assertEqual( disco.errors.errors, [] )
+			main_fn = next( lf for lf in compiler.functions if lf.function.qualname == 'main' )
+			calls = [ i for i in main_fn.instructions if isinstance( i, ir.Call ) ]
+			self.assertEqual( len( calls ), 1 )
+			# the CALLER's file (__main__.py), not f's defining module (a.py)
+			self.assertEqual( calls[0].kwargs['x'].value, str( main_path ) )
+
+	def test_compiler_caller_line_explicit_argument_overrides_default( self ) -> None:
+		code = '\n'.join([
+			'def f( x: i32 = compiler.caller_line() ) -> i32:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	a: i32 = f( x = 999 )',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'f' ]
+		self.assertEqual( calls[0].kwargs['x'].value, 999 ) # no folding - explicit argument wins, ordinary default semantics
+
+	def test_compiler_caller_line_used_outside_default_position_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	x: i32 = compiler.caller_line() + 1',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( "only valid as a parameter's default value", self.discovery.errors.errors[0] )
+
+	def test_compiler_caller_line_bare_statement_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def main() -> None:',
+			'	compiler.caller_line()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( "only valid as a parameter's default value", self.discovery.errors.errors[0] )
+
+	def test_compiler_caller_line_wrong_param_type_is_a_compile_error( self ) -> None:
+		disco = Discovery( import_builtins = True ) # str is a builtin, not an intrinsic
+		comp = Compiler( disco )
+		code = '\n'.join([
+			'def f( x: str = compiler.caller_line() ) -> str:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	s: str = f()',
+			'	return',
+		])
+		comp.import_code( code, filename = Path( '__test__.py' ))
+		comp._lower( disco.main )
+		self.assertIn( 'can only default an i32 parameter', disco.errors.errors[0] )
+
+	def test_compiler_caller_file_wrong_param_type_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'def f( x: i32 = compiler.caller_file() ) -> i32:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	s: i32 = f()',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertIn( 'can only default a str parameter', self.discovery.errors.errors[0] )
+
+	def test_bare_generic_call_fills_in_caller_line_default( self ) -> None:
+		# confirms _fill_generic_call_defaults (a separate default-fill site
+		# from _lower_call_args) routes through the same shared helper
+		code = '\n'.join([
+			'def take[S]( seq: S, ln: i32 = compiler.caller_line() ) -> i32:',
+			'	return ln',
+			'',
+			'def main() -> i32:',
+			'	t = ( 1, 2, 3 )',
+			'	return take( t )',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'take' ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].kwargs['ln'].value, 6 )
+
+	def test_overload_resolved_call_fills_in_caller_line_default( self ) -> None:
+		# confirms the resolved-Overload-candidate default-fill site (the
+		# third of three) also routes through the shared helper
+		disco = Discovery( import_builtins = True ) # str/bytes are builtins, not intrinsics
+		comp = Compiler( disco )
+		code = '\n'.join([
+			'class Foo:',
+			'	def match( self, a: str, ln: i32 = compiler.caller_line() ) -> i32:',
+			'		return ln',
+			'',
+			'	def match( self, a: bytes, ln: i32 = compiler.caller_line() ) -> i32:',
+			'		return ln',
+			'',
+			'def main() -> i32:',
+			'	f: Foo = Foo()',
+			'	return f.match( "hi" )',
+		])
+		comp.import_code( code, filename = Path( '__test__.py' ))
+		fn = comp._lower( disco.main )
+		self.assertEqual( disco.errors.errors, [] )
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'match' ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertEqual( calls[0].kwargs['ln'].value, 10 )
+
+	def test_overload_resolved_default_referencing_callee_module_private_name( self ) -> None:
+		# regression for a drive-by fix: the resolved-Overload-candidate
+		# default-fill site used to skip module_context/scope_context
+		# entirely (unlike the other two default-fill sites), so an ordinary
+		# default referencing a name private to the callee's own module
+		# would fail to resolve under the CALLER's context instead
+		import tempfile
+		with tempfile.TemporaryDirectory() as tmp:
+			root = Path( tmp )
+			( root / 'a.py' ).write_text( '\n'.join([
+				'SPECIAL: i32 = 5', # never imported by __main__.py below
+				'class Foo:',
+				'	def match( self, x: str, pad: i32 = SPECIAL ) -> i32:',
+				'		return pad',
+				'',
+				'	def match( self, x: bytes, pad: i32 = SPECIAL ) -> i32:',
+				'		return pad',
+			]), encoding = 'utf-8' )
+			( root / '__main__.py' ).write_text( '\n'.join([
+				'from a import Foo',
+				'def main() -> i32:',
+				'	f: Foo = Foo()',
+				'	return f.match( "hi" )', # pad omitted
+			]), encoding = 'utf-8' )
+			disco = Discovery( paths = [ root, Path( discovery.__file__ ).parent / 'lib' ], import_builtins = True ) # str/bytes are builtins, not intrinsics
+			compiler = Compiler( disco )
+			compiler.import_file( root / '__main__.py' )
+			compiler.run()
+			self.assertEqual( disco.errors.errors, [] )
+
 	# --- compiler.is_rc(T/x) -----------------------------------------------------
 	# no dedicated tests existed for this intrinsic before - the value-argument
 	# gap below (silently miscomputing instead of erroring) went unnoticed

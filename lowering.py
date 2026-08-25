@@ -14683,7 +14683,7 @@ class FunctionLowering:
 				# non-generic branch below gets this for free from
 				# _lower_call_args; a generic class's own __init__ needs it
 				# applied explicitly, same as any other generic call target
-				self._fill_generic_call_defaults( init, args, kwargs )
+				self._fill_generic_call_defaults( init, args, kwargs, node )
 			else:
 				self.lowering.schedule( target_cls )
 				self.lowering._ensure_resolved( init )
@@ -15194,6 +15194,21 @@ class FunctionLowering:
 			self._emit( ir.MarkUsed( operand = unwrapped ))
 			return None
 		return unwrapped
+
+	def _fold_caller_location( self, intrinsic: str, param: Parameter, node: ast.Call ) -> ir.Operand:
+		call = param.default
+		if call.args or call.keywords:
+			self.lowering.discovery.fail( f'compiler.{intrinsic}() takes no arguments', call )
+		if intrinsic == 'caller_line':
+			i32_cls = self.lowering.discovery.get_intrinsics()['i32']
+			if param.type is not i32_cls:
+				self.lowering.discovery.fail( f'compiler.caller_line() can only default an i32 parameter, not {param.type.qualname}', call )
+			return self._const_i32( node.lineno )
+		str_cls = self.lowering.discovery.find_name_or_none( 'str' )
+		if param.type is not str_cls:
+			self.lowering.discovery.fail( f'compiler.caller_file() can only default a str parameter, not {param.type.qualname}', call )
+		caller_file = self.lowering.discovery.module_stack[-1].file if self.lowering.discovery.module_stack else None
+		return ir.Const( type = str_cls, value = str( caller_file ) if caller_file is not None else '<unknown>' )
 
 	def _lower_or_return_with_mapper(
 		self, node: ast.Call, receiver: ir.Operand, mapper_node: ast.expr, want_result: bool, *, receiver_pending_start: int|None = None,
@@ -15802,7 +15817,7 @@ class FunctionLowering:
 		self._auto_or_throw( node, result, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = False )
 		return None
 
-	def _lower_parameter_default( self, target: Function, param: Parameter ) -> ir.Operand:
+	def _lower_parameter_default( self, target: Function, param: Parameter, node: ast.Call ) -> ir.Operand:
 		''' an omitted argument's default VALUE, lowered in the DEFINING
 		function/class's own module/scope - not the caller's: a default
 		expression can reference names visible where the function was
@@ -15828,8 +15843,15 @@ class FunctionLowering:
 		that OTHER module illegally reaching pathlib's own package-private
 		constant - same bug shape as _lower_inline_call's own identical
 		fix, just for default-argument filling instead of @inline
-		splicing. '''
+		splicing.
+
+		node is the real CALL SITE (e.g. logger.debug("hi")) - needed so
+		compiler.caller_line()/caller_file() (see _fold_caller_location) can
+		capture ITS location rather than param.default's own. '''
 		self.lowering._type_resolver.resolve_parameter_default( target, param )
+		intrinsic = self.lowering._is_compiler_call( param.default )
+		if intrinsic in ( 'caller_line', 'caller_file' ):
+			return self._fold_caller_location( intrinsic, param, node )
 		saved_owning_module = self._owning_module
 		self._owning_module = self.lowering._find_module_for( target )
 		try:
@@ -15877,7 +15899,7 @@ class FunctionLowering:
 				# function_body's fn.node.body loop, and are lowered here,
 				# often before target's own turn on the compile queue ever
 				# comes up - see _lower_parameter_default's own docstring
-				kwargs[param.stem] = self._lower_parameter_default( target, param )
+				kwargs[param.stem] = self._lower_parameter_default( target, param, node )
 		return args, kwargs
 
 	def _lower_inline_call( self, node: ast.Call, target: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
@@ -16454,7 +16476,7 @@ class FunctionLowering:
 		# yet (no general type-checking pass exists), same as every other
 		# call site in this file today
 
-	def _fill_generic_call_defaults( self, monomorphized: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand] ) -> None:
+	def _fill_generic_call_defaults( self, monomorphized: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], node: ast.Call ) -> None:
 		# _lower_inferred_generic_call/_lower_overload_generic_call's own
 		# argument lowering (lower_and_unify, and the Overload group's own
 		# _lower_overload_arg) only ever populates args/kwargs from what the
@@ -16478,7 +16500,7 @@ class FunctionLowering:
 				# see _lower_parameter_default's own docstring for why this
 				# is needed - a construction call embedded in the default
 				# otherwise never gets its __init__ eagerly pre-resolved
-				kwargs[param.stem] = self._lower_parameter_default( monomorphized, param )
+				kwargs[param.stem] = self._lower_parameter_default( monomorphized, param, node )
 
 	def _finish_generic_call( self, node: ast.Call, target: Function, type_params: list[TypeVar], bindings: dict[int,Type], receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		# shared tail of _lower_inferred_generic_call (extracted verbatim,
@@ -16527,13 +16549,13 @@ class FunctionLowering:
 			inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 			self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 			spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
-			self._fill_generic_call_defaults( monomorphized, args, kwargs )
+			self._fill_generic_call_defaults( monomorphized, args, kwargs, node )
 			return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result, already_compiled = True )
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 		self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self.lowering._monomorphized_function( spec )
-		self._fill_generic_call_defaults( monomorphized, args, kwargs )
+		self._fill_generic_call_defaults( monomorphized, args, kwargs, node )
 		if monomorphized.is_inline:
 			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )
 		return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
@@ -16860,7 +16882,7 @@ class FunctionLowering:
 			# doesn't need filling in here (unlike the non-inline variant) -
 			# this call RETURNS the final operand straight to _lower_call's
 			# own caller, nothing downstream reads `bindings` again
-			self._fill_generic_call_defaults( pending_spec.monomorphized, args, kwargs )
+			self._fill_generic_call_defaults( pending_spec.monomorphized, args, kwargs, node )
 			return self._lower_inline_call( node, pending_spec.monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 		if id( target ) in self.lowering._eager_return_inference_stack:
@@ -16884,7 +16906,7 @@ class FunctionLowering:
 			# own parameters are already substituted (built via
 			# _build_monomorphized_function above), same as any other
 			# generic call's monomorphized target
-			self._fill_generic_call_defaults( provisional, args, kwargs )
+			self._fill_generic_call_defaults( provisional, args, kwargs, node )
 			# forced True regardless of the real want_result - the real
 			# operand (and its .type) is needed to discover the return-only
 			# bindings even when the CALLER's own want_result is False; the
@@ -17012,11 +17034,18 @@ class FunctionLowering:
 		self.lowering._check_type_param_bounds( node, class_type_params, cls_args, cls.qualname if cls else target.qualname )
 		method_spec = self.lowering.discovery._get_or_create_specialization( target, cls_args )
 		monomorphized = self.lowering._monomorphized_function( method_spec )
-		self._fill_generic_call_defaults( monomorphized, args, kwargs )
+		self._fill_generic_call_defaults( monomorphized, args, kwargs, node )
 		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		match self.lowering._is_compiler_call( node ):
+			case 'caller_line' | 'caller_file' as name:
+				self.lowering.discovery.fail(
+					f"compiler.{name}() is only valid as a parameter's default value "
+					f"(e.g. `def f(x: i32 = compiler.{name}()) -> None:`), not as a general expression: {ast.unparse(node)}",
+					node,
+				)
+
 			case 'sizeof':
 				result = self._lower_compiler_sizeof( node, expected_type )
 				return result if want_result else None
@@ -17679,7 +17708,7 @@ class FunctionLowering:
 					# pre-existing bug, not just missing the later privacy-
 					# check fix: it silently resolved a default value against
 					# the CALLER's own scope instead of the callee's.
-					kwargs[param.stem] = self._lower_parameter_default( target, param )
+					kwargs[param.stem] = self._lower_parameter_default( target, param, node )
 		else:
 			self.lowering._resolve_call_target( target )
 			# a Scalar-registered method's receiver isn't threaded through
