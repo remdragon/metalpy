@@ -11203,8 +11203,14 @@ class FunctionLowering:
 		# in _BINOP_DUNDER above (dispatched through it, or through the float
 		# checks just above, before ever reaching here) - what's left is a
 		# genuinely unsupported operator (`/` on an int - only `//` exists;
-		# `**`/`@`, never mapped to anything at all)
-		self.lowering.discovery.fail( f'unsupported binary operator: {ast.unparse(node)}', node )
+		# `**`/`@`, never mapped to anything at all), OR a supported operator
+		# with no dunder registered for THIS particular pair of operand types
+		# (e.g. `int + str`) - name both sides' types so it's clear which
+		self.lowering.discovery.fail(
+			f'unsupported binary operator between {left.type.qualname if left.type else "?"} and '
+			f'{right.type.qualname if right.type else "?"}: {ast.unparse(node)}',
+			node,
+		)
 
 	def _mode_qualified_dunder_names( self, base_name: str ) -> list[str]:
 		# see _MODE_DUNDER_PREFIX's own module-level comment for the full
