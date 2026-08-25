@@ -2043,6 +2043,32 @@ class TypeResolver:
 						)
 		return locals_decl
 
+	def _generator_backing_class_qualname_base( self, fn: Function ) -> str:
+		''' plain fn.qualname is NOT enough here: every member of an
+		@overload group shares its group's own .qualname (mpy_types.Overload's
+		docstring), and a generator's own real body is exactly the kind of
+		"distinct implementation for a distinct signature" case
+		emitter_c.py's mangle_function_qualname/_overload_symbol_index
+		already disambiguates for the FUNCTION's own C symbol via a
+		$$overload<N> suffix - this backing-class qualname needs the
+		identical suffix, or two overloaded generator methods/functions
+		(confirmed via a real repro: re.Pattern.finditer(bytes) and
+		re.Pattern.finditer(memoryview), same stem, same qualname) collide
+		on the SAME generated C struct/vtable/__next__ symbol name once
+		more than one overload is actually reached in the same program -
+		a genuine miscompilation (the two overloads' own DIFFERENT state
+		shapes got silently merged into one struct), not just a linker
+		error. Mirrors _overload_symbol_index's own (file, line) keying
+		exactly, duplicated rather than imported from emitter_c.py to keep
+		this compile-time pass from depending on the emission stage. '''
+		group = fn.overload_group
+		if group is None or len( group.implementations ) <= 1:
+			return fn.qualname
+		for i, candidate in enumerate( group.implementations ):
+			if candidate.file == fn.file and candidate.line == fn.line:
+				return f'{fn.qualname}$$overload{i}'
+		raise AssertionError( f'{fn.qualname}: not found in its own overload_group.implementations by (file, line)' )
+
 	def _live_flag_stem( self, local_stem: str ) -> str:
 		''' PLAN_GENERATORS.md Phase 5 (roadmap Phase 5) - the companion
 		boolean field name for an RC-typed promoted local, tracking
@@ -2085,7 +2111,7 @@ class TypeResolver:
 		docstring for why the unconditional cascade would be wrong here). '''
 		usize_cls = self.discovery.get_intrinsics()['usize']
 		bool_cls = self.discovery.get_intrinsics()['bool']
-		qualname = f'{fn.qualname}$$generator'
+		qualname = f'{self._generator_backing_class_qualname_base( fn )}$$generator'
 		state_attr = Variable( stem = '__state', qualname = f'{qualname}.__state', file = fn.file, line = fn.line, type = usize_cls )
 		param_attrs = [
 			Variable( stem = p.stem, qualname = f'{qualname}.{p.stem}', file = fn.file, line = fn.line, type = p.type )
@@ -5401,6 +5427,20 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			)
 		except CompileError:
 			return None
+		# resolved is the winning IMPLEMENTATION (never a stub - real body,
+		# real yields if any) - a generator's true return type (the real
+		# synthesized backing RCClass, with a genuine __next__) only exists
+		# after this, exactly like the plain-Function branch above (see its
+		# own comment on why ensure_generator_synthesized must run before
+		# .return_type is read at all). Without this, an overloaded
+		# generator (confirmed via a real repro: re.Pattern.finditer's own
+		# bytes/memoryview overloads, reached through a `yield from`) came
+		# back still bare-Iterator[T]-typed here, so the caller's own
+		# __next__() probe against it failed - not a hypothetical, this
+		# whole method already documents disagreeing with lowering.py's
+		# real resolution as a correctness bug, and a stale return type is
+		# exactly that.
+		self.resolver.ensure_generator_synthesized( resolved )
 		winning_stub = next( ( s for s in group.stubs if s.bound_to is resolved ), None )
 		if winning_stub is None:
 			return resolved.return_type
