@@ -698,6 +698,182 @@ def main() -> i32:
 	return 0
 '''
 
+# Bare `raise` (re-raise): logs then re-raises the handler's own caught
+# value, caught by an OUTER try's matching handler.
+_BARE_RAISE_RERAISE_TO_OUTER_HANDLER = '''
+class ErrorA:
+	code: i32
+
+def risky( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		return Result.Err( ErrorA( code = 7 ) )
+	return Result.Ok( 1 )
+
+def run( bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		try:
+			result = risky( bad ).or_throw()
+		except ErrorA as e:
+			result = e.code # "log" it
+			raise
+	except ErrorA as e2:
+		with compiler.wrap_arithmetic:
+			result = e2.code * 100
+	return result
+
+def main() -> i32:
+	if run( False ) != 1:
+		return 1
+	if run( True ) != 700:
+		return 2
+	return 0
+'''
+
+# Bare `raise` with NO outer try at all - must propagate to the enclosing
+# function's own return, same as a real `raise EXPR` with no enclosing try.
+_BARE_RAISE_RERAISE_PROPAGATES_TO_FUNCTION_RETURN = '''
+class ErrorA:
+	code: i32
+
+def risky( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		return Result.Err( ErrorA( code = 9 ) )
+	return Result.Ok( 2 )
+
+def run( bad: bool ) -> Result[i32, ErrorA]:
+	try:
+		v: i32 = risky( bad ).or_throw()
+		return Result.Ok( v )
+	except ErrorA as e:
+		raise # nothing else covers ErrorA - propagates to run()'s own return
+
+def main() -> i32:
+	match run( True ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			if e.code != 9:
+				return 2
+	match run( False ):
+		case Result.Ok( v ):
+			if v != 2:
+				return 3
+		case Result.Err( e ):
+			return 4
+	return 0
+'''
+
+# Bare `raise` escapes to the OUTER try's own matching handler one level at a
+# time - proves _try_stack's own pop-before-handler-lowering (see _stmt_Try)
+# correctly excludes the CURRENT try's own siblings from a re-raise's
+# dispatch: the only handler a re-raised ErrorA can reach here is the
+# OUTER try's, never a (nonsensical, impossible) loop back into its own try.
+_BARE_RAISE_ESCAPES_TO_OUTER_MATCHING_HANDLER_ONE_LEVEL_AT_A_TIME = '''
+class ErrorA:
+	code: i32
+
+def risky() -> Result[i32, ErrorA]:
+	return Result.Err( ErrorA( code = 3 ) )
+
+def run() -> i32:
+	result: i32 = 0
+	try:
+		try:
+			v: i32 = risky().or_throw()
+			result = v
+		except ErrorA as e:
+			result = e.code
+			raise
+	except ErrorA as e2:
+		with compiler.wrap_arithmetic:
+			result = e2.code + 1000
+	return result
+
+def main() -> i32:
+	if run() != 1003:
+		return 1
+	return 0
+'''
+
+# Bare `raise` inside `except SomeError:` with NO `as NAME` at all - exercises
+# the hidden, compiler-synthesized bind variable (TryHandler.raise_value_var)
+# that every handler now gets regardless of whether the user named one.
+_BARE_RAISE_WITH_NO_AS_NAME_STILL_WORKS = '''
+class ErrorA:
+	pass
+
+def risky( bad: bool ) -> Result[i32, ErrorA]:
+	if bad:
+		return Result.Err( ErrorA() )
+	return Result.Ok( 4 )
+
+def run( bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		try:
+			result = risky( bad ).or_throw()
+		except ErrorA:
+			raise
+	except ErrorA:
+		result = -1
+	return result
+
+def main() -> i32:
+	if run( False ) != 4:
+		return 1
+	if run( True ) != -1:
+		return 2
+	return 0
+'''
+
+# Nested-handler shadowing: a handler body containing its OWN nested
+# try/except, whose handler ALSO does a bare `raise` - must re-raise ITS OWN
+# caught value (ErrorB), never the enclosing handler's (ErrorA) - proves
+# _active_raise_values is a real stack, not a single slot.
+_BARE_RAISE_NESTED_HANDLER_SHADOWS_OUTER_OWN_VALUE = '''
+class ErrorA:
+	code: i32
+
+class ErrorB:
+	code: i32
+
+def risky_a() -> Result[i32, ErrorA]:
+	return Result.Err( ErrorA( code = 1 ) )
+
+def risky_b( bad: bool ) -> Result[i32, ErrorB]:
+	if bad:
+		return Result.Err( ErrorB( code = 2 ) )
+	return Result.Ok( 0 )
+
+def run( inner_bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		try:
+			v: i32 = risky_a().or_throw()
+			result = v
+		except ErrorA as e:
+			try:
+				result = risky_b( inner_bad ).or_throw()
+			except ErrorB as e2:
+				raise # must re-raise e2 (ErrorB), NOT e (ErrorA)
+			raise # only reached if risky_b succeeded - re-raises e (ErrorA)
+	except ErrorA as outer_e:
+		with compiler.wrap_arithmetic:
+			result = 100 + outer_e.code
+	except ErrorB as outer_e2:
+		with compiler.wrap_arithmetic:
+			result = 200 + outer_e2.code
+	return result
+
+def main() -> i32:
+	if run( True ) != 202:
+		return 1
+	if run( False ) != 101:
+		return 2
+	return 0
+'''
+
 # Change 3: a tuple except-clause where only ONE of two leaves is ever
 # thrown - the whole clause must still NOT be flagged dead.
 _TUPLE_EXCEPT_CLAUSE_ONE_LEAF_NEVER_THROWN_STILL_NOT_DEAD = '''
@@ -1067,6 +1243,21 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 	def test_raise_and_or_throw_same_try_dispatch_to_same_handler( self ) -> None:
 		self.assert_programs_run([ ( 'raise_and_or_throw', _RAISE_AND_OR_THROW_SAME_TRY_DISPATCH_TO_SAME_HANDLER ) ])
 
+	def test_bare_raise_reraise_to_outer_handler( self ) -> None:
+		self.assert_programs_run([ ( 'bare_raise_outer', _BARE_RAISE_RERAISE_TO_OUTER_HANDLER ) ])
+
+	def test_bare_raise_reraise_propagates_to_function_return( self ) -> None:
+		self.assert_programs_run([ ( 'bare_raise_fn_return', _BARE_RAISE_RERAISE_PROPAGATES_TO_FUNCTION_RETURN ) ])
+
+	def test_bare_raise_escapes_to_outer_matching_handler_one_level_at_a_time( self ) -> None:
+		self.assert_programs_run([ ( 'bare_raise_one_level', _BARE_RAISE_ESCAPES_TO_OUTER_MATCHING_HANDLER_ONE_LEVEL_AT_A_TIME ) ])
+
+	def test_bare_raise_with_no_as_name_still_works( self ) -> None:
+		self.assert_programs_run([ ( 'bare_raise_no_as_name', _BARE_RAISE_WITH_NO_AS_NAME_STILL_WORKS ) ])
+
+	def test_bare_raise_nested_handler_shadows_outer_own_value( self ) -> None:
+		self.assert_programs_run([ ( 'bare_raise_nested_shadow', _BARE_RAISE_NESTED_HANDLER_SHADOWS_OUTER_OWN_VALUE ) ])
+
 	def test_tuple_except_clause_one_leaf_never_thrown_still_not_dead( self ) -> None:
 		self.assert_programs_run([ ( 'tuple_except_one_leaf', _TUPLE_EXCEPT_CLAUSE_ONE_LEAF_NEVER_THROWN_STILL_NOT_DEAD ) ])
 
@@ -1346,7 +1537,9 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 
 	# --- Change 2: raise EXPR rejection coverage ----------------------------
 
-	def test_bare_raise_is_rejected( self ) -> None:
+	def test_bare_raise_inside_try_body_not_a_handler_is_rejected( self ) -> None:
+		# the try BODY, not a handler's own body - _active_raise_values is
+		# empty there even though a handler exists right below it
 		code = '\n'.join([
 			'class ErrorA: pass',
 			'',
@@ -1359,6 +1552,55 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		])
 		errors = self._lower_and_get_errors( code, 'run' )
 		self.assertTrue( any( 'bare raise' in e for e in errors ), errors )
+		self.assertTrue( any( 'only valid inside an except handler' in e for e in errors ), errors )
+
+	def test_bare_raise_at_function_top_level_is_rejected( self ) -> None:
+		# not inside a try/except at all
+		code = '\n'.join([
+			'def run() -> i32:',
+			'	raise',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'only valid inside an except handler' in e for e in errors ), errors )
+
+	def test_bare_raise_inside_else_block_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def risky() -> Result[i32, ErrorA]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def run() -> i32:',
+			'	try:',
+			'		v: i32 = risky().or_throw()',
+			'	except ErrorA:',
+			'		return -1',
+			'	else:',
+			'		raise',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'only valid inside an except handler' in e for e in errors ), errors )
+
+	def test_bare_raise_inside_finally_block_is_rejected( self ) -> None:
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def risky() -> Result[i32, ErrorA]:',
+			'	return Result.Ok( 1 )',
+			'',
+			'def run() -> i32:',
+			'	try:',
+			'		v: i32 = risky().or_throw()',
+			'	except ErrorA:',
+			'		return -1',
+			'	finally:',
+			'		raise',
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( any( 'only valid inside an except handler' in e for e in errors ), errors )
 
 	def test_raise_from_is_rejected( self ) -> None:
 		code = '\n'.join([
