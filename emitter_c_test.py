@@ -10569,6 +10569,32 @@ def main() -> i32:
 		errors = self.discovery.errors.errors
 		self.assertEqual( len( errors ), 1 )
 		self.assertIn( 'cannot unpack a non-tuple value', errors[0] )
+		self.assertIn( 'got intrinsics.i32', errors[0] )
+
+	def test_tuple_unpack_unconsumed_result_names_the_result_type( self ) -> None:
+		# regression: the message said only what the value ISN'T (a tuple),
+		# never what it actually IS - a real repro (grap.mpy's own `u1, u2 =
+		# pairs[u]`, pairs[u] being a fallible __getitem__'s own unconsumed
+		# Result[tuple[...],IndexError], a forgotten .unwrap()) left the
+		# reader guessing. Naming the real type turns "cannot unpack a
+		# non-tuple value" into an immediately actionable "oh, I forgot to
+		# unwrap this Result" - see this same case reaching the check at all
+		# (a bare Result argument isn't itself auto-consumed by _lower_expr(
+		# node.value, None) - no expected_type here to trigger that hook).
+		self._run( '\n'.join([
+			'def pair( i: i32 ) -> Result[tuple[i32,i32], IndexError]:',
+			'	return Result.Ok(( i, i ))',
+			'',
+			'def main() -> i32:',
+			'	a, b = pair( 0 )',
+			'	return 0',
+		]))
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 1 )
+		self.assertIn( 'cannot unpack a non-tuple value', errors[0] )
+		self.assertIn( 'got builtins.Result[', errors[0] )
+		self.assertIn( 'tuple[intrinsics.i32,intrinsics.i32]', errors[0] )
+		self.assertIn( 'IndexError', errors[0] )
 
 	def test_tuple_unpack_starred_target_is_rejected( self ) -> None:
 		self._run( '\n'.join([

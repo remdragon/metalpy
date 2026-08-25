@@ -4272,7 +4272,11 @@ class FunctionLowering:
 				resolved_value_type = self.lowering._ensure_resolved( value.type )
 				tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_value_type )
 				if tuple_type is None:
-					self.lowering.discovery.fail( f'cannot unpack a non-tuple value: {ast.unparse(node)}', node )
+					self.lowering.discovery.fail(
+						f'cannot unpack a non-tuple value (got {resolved_value_type.qualname if resolved_value_type else "?"}): '
+						f'{ast.unparse(node)}',
+						node,
+					)
 				if len( tuple_type.elem_types ) != len( target.elts ):
 					self.lowering.discovery.fail(
 						f'unpacking target has {len(target.elts)} name(s), value has {len(tuple_type.elem_types)}: {ast.unparse(node)}',
