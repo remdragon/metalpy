@@ -3884,9 +3884,17 @@ class FunctionLowering:
 		below instead of _declare_local. Re-registers it into fn.names too -
 		unlike _declare_local, a plain reassign doesn't do that itself, and
 		later code (same iteration or after the loop) needs to find it again.
-		Only the innermost active loop is checked - a name loop-carried from
-		an OUTER loop but del'd/reassigned inside a NESTED one isn't handled
-		here yet. '''
+		Only the innermost active loop is checked - safe regardless of
+		nesting depth: a loop's own entry snapshot already inherits every
+		binding live from its enclosing scopes, so del+reassign sharing any
+		one (possibly nested) loop body always finds `target_id` via
+		whichever loop directly encloses them. Splitting del and the
+		reassignment across two different loop nesting levels (e.g. del
+		inside an inner loop with the reassignment only after it exits)
+		never reaches this fallback at all - loop_back_edge()'s own entry/
+		back-edge stability check already rejects that shape as a hard
+		compile error first (confirmed: "does not exist consistently across
+		loop iterations"). '''
 		if not self._loop_labels:
 			return None
 		entry_binding = self._loop_labels[-1].loop_snapshot.bindings.get( target_id )
