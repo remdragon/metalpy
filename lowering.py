@@ -7455,6 +7455,23 @@ class FunctionLowering:
 			defer_flags_mark = len( self._defer_flags )
 			cancel_flags_mark = self._cfg.cancel_flag_count
 			pending_temps_mark = len( self._pending_temps )
+			# fn.names is lowering.py's own (not cfg.py's) name->Variable table -
+			# hard_restore() below only reverts cfg.py's OWN bindings/epilogue
+			# state, it has no notion of this dict at all. A name `del`'d and
+			# then reassigned INSIDE the loop body mints a fresh, uid-suffixed
+			# Variable (Variable.needs_uid_suffix - see _mark_fresh_local_
+			# declared()) and registers it here (fn.add_name) - if attempt 1
+			# reaches that shape and then fails/rolls back, this entry is left
+			# pointing at attempt 1's own now-abandoned Variable (its own
+			# declaration instruction was just discarded above) instead of
+			# reverting to whatever fn.names held before this attempt started.
+			# The retried attempt's own `del` of that same name then resolves
+			# through THIS stale entry (fn.get_local_or_raise - see
+			# _stmt_Delete) rather than the true pre-loop original, referencing
+			# a C-level local that was never actually declared - confirmed by a
+			# real repro ("use of undeclared identifier"), the fn.names
+			# analogue of hard_restore()'s own identity-divergence fix above.
+			names_snapshot = dict( self._current_fn.names )
 			try:
 				break_narrowed, break_live, continue_captured = self._lower_loop_body(
 					body, continue_label = continue_label, break_label = break_label, loop_snapshot = loop_snapshot,
@@ -7469,6 +7486,8 @@ class FunctionLowering:
 				self._cfg.truncate_cancel_flags( cancel_flags_mark )
 				del self._pending_temps[pending_temps_mark:]
 				self._cfg.hard_restore( body_snapshot )
+				self._current_fn.names.clear()
+				self._current_fn.names.update( names_snapshot )
 				promo_instructions: list[ir.Instruction] = []
 				for promoted_name in sorted( promotable ):
 					promo_instructions += self._cfg.promote_borrowed_for_loop( promoted_name )

@@ -621,7 +621,7 @@ def run( bad: bool ) -> i32:
 			raise Boom( tag = 222 )
 		del g
 	except Boom as e:
-		compiler.decref( e )
+		del e
 		return -1
 	return 0
 
@@ -634,22 +634,23 @@ def main() -> i32:
 '''
 
 # regression: an RC local declared BEFORE the try (not confined to it at
-# all - the ordinary function-scope case) that's manually compiler.decref'd
-# on the try body's own non-raising fall-through used to corrupt memory (a
-# real double-free, not just a leak) on the RAISING path, whenever the
-# fall-through path had ALREADY run at least once first. restore() only
-# ever reverted STACK MEMBERSHIP, never an already-mutated Epilogue's own
-# .cancelled flag (shared by reference, never copied per snapshot) - the
-# fall-through's own compiler.decref(g) permanently cancelled g's SHARED
-# entry, so a LATER call's raise-then-handler path (independently restored
-# back to the same try-entry snapshot) treated g as already-released too,
-# even though THAT path never touched it - then g's real, still-live
-# reference got released a second time by the function's own closing
-# epilogue. Fixed via cfg.py's enter_try()/exit_try() (CFGState.
-# _try_protected) routing any manual cancellation of a try-predating entry
-# through the SAME runtime-flag mechanism an already-captured entry's own
-# cancellation already used, rather than statically (and irreversibly)
-# cancelling it.
+# all - the ordinary function-scope case) that's `del`'d on the try body's
+# own non-raising fall-through used to double-release on the RAISING path -
+# not a restore()/.cancelled bug (restore() already resyncs a survivor's own
+# object identity back to the pristine, uncancelled entry_snapshot object
+# correctly), but a merge_if() gap: when one branch of a construct
+# terminates (the handler's own `return`), merge_if()'s terminating-branch
+# shortcut only re-establishes whatever the SURVIVING branch's own end
+# state still has - it never even looks at a name that was live entering
+# the construct but is ABSENT from the survivor (del'd there). The
+# terminating branch's own restore()-reverted, uncancelled entry for that
+# name was therefore never reconciled at all, and leaked straight through
+# into the merged post-construct state - build_epilogue_ladder() then
+# released it a SECOND time. Fixed in cfg.py's merge_if(): the
+# terminating-branch path now also walks entry_bindings for names missing
+# from the survivor, neutralizing (flag-guarding, since the handler's own
+# `return` already captured this entry's shared label) whatever stale
+# object the terminating branch's restore() left behind.
 _LOCAL_BEFORE_TRY_SURVIVES_ACROSS_REPEATED_CALLS_REGARDLESS_OF_ORDER = '''
 class Guard:
 	tag: i32
@@ -662,9 +663,9 @@ def run( bad: bool ) -> i32:
 	try:
 		if bad:
 			raise Boom( tag = 222 )
-		compiler.decref( g )
+		del g
 	except Boom as e:
-		compiler.decref( e )
+		del e
 		return -1
 	return 0
 
