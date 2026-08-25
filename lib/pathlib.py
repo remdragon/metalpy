@@ -253,7 +253,7 @@ class Path:
 		return self._raw
 
 	def __repr__( self ) -> str:
-		return f"Path('{self._raw}')"
+		return f"Path({self._raw!r})"
 
 	def __eq__( self, other: Path ) -> bool:
 		if self._flavor != other._flavor:
