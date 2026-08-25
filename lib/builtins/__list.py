@@ -172,7 +172,7 @@ class RawList:
 # RC operations (incref/decref) are performed here so RawList stays generic.
 # ---------------------------------------------------------------------------
 
-class UnsafeList[T]:
+class UnsafeList[T]( Sized ):
 	__raw: RawList
 
 	def __init__( self, initial_capacity: usize = 8 ) -> None:
@@ -335,7 +335,7 @@ def _list_iter[T]( seq: list[T] ) -> Generator[T, StopIteration]:
 		with compiler.wrap_arithmetic:
 			i += 1
 
-class list[T]( Sequence[T], Iterable[T] ):
+class list[T]( Sequence[T], Iterable[T], Sized ):
 	__inner:   UnsafeList[T]
 	__lock:    threading.FastLock
 

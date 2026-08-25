@@ -24,7 +24,7 @@
 
 import compiler
 
-class VariadicTuple[T]( Sequence[T], Iterable[T] ):
+class VariadicTuple[T]( Sequence[T], Iterable[T], Sized ):
 	__inner: UnsafeList[T]
 
 	# takes ownership of an already-built UnsafeList[T] directly - the

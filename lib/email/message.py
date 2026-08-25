@@ -94,7 +94,7 @@ def _header_name_eq( a: str, b: str ) -> bool:
 	return a.lower() == b.lower()
 
 
-class _Headers:
+class _Headers( Sized ):
 	__entries: list[tuple[str,str]]
 
 	def __init__( self ) -> None:

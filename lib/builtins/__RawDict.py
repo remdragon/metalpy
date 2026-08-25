@@ -42,7 +42,7 @@ class RawIndex:
 def _raw_index_hash( node: RawIndex ) -> u64:
 	return node.hash
 
-class RawDict:
+class RawDict( Sized ):
 	# UnsafeList[T], not list[T]: RawDict's own storage is private and never
 	# escapes - it has nothing to do with cross-thread sharing, and
 	# shouldn't silently pay list[T]'s own lock-acquire cost on every dict

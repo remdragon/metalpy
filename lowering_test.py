@@ -9844,6 +9844,41 @@ class InlineTests( unittest.TestCase ):
 		qualnames = { lf.function.qualname for lf in self.compiler.functions }
 		self.assertNotIn( '__test__.Result.is_ok[intrinsics.i32,__test__.MyError]', qualnames )
 
+	def test_type_error_inside_inline_body_names_the_real_call_site_and_arg_types( self ) -> None:
+		# regression: a type mismatch inside an @inline function's own
+		# spliced body (e.g. builtins.len[T]'s `return t.__len__()`) used to
+		# report ONLY that body's own source location (lib/builtins/
+		# __init__.py, in the real case) - useless for a caller with more
+		# than one call site to the same @inline generic, and it never said
+		# what T actually was either. _lower_inline_call now appends one
+		# additional, purely additive note pointing at THIS call's own real
+		# site plus each argument's own concrete type - confirmed via this
+		# exact shape (mirrors builtins.len[T] without depending on real
+		# builtins, same posture as this whole class' own docstring)
+		code = '\n'.join([
+			'class Thing:',
+			'	def get( self ) -> usize:',
+			'		return usize( 3 )',
+			'',
+			'@inline',
+			'def get_it[T]( t: T ) -> usize:',
+			'	return t.get()',
+			'',
+			'def main() -> i32:',
+			'	t: Thing = Thing()',
+			'	count: i32 = get_it( t )',
+			'	return count',
+		])
+		self._import( code )
+		self._lower_main()
+		errors = self.discovery.errors.errors
+		self.assertEqual( len( errors ), 2 )
+		self.assertIn( 't.get()', errors[0] )
+		note = errors[1]
+		self.assertIn( '__test__.py:11', note ) # the real call site, not get_it's own body
+		self.assertIn( 'get_it[__test__.Thing]', note )
+		self.assertIn( 't: __test__.Thing', note )
+
 # --- multi-statement @inline bodies (generalization of PLAN_INLINE.md) -------
 
 class InlineMultiStatementTests( unittest.TestCase ):

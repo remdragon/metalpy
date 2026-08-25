@@ -20,7 +20,7 @@ analogous thing via its exporter's buffer-refcount protocol.
 import compiler
 from mmap import mmap
 
-class memoryview( Sequence[u8], Iterable[u8] ):
+class memoryview( Sequence[u8], Iterable[u8], Sized ):
 	__ptr: Ptr[u8]
 	__len: usize
 	__source: bytearray|mmap
