@@ -166,15 +166,25 @@ class _Snapshot:
 	''' captured by snapshot(), consumed by restore() - see the IF/loop
 	orchestration lowering.py performs around branches/loop bodies.
 	entry_cancelled/entry_flag record every SURVIVING entry's (index <
-	stack_depth) own Epilogue state as of snapshot time - restore() itself
-	never applies these (see its own docstring - a branch's own flag-
-	guarded entries are meant to keep whatever CURRENT state they have
-	across an ordinary restore()); hard_restore() is the one consumer, for
-	the loop-ownership retry's own "discard this WHOLE attempt, including
-	anything it did to an entry declared before the loop" rollback - see
-	its own docstring. No entry_captured here - see Epilogue's own
-	docstring for why captured-ness isn't per-entry snapshotted state at
-	all. '''
+	stack_depth) own Epilogue state as of snapshot time; entry_objects
+	records the ACTUAL Epilogue objects themselves (same order/indices),
+	for restore()'s own identity-preserving swap-back (see its own
+	docstring - a static cancel's own REPLACEMENT object must be swapped
+	back to the ORIGINAL object identity, not just have its .cancelled
+	field flipped, or self.bindings[stem].entry and self._epilogue_stack[i]
+	silently diverge into two different objects that both claim to be
+	"the" entry for the same name - confirmed by a real repro: a later
+	_neutralize() on the reestablished (bindings-side) original object then
+	fails its own `self._epilogue_stack[i] = new_entry` identity search
+	entirely, since the stack-side slot never got reverted to that same
+	object, leaving the earlier restore-reset replacement (cancelled=False)
+	sitting there permanently - a real double release once the function's
+	own closing ladder gets to it). entry_cancelled/entry_flag are ONLY
+	consumed by hard_restore() now (unconditional field reset on whatever's
+	CURRENTLY at each index - correct there since a hard_restore() discards
+	the whole abandoned attempt, no identity to preserve). No entry_captured
+	here - see Epilogue's own docstring for why captured-ness isn't
+	per-entry snapshotted state at all. '''
 	bindings: Bindings
 	stack_depth: int
 	results: set[str]
@@ -182,6 +192,7 @@ class _Snapshot:
 	live: set[str]
 	entry_cancelled: list[bool]
 	entry_flag: list['Variable | None']
+	entry_objects: list['Epilogue']
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -395,6 +406,7 @@ class CFGState:
 			narrowed = dict( self._narrowed ), live = set( self._live ),
 			entry_cancelled = [ e.cancelled for e in self._epilogue_stack ],
 			entry_flag = [ e.flag for e in self._epilogue_stack ],
+			entry_objects = list( self._epilogue_stack ),
 		)
 
 	def restore( self, snap: _Snapshot ) -> None:
@@ -444,11 +456,52 @@ class CFGState:
 		enter_loop() depth) never reaches captured=True in the first place,
 		since current_epilogue_label() refuses to hand out a label for one
 		(see its own docstring) - so this can never resurrect an entry that
-		was truly meant to be block-scoped. '''
+		was truly meant to be block-scoped.
+
+		Also swaps every SURVIVING pre-branch entry (index < stack_depth)
+		that's still NOT flag-guarded back to its ORIGINAL object identity
+		(snap.entry_objects), not just a reset .cancelled field:
+		_neutralize()'s static-cancel path (move()/deleted()/manually_
+		decreffed() on an entry declared before this branch) swaps a
+		cancelled=True REPLACEMENT object into self._epilogue_stack IN
+		PLACE - self.bindings gets the replacement too, but restore() above
+		already resets bindings back to snap's own pristine entry OBJECT, so
+		only this raw list is left pointing at the stale replacement.
+		Merely flipping the replacement's OWN .cancelled back to False (a
+		prior version of this) still leaves self.bindings[stem].entry and
+		self._epilogue_stack[i] as two DIFFERENT objects claiming to be the
+		same entry - a later _neutralize() on the reestablished
+		(bindings-side, original) object then searches self._epilogue_stack
+		for `e is entry` and never finds it (the list still holds the
+		replacement), so its own `self._epilogue_stack[i] = new_entry` swap
+		silently fails to happen at all, leaving the earlier reset
+		replacement (cancelled=False) sitting there permanently - confirmed
+		by a real repro: a pre-if local del'd on an if's own terminating
+		branch, then unconditionally del'd again right after the if -
+		the second del's own cancellation never reached the real stack
+		slot, a real double release at the function's own closing ladder.
+		Swapping the actual object back, not just its field, keeps identity
+		consistent for every later lookup. Without reverting this at all,
+		the FIRST branch's cancellation permanently leaks into every
+		sibling restored back to the SAME snap (confirmed by a real repro:
+		`del`/compiler.decref() on a pre-if local in the true branch only,
+		then an unconditional release expected in the false branch -
+		build_epilogue_ladder() found the entry still cancelled and
+		silently dropped the false branch's own release, a real leak) -
+		exactly the bug enter_diverging_paths() used to paper over before it
+		was removed as "provably redundant". A flag-guarded entry is left
+		untouched on purpose (matches hard_restore()'s own carve-out): its
+		runtime flag already reconciles both branches correctly regardless
+		of which one(s) actually disarmed it, and a NEWLY minted flag from
+		THIS branch (entry.flag now set, snap recorded None) must stay live
+		for the caller's own already-emitted flag-guarded release. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
+		for i, orig_entry in enumerate( snap.entry_objects ):
+			if not self._epilogue_stack[i].is_flag_guarded:
+				self._epilogue_stack[i] = orig_entry
 		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.name in self._captured_labels ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
@@ -2070,6 +2123,24 @@ class CFGState:
 			# into dest, not a second independent owner - untrack it so its
 			# own eventual DeleteTemp doesn't ALSO decref the same object
 			self._temp_states.pop( src.id, None )
+		elif isinstance( src, Variable ):
+			# is_alias=False but src is a full Variable (not ir.Temp) - only
+			# reached via a hidden-local "result" a lowering helper hands
+			# back as its own fresh owned value (e.g. or_throw(mapper)'s own
+			# ok_thunk: `w: T = recv.or_throw(mapper)` binds w straight to
+			# the synthesized __ot_ok_N local, not a Temp copy of it).
+			# src's own binding/epilogue entry has to be neutralized here
+			# the same way a Temp's tracking is untracked above - dest's
+			# fresh _push() below is now the ONE owner - otherwise src's own
+			# still-live entry AND dest's new one both release the same
+			# object at scope exit. Confirmed by a real repro (or_throw(
+			# mapper)'s Ok arm, "already released once"). No-op for a
+			# BORROWED/already-MOVED src (nothing here to cancel).
+			src_binding = self.bindings.get( src.stem )
+			if src_binding is not None and src_binding.entry is not None and src_binding.state == OwnState.OWNED:
+				new_entry, neutralize_instructions = self._neutralize( src_binding.entry )
+				instructions += neutralize_instructions
+				self.bindings[src.stem] = _Binding( operand = src_binding.operand, type = src_binding.type, state = OwnState.MOVED, entry = new_entry )
 		if dest.is_global:
 			# a global's storage isn't scoped to THIS function's own
 			# epilogue at all - whatever gets stored now must persist for
@@ -2445,17 +2516,19 @@ class CFGState:
 		- see move()/deleted()/manually_decreffed()'s own call sites.
 
 		This replace-don't-mutate discipline is also why a manual
-		compiler.decref() on an entry declared before an if/try/or_throw()
-		dispatch's own sibling-branch split needs no special runtime-flag
-		protection at all (an earlier design here, enter_diverging_paths(),
-		minted a flag for exactly that case before this fix - removed once
-		this made it provably redundant, confirmed by the full test suite
-		staying green with that mechanism disabled entirely): the branch
-		that decref's it gets a fresh REPLACEMENT object, so the sibling
-		branch's own restore() - which just re-establishes entry_snapshot's
-		own bindings, never touched by the replacement - sees the original,
-		untouched entry exactly as if nothing had happened on the other
-		path. '''
+		compiler.decref()/del on an entry declared before an if/try/
+		or_throw() dispatch's own sibling-branch split needs no special
+		runtime-flag protection (an earlier design here,
+		enter_diverging_paths(), minted a flag for exactly that case -
+		removed once this made it provably redundant): the branch that
+		cancels it gets a fresh REPLACEMENT object swapped into
+		self._epilogue_stack's own live slot, so the ORIGINAL entry object
+		itself stays untouched - restore()'s own .cancelled revert (see its
+		own docstring) then resyncs the sibling branch's copy of that same
+		slot back to the pristine, uncancelled state, rather than relying on
+		object identity alone (self._epilogue_stack is a flat list of
+		mutable slots, not a tree of untouched objects - restore() has to
+		actively resync it). '''
 		if entry.name not in self._captured_labels:
 			new_entry = _dc_replace( entry, cancelled = True )
 			for i, e in enumerate( self._epilogue_stack ):
