@@ -15373,29 +15373,63 @@ class FunctionLowering:
 		def err_thunk() -> bool:
 			self._cfg.narrow( recv_var.stem, err_member )
 			err_bind_name = f'__or_err_{unique}'
-			self._declare_hidden_local( err_bind_name, error_cls, node )
+			err_bind_var = self._declare_hidden_local( err_bind_name, error_cls, node )
 			extract = ast.Assign(
 				targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
 			)
 			ast.copy_location( extract, node )
 			self._lower_stmt( extract )
-			# KNOWN GAP, not yet fixed: unlike or_throw_with_mapper's own
-			# err_thunk (recv_var/err_bind_name/mapper_var all explicitly
-			# released there - see its own comment/history), this arm
-			# releases none of them, leaking all three whenever this path is
-			# taken. Fixing it safely needs mapped_call's own result to stay
-			# a bare, never-named operand through to the final `return
-			# Result.Err(...)` (mirroring _raise_value's own "why a NAMED
-			# local doesn't work" constraint - binding it via ast.Assign
-			# first, as or_throw_with_mapper does, defeats that) - not yet
-			# implemented; see [[or_return_mapper_err_arm_leak]] memory.
+			# recv_var's own payload is already safely aliased into err_bind_
+			# name by this point - see or_throw_with_mapper's own identical
+			# comment for why releasing it here (rather than leaving it to a
+			# later epilogue) is correct, not premature.
+			if cfg.rc_leaves( receiver.type ):
+				self._internal_decref_var( recv_var )
+			# mapped_call is lowered EAGERLY here, as its own statement,
+			# rather than embedded unevaluated inside `return Result.Err(...)`
+			# the way this used to work - a real `return` is unconditional
+			# once lowered (_lower_stmt(ret) below never falls back through
+			# to here), so err_bind_var/mapper_var's own release has to
+			# happen BETWEEN the mapper call and the return, exactly like
+			# or_throw_with_mapper's own err_thunk (see its own comment on
+			# why eager evaluation, not embedding, is required once anything
+			# needs to run between the call and the terminal statement).
+			mapper_callable_type_resolved = self.lowering._type_resolver._callable_type_of( mapper_var.type )
+			if mapper_callable_type_resolved is None and isinstance( mapper_var.type, ClosureType ):
+				mapper_callable_type_resolved = mapper_var.type
 			mapped_call = ast.Call(
 				func = self.lowering._synth_name( mapper_var.stem, node ), args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
 			)
 			ast.copy_location( mapped_call, node )
+			mapped_value = self._lower_expr( mapped_call, mapper_callable_type_resolved.return_type )
+			if error_cls.is_rc():
+				# fully consumed as the mapper's own argument - see or_throw_
+				# with_mapper's own identical comment
+				self._internal_decref_var( err_bind_var )
+			if mapper_var.type.is_rc():
+				# a real capturing closure - see or_throw_with_mapper's own
+				# identical comment on why its own epilogue entry needs an
+				# explicit release here rather than relying on the (absent,
+				# for this confined branch) automatic one
+				self._internal_decref_var( mapper_var )
+			# mapped_value is an already-lowered Operand, not an AST
+			# expression, so it can't be re-embedded into a fresh ast.Call
+			# the way the original (pre-eager) code did - bound into its own
+			# hidden local instead, purely so `Result.Err(...)` below has a
+			# real Name to reference. Ownership transfers into the union via
+			# an ordinary retain-on-construction + this local's own release
+			# (see ok_thunk's own comment on why THAT extraction instead
+			# needed an explicit manually_decreffed() move - Result.Err(...)'s
+			# construction here, unlike a bare `w = <expr>` assignment, does
+			# its own internal retain, so mapped_var's normal scope-exit
+			# release balances against mapped_call's own single returned
+			# reference correctly, without any double-release).
+			mapped_var = self._declare_hidden_local( f'__or_mapped_{unique}', mapped_value.type, node )
+			mapped_is_alias = self.lowering._is_aliasing_expr( mapped_call, mapped_value )
+			self._cfg_assign( mapped_var, mapped_value, is_alias = mapped_is_alias, node = node )
 			wrap_err = ast.Call(
 				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
-				args = [ mapped_call ], keywords = [],
+				args = [ self.lowering._synth_name( mapped_var.stem, node ) ], keywords = [],
 			)
 			ast.copy_location( wrap_err, node ); ast.copy_location( wrap_err.func, node ); ast.copy_location( wrap_err.func.value, node )
 			ret = ast.Return( value = wrap_err )
@@ -15412,6 +15446,54 @@ class FunctionLowering:
 			)
 			ast.copy_location( extract, node )
 			self._lower_stmt( extract )
+			# recv_var's own reference (from whatever originally constructed
+			# it, e.g. Result.Ok(...)'s own retain-on-construction) is never
+			# released on this arm otherwise - only err_thunk's own mirror
+			# release does that, for its own leg. ok_var's own retain just
+			# above is a SEPARATE, fresh reference - releasing recv_var here
+			# doesn't touch it - see err_thunk's own identical comment on why
+			# this is correct, not premature, once the payload's already
+			# safely copied out.
+			if cfg.rc_leaves( receiver.type ):
+				self._internal_decref_var( recv_var )
+			# mapper_var was retained ONCE, unconditionally, before this
+			# branch even started (see this function's own prefix, mirroring
+			# or_throw_with_mapper's identical setup) - its release therefore
+			# has to happen on BOTH arms, not just err_thunk's. Confirmed via
+			# a real repro that this does NOT happen automatically even
+			# though the caller's own eventual `return Result.Ok(w)` is an
+			# ordinary, unconfined real return (mapper_var's own binding
+			# stayed live, unreleased, all the way to program exit) - unlike
+			# or_throw_with_mapper, whose OWN err_thunk is a goto/raise that
+			# never merges back into this branch at all, or_return's err_
+			# thunk EXPLICITLY moves mapper_var out (see its own comment)
+			# before its real `return` - merge_if's own OWNED-vs-MOVED
+			# reconciliation across the two arms apparently doesn't leave
+			# the merged-back state in a form the later real return's walk
+			# still recognizes as needing release either way, so this arm
+			# needs the same explicit release, not just a differently-timed
+			# one.
+			if mapper_var.type.is_rc():
+				self._internal_decref_var( mapper_var )
+			# ok_var is handed out below as this whole expression's OWN
+			# return value (to whatever ordinary assignment/expression
+			# context invoked or_return(mapper)) - a move, not a borrow: the
+			# caller receives ok_var's single retained reference as-is (no
+			# fresh retain of its own - confirmed via emitted C, matching
+			# every other "expression already returns an owned value"
+			# convention in this file). Without cancelling ok_var's own
+			# pending epilogue here, its scope-exit release fires ANYWAY on
+			# top of whatever the caller does with the value it was handed -
+			# a real double-release, confirmed via a real repro
+			# (`w: Elem = probe(...).or_return(to_stop); return Result.Ok(w)`
+			# on the Ok path, e's own refcount left one short at the far end
+			# of a chain of two retains and two releases). manually_decreffed()
+			# alone (no preceding decref - see its own docstring, "mirrors
+			# move()'s own cancellation exactly") is exactly the move-out
+			# primitive this needs: cancel the binding, emit nothing else,
+			# same as move()'s own call-argument transfer.
+			for instr in self._cfg.manually_decreffed( ok_var ):
+				self._emit( instr )
 			ok_var_holder.append( ok_var )
 			return False
 
@@ -15647,6 +15729,20 @@ class FunctionLowering:
 			)
 			ast.copy_location( extract, node )
 			self._lower_stmt( extract )
+			# see or_return_with_mapper's own identical ok_thunk comment: recv_
+			# var's own reference (from whatever originally constructed it) is
+			# never released on this arm otherwise - only err_thunk's own
+			# mirror release does that, for its own leg.
+			if cfg.rc_leaves( receiver.type ):
+				self._internal_decref_var( recv_var )
+			# this expression hands ok_var's single retained reference
+			# straight to its own caller (no fresh retain of its own) - move
+			# it out via manually_decreffed() (no preceding decref, per its
+			# own "mirrors move()'s own cancellation exactly") so ok_var's
+			# own scope-exit release doesn't ALSO fire on top of whatever the
+			# caller does with it.
+			for instr in self._cfg.manually_decreffed( ok_var ):
+				self._emit( instr )
 			ok_var_holder.append( ok_var )
 			return False
 
