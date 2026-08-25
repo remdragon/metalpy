@@ -1,12 +1,22 @@
 # Follow-ups from the `_sequence_iter` simplification attempt (2026-08-25)
 
-**UPDATE 2 (same day, worktree `simplify-sequence-iter`): item 1 is FULLY
-ROOT-CAUSED, both halves.** Two independent, real compiler bugs were found
-and fixed; a third, narrower gap remains (understood, contained, not a
-crash/corruption risk) that blocks `_sequence_iter` itself from being
-rewritten with `match` for one specific conformer (`set[T]`). Both fixes
-are committed on their own (`_sequence_iter` itself is NOT changed - still
-the pre-existing if/is_err()/unwrap() shape on master).
+**UPDATE 3 (worktree `sequence-iter-match-retry`): the `set[T]` gap is now
+ALSO fixed (real root-cause fix, not just decline) - but a THIRD,
+DIFFERENT reentrancy variant was found, affecting homogeneous variadic
+tuples (`tuple[T,...]`) with an RC element. `_sequence_iter` STILL cannot
+be safely rewritten with `match` yet - see "UPDATE 3" further down for
+full detail.** Three independent, real compiler bugs found and fixed so
+far this multi-session effort; a fourth (tuple-specific) remains, not yet
+root-caused. All landed fixes are committed on their own -
+`_sequence_iter` itself is UNCHANGED on master, still the pre-existing
+if/is_err()/unwrap() shape.
+
+**UPDATE 2 (worktree `simplify-sequence-iter`, superseded by UPDATE 3
+above): item 1 was believed fully root-caused at the time** - two
+independent real compiler bugs found and fixed, with a third gap believed
+narrow and specific to `set[T]`. UPDATE 3 found and fixed that `set[T]`
+gap for real, but ALSO found the tuple variant, so `_sequence_iter`
+remains unchanged. Kept below for the historical trail.
 
 **Fix 1 - crash (`mpy_types.py`):** `Name.__deepcopy__` now returns `self`.
 Every `Name`/`Type`/`Function`/`Variable`/`Module`/... instance is an
@@ -57,55 +67,119 @@ test_match_subject_reentrant_generic_class_resolution_declines_safely`.
 
 **Both fixes verified: full suite clean on clang/MSVC/gcc(WSL), 1831/1831.**
 
-**Remaining, narrower gap (NOT fixed, understood and contained):** fix 2's
-"decline" safety net avoids the crash/type-corruption, but for the ONE
-conformer that's ITSELF a generic class (`set[T]` - `str`/`bytearray`/
-`memoryview`/`mmap` are all concrete, non-generic classes and are NOT
-affected), declining the reservation means `set[T]`'s own match-subject
-field falls back to the ORIGINAL (pre-`dc409bb`) unpromoted plain-local
-shape - reintroducing THAT bug's own uninitialized-read risk, but ONLY
-for `set[T]` specifically, and ONLY for an RC-typed element (`set[str]`,
-`set[SomeRCClass]` - `set[i32]` and other scalar elements are unaffected,
-since a scalar promoted-vs-plain-local distinction is moot, no decref
-involved). Confirmed via a real MSVC compile of `set[str]` iteration:
-`warning C4700: uninitialized local variable '__match_subj_0' used` /
-`'item' used` (both real, matching the ORIGINAL bug's own signature) -
-does NOT crash in current testing (matches the original bug's own
-"works by luck" pattern, not proof of soundness). **This is why
-`_sequence_iter` itself was NOT rewritten with `match` this session** -
-doing so would ship a known (if narrow) regression for `set[str]`/
-`set[<RCClass>]` iteration specifically. Fixing this properly needs the
-SAME "chicken-and-egg" reentrancy problem `ensure_resolved`'s own
-docstring already flags as deliberately unsolved (retry the reservation
-once the enclosing class's REAL monomorphization finishes, rather than
-declining permanently) - a bigger, riskier pipeline-ordering change,
-matching the scope PLAN_GENERATORS.md's own "Why NOT fixed in this
-session" sections describe for the sibling bugs. Left as a known, safe-
-to-defer gap: `set[T]` iteration already has this risk on CURRENT master
-too (via `_sequence_iter`'s own EXISTING if/is_err()/unwrap() shape,
-which never promotes anything, so it never had this fix's protection to
-begin with) - fix 2 does not make `set[T]` iteration any WORSE than it
-already is today, it just doesn't make it any BETTER either.
+**UPDATE 3 (same day, worktree `sequence-iter-match-retry`): the `set[T]`
+gap above is FIXED too** (a real root-cause fix, not just a wider
+"decline" net) - **but a THIRD, DIFFERENT reentrancy variant was found
+along the way, affecting variadic tuples specifically, still unfixed.**
+Net result: `_sequence_iter` STILL cannot be safely rewritten with
+`match` this session, but the reason has narrowed from "`set[T]`" to
+"homogeneous variadic tuples (`tuple[T,...]`) with an RC element".
 
-**Where to pick this up (if solving `set[T]` iteration's residual gap, or
-finally rewriting `_sequence_iter` with `match`):**
-1. Confirm the gap is real and current: `METALPY_CC=msvc python mpy.py
-   <a set[str]-iterating program>.py` and check for `C4700` on
-   `__match_subj_N`/the arm binding.
-2. The real fix is making `ensure_resolved`'s reentrant path RETRY rather
-   than permanently accept the degraded answer - e.g. `_reserve_
-   generator_match_subject_fields`/`_reserve_generator_match_binding_
-   fields` could be re-run (or their result invalidated and recomputed)
-   once the enclosing class's monomorphization actually completes, rather
-   than running once, early, and being trusted forever. Needs real design
-   work on WHEN/HOW to detect "the enclosing class just finished" and
-   trigger a recompute - not attempted here.
-3. Once that's solid, rewrite `_sequence_iter` with `match` (the ORIGINAL
-   ask) and verify with a full multi-conformer suite run (str +
-   bytearray + memoryview + mmap + `set[T]` with an RC element, all
-   iterated in one compiled program) on all 3 compilers, plus explicit
-   MSVC C4700/gcc -Wmaybe-uninitialized warning-absence checks for
-   `set[<RCClass>]` specifically (the one shape that was actually broken).
+**Fix 3 (`type_resolver.py`, on top of fix 2):** rather than accepting
+`ensure_resolved`'s degraded-to-abstract answer and declining, `_type_of_
+expr`'s `ast.Call` branch now DETECTS the degradation (`ensure_resolved`
+returning literally `original_specialization.base`, discarding its own
+args - the exact identity signature of the documented reentrancy
+fallback) and RECOVERS the real answer directly: looks up the same
+method on the abstract base via `Specialization.names` (a cheap
+passthrough to `.base.names` - mpy_types.py - that NEVER itself triggers
+`Monomorphizer.monomorphize_class`, so it can't retrigger the reentrancy),
+then substitutes its declared return type against the ORIGINAL
+Specialization's own real args via `Monomorphizer.substitute_type_params`
+- the same primitive real monomorphization already uses. Critically, the
+recovered `Function` is used ONLY to read its declared return type -
+never scheduled/resolved as its own compile unit (an earlier attempt at
+this fix let the abstract template Function flow into the method's own
+shared "resolve and schedule" handling and crashed elsewhere with
+`AttributeError: 'Specialization' object has no attribute 'node'`,
+confirming that path assumes a real per-instantiation Function, not the
+shared abstract template).
+
+**Verified TWICE, for two different symptoms of the SAME underlying
+degradation:**
+1. The reentrant-class repro from fix 2 (`Wrap[T]`/`Wrap[i32]`+`Wrap[i64]`)
+   now compiles AND RUNS correctly (previously: real compile errors).
+2. `set[str]` iteration under `_sequence_iter` rewritten with `match`: the
+   `C4700` warnings on `__match_subj_0`/`item` are GONE (previously
+   present, matching the original pre-`dc409bb` bug's own signature).
+
+**Caught a real regression while building this, now fixed too:** the
+first version of fix 3 ALWAYS preferred the new Specialization-based
+lookup, even for the ORDINARY (non-reentrant) case - which broke
+`list[T].__iter__`'s own return type (a real synthesized `Generator`
+backing class, which the fast lookup can't produce, since it deliberately
+never calls `ensure_generator_synthesized`). Fixed by trying the
+ORIGINAL `ensure_resolved` path FIRST, as before, and only falling back
+to the recovery path when the degradation is actually detected
+(`receiver_type is original_receiver_spec.base`) - confirmed via the full
+suite going from a real failure (`for loop requires an IteratorProtocol
+[T] or Iterable[T] conformer, got Generator[...]` on `enumerate`/`list`)
+back to clean.
+
+**Fix 3 alone (WITHOUT rewriting `_sequence_iter`) is verified clean on
+clang/MSVC/gcc(WSL), 1852/1852** (only the one pre-existing, unrelated
+`deflate_test.py` zlib-hex-parsing failure, confirmed via `git stash` to
+already exist on unmodified master, nothing to do with this work).
+**Committed on its own, real, independently-useful fix, same posture as
+fixes 1/2.**
+
+**THE NEW, THIRD GAP - homogeneous variadic tuples specifically:**
+rewriting `_sequence_iter` with `match` ON TOP of fix 3 and running the
+full suite surfaced a NEW MSVC-only crash (`STATUS_BREAKPOINT`, an
+`/RTC1` uninitialized-variable trap - NOT the same code path fix 3
+covers) in `emitter_c_test.py`'s `VariadicTupleTests.test_programs_
+compile_and_run`. Isolated to a standalone repro (`tuple[Elem,...]`
+iteration, `Elem` an RC class) - real `C4700` on `item`/`__match_subj_0`
+under MSVC even with fix 3 applied, confirming fix 3's own reentrancy-
+detection does NOT cover this shape. Root cause not yet traced, but the
+mechanism is clearly DIFFERENT from fixes 1-3: a variadic tuple's own
+`Sequence[T]` conformance is synthesized directly by `tuple_storage.py`'s
+`TupleStorage._declare_sequence_conformance` (building the backing
+`RCClass` itself, not through the ordinary `class Foo[T]:`/
+`Specialization` ordinary-generic-class machinery fix 3's own detection
+is keyed on) - `receiver_type` for a tuple's own `seq: S` parameter
+inside `_sequence_iter` may never even BE a `Specialization` the way
+`Wrap[i32]`/`set[i32]` are, meaning fix 3's `original_receiver_spec is
+not None` guard likely just never fires for tuples at all, leaving them
+on the OLD, still-buggy `ensure_resolved`-only path. **`_sequence_iter`
+still cannot be safely rewritten with `match` until this is understood
+and fixed too** - reverted again this session, `_sequence_iter` itself
+is UNCHANGED on master (still the if/is_err()/unwrap() shape).
+
+**Where to pick this up:**
+1. Minimal standalone repro (already have one, non-generic-class-based):
+   ```python
+   import compiler
+   class Elem: pass
+   def main() -> i32:
+   	xs: list[Elem] = list[Elem]()
+   	xs.append( Elem() ); xs.append( Elem() ); xs.append( Elem() )
+   	t: tuple[Elem, ...] = tuple( xs )
+   	count: i32 = 0
+   	with compiler.wrap_arithmetic:
+   		for e in t:
+   			count += 1
+   	return count - 3  # 0 on success
+   ```
+   Compile with `METALPY_CC=msvc python mpy.py <file>.py` against a
+   `_sequence_iter` rewritten with `match` (temporarily, for testing) and
+   check for `C4700` on `item`/`__match_subj_N`.
+2. Trace `tuple_storage.py`'s `_declare_sequence_conformance`/`tuple_type_
+   for` to find what TYPE OBJECT actually flows as `seq`'s own parameter
+   type inside `_sequence_iter[T,S]` when `S` = a variadic tuple's own
+   backing class - is it a `Specialization` at all, or something else
+   (`TupleType` directly, a plain already-built `RCClass` with no
+   Specialization wrapper)? This determines whether fix 3's existing
+   detection can be extended to cover it, or whether tuples need their
+   OWN separate reentrancy-recovery path.
+3. Once understood, extend (or add a sibling to) fix 3's detection in
+   `_type_of_expr`'s `ast.Call` branch, verify with the SAME standalone
+   repro plus the full `VariadicTupleTests` suite on all 3 compilers,
+   THEN attempt the `_sequence_iter` `match` rewrite again with a full
+   multi-conformer verification pass (str + bytearray + memoryview + mmap
+   + `set[<RCClass>]` + `tuple[<RCClass>,...]`, all iterated in one
+   compiled program, explicit MSVC `C4700`/gcc `-Wmaybe-uninitialized`
+   absence checks for every RC-element case).
 
 ## 2. Subscript-sugar (`x[i]`) not recognized by match-subject-type resolution
 
