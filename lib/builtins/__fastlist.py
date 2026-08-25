@@ -360,9 +360,17 @@ class FastList[T]( Sized ):
 	# call's RC-typed result gets its own automatic release as an "owned"
 	# value, on top of the explicit decref right here - a real double-free.
 	def _release_element( self, slot: Ptr[None] ) -> None:
+		# compiler.decref(...) reached unconditionally in both branches -
+		# see UnsafeList._release_element (__list.py) for the full
+		# reasoning: compiler.is_rc(T) is storage-layout-only (is_rc_
+		# POINTER), not "does T need RC bookkeeping" - a @union T whose RC
+		# leaf is a plain RCClass takes the value-typed branch below for
+		# STORAGE yet still owns a real reference that must be released.
 		if compiler.is_rc( T ):
 			handle_slot: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], slot )
 			compiler.decref( compiler.cast( T, handle_slot[0] ))
+		else:
+			compiler.decref( compiler.cast( Ptr[T], slot )[0] )
 
 	def __del__( self ) -> None:
 		# Decref all RC elements before RawFastList frees the buffer - see
