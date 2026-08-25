@@ -406,6 +406,11 @@ class Lowering:
 	def lower_global( self, var: Variable ) -> list[ir.Instruction]:
 		return FunctionLowering( self, None ).run_global( var )
 
+	def lower_deinit_epilogue( self, ordered_vars: list[Variable] ) -> list[ir.Instruction]:
+		''' emitter_c.py's own __metalpy_deinit() synthesis - see
+		FunctionLowering.run_deinit_epilogue's docstring. '''
+		return FunctionLowering( self, None ).run_deinit_epilogue( ordered_vars )
+
 	# --- __init__ construction (RCCLASS ATTRIBUTE LIFETIME.md) -----------------
 
 	def _init_fallibility( self, fn: Function ) -> bool:
@@ -1912,15 +1917,23 @@ class TryHandler:
 	leaves this clause covers (each may itself be one class, or several
 	for a tuple-of-classes clause). `bind` is the real, already-registered
 	local Variable `as NAME` binds (see _stmt_Try), or None for a bare
-	`except T:`. `matched` is set True the moment ANY leaf of this
-	handler is actually selected by a .or_throw()/raise dispatch anywhere
-	inside this handler's own try body (see
-	_dispatch_leaves_against_try_stack) - an except clause left False once
-	its own try's body is fully lowered is unreachable dead code, a
-	compile error (_stmt_Try's own check, after the try_stack pop). '''
+	`except T:` - kept None in that case since nothing user-visible should
+	depend on it existing. `raise_value_var` is ALWAYS a real registered
+	local of the same type `bind` would have (equal to `bind` itself when
+	the clause wrote `as NAME`, otherwise a hidden compiler-synthesized
+	one) - a bare `raise` inside this handler's own body re-raises
+	whatever this holds (see FunctionLowering._active_raise_values), so
+	every handler needs one regardless of whether the user named it.
+	`matched` is set True the moment ANY leaf of this handler is actually
+	selected by a .or_throw()/raise dispatch anywhere inside this
+	handler's own try body (see _dispatch_leaves_against_try_stack) - an
+	except clause left False once its own try's body is fully lowered is
+	unreachable dead code, a compile error (_stmt_Try's own check, after
+	the try_stack pop). '''
 	leaves: list[Type]
 	label: str
 	bind: 'Variable|None'
+	raise_value_var: 'Variable'
 	matched: bool = False
 
 
@@ -2045,6 +2058,12 @@ class FunctionLowering:
 		# first (_dispatch_leaves_against_try_stack), so a nested try's own
 		# uncovered leaf DOES fall back to an outer try's own handlers.
 		self._try_stack: list[TryContext] = []
+		# bare `raise` (re-raise) - the innermost enclosing except handler's
+		# own TryHandler.raise_value_var, pushed right before that handler's
+		# body is lowered and popped right after (_stmt_Try) - a nested
+		# handler's own push shadows its enclosing handler's for the
+		# duration of ITS body, matching real re-raise scoping.
+		self._active_raise_values: list[Variable] = []
 		# PLAN_INLINE.md - @inline call splicing (see _lower_inline_call).
 		# _inlining_stack (by id(target)) is the reentrancy guard - a target
 		# already present means direct or mutual @inline recursion, rejected
@@ -2464,6 +2483,33 @@ class FunctionLowering:
 				for t in reversed( self._pending_temps ):
 					self._emit( ir.DeleteTemp( temp = t ))
 
+		return self._instructions
+
+	def run_deinit_epilogue( self, ordered_vars: list[Variable] ) -> list[ir.Instruction]:
+		''' debug-mode automatic leak-check epilogue (emitter_c.py's
+		__metalpy_deinit()) - decrefs every global RC variable in
+		`ordered_vars` (caller passes them in REVERSE dependency order,
+		undoing __metalpy_init()'s own construction order - see emitter_c.
+		py's own __metalpy_deinit assembly). Same "real CFGState, fn=None"
+		shape as run_global above (no self/construction of its own), reused
+		here purely for its union-aware decref() (cfg.py's
+		_tag_gated_refcount_instructions) - a nested-union RC global needs
+		the identical runtime tag dispatch an ordinary local/field release
+		already gets, not a hand-rolled duplicate. '''
+		bool_cls = self.lowering.discovery.get_intrinsics()['bool']
+		self._cfg = cfg.CFGState(
+			None,
+			bool_type = bool_cls,
+			new_temp = self._new_temp,
+			new_label = self._new_label,
+			union_storage = self.lowering._union_storage.get,
+			resolve_type = self.lowering._ensure_resolved,
+		)
+		for var in ordered_vars:
+			for instr in self._cfg.decref( var.type, var ):
+				self._emit( instr )
+		for t in reversed( self._pending_temps ):
+			self._emit( ir.DeleteTemp( temp = t ))
 		return self._instructions
 
 	def _emit_epilogue( self, fn: Function, none_type: Type, body_start: int ) -> None:
@@ -5165,20 +5211,32 @@ class FunctionLowering:
 					)
 				leaves.append( resolved )
 			label = self._new_label( 'except' )
+			bind_type = leaves[0] if len( leaves ) == 1 else self.lowering.discovery._get_or_create_union( leaves )
+			if len( leaves ) > 1:
+				self.lowering._union_storage.get( bind_type ) # ensures bind_type's own tag/data storage exists by emit time
+			self.lowering.schedule( bind_type )
+			fn = self._current_fn
 			bind_var: Variable|None = None
 			if h.name is not None:
-				bind_type = leaves[0] if len( leaves ) == 1 else self.lowering.discovery._get_or_create_union( leaves )
-				if len( leaves ) > 1:
-					self.lowering._union_storage.get( bind_type ) # ensures bind_type's own tag/data storage exists by emit time
-				self.lowering.schedule( bind_type )
 				needs_uid_suffix = self._mark_fresh_local_declared( h.name )
-				fn = self._current_fn
 				bind_var = Variable(
 					stem = h.name, qualname = f'{fn.qualname}.{h.name}', file = fn.file, line = getattr( h, 'lineno', None ),
 					type = bind_type, needs_uid_suffix = needs_uid_suffix,
 				)
 				fn.add_name( bind_var.stem, bind_var )
-			handlers.append( TryHandler( leaves = leaves, label = label, bind = bind_var ))
+				raise_value_var = bind_var
+			else:
+				# hidden, not user-facing - only bare `raise` inside this
+				# handler's own body ever references it (_stmt_Raise), so no
+				# uid-suffix collision tracking is needed: `label` is already
+				# unique per handler within this function (_new_label).
+				hidden_stem = f'__except_value_{label}'
+				raise_value_var = Variable(
+					stem = hidden_stem, qualname = f'{fn.qualname}.{hidden_stem}', file = fn.file, line = getattr( h, 'lineno', None ),
+					type = bind_type, needs_uid_suffix = False,
+				)
+				fn.add_name( raise_value_var.stem, raise_value_var )
+			handlers.append( TryHandler( leaves = leaves, label = label, bind = bind_var, raise_value_var = raise_value_var ))
 		end_label = self._new_label( 'try_end' )
 
 		if node.finalbody and self._body_contains_return( node.finalbody ):
@@ -5253,22 +5311,28 @@ class FunctionLowering:
 			self._instructions = []
 			self._cfg.enter_branch( entry_snapshot.stack_depth )
 			try:
-				if handler.bind is not None:
-					# the emitter unconditionally assigns handler.bind's own
-					# payload before jumping to this exact label (ir.OrThrow's/
-					# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
-					# definitely assigned on entry here, same reasoning
-					# _declare_hidden_local/@inline's own parameter binding
-					# already rely on mark_live() for (see its own docstring).
-					# Must happen INSIDE this branch-confined window (moved
-					# from the old unconfined lowering) so restore() below
-					# correctly tears it back down before the next handler.
-					self._cfg.mark_live( handler.bind.stem )
-				for stmt in h.body:
-					try:
-						self._lower_stmt( stmt )
-					except CompileError:
-						continue
+				# the emitter unconditionally assigns handler.raise_value_var's
+				# own payload before jumping to this exact label (ir.OrThrow's/
+				# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
+				# definitely assigned on entry here, same reasoning
+				# _declare_hidden_local/@inline's own parameter binding
+				# already rely on mark_live() for (see its own docstring).
+				# Must happen INSIDE this branch-confined window (moved
+				# from the old unconfined lowering) so restore() below
+				# correctly tears it back down before the next handler. Always
+				# runs now (not just `as NAME` clauses) - a hidden hand-off
+				# variable exists for every handler, see TryHandler's own
+				# docstring.
+				self._cfg.mark_live( handler.raise_value_var.stem )
+				self._active_raise_values.append( handler.raise_value_var )
+				try:
+					for stmt in h.body:
+						try:
+							self._lower_stmt( stmt )
+						except CompileError:
+							continue
+				finally:
+					self._active_raise_values.pop()
 			finally:
 				self._cfg.exit_branch()
 			handler_captured = self._instructions
@@ -5383,23 +5447,37 @@ class FunctionLowering:
 		emitted shape, which reuses _emit_leaf_dispatch_case's existing
 		uncovered-leaf machinery in emitter_c.py.
 
-		No bare `raise` (Python's own re-raise - there is no ambient
-		current exception in this design) and no `raise ... from ...`
-		(exception chaining); same generator-body rejection as .or_throw()
-		(_lower_or_throw). The @inline-splice-prelude case is now
-		generalized (ir.Raise.inline_exit) rather than rejected - same
-		carve-out _emit_or_throw's own uncovered-leaf branch applies, and
-		same PLAN_RETURN_INFERENCE.md sentinel-state rejection as
-		_consume_checked_result/_emit_or_throw's own. '''
-		if node.exc is None:
-			self.lowering.discovery.fail(
-				f'bare raise (re-raise) is not supported - there is no ambient current exception in this design, '
-				f'raise the specific error value instead: {ast.unparse(node)}', node,
-			)
+		Bare `raise` (re-raise) inside an except handler re-raises THAT
+		handler's own currently-caught value - reuses this exact same
+		dispatch/emission path, just sourced from
+		FunctionLowering._active_raise_values's top (the innermost
+		enclosing handler's own TryHandler.raise_value_var) instead of a
+		freshly-lowered node.exc; a plain `ast.Name` read off it, fed back
+		through the ordinary expression pipeline (_lower_expr), gets the
+		usual aliasing incref for free - see TryHandler's own docstring.
+		Because _stmt_Try pops the current try's own TryContext off
+		_try_stack before lowering ANY handler body, this dispatch can
+		never re-match a sibling except of the SAME try - it only ever
+		walks OUTER enclosing tries, same as it would for a real re-raised
+		value written out by hand. Bare `raise` with nothing on
+		_active_raise_values (not textually inside a handler's own body at
+		all) is a compile error. No `raise ... from ...` (exception
+		chaining). Same generator-body rejection as .or_throw()
+		(_lower_or_throw) - see its own comment for why. The @inline-
+		splice-prelude case is now generalized (ir.Raise.inline_exit)
+		rather than rejected - same carve-out _emit_or_throw's own
+		uncovered-leaf branch applies, and same PLAN_RETURN_INFERENCE.md
+		sentinel-state rejection as _consume_checked_result/
+		_emit_or_throw's own. '''
 		if node.cause is not None:
 			self.lowering.discovery.fail( f'raise ... from ... (exception chaining) is not supported: {ast.unparse(node)}', node )
 		if self._current_fn is not None and self._current_fn.is_generator_next:
-			self.lowering.discovery.fail( f'raise is not supported inside a generator body yet: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail(
+				f'raise is not supported inside a generator body yet - a generator body is a state machine re-entered '
+				f'across multiple send()/next() resumptions, not called once like an ordinary function, so what an '
+				f'uncaught error should even mean here (fail just this resumption vs. end the generator entirely) '
+				f'needs real design first: {ast.unparse(node)}', node,
+			)
 		if self._in_inline_splice_prelude and not self._inline_scope_vars:
 			self.lowering.discovery.fail(
 				f'@inline: or_throw()/raise that could propagate an error is not yet supported before the '
@@ -5407,7 +5485,17 @@ class FunctionLowering:
 				node,
 			)
 
-		value = self._lower_expr( node.exc, None )
+		if node.exc is None:
+			if not self._active_raise_values:
+				self.lowering.discovery.fail(
+					f'bare raise (re-raise) is only valid inside an except handler: {ast.unparse(node)}', node,
+				)
+			raise_var = self._active_raise_values[-1]
+			exc_node = ast.Name( id = raise_var.stem, ctx = ast.Load())
+			ast.fix_missing_locations( ast.copy_location( exc_node, node ))
+		else:
+			exc_node = node.exc
+		value = self._lower_expr( exc_node, None )
 		error_cls = value.type
 		if error_cls is None or not isinstance( error_cls, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			self.lowering.discovery.fail(
@@ -14843,7 +14931,10 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'or_throw() takes no arguments: {ast.unparse(node)}', node )
 		if self._current_fn is not None and self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
-				f'or_throw() is not supported inside a generator body yet: {ast.unparse(node)}', node,
+				f'or_throw() is not supported inside a generator body yet - a generator body is a state machine '
+				f're-entered across multiple send()/next() resumptions, not called once like an ordinary function, so '
+				f'what an uncaught error should even mean here (fail just this resumption vs. end the generator '
+				f'entirely) needs real design first: {ast.unparse(node)}', node,
 			)
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		if shape is None:
@@ -14876,7 +14967,7 @@ class FunctionLowering:
 					break
 			if handler is not None:
 				handler.matched = True
-				dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.bind, label = handler.label ))
+				dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.raise_value_var, label = handler.label ))
 				covered_leaves.append( leaf )
 		return dispatch, covered_leaves
 

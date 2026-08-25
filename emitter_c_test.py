@@ -234,12 +234,13 @@ def main() -> None:
 		lf = self.compiler.functions[0]
 		# 'main' is reserved by discovery.py for the entry point - bare,
 		# never module-qualified (discovery.py:994-995) - and compiles to
-		# C's own real `int main(int argc, char** argv)` (argc/argv so
-		# sys.argv, lib/sys.py, can capture the real ones - see emit_c's
-		# own entry-point prelude), not `void`
+		# the private __metalpy_user_main( void ) helper (emit_c() itself
+		# synthesizes the real C `int main(argc, argv)` separately, which
+		# calls this, __metalpy_init(), and the debug-mode leak-check
+		# epilogue - see _USER_MAIN_C_NAME's own comment)
 		self.assertEqual( lf.function.qualname, 'main' )
 		src = emitter_c.emit_function( lf )
-		self.assertIn( 'int main( int argc, char** argv ) {', src )
+		self.assertIn( 'int __metalpy_user_main( void ) {', src )
 		self.assertIn( 'return 0;', src )
 		self.assertTrue( src.rstrip().endswith( '}' ))
 
@@ -250,7 +251,7 @@ def main() -> None:
 ''' )
 		lf = self.compiler.functions[0]
 		src = emitter_c.emit_function( lf, prototype_only = True )
-		self.assertEqual( src, 'int main( int argc, char** argv );' )
+		self.assertEqual( src, 'int __metalpy_user_main( void );' )
 
 	def test_non_entry_function_keeps_its_declared_return_type( self ) -> None:
 		self._run( '''
@@ -273,8 +274,10 @@ def main() -> None:
 ''' )
 		src = emitter_c.emit_c( self.compiler )
 		self.assertIn( 'ObjectHeader', src )
-		self.assertIn( 'int main( int argc, char** argv );', src ) # forward-declared
-		self.assertIn( 'int main( int argc, char** argv ) {', src ) # then defined
+		self.assertIn( 'int __metalpy_user_main( void );', src ) # forward-declared
+		self.assertIn( 'int __metalpy_user_main( void ) {', src ) # then defined
+		self.assertIn( 'static int __metalpy_main( int argc, char** argv ) {', src ) # canonical orchestrator
+		self.assertIn( 'int main( int argc, char** argv ) {\n\treturn __metalpy_main( argc, argv );\n}', src ) # trivial real entry point
 
 # shared by every test needing Result[T,E] - matches lowering_test.py's own
 # _RESULT_FIXTURE (self-contained snippet, not a real lib/ import -
@@ -4854,13 +4857,20 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 		# not only the Windows-specific console-codepage setup (this is
 		# exactly the condition PLAN_GLOBAL_INIT.md's own implementation
 		# changed from `_is_entry_point(...) and active_target['os'] ==
-		# 'windows'` to a plain `_is_entry_point(...)`)
+		# 'windows'` to a plain `_is_entry_point(...)`). __metalpy_main
+		# (emit_c()'s own synthesized canonical orchestrator, called by both
+		# the real main() forwarder and mainCRTStartup) calls __metalpy_init()
+		# BEFORE calling __metalpy_user_main() - not necessarily the literal
+		# first statement any more (an unused-argc/argv marker or the
+		# sys.argv capture may precede it), so check ordering, not line
+		# position.
 		for target in ( self._WINDOWS_TARGET, self._LINUX_TARGET ):
 			with self.subTest( target = target[ 'os' ] ):
 				src = self._compiled_source( target )
-				main_start = src.index( 'int main( int argc, char** argv ) {' )
-				second_line = src[ main_start: ].split( '\n', 2 )[1]
-				self.assertIn( '__metalpy_init();', second_line )
+				main_start = src.index( 'static int __metalpy_main( int argc, char** argv ) {' )
+				end = src.index( '\n}', main_start )
+				body = src[ main_start : end ]
+				self.assertLess( body.index( '__metalpy_init();' ), body.index( '__metalpy_user_main();' ))
 
 	def test_metalpy_init_calls_every_non_trivial_globals_init_function( self ) -> None:
 		src = self._compiled_source( self._LINUX_TARGET )
