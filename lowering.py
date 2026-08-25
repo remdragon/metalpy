@@ -16852,12 +16852,14 @@ class FunctionLowering:
 		# picks it up instead of hard-rejecting; force_result routes this
 		# call through the SAME dest-producing machinery `want_result=True`
 		# already uses below, purely so there's something to auto-consume.
-		# v1 gap: this only covers calls that reach this shared tail (plain
-		# Function targets, and Overload targets that resolve to one
-		# unambiguous implementation without needing _lower_conditional_
-		# dispatch) - a bare-statement call to a GENERIC Result-returning
-		# function/method, or one requiring runtime union-argument dispatch,
-		# isn't covered
+		# every other call-emission tail that can produce a Result from a
+		# bare statement carries this same force_result copy:
+		# _emit_generic_call (generic calls), _infer_return_only_type_params_
+		# inline (return-only-inferred generics), _lower_inline_call/
+		# _finish_call_result (@inline splices), and _lower_conditional_
+		# dispatch/_lower_union_receiver_call (runtime union-argument/
+		# receiver dispatch) - so this is no longer a gap, just this tail's
+		# own copy of a check every call-lowering path shares
 		force_result = not want_result and cfg.is_result_type( target.return_type )
 
 		if want_result or force_result:
@@ -16975,17 +16977,24 @@ class FunctionLowering:
 		for branch in branches:
 			self.lowering._ensure_resolved( branch.function )
 
-		dest = self._new_temp( expected_type or default.return_type ) if want_result else None
+		# case 1 of the general auto-or_throw() rule (_finish_call_result,
+		# below) - this is its own call-emission tail (union-argument
+		# runtime dispatch), never reaches _lower_call's shared tail, so
+		# needs the identical force_result copy _emit_generic_call already
+		# carries for the generic-call tail
+		force_result = not want_result and cfg.is_result_type( default.return_type )
+		produce_result = want_result or force_result
+		dest = self._new_temp( expected_type or default.return_type ) if produce_result else None
 		end_label = self._new_label( 'dispatch_end' )
 		for branch in branches:
 			next_label = self._new_label( 'dispatch_next' )
 			self._lower_dispatch_tests( node, branch.function, branch.conditions, args, kwargs, next_label )
-			self._emit_dispatch_call( branch.function, receiver, args, kwargs, dest, want_result )
+			self._emit_dispatch_call( branch.function, receiver, args, kwargs, dest, produce_result )
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = next_label ))
-		self._emit_dispatch_call( default, receiver, args, kwargs, dest, want_result )
+		self._emit_dispatch_call( default, receiver, args, kwargs, dest, produce_result )
 		self._emit( ir.Label( name = end_label ))
-		return dest
+		return self._finish_call_result( node, dest, want_result )
 
 	def _lower_dispatch_tests( self, node: ast.AST, target: Function, conditions: list[tuple[Parameter,Type]], args: list[ir.Operand], kwargs: dict[str,ir.Operand], next_label: str ) -> None:
 		# a branch's conditions are ANDed together - emits one Cmp +
@@ -17103,7 +17112,12 @@ class FunctionLowering:
 
 		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( dispatch.union )
 		bool_cls = self.lowering.discovery.find_name( 'bool', node )
-		dest = self._new_temp( expected_type or reference.return_type ) if want_result else None
+		# case 1 of the general auto-or_throw() rule - same force_result
+		# copy _lower_conditional_dispatch's own identical fix needs, for
+		# the union-RECEIVER dispatch tail
+		force_result = not want_result and cfg.is_result_type( reference.return_type )
+		produce_result = want_result or force_result
+		dest = self._new_temp( expected_type or reference.return_type ) if produce_result else None
 		end_label = self._new_label( 'recv_dispatch_end' )
 		for i, ( member, fn ) in enumerate( dispatch.per_leaf ):
 			is_last = i == len( dispatch.per_leaf ) - 1
@@ -17170,7 +17184,7 @@ class FunctionLowering:
 				self._emit( ir.Jump( target = end_label ))
 				self._emit( ir.Label( name = next_label ))
 		self._emit( ir.Label( name = end_label ))
-		return dest
+		return self._finish_call_result( node, dest, want_result )
 
 	def _corresponding_leaf_param( self, reference: Function, fn: Function, ref_param: Parameter ) -> Parameter:
 		''' the Parameter in `fn`'s own parameter list at the SAME POSITION
