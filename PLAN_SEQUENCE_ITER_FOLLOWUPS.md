@@ -1,138 +1,111 @@
 # Follow-ups from the `_sequence_iter` simplification attempt (2026-08-25)
 
-**UPDATE (same day, worktree `simplify-sequence-iter`): item 1's CRASH half
-is FIXED** — `mpy_types.py`'s `Name` gained a `__deepcopy__` returning `self`
-(every `Name`/`Type`/`Function`/`Variable`/`Module`/... instance is an
+**UPDATE 2 (same day, worktree `simplify-sequence-iter`): item 1 is FULLY
+ROOT-CAUSED, both halves.** Two independent, real compiler bugs were found
+and fixed; a third, narrower gap remains (understood, contained, not a
+crash/corruption risk) that blocks `_sequence_iter` itself from being
+rewritten with `match` for one specific conformer (`set[T]`). Both fixes
+are committed on their own (`_sequence_iter` itself is NOT changed - still
+the pre-existing if/is_err()/unwrap() shape on master).
+
+**Fix 1 - crash (`mpy_types.py`):** `Name.__deepcopy__` now returns `self`.
+Every `Name`/`Type`/`Function`/`Variable`/`Module`/... instance is an
 identity-based singleton; `copy.deepcopy` reaching one via a cached
-AST-node tag like `resolved_callee` must never clone it). Root-caused via
-`compiler.py`'s crashing `unit not in self.tagged_unions` check: two
-non-identical-but-qualname-identical `Result[i32,IndexError]` TaggedUnion
-objects were being compared, traced to `type_resolver.py`'s
-`_apply_live_flag_guards` deep-copying a promoted field's own assignment
-statement (to build its "first assignment" branch) and sweeping along a
-`resolved_callee`-tagged `Function` reference, cloning its entire
-return-type graph — including supposedly-singleton scalars. **Full suite
-verified clean on clang/MSVC/gcc(WSL), 1830/1830, with 2 new regression
-tests in `mpy_types_test.py`'s `NameDeepcopyIdentityTestCase`.** Ready to
-commit/merge on its own — real, independently-justified fix, unrelated to
-whether `_sequence_iter` itself ever gets rewritten.
+AST-node tag (`resolved_callee`) must never clone it. Root-caused via a
+crashing `unit not in self.tagged_unions` membership check in
+`compiler.py`: two non-identical-but-qualname-identical
+`Result[i32,IndexError]` `TaggedUnion` objects were being compared,
+triggering infinite recursion in dataclass `__eq__`. Traced to
+`type_resolver.py`'s `_apply_live_flag_guards` deep-copying a promoted
+field's own assignment statement (to build its "first assignment" branch)
+and sweeping along a `resolved_callee`-tagged `Function` reference,
+cloning its entire return-type graph - including supposedly-singleton
+scalars. 2 new regression tests in `mpy_types_test.py`'s
+`NameDeepcopyIdentityTestCase`.
 
-**Item 1's TYPE-LEAK half is NOT fixed** — seeSection "Remaining work"
-below: even with the crash gone, `_sequence_iter` rewritten with `match`
-still produces a real compile error (`expected Result[set.T,...], got
-Result[i32,...]`) when multiple `Sequence[T]` conformers share it in one
-program. This is a SEPARATE bug from the crash (different symptom, not
-yet root-caused) — do not assume the deepcopy fix resolves it.
+**Fix 2 - type leak / reentrancy (`type_resolver.py`):** root cause is
+`Monomorphizer.ensure_resolved`'s OWN documented, deliberate reentrancy
+fallback (`monomorphize.py` - the exact same case its own comment already
+describes for `dict[i32,i32].__iter__` needing `self`'s type while
+`dict[i32,i32]` is itself still mid-build): when a generic CLASS's own
+method body (e.g. `class Wrap[T](Sequence[T]): def __iter__(self): return
+helper(self)`) is being monomorphized, and resolving that method's return
+type requires resolving `helper[i32,Wrap[i32]]`'s own match-subject type,
+that happens WHILE `Wrap[i32]` is still mid-build - hitting
+`ensure_resolved`'s documented fallback to the ABSTRACT, still-TypeVar'd
+`Wrap` template. `_reserve_generator_match_subject_fields`/`_reserve_
+generator_match_binding_fields` had no way to detect this degraded answer
+and PERMANENTLY baked `Wrap.T` (the class template's own internal
+TypeVar) into the promoted field's declared type - wrong for every
+instantiation, not just the one that happened to trigger the reentrant
+path first (confirmed via a real repro: mixing `Wrap[i32]`/`Wrap[i64]` in
+one program produced `expected Result[Wrap.T,...], got
+Result[i32,...]`/`Result[i64,...]` real compile errors). **Fix:** both
+reservation methods now call the already-existing `Monomorphizer.
+_is_concrete()` check on the resolved subject type and DECLINE the
+reservation (same safe fallback as the pre-existing `subject_type is
+None` case) whenever it still contains a free TypeVar. Also added, as a
+smaller, independently-useful improvement found along the way: `_type_of_
+expr`'s `ast.Call` branch (used by the SAME reservation pass) didn't
+substitute a generic receiver's own concrete type args into a found
+method's declared return type at all (`receiver.__getitem__(...)`'s
+return type came back with the RECEIVER CLASS's own unsubstituted
+TypeVar, not the receiver's concrete arg) - fixed via `Monomorphizer.
+substitute_type_params`, the same primitive monomorphization itself uses.
+1 new regression test in `emitter_c_test.py`'s `GeneratorFunctionTests.
+test_match_subject_reentrant_generic_class_resolution_declines_safely`.
 
-Two more independent pieces of work were scoped but not implemented this
-session (item 3, and item 1's remaining type-leak half). Start from a
-fresh `EnterWorktree` per CLAUDE.md.
+**Both fixes verified: full suite clean on clang/MSVC/gcc(WSL), 1831/1831.**
 
-## 1. Cross-instantiation match-subject promotion cache bug (crash FIXED; a type-leak variant remains)
+**Remaining, narrower gap (NOT fixed, understood and contained):** fix 2's
+"decline" safety net avoids the crash/type-corruption, but for the ONE
+conformer that's ITSELF a generic class (`set[T]` - `str`/`bytearray`/
+`memoryview`/`mmap` are all concrete, non-generic classes and are NOT
+affected), declining the reservation means `set[T]`'s own match-subject
+field falls back to the ORIGINAL (pre-`dc409bb`) unpromoted plain-local
+shape - reintroducing THAT bug's own uninitialized-read risk, but ONLY
+for `set[T]` specifically, and ONLY for an RC-typed element (`set[str]`,
+`set[SomeRCClass]` - `set[i32]` and other scalar elements are unaffected,
+since a scalar promoted-vs-plain-local distinction is moot, no decref
+involved). Confirmed via a real MSVC compile of `set[str]` iteration:
+`warning C4700: uninitialized local variable '__match_subj_0' used` /
+`'item' used` (both real, matching the ORIGINAL bug's own signature) -
+does NOT crash in current testing (matches the original bug's own
+"works by luck" pattern, not proof of soundness). **This is why
+`_sequence_iter` itself was NOT rewritten with `match` this session** -
+doing so would ship a known (if narrow) regression for `set[str]`/
+`set[<RCClass>]` iteration specifically. Fixing this properly needs the
+SAME "chicken-and-egg" reentrancy problem `ensure_resolved`'s own
+docstring already flags as deliberately unsolved (retry the reservation
+once the enclosing class's REAL monomorphization finishes, rather than
+declining permanently) - a bigger, riskier pipeline-ordering change,
+matching the scope PLAN_GENERATORS.md's own "Why NOT fixed in this
+session" sections describe for the sibling bugs. Left as a known, safe-
+to-defer gap: `set[T]` iteration already has this risk on CURRENT master
+too (via `_sequence_iter`'s own EXISTING if/is_err()/unwrap() shape,
+which never promotes anything, so it never had this fix's protection to
+begin with) - fix 2 does not make `set[T]` iteration any WORSE than it
+already is today, it just doesn't make it any BETTER either.
 
-**Symptom:** compiling a program that iterates two DIFFERENT concrete
-`Sequence[T]` conformers (e.g. `str` and `set[i32]`) through the SAME
-shared generic generator function, where that generator's body contains a
-`match <non-Name subject>: ... case Ok(x): yield x ...`, produces bogus
-type errors like:
-
-```
-expected builtins.Result[builtins.set.T,builtins.IndexError],
-got builtins.Result[intrinsics.i32,builtins.IndexError]
-```
-
-**Root cause (confirmed via repro, not yet traced to an exact line):**
-`type_resolver.py`'s `_reserve_generator_match_subject_fields` (added by
-the match-subject-yield-resume fix, commit `dc409bb`, merged) tags the
-match statement's own AST node with a promoted field name + resolved
-type, so `visit_Match` can build `self.<stem> = ...` instead of an
-unpromoted, RC-unsafe plain local. This machinery was implicitly assumed
-to run fresh per Function instantiation. It does NOT, for a shared
-generic generator body: the type resolved for the FIRST monomorphized
-instantiation that reaches this pass appears to stick (via node mutation
-or some other cache) for every LATER instantiation sharing the same
-underlying `fn.node` — even though `ensure_generator_synthesized` is
-supposed to be `id(fn)`-memoized per PLAN_GENERATORS.md, `fn.node` itself
-may be a SHARED object across Specializations of one generic function,
-not deep-copied per instantiation.
-
-**Reproduced with BOTH spellings** — `match seq[i]:` (subscript sugar)
-AND `match seq.__getitem__(i):` (explicit call) — ruling out the
-subscript-sugar gap (see item 2 below) as the cause. Confirmed via:
-
-```python
-# lib/builtins/__init__.py, _sequence_iter, rewritten to:
-def _sequence_iter[T, S: Sequence[T]]( seq: S ) -> Generator[T, StopIteration]:
-	i: usize = 0
-	while True:
-		match seq.__getitem__( i ):
-			case Result.Ok( item ):
-				yield item
-			case _:
-				return
-		with compiler.panic_arithmetic( '...' ):
-			i += 1
-```
-
-then running the full test suite (`python tests.py`) — since `_sequence_iter`
-is shared by `str`/`bytearray`/`memoryview`/`mmap`/`set[T]`'s own
-`__iter__`, multiple concrete instantiations compile in the same program
-and collide.
-
-**Why this matters beyond `_sequence_iter`:** ANY shared generic generator
-function with a non-Name match subject crossing a yield, instantiated more
-than once in the same compiled program, is affected — not hypothetical,
-just never previously exercised (existing tests for the subject/binding
-promotion fixes used single-instantiation repros).
-
-**Attempts to build a minimal standalone repro for the TYPE-LEAK half (all
-tried this session, none reproduce it in isolation — the bug needs
-`_sequence_iter`'s REAL shape, not just "some generic generator, called
-twice"):**
-- A free generic helper `probe[T](v,ok)` called AS the match subject
-  inside `gen[T](v)` — does NOT reproduce the type-leak; instead hits a
-  SEPARATE, already-documented, deliberately-scoped limitation
-  (PLAN_GENERATORS.md Phase 7 point 5: a generic generator body calling
-  ANOTHER generic function via its own type param fails cleanly with
-  "cannot build a generator zero-placeholder value for ...probe.T"). Not
-  useful as a repro — it's a different, known gap.
-- A generic class `Box[T]` with its own method `probe(self,ok)->Result[T,
-  IndexError]`, called as the match subject inside `gen[T](b: Box[T])`,
-  instantiated as `Box[i32]` and `Box[i64]` in one program — compiles AND
-  RUNS CLEANLY (exit 0), both before and after the deepcopy fix. Does NOT
-  reproduce either half of the bug (not the old crash, not the type-leak).
-- Conclusion: whatever's special about `_sequence_iter`'s real trigger
-  isn't just "shared generic generator + match-with-yield + 2
-  instantiations" — something about ITS SPECIFIC shape matters (two type
-  params `[T, S: Sequence[T]]` with a PROTOCOL-parametrized bound, not
-  just one plain `[T]`; and/or being reached via ANOTHER generic class's
-  OWN method body — `set[T].__iter__` calling `_sequence_iter(self)` — as
-  opposed to a plain top-level call). The "set.T" in the real error
-  (`expected ...Result[builtins.set.T,...]`) strongly suggests the leak
-  specifically involves `set[T].__iter__`'s OWN still-abstract `T`
-  bleeding into `_sequence_iter`'s reservation, not just any generic T.
-  **Next attempt should start from a generic CLASS whose method calls a
-  SEPARATE generic function bound via a protocol-parametrized TypeVar
-  (`S: Sequence[T]`)** — closer to matching `_sequence_iter`'s exact
-  parametrization — rather than a single-type-param free function.
-
-**Where to start:**
-1. Build the closer repro above (generic class method → separate function
-   with a protocol-parametrized TypeVar bound) to isolate the type-leak
-   half from `_sequence_iter` itself while still reproducing it.
-2. Trace whether `fn.node` is actually the SAME Python object across two
-   Specializations of one generic Function (`id(fn1.node) == id(fn2.node)`)
-   — if so, that's the structural root cause, and either (a) `_reserve_
-   generator_match_subject_fields`/`_reserve_generator_match_binding_fields`
-   need their own per-instantiation state (not stored on the shared node),
-   or (b) `fn.node` needs to be deep-copied per instantiation earlier in
-   the pipeline (bigger, riskier change).
-3. Check whether `_build_generator_backing_class`/`extra_locals` threading
-   has the same issue independently of the AST tagging.
-4. Follow the existing methodology for this subsystem (small, incremental,
-   real-compile-verified steps, all 3 compilers) — see
-   `[[match_subject_yield_resume_uninitialized_read_confirmed]]` memory
-   entry for how the sibling bugs were actually root-caused and fixed.
+**Where to pick this up (if solving `set[T]` iteration's residual gap, or
+finally rewriting `_sequence_iter` with `match`):**
+1. Confirm the gap is real and current: `METALPY_CC=msvc python mpy.py
+   <a set[str]-iterating program>.py` and check for `C4700` on
+   `__match_subj_N`/the arm binding.
+2. The real fix is making `ensure_resolved`'s reentrant path RETRY rather
+   than permanently accept the degraded answer - e.g. `_reserve_
+   generator_match_subject_fields`/`_reserve_generator_match_binding_
+   fields` could be re-run (or their result invalidated and recomputed)
+   once the enclosing class's monomorphization actually completes, rather
+   than running once, early, and being trusted forever. Needs real design
+   work on WHEN/HOW to detect "the enclosing class just finished" and
+   trigger a recompute - not attempted here.
+3. Once that's solid, rewrite `_sequence_iter` with `match` (the ORIGINAL
+   ask) and verify with a full multi-conformer suite run (str +
+   bytearray + memoryview + mmap + `set[T]` with an RC element, all
+   iterated in one compiled program) on all 3 compilers, plus explicit
+   MSVC C4700/gcc -Wmaybe-uninitialized warning-absence checks for
+   `set[<RCClass>]` specifically (the one shape that was actually broken).
 
 ## 2. Subscript-sugar (`x[i]`) not recognized by match-subject-type resolution
 
@@ -170,23 +143,26 @@ worktree `simplify-sequence-iter`'s reflog if not GC'd):
   excluded — a still-generic body should never resolve a promoted
   field's type off its own abstract Protocol bound).
 
-This point-fix alone is safe and independently useful, but was reverted
-because it doesn't fix item 1 — a program using `[i]` sugar as a match
-subject in a shared generic generator would still hit the cross-
-instantiation cache bug once fixed to resolve at all. **Land item 1
-first** (or verify the specific target generator is never multiply-
-instantiated) before reintroducing this.
+This point-fix alone is safe and independently useful (str/bytearray/
+memoryview/mmap are all concrete, non-generic classes, unaffected by
+item 1's remaining `set[T]` gap), but was reverted alongside item 1's own
+fixes to keep this session's landed changes minimal and independently
+reviewable. **Safe to reapply now** (item 1's crash/type-corruption
+halves are fixed) for any NON-generic-class `Sequence[T]` conformer using
+`[i]` sugar as a match subject; still gated on item 1's remaining `set[T]`
+gap (see above) if the target conformer is itself a generic class.
 
 ## Recommended path when picking this up
 
-Fix item 1 first (it's the load-bearing correctness bug — affects code
-that ALREADY compiles today, silently). Once verified fixed (multi-
-instantiation repro clean on all 3 compilers), item 2 can be reapplied
-on top to let `_sequence_iter` (and anything else) use `match subject[i]:`
-sugar safely. Only then attempt the original ask: rewrite
-`_sequence_iter` using `match`, verified across the SAME multi-conformer
-scenario that exposed item 1 (str + set[T] + bytearray + memoryview +
-mmap all iterated in one compiled test program).
+Item 1's crash and type-leak halves are fixed and merged-ready (see the
+top-of-file update). What's left: (a) reapply item 2's subscript-sugar
+fix if wanted, (b) solve item 1's remaining `set[T]`-specific reentrancy
+gap (see item 1's own "Where to pick this up" above) if `_sequence_iter`
+itself is to be rewritten with `match`, verified across the SAME multi-
+conformer scenario that originally exposed item 1 (str + set[T] +
+bytearray + memoryview + mmap all iterated in one compiled test program,
+including a `set[<RCClass>]` case specifically, with explicit MSVC
+C4700/gcc -Wmaybe-uninitialized checks).
 
 ## 3. `Result.or_return(mapper)` — ergonomic error-type conversion (separate feature, unrelated to items 1/2)
 

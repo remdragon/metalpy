@@ -22179,6 +22179,75 @@ def main() -> i32:
 ''' ),
 		])
 
+	def test_match_subject_reentrant_generic_class_resolution_declines_safely( self ) -> None:
+		''' Regression for a THIRD distinct bug in the same family as
+		test_match_on_fallible_call_subject_crossing_a_yield/test_match_
+		arm_binding_crossing_a_yield above, found while simplifying
+		lib/builtins/__init__.py's _sequence_iter to use match (not
+		merged - see PLAN_SEQUENCE_ITER_FOLLOWUPS.md). A generic generator
+		function's own match-subject/binding promotion (_reserve_
+		generator_match_subject_fields/_reserve_generator_match_binding_
+		fields) can be reached REENTRANTLY: when the generator is called
+		from within ANOTHER generic CLASS's own method body (e.g. `class
+		Wrap[T](Sequence[T]): def __iter__(self): return helper(self)`),
+		resolving that method's own return type as part of monomorphizing
+		Wrap[i32] itself needs to resolve helper[i32,Wrap[i32]]'s own
+		match subject type WHILE Wrap[i32] is still mid-build - hitting
+		Monomorphizer.ensure_resolved's own documented, deliberate
+		reentrancy fallback (the identical dict[i32,i32].__iter__
+		situation its own comment already describes) to the class's
+		ABSTRACT, still-TypeVar'd shape. Before this fix, that degraded
+		type was accepted and promoted anyway, permanently baking
+		`Wrap.T` (the class template's own internal TypeVar) into the
+		promoted field's declared type - wrong for every instantiation,
+		not just the one that happened to trigger the reentrant path
+		first (confirmed via a real repro: mixing Wrap[i32] and Wrap[i64]
+		in one program produced "expected Result[Wrap.T,...], got
+		Result[intrinsics.i32,...]" real compile errors, not a crash).
+		Fixed by declining the reservation (Monomorphizer._is_concrete
+		check) whenever the resolved subject type still contains a free
+		TypeVar - safely falls back to today's pre-existing plain-local
+		behavior for exactly this narrow reentrant shape, same posture as
+		the pre-existing "subject_type is None" decline just above it. '''
+		self.assert_programs_run([
+			( 'match_subject_reentrant_generic_class_resolution', '''
+class Wrap[T]:
+	v: T
+	def probe( self, ok: bool ) -> Result[T, IndexError]:
+		if ok:
+			return Result.Ok( self.v )
+		return Result.Err( IndexError() )
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return helper( self )
+
+def helper[T]( w: Wrap[T] ) -> Generator[T, StopIteration]:
+	i: usize = 0
+	while True:
+		match w.probe( i == 0 ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
+		with compiler.panic_arithmetic( 'not possible' ):
+			i += 1
+
+def main() -> i32:
+	w1: Wrap[i32] = Wrap[i32]( v = 42 )
+	g1 = w1.__iter__()
+	v1: i32 = g1.__next__().unwrap( 'g1' )
+	if v1 != 42:
+		return 1
+
+	w2: Wrap[i64] = Wrap[i64]( v = i64( 43 ))
+	g2 = w2.__iter__()
+	v2: i64 = g2.__next__().unwrap( 'g2' )
+	if v2 != i64( 43 ):
+		return 2
+
+	return 0
+''' ),
+		])
+
 	def test_match_same_name_reuse_narrowing_inside_generator( self ) -> None:
 		''' Regression for a DISTINCT bug from test_match_on_fallible_call_
 		subject_crossing_a_yield/test_match_arm_binding_crossing_a_yield
