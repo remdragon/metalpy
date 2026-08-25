@@ -70,35 +70,13 @@ class IteratorProtocol[T]:
 # yield - see type_resolver.py's ensure_generator_synthesized - so a
 # conformer always needs a thin delegating method like this one regardless).
 def _sequence_iter[T, S: Sequence[T]]( seq: S ) -> Generator[T, StopIteration]:
-	# if/is_err()/unwrap(), NOT match - a match statement whose Ok-arm
-	# contains the yield triggers a real, confirmed MSVC-only compiler bug:
-	# the generator state-machine split at the yield duplicates the match
-	# subject's own "release Err payload if any" RC-cleanup code onto the
-	# POST-YIELD RESUME path, where the match subject was never (re-)
-	# assigned in that call frame at all - a genuine uninitialized-memory
-	# read (confirmed via generated-C inspection: __match_subj_0 read at
-	# the merge point directly reachable from the resume label, which
-	# skips the match statement's own subject assignment entirely).
-	# Reported for a real fix (compiler bug, not a library one) - this
-	# rewrite just avoids the trigger shape here.
-	# __getitem__ called TWICE per element (once to check, once to unwrap)
-	# rather than held in one local: a bare (unannotated) generator local
-	# is rejected outright ("must be declared with an explicit type
-	# annotation"), and an EXPLICIT `r: Result[T,IndexError]` annotation
-	# hits the separate, pre-existing "generic generator body referencing
-	# its own type param T outside a parameter/return annotation" Phase 3
-	# rejection (PLAN_GENERATORS.md) - confirmed by real repros of both.
-	# __getitem__ is a plain, side-effect-free lookup for every conformer
-	# this ships with (list/slice/tuple), so the extra call is a minor
-	# inefficiency, not a correctness concern.
 	i: usize = 0
 	while True:
-		# not seq[i]: subscript sugar on a fallible __getitem__ auto-
-		# propagates Err via the enclosing function's OWN return type,
-		# which doesn't match here (IndexError vs StopIteration)
-		if seq.__getitem__( i ).is_err():
-			return
-		yield seq.__getitem__( i ).unwrap( 'Sequence.__getitem__: was just checked is_ok() above' )
+		match seq.__getitem__( i ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
 		with compiler.wrap_arithmetic:
 			i += 1
 

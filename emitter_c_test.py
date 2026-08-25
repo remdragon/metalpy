@@ -22379,6 +22379,67 @@ def main() -> i32:
 ''' ),
 		])
 
+	def test_match_subject_reentrant_generic_class_resolution_overloaded_getitem( self ) -> None:
+		''' SIBLING of test_match_subject_reentrant_generic_class_
+		resolution_rc_element_no_uninitialized_warning above, found while
+		attempting to rewrite lib/builtins/__init__.py's own
+		_sequence_iter with match (see PLAN_SEQUENCE_ITER_FOLLOWUPS.md):
+		the reentrancy-recovery fix's own abstract-method lookup only
+		handled a plain (non-overloaded) Function - VariadicTuple[T]
+		(tuple[T,...]'s real backing class)'s own __getitem__ is
+		@overload'd (usize index / slice), so `names.get('__getitem__')`
+		returns an Overload group, not a Function, and the recovery
+		silently declined to fire at all for it - confirmed via a real
+		repro (tuple[Elem,...] iteration, Elem an RCClass) still showing
+		the original C4700 on __match_subj_0/item under MSVC even with
+		the plain-Function recovery in place. Fixed by resolving the
+		Overload group's own winning leaf first (via the SAME arg-
+		matching _overload_call_return_type this method already uses for
+		an ordinary Overload-typed call target), then substituting THAT
+		leaf's return type exactly like the plain-Function case. '''
+		self.assert_programs_run([
+			( 'match_subject_reentrant_generic_class_overloaded_getitem', '''
+class Elem:
+	pass
+
+class Box[T]( Sequence[T] ):
+	v: T
+	@overload
+	def __getitem__( self, i: usize ) -> Result[T, IndexError]:
+		if i == 0:
+			return Result.Ok( self.v )
+		return Result.Err( IndexError() )
+	@overload
+	def __getitem__( self, s: slice ) -> Box[T]:
+		return self
+	def __iter__( self ) -> Generator[T, StopIteration]:
+		return helper( self )
+
+def helper[T]( b: Box[T] ) -> Generator[T, StopIteration]:
+	i: usize = 0
+	while True:
+		match b.__getitem__( i ):
+			case Result.Ok( item ):
+				yield item
+			case _:
+				return
+		with compiler.panic_arithmetic( 'not possible' ):
+			i += 1
+
+def main() -> i32:
+	e: Elem = Elem()
+	before: usize = compiler.refcount( e )
+	b: Box[Elem] = Box[Elem]( v = e )
+	g = b.__iter__()
+	got: Elem = g.__next__().unwrap( 'g' )
+	if compiler.refcount( got ) == before:
+		return 1
+	if not g.__next__().is_err():
+		return 2
+	return 0
+''' ),
+		])
+
 	def test_match_same_name_reuse_narrowing_inside_generator( self ) -> None:
 		''' Regression for a DISTINCT bug from test_match_on_fallible_call_
 		subject_crossing_a_yield/test_match_arm_binding_crossing_a_yield

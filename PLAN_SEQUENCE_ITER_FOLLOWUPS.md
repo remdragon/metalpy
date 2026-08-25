@@ -1,5 +1,35 @@
 # Follow-ups from the `_sequence_iter` simplification attempt (2026-08-25)
 
+**DONE (worktree `sequence-iter-tuple-fix`): `_sequence_iter` is now
+rewritten with `match`, all four compiler bugs found along the way are
+fixed, full suite clean 1856/1856 on clang/MSVC/gcc(WSL).** The tuple gap
+UPDATE 3 (below) left open turned out to be one more instance of the SAME
+reentrancy-recovery mechanism, just missing @overload support: `type_
+resolver.py`'s recovery path only handled a plain (non-overloaded)
+`Function` found via `Specialization.names` - `VariadicTuple[T]`
+(`tuple[T,...]`'s real backing class)'s own `__getitem__` is `@overload`'d
+(usize/slice), so the lookup returned an `Overload` group instead and the
+recovery silently declined. Fixed by resolving the `Overload` group's own
+winning leaf first (via the SAME arg-matching `_overload_call_return_
+type` this method already used elsewhere for an ordinary `Overload`-typed
+call target), then substituting that leaf's return type exactly like the
+plain-`Function` case. Confirmed fixed via a real MSVC compile of
+`tuple[Elem,...]` iteration (`Elem` an RCClass) - the `C4700` warnings on
+`__match_subj_0`/`item` are gone, matching the earlier `set[str]` fix.
+Verified with the SAME multi-conformer full-suite run this doc's own
+"Where to pick this up" sections called for (str + bytes + bytearray +
+memoryview + mmap + `set[T]` + `tuple[T,...]`, all exercised by the
+existing suite, plus 4 dedicated regression tests). +2 new regression
+tests this round (on top of the 2 already added for the `set[T]` fix),
+`GeneratorFunctionTests.test_match_subject_reentrant_generic_class_
+resolution_overloaded_getitem`.
+
+The rest of this document is the historical trail (three prior updates,
+four compiler bugs total) kept for reference - see git history/blame on
+`lib/builtins/__init__.py`'s `_sequence_iter` and `type_resolver.py`'s
+`_type_of_expr`/`_reserve_generator_match_subject_fields`/`_reserve_
+generator_match_binding_fields` for the actual landed code.
+
 **UPDATE 3 (worktree `sequence-iter-match-retry`): the `set[T]` gap is now
 ALSO fixed (real root-cause fix, not just decline) - but a THIRD,
 DIFFERENT reentrancy variant was found, affecting homogeneous variadic

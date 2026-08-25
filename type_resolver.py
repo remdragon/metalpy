@@ -5090,15 +5090,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					if original_receiver_spec is not None and receiver_type is original_receiver_spec.base:
 						names = original_receiver_spec.names
 						abstract_target = names.get( node.func.attr ) if isinstance( names, dict ) else None
+						# an @overload'd method (e.g. VariadicTuple[T].
+						# __getitem__'s usize/slice leaves) isn't itself a
+						# Function - resolve to the WINNING leaf's own
+						# (still abstract) return type first, via the same
+						# arg-matching _overload_call_return_type already
+						# uses elsewhere in this method, THEN substitute
+						# that, same as the plain-Function case below.
+						# Confirmed necessary via a real repro: tuple[T,...]
+						# iteration (an @overload'd __getitem__) still hit
+						# the original uninitialized-read bug even after
+						# the plain-Function-only recovery above, since
+						# this branch never fired for it at all.
+						abstract_return_type: 'Type|None' = None
 						if isinstance( abstract_target, Function ):
 							if abstract_target.resolve is not None:
 								abstract_target.resolve()
+							abstract_return_type = abstract_target.return_type
+						elif isinstance( abstract_target, Overload ):
+							abstract_return_type = self._overload_call_return_type( abstract_target, node )
+						if abstract_return_type is not None:
 							owner_type_params = getattr( original_receiver_spec.base, 'type_params', None )
 							if owner_type_params:
 								return self.resolver.monomorphizer.substitute_type_params(
-									abstract_target.return_type, owner_type_params, original_receiver_spec.args,
+									abstract_return_type, owner_type_params, original_receiver_spec.args,
 								)
-							return abstract_target.return_type
+							return abstract_return_type
 					names = getattr( receiver_type, 'names', None )
 					if isinstance( names, dict ):
 						target = names.get( node.func.attr )
