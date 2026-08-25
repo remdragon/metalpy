@@ -270,6 +270,48 @@ C4700/gcc -Wmaybe-uninitialized checks).
 
 ## 3. `Result.or_return(mapper)` — ergonomic error-type conversion (separate feature, unrelated to items 1/2)
 
+**DONE (worktree `or-return-callable`): implemented, landed.** `.or_return(mapper)`
+now works for plain functions, non-capturing lambdas (including written
+inline), and real capturing closures - all reusing `_stmt_Return`'s own
+widening/defer/errdefer/inline-splice machinery per the design below, built
+as a real conditional branch via `_lower_binary_branch` (the same primitive
+`_lower_for_over_iterator` already uses) rather than a new IR shape.
+Explicitly rejected inside a generator body (untested interaction with the
+separate yield/resume desugaring pass - a clear compile error, not a risked
+silent miscompile).
+
+Building this surfaced and fixed TWO real, pre-existing, generator-
+unrelated compiler bugs (both general, not specific to this feature):
+1. `Lowering._emit`'s central "every Call/Allocate dest is fresh" hook
+   never included `ir.CallIndirect` - a closure/indirect call's own result
+   passed into anything that retains it (e.g. `Result.Err(closure())`)
+   leaked one reference every time. Reproduces with a bare `return Result.
+   Err(closure())`, nothing to do with `or_return`. Regression test:
+   `or_return_rc_test.py`'s `ClosureCallResultFreshTempTests`.
+2. `_stmt_Return`'s inline-unwind path (forced whenever the topmost
+   pending epilogue entry is confined to the current branch/loop) never
+   populated `self._return_value_var` before replaying pending errdefer
+   entries, so errdefer's own `is_err()` check silently read a stale
+   value and never fired - no crash, no error, just skipped cleanup.
+   Reproduces with ordinary hand-written code (an RC-typed local declared
+   in the same branch as an errdefer-covered early return); `or_return
+   (mapper)`'s own error-payload extraction is itself always such a
+   confined entry, so this fired on EVERY `or_return(mapper)` +
+   `errdefer` combination. Fixed gated on an actual live errdefer entry
+   (an earlier, unconditional version broke many unrelated functions with
+   "variable has incomplete type void"). Regression test: `or_return_rc_
+   test.py`'s `ErrdeferPastConfinedLocalTests`.
+
+Both fixes verified by temporarily reverting each and confirming its own
+new regression test catches it. Full suite clean on clang/MSVC/gcc(WSL),
+1865/1865. 6 new tests in `or_return_mapper_test.py`, 2 more in
+`or_return_rc_test.py`.
+
+The rest of this section is the original design writeup, kept for
+reference - the landed implementation follows it closely (same AST-
+synthesis-as-a-real-branch approach), with the two bug fixes above as the
+only real surprises along the way.
+
 **Motivation:** `.or_return()` always propagates the receiver's OWN Err
 payload unchanged. Converting one error type into another today requires
 a full `match`/`if is_err()` block, which is noisy for a common need

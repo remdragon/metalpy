@@ -408,5 +408,122 @@ class FreshConstructionIntoInferredUnionTests( RealCompileMixin, unittest.TestCa
 		self.assert_programs_run([ ( 'fresh_construction_into_inferred_union', _FRESH_CONSTRUCTION_INTO_INFERRED_UNION ) ])
 
 
+# --- ir.CallIndirect result never registered as fresh_temp (Lowering._emit) -
+#
+# A closure/indirect call's own result (ir.CallIndirect.dest), unlike an
+# ordinary ir.Call's, was never auto-registered via cfg.fresh_temp() -
+# Lowering._emit's central "every Call/Allocate dest is a fresh, owned
+# value" hook only checked isinstance(instr, (ir.Call, ir.Allocate)). A
+# closure call's own result therefore never got queued for the ordinary
+# end-of-statement decref, so passing it directly into anything that ALSO
+# retains it (a union-wrap constructor, an RC field assignment, ...)
+# permanently leaked one reference - reproduces with a bare
+# `return Result.Err(some_capturing_closure())`, nothing to do with
+# or_return()/generators at all. Found while building or_return(mapper)
+# (see or_return_mapper_test.py), fixed by adding ir.CallIndirect
+# alongside ir.Call/ir.Allocate in that same central check.
+
+_CLOSURE_CALL_RESULT_CONSUMED_BY_UNION_CONSTRUCTOR = '''
+class Elem:
+	pass
+
+def inner( prefix: str ) -> Result[i32, Elem]:
+	def make_elem() -> Elem:
+		x: usize = len( prefix )
+		return Elem()
+
+	return Result.Err( make_elem() )
+
+def main() -> i32:
+	match inner( 'context' ):
+		case Result.Ok( _ ):
+			return 1
+		case Result.Err( _ ):
+			pass
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class ClosureCallResultFreshTempTests( RealCompileMixin, unittest.TestCase ):
+	def test_closure_call_result_consumed_by_union_constructor_not_leaked( self ) -> None:
+		# relies on the debug build's own automatic leak-check report
+		# (_split_off_leak_report), not assert_programs_run's plain exit-
+		# code check - the whole point is that the ORIGINAL bug (a real,
+		# confirmed leak) never crashed or produced a wrong exit code, only
+		# a permanently-live object at teardown.
+		import emitter_c
+		compiler = self._compile_source( _CLOSURE_CALL_RESULT_CONSUMED_BY_UNION_CONSTRUCTOR )
+		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), None )
+		self.assertEqual( result.returncode, 0, f'exe exited {result.returncode} (stderr: {result.stderr})' )
+		self._split_off_leak_report( result.stdout )
+
+
+# --- errdefer silently not firing when forced onto the inline-unwind
+# return path (lowering.py's _stmt_Return) -----------------------------------
+#
+# _stmt_Return's own inline-unwind branch (taken whenever current_epilogue_
+# label() returns None because the topmost pending epilogue entry is
+# confined to the current branch/loop - e.g. an ordinary RC-typed local
+# declared earlier in the SAME if-branch as an errdefer-covered early
+# return) never populated self._return_value_var before replaying pending
+# defer/errdefer entries. errdefer's own is_err() check unconditionally
+# reads self._return_value_var as its receiver - with it stale/never
+# assigned, the check silently evaluated the WRONG value, so errdefer never
+# fired on this path: no crash, no compile error, just silently skipped
+# cleanup. The shared-label return path (used whenever nothing forces the
+# inline one) was never affected - this is why simple errdefer+return
+# code (no confined local in the way) always worked correctly. Found while
+# building or_return(mapper) (or_return_mapper_test.py's own error-payload
+# extraction is itself always such a confined entry, so this fired on
+# EVERY errdefer+or_return(mapper) combination) - fixed by populating
+# self._return_value_var in the inline branch too, gated on an actual live
+# errdefer entry being present (an earlier, unconditional version of this
+# fix broke many unrelated functions with "variable has incomplete type
+# void" by forcing self._return_value_var's own reference into functions
+# that never otherwise touch it).
+
+_ERRDEFER_FIRES_PAST_A_CONFINED_LOCAL = '''
+class Guard:
+	fired: i32
+
+def probe( i: usize, g: Guard ) -> Result[i32, StopIteration]:
+	errdefer( compiler.incref( g ))
+	if i == 1:
+		e: Guard = Guard( fired = 0 )  # a confined RC local in the SAME branch as the early return below
+		return Result.Err( StopIteration() )
+	return Result.Ok( 42 )
+
+def main() -> i32:
+	g: Guard = Guard( fired = 0 )
+	before: usize = compiler.refcount( g )
+	with compiler.wrap_arithmetic:
+		expected: usize = before + 1
+	match probe( 0, g ):
+		case Result.Ok( _ ):
+			pass
+		case Result.Err( _ ):
+			return 1
+	if compiler.refcount( g ) != before:
+		return 2  # errdefer must NOT fire on the Ok path
+
+	match probe( 1, g ):
+		case Result.Ok( _ ):
+			return 3
+		case Result.Err( _ ):
+			pass
+	if compiler.refcount( g ) != expected:
+		return 4  # errdefer MUST fire exactly once, even past the confined local
+	compiler.decref( g )
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class ErrdeferPastConfinedLocalTests( RealCompileMixin, unittest.TestCase ):
+	def test_errdefer_fires_past_a_confined_local_forcing_inline_return( self ) -> None:
+		self.assert_programs_run([ ( 'errdefer_past_confined_local', _ERRDEFER_FIRES_PAST_A_CONFINED_LOCAL ) ])
+
+
 if __name__ == '__main__':
 	unittest.main()

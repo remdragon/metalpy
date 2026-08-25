@@ -2767,20 +2767,33 @@ class FunctionLowering:
 		self._instructions.append( instr )
 
 	def _emit( self, instr: ir.Instruction ) -> None:
-		# a Call/Allocate's dest is always a genuinely fresh, owned value
-		# from the caller's perspective (same rule _is_aliasing_expr already
-		# encodes for Call; Allocate is fresh by definition) - registering it
-		# here, centrally, at the exact moment it's actually emitted, is what
+		# a Call/CallIndirect/Allocate's dest is always a genuinely fresh,
+		# owned value from the caller's perspective (same rule _is_aliasing_
+		# expr already encodes for Call; Allocate is fresh by definition;
+		# CallIndirect - calling THROUGH a Ptr[Callable[...]]/closure value,
+		# e.g. a real capturing closure passed to or_return(mapper) - is the
+		# identical "fresh owned handoff" shape as an ordinary Call, just
+		# reached through a different ir.Instruction) - registering it here,
+		# centrally, at the exact moment it's actually emitted, is what
 		# guarantees every one of these sites is covered instead of needing
 		# individual fresh_temp() calls hunted down at each of the many
-		# places that build a Call/Allocate (plain calls, generic calls,
-		# conditional dispatch, union-receiver dispatch, struct/union
-		# construction, ...). Gated on self._current_fn - lower_global()
-		# never constructs a CFGState at all, and self._cfg would otherwise
-		# be whatever function was lowered most recently (this Lowering
-		# instance is reused across units), a strictly worse outcome than
-		# just skipping it for globals
-		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
+		# places that build a Call/CallIndirect/Allocate (plain calls,
+		# generic calls, conditional dispatch, union-receiver dispatch,
+		# struct/union construction, ...). CallIndirect was missing from
+		# this check entirely until confirmed via a real repro: its own
+		# result, passed directly into a retaining constructor (e.g.
+		# `Result.Err(some_closure())`), never got queued for the ordinary
+		# end-of-statement decref that cancels the constructor's own
+		# retain out to net-one - a permanent one-reference-per-call leak
+		# for any RC-typed indirect/closure call result, regardless of
+		# what consumes it (not specific to or_return(mapper) - the same
+		# repro leaks with a bare `return Result.Err(closure())`, no
+		# generator/or_return involved at all). Gated on self._current_fn -
+		# lower_global() never constructs a CFGState at all, and self._cfg
+		# would otherwise be whatever function was lowered most recently
+		# (this Lowering instance is reused across units), a strictly worse
+		# outcome than just skipping it for globals
+		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.CallIndirect, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
 			self._cfg.fresh_temp( instr.dest, instr.dest.type )
 		if self._current_fn is not None and isinstance( instr, ir.Allocate ):
 			instr.loc = f'{self._current_fn.file}:{self._current_lineno}'
@@ -3297,6 +3310,30 @@ class FunctionLowering:
 			# return_() own comment). Still has to replay any pending
 			# defer/errdefer entries itself (return_() does this now too -
 			# they're just as "pending" as an RC decref from here)
+			#
+			# self._return_value_var populated here too, ONLY when a live
+			# errdefer entry could actually need it: _build_is_err_check's
+			# own is_err() probe (invoked lazily, only if return_() below
+			# finds one to replay) unconditionally reads self._return_
+			# value_var as ITS receiver, with no other way to learn what
+			# THIS return's own value even is - previously only assigned on
+			# the shared-label branch above. Confirmed missing via a real
+			# repro: an errdefer entry sitting beneath a CONFINED entry (an
+			# ordinary RC-typed local declared earlier in the same still-
+			# open branch, forcing this inline path instead of the shared-
+			# label one) silently checked a stale/uninitialized self.
+			# _return_value_var instead of this return's real Err value -
+			# the errdefer fired 0 times instead of once, no error, no
+			# crash, just silently skipped cleanup. Gated on an actual live
+			# errdefer entry (not unconditional like the label branch above)
+			# - an earlier, unconditional version of this fix broke many
+			# unrelated functions ("variable has incomplete type void") by
+			# forcing self._return_value_var's own declaration/reference
+			# into functions that never otherwise touch it at all.
+			if self._return_value_var is not None and value is not None and any(
+				e.is_err_only and not e.cancelled for e in self._cfg._epilogue_stack
+			):
+				self._emit( ir.Assign( dest = self._return_value_var, src = return_value ))
 			for instr in self._cfg.return_( value, lambda: self._build_is_err_check( node )):
 				self._emit( instr )
 			# same reasoning as the label-is-not-None branch above - flush
@@ -14885,8 +14922,14 @@ class FunctionLowering:
 		# the error to the enclosing function, continue with the unwrapped
 		# value" shape - no new IR needed, and Result.or_return is never
 		# scheduled/lowered as a real function as a result.
+		#
+		# or_return(mapper): a single positional argument is a whole
+		# separate shape (see _lower_or_return_with_mapper) - dispatched
+		# here, before any of the no-arg-specific validation below runs.
+		if len( node.args ) == 1 and not node.keywords:
+			return self._lower_or_return_with_mapper( node, receiver, node.args[0], want_result, receiver_pending_start = receiver_pending_start )
 		if node.args or node.keywords:
-			self.lowering.discovery.fail( f'or_return() takes no arguments: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail( f'or_return() takes no arguments, or a single error-mapping callable: {ast.unparse(node)}', node )
 		shape = self.lowering._type_resolver._result_shape( receiver.type )
 		if shape is None:
 			self.lowering.discovery.fail( f'or_return() receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
@@ -14913,6 +14956,157 @@ class FunctionLowering:
 			self._emit( ir.MarkUsed( operand = unwrapped ))
 			return None
 		return unwrapped
+
+	def _lower_or_return_with_mapper(
+		self, node: ast.Call, receiver: ir.Operand, mapper_node: ast.expr, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
+		''' <result_expr>.or_return(mapper) - like the no-arg or_return()
+		above, but the Err leg calls `mapper(err)` first and propagates
+		ITS result instead of the receiver's own error payload unchanged
+		(converting one error type into another, e.g. `IndexError` ->
+		`StopIteration`, without a full match/if-is_err() block).
+
+		Unlike the no-arg form (a single flat OrReturn/OrJump instruction,
+		since it only ever moves the SAME payload through unmodified),
+		this needs a real conditional: the mapper call must run ONLY on
+		the Err path, and needs a genuine Operand for the receiver's own
+		error payload to pass it - built here as an ordinary binary branch
+		(_lower_binary_branch, the same primitive _lower_for_over_iterator
+		already uses for its own Ok/Err dispatch) rather than a new IR
+		shape. The Err arm ends in a real `return Result.Err(mapper(err))`
+		statement (_stmt_Return), deliberately reusing its ALREADY-correct
+		widening/defer/errdefer/inline-splice/generator-pessimistic-done
+		handling rather than re-implementing any of it for a second time -
+		mapper(err)'s own call goes through the ordinary _lower_call
+		dispatch too (via a synthesized ast.Call, not hand-built IR),
+		which is what makes a real capturing closure work here for free,
+		the same as a plain function/non-capturing lambda.
+
+		Deliberately NOT supported yet inside a generator body
+		(self._current_fn.is_generator_next) - a generator's own body is
+		desugared into its yield/resume state machine by an EARLIER,
+		separate pass (type_resolver.py, before lowering.py ever runs),
+		which never sees this method's own synthesized branch/return at
+		all (it's built directly as IR, here, after that pass has already
+		finished) - untested interaction, rejected outright rather than
+		risking a silent miscompile. '''
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'or_return(mapper) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		if shape is None:
+			self.lowering.discovery.fail( f'or_return(mapper) receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		result_ok_type, error_cls = shape
+		tagged_shape = self.lowering._type_resolver._tagged_union_shape( receiver.type )
+		assert tagged_shape is not None, 'internal compiler error: _result_shape succeeded but _tagged_union_shape did not'
+		_result_base, result_members = tagged_shape
+		err_member = next( a for a in result_members if a.stem == 'Err' )
+		ok_member = next( a for a in result_members if a.stem == 'Ok' )
+		concrete_result_union = self.lowering.monomorphize_class( receiver.type ) if isinstance( receiver.type, Specialization ) else receiver.type
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( concrete_result_union )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+
+		is_alias = self.lowering._is_aliasing_expr( node.func.value, receiver )
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, receiver )
+		unique = self._label_id
+		self._label_id += 1
+		recv_var = self._declare_hidden_local( f'__or_recv_{unique}', receiver.type, node )
+		# track_result=False: recv_var's own Result-ness is scaffolding
+		# inspected via the raw .tag comparison below, not is_ok()/is_err()/
+		# match - same reasoning as _lower_for_over_iterator's own next_var
+		self._cfg_assign( recv_var, receiver, is_alias = is_alias, node = node, track_result = False )
+
+		# mapper is lowered here, ONCE, unconditionally (matching ordinary
+		# Python call-argument evaluation semantics - a Call's own callee
+		# expression is always evaluated regardless of what its result is
+		# later used for), then bound into its own hidden local so err_
+		# thunk below (which only runs conditionally) can reference it by
+		# a bare Name - required for TWO reasons, not just consistency:
+		# (1) _try_lower_indirect_call/_try_lower_closure_call's own callee
+		# dispatch needs a real Name/Attribute AST shape to statically
+		# resolve HOW to call it (raw fn ptr vs closure), which an
+		# already-computed Operand alone can't provide; (2) an inline
+		# lambda (`or_return(lambda e: StopIteration())`) needs a real
+		# expected Callable[...] type to infer its own parameter types
+		# from (confirmed via a real repro: without this, lowering the raw
+		# mapper_node directly as err_thunk's own ast.Call.func failed with
+		# "cannot infer lambda parameter types - no expected Callable[...]
+		# context") - built here as Ptr[Callable[[error_cls],<TypeVar>]],
+		# the SAME provisional-TypeVar-return shape any other generic call
+		# site accepting a lambda argument already uses (_expr_Lambda's own
+		# return_type_provisional branch infers the real return type
+		# eagerly from the lambda's own body either way).
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		mapper_ret_placeholder = TypeVar( stem = '_MapperRet', qualname = f'{self._current_fn.qualname}._MapperRet_{unique}', file = None, line = None )
+		mapper_callable_type = self.lowering.discovery._get_or_create_callable_type( [ error_cls ], mapper_ret_placeholder )
+		mapper_expected_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ mapper_callable_type ] )
+		# strict=False: mapper_expected_type carries a PROVISIONAL return
+		# type (an unbound TypeVar, needed only so _expr_Lambda has
+		# somewhere to infer parameter types from) - the operand actually
+		# produced legitimately has a narrower, fully concrete return type
+		# once a lambda's own body resolves it, which the ordinary strict
+		# _check_assignable tail would otherwise reject as a mismatch
+		# against the placeholder type it was never meant to literally match
+		mapper_operand = self._lower_expr( mapper_node, mapper_expected_type, strict = False )
+		mapper_var = self._declare_hidden_local( f'__or_mapper_{unique}', mapper_operand.type, node )
+		mapper_is_alias = self.lowering._is_aliasing_expr( mapper_node, mapper_operand )
+		self._cfg_assign( mapper_var, mapper_operand, is_alias = mapper_is_alias, node = node )
+
+		tag_expr = ast.Attribute( value = self.lowering._synth_name( recv_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		is_err_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ err_member.stem ] ) ] )
+		ast.copy_location( is_err_test, node )
+		is_err_cond = self._lower_expr( is_err_test, bool_cls )
+
+		ok_var_holder: list[Variable] = []
+
+		def err_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, err_member )
+			err_bind_name = f'__or_err_{unique}'
+			self._declare_hidden_local( err_bind_name, error_cls, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			mapped_call = ast.Call(
+				func = self.lowering._synth_name( mapper_var.stem, node ), args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( mapped_call, node )
+			wrap_err = ast.Call(
+				func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+				args = [ mapped_call ], keywords = [],
+			)
+			ast.copy_location( wrap_err, node ); ast.copy_location( wrap_err.func, node ); ast.copy_location( wrap_err.func.value, node )
+			ret = ast.Return( value = wrap_err )
+			ast.copy_location( ret, node )
+			self._lower_stmt( ret )
+			return True
+
+		def ok_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, ok_member )
+			ok_bind_name = f'__or_ok_{unique}'
+			ok_var = self._declare_hidden_local( ok_bind_name, result_ok_type, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = ok_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			ok_var_holder.append( ok_var )
+			return False
+
+		self._lower_binary_branch( is_err_cond, node, err_thunk, ok_thunk )
+		# err_thunk always terminates (a real `return`, never falls through
+		# to here) - ok_var is therefore always live whenever control
+		# actually reaches this point, exactly like a local declared in a
+		# non-terminating if-branch when the other branch returns.
+		ok_operand = ok_var_holder[0]
+		if not want_result:
+			self._emit( ir.MarkUsed( operand = ok_operand ))
+			return None
+		return ok_operand
 
 	def _lower_or_throw(
 		self, node: ast.Call, receiver: ir.Operand, want_result: bool, *, receiver_pending_start: int|None = None,
