@@ -150,12 +150,23 @@ class InlineScope:
 @dataclass
 class _Snapshot:
 	''' captured by snapshot(), consumed by restore() - see the IF/loop
-	orchestration lowering.py performs around branches/loop bodies. '''
+	orchestration lowering.py performs around branches/loop bodies.
+	entry_cancelled/entry_captured/entry_flag record every SURVIVING
+	entry's (index < stack_depth) own Epilogue state as of snapshot time -
+	restore() itself never applies these (see its own docstring - a
+	branch's own captured/flag-guarded entries are meant to keep whatever
+	CURRENT state they have across an ordinary restore()); hard_restore()
+	is the one consumer, for the loop-ownership retry's own "discard this
+	WHOLE attempt, including anything it did to an entry declared before
+	the loop" rollback - see its own docstring. '''
 	bindings: Bindings
 	stack_depth: int
 	results: set[str]
 	narrowed: dict[str,Variable]
 	live: set[str]
+	entry_cancelled: list[bool]
+	entry_captured: list[bool]
+	entry_flag: list['Variable | None']
 
 class CFGState:
 	''' one instance per function being lowered. `bindings` is public and
@@ -195,7 +206,7 @@ class CFGState:
 		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
 		self._cancel_flags: list[Variable] = [] # see _neutralize()/cancel_flags() - minted lazily, only for an entry that turns out to need one
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
-		self._try_protected: list[set[int]] = [] # see enter_try()/exit_try() - id()s of every entry a currently-lowering try's own body/handlers must NOT statically cancel
+		self._protected_entries: list[set[int]] = [] # see enter_diverging_paths()/exit_diverging_paths() - id()s of every entry a currently-lowering try's own body/handlers must NOT statically cancel
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self._break_live_stack: list[list[set[str]]] = [] # the definite-assignment analogue of _break_narrowed_stack above - one set[str] snapshot per break, see record_break_live()
@@ -358,6 +369,9 @@ class CFGState:
 		return _Snapshot(
 			bindings = dict( self.bindings ), stack_depth = len( self._epilogue_stack ), results = set( self._unchecked_results ),
 			narrowed = dict( self._narrowed ), live = set( self._live ),
+			entry_cancelled = [ e.cancelled for e in self._epilogue_stack ],
+			entry_captured = [ e.captured for e in self._epilogue_stack ],
+			entry_flag = [ e.flag for e in self._epilogue_stack ],
 		)
 
 	def restore( self, snap: _Snapshot ) -> None:
@@ -575,40 +589,43 @@ class CFGState:
 	def exit_branch( self ) -> None:
 		self._confinement_depths.pop()
 
-	def enter_try( self, floor: int ) -> None:
-		''' lowering.py's _stmt_Try - brackets the WHOLE body-through-
-		handlers window (wider than enter_branch()'s own per-handler
-		confinement: the try body itself stays unconfined, but every
-		SURVIVING entry below `floor` - index < floor, i.e. declared
-		BEFORE this try - is independently restore()'d back to the SAME
-		entry snapshot for the try body's own fall-through AND for each
-		handler in turn). Those entries' own Epilogue objects are shared
-		by reference, never copied per restore() (see restore()'s own
-		comment) - a manually_decreffed()/move()/deleted() call on one,
-		already-lowered sibling path (e.g. `compiler.decref(g)` on the try
-		body's own non-raising fall-through) would otherwise permanently
-		mutate the SAME object an earlier-taken, mutually-exclusive path
-		(a handler restored back to the try's own entry) still depends
-		on - confirmed by a real repro: an ordinary local declared before
-		a try, decref'd only on the non-raising fall-through, leaked on
-		the raising path instead, because the handler's own `return`
-		walked right past an entry a SIBLING path had already (wrongly,
-		from this path's own perspective) cancelled.
+	def enter_diverging_paths( self, floor: int ) -> None:
+		''' any construct that lowers more than one MUTUALLY-EXCLUSIVE
+		sibling pass over its own body, each independently restore()'d
+		back to the SAME entry snapshot (_stmt_If's true/false branches,
+		_stmt_Try's try-body-fall-through/each-handler,
+		_lower_binary_branch's own true/false thunks - every one of them
+		shares this exact `entry_snapshot = snapshot(); ...; restore(
+		entry_snapshot)` shape). Every SURVIVING entry below `floor` -
+		index < floor, i.e. declared BEFORE this construct - has its own
+		Epilogue object shared by reference across every sibling pass,
+		never copied per restore() (see restore()'s own comment) - a
+		manually_decreffed()/move()/deleted() call on one, already-lowered
+		sibling (e.g. `compiler.decref(g)` on an if's own true branch, or
+		a try body's own fall-through) would otherwise permanently mutate
+		the SAME object an earlier-taken, mutually-exclusive sibling still
+		depends on. Confirmed by real repros in EVERY one of these
+		constructs, not just _stmt_Try: an ordinary local declared before
+		a PLAIN `if bad: compiler.decref(g); return -1` (no try/except,
+		no loop at all) leaked on the `bad=False` path, because that
+		branch's own `return 0` walked right past an entry the OTHER,
+		already-lowered branch had already (wrongly, from this branch's
+		own perspective) cancelled.
 
 		Recorded by id() (Epilogue is unhashable-by-default dataclass
 		identity, and entries can't be deep-copied - see Epilogue.type's
 		own docstring on why instructions are always regenerated fresh)
 		rather than by index: indices can still shift beneath a nested
-		try's own narrower protection. A stack (not a single set), same
-		shape as _confinement_depths, so nested trys compose - an entry
-		protected by an outer try stays protected for the whole time an
-		inner try is ALSO being lowered, popped back to the outer try's
-		own view once the inner one exits. See _neutralize()'s own use of
-		this. '''
-		self._try_protected.append({ id( e ) for e in self._epilogue_stack[:floor] })
+		construct's own narrower protection. A stack (not a single set),
+		same shape as _confinement_depths, so nesting composes - an entry
+		protected by an outer construct stays protected for the whole
+		time an inner one is ALSO being lowered, popped back to the outer
+		construct's own view once the inner one exits. See _neutralize()'s
+		own use of this. '''
+		self._protected_entries.append({ id( e ) for e in self._epilogue_stack[:floor] })
 
-	def exit_try( self ) -> None:
-		self._try_protected.pop()
+	def exit_diverging_paths( self ) -> None:
+		self._protected_entries.pop()
 
 	# --- union narrowing (compile-time only - see _narrowed's own comment) -
 
@@ -930,7 +947,30 @@ class CFGState:
 			if survivor is not None:
 				for name, binding in survivor.items():
 					prior = entry_bindings.get( name )
-					already_live = prior is not None and prior.entry is binding.entry
+					# an entry can be "already live" two ways: present (by
+					# identity) in entry_bindings (the ordinary case), OR -
+					# for a binding declared MID-BODY, after entry_bindings
+					# was captured, so never eligible for the first check at
+					# all - already sitting in self._epilogue_stack right
+					# now because restore() (called by the caller before
+					# this method runs) preserved it as a flag-guarded/
+					# captured survivor (see restore()'s own "survivors"
+					# comment). Missing this second case double-pushes a
+					# BRAND NEW entry for the SAME already-tracked object -
+					# the new one's own natural release fires unconditionally
+					# (never flag-guarded itself), stacking on top of the
+					# original's own still-live flag-guarded one - confirmed
+					# by a real repro (a name manually compiler.decref()d only
+					# on a terminating branch of a construct nested inside an
+					# enclosing one - e.g. or_throw(mapper)'s own err_thunk
+					# decref'ing its receiver, or a raise inside a nested
+					# try's own handler decref'ing an outer local before
+					# re-raising outward): a real double release/heap
+					# corruption on the OTHER (surviving) path, which never
+					# actually touched the entry at all.
+					already_live = ( prior is not None and prior.entry is binding.entry ) or (
+						binding.entry is not None and any( e is binding.entry for e in self._epilogue_stack )
+					)
 					reestablish( name, binding, already_live )
 			# both terminate -> nothing reaches the join at all (dead code
 			# past here, same reasoning as the RC side above) - empty is the
@@ -986,10 +1026,17 @@ class CFGState:
 					entry.flag = flag
 					continue
 				prior = entry_bindings.get( name )
+				# see the survivor-path's own identical comment above for why
+				# a mid-body entry needs this second check too - a shared
+				# entry already flag-guard-surviving in self._epilogue_stack
+				# right now, not just one present in entry_bindings.
 				already_live = (
 					prior is not None
 					and prior.entry is true_binding.entry
 					and prior.entry is false_binding.entry
+				) or (
+					true_binding.entry is not None and true_binding.entry is false_binding.entry
+					and any( e is true_binding.entry for e in self._epilogue_stack )
 				)
 				reestablish( name, true_binding, already_live )
 				continue
@@ -1226,11 +1273,39 @@ class CFGState:
 		dropped rather than kept alive for a function epilogue that will
 		never see the abandoned code again. Using ordinary restore() here
 		would leave that stale entry referencing a flag lowering.py already
-		rolled out of _defer_flags - a dangling reference. '''
+		rolled out of _defer_flags - a dangling reference.
+
+		Also reverts every SURVIVING entry's (index < stack_depth, i.e.
+		declared BEFORE the loop) own .cancelled/.captured/.flag back to
+		snap's own recording - those Epilogue objects are shared by
+		reference and NOT freshly re-declared by the retried attempt (only
+		entries pushed AFTER the snapshot are, via the del below), so
+		anything the ABANDONED attempt did to one - e.g. compiler.decref()
+		on a name captured earlier in that SAME abandoned attempt, which
+		mints a cancel flag and stores it on entry.flag - would otherwise
+		leak into the retried attempt exactly like restore()'s own
+		identical problem for _stmt_Try (see enter_diverging_paths()'s docstring).
+		Confirmed by a real repro: a loop whose body both captures a pre-
+		loop local via an early return and then compiler.decref()s it,
+		combined with an unrelated borrowed-to-owned promotion that
+		triggers this exact retry - "use of undeclared identifier
+		__cancel_flag_0" from clang, because the retried attempt reused
+		attempt 1's own now-truncated-out-of-_cancel_flags flag reference
+		instead of minting its own. Unlike restore() (which must NOT do
+		this - a genuinely surviving branch's own capture/flag has to
+		remain live), hard_restore()'s whole point is discarding
+		EVERYTHING about the abandoned attempt, entry-internal state
+		included. '''
 		self.bindings = dict( snap.bindings )
 		self._unchecked_results = set( snap.results )
 		self._narrowed = dict( snap.narrowed )
 		self._live = set( snap.live )
+		for e, cancelled, captured, flag in zip(
+			self._epilogue_stack[:snap.stack_depth], snap.entry_cancelled, snap.entry_captured, snap.entry_flag,
+		):
+			e.cancelled = cancelled
+			e.captured = captured
+			e.flag = flag
 		del self._epilogue_stack[snap.stack_depth:]
 
 	def unwind_to( self, snap: _Snapshot ) -> list[ir.Instruction]:
@@ -2353,14 +2428,14 @@ class CFGState:
 		instructions" rule, cancelling it too would just silently drop the
 		flag check itself).
 
-		enter_try()'s own protection is the SAME "must go through the flag
+		enter_diverging_paths()'s own protection is the SAME "must go through the flag
 		instead of a static cancel" situation, just without an actual
 		captured goto target - a try's own handler, restored back to this
 		SAME entry's snapshot, is a mutually-exclusive sibling path that
 		may independently still need this entry released, exactly like an
-		earlier captured return would. See enter_try()'s own docstring for
+		earlier captured return would. See enter_diverging_paths()'s own docstring for
 		the real repro this fixes. '''
-		protected = any( id( entry ) in prot for prot in self._try_protected )
+		protected = any( id( entry ) in prot for prot in self._protected_entries )
 		if not entry.captured and not protected:
 			entry.cancelled = True
 			return []
