@@ -22,8 +22,11 @@
 # on_real_overflow for panic_arithmetic's own real compile+run regression
 # coverage (unaffected by this whole file's change) - not duplicated here.
 
+from pathlib import Path
 import unittest
 
+from compiler import Compiler
+from discovery import Discovery
 import emitter_c
 import test_support
 from test_support import RealCompileMixin
@@ -272,6 +275,255 @@ def main() -> i32:
 '''
 
 
+# --- item 11: bare discarded call to a GENERIC Result-returning function ---
+# --- (v1 gap #1 - didn't reach _lower_call's shared tail at all) -----------
+
+_BARE_DISCARDED_GENERIC_CALL_PROPAGATES_AND_DISPATCHES = '''
+class MyError:
+	pass
+
+def try_insert[T]( key: T, bad: bool ) -> Result[None,MyError]:
+	if bad:
+		return Result.Err( MyError() )
+	return Result.Ok( None )
+
+def propagate_generic( bad: bool ) -> Result[None,MyError]:
+	try_insert( 5, bad ) # bare discarded GENERIC call - case 1, never reached _lower_call's shared tail
+	return Result.Ok( None )
+
+def dispatch_generic( bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		try_insert( 5, bad ) # same, inside a covering try - dispatches
+	except MyError:
+		result = 1
+	return result
+
+def main() -> i32:
+	match propagate_generic( True ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
+	match propagate_generic( False ):
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			return 2
+	if dispatch_generic( True ) != 1:
+		return 3
+	if dispatch_generic( False ) != 0:
+		return 4
+	return 0
+'''
+
+# --- item 12 (regression): an already-ASSIGNED generic call is unaffected --
+
+_ASSIGNED_GENERIC_CALL_STILL_CAPTURES_RESULT = '''
+class MyError:
+	pass
+
+def try_insert[T]( key: T, bad: bool ) -> Result[None,MyError]:
+	if bad:
+		return Result.Err( MyError() )
+	return Result.Ok( None )
+
+def main() -> i32:
+	r: Result[None,MyError] = try_insert( 5, True )
+	if r.is_ok():
+		return 1
+	if not r.is_err():
+		return 2
+	r2: Result[None,MyError] = try_insert( 5, False )
+	if r2.is_err():
+		return 3
+	return 0
+'''
+
+# --- item 13: bare discarded call requiring runtime UNION-ARGUMENT dispatch
+# --- (v1 gap #2 - _lower_conditional_dispatch never reached _finish_call_result)
+
+_BARE_DISCARDED_UNION_ARG_DISPATCH_PROPAGATES_AND_DISPATCHES = '''
+class FeedError:
+	pass
+
+class Cat:
+	pass
+
+class Dog:
+	pass
+
+@overload
+def feed( pet: Cat, bad: bool ) -> Result[None,FeedError]: ...
+@overload
+def feed( pet: Dog, bad: bool ) -> Result[None,FeedError]: ...
+
+def feed( pet: Cat, bad: bool ) -> Result[None,FeedError]:
+	if bad:
+		return Result.Err( FeedError() )
+	return Result.Ok( None )
+
+def feed( pet: Dog, bad: bool ) -> Result[None,FeedError]:
+	if bad:
+		return Result.Err( FeedError() )
+	return Result.Ok( None )
+
+def propagate_union_arg( pet: Cat|Dog, bad: bool ) -> Result[None,FeedError]:
+	feed( pet, bad ) # bare discarded call, runtime union-ARGUMENT dispatch
+	return Result.Ok( None )
+
+def dispatch_union_arg( pet: Cat|Dog, bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		feed( pet, bad ) # same, inside a covering try - dispatches
+	except FeedError:
+		result = 1
+	return result
+
+def main() -> i32:
+	match propagate_union_arg( Cat(), True ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
+	match propagate_union_arg( Dog(), False ):
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			return 2
+	if dispatch_union_arg( Cat(), True ) != 1:
+		return 3
+	if dispatch_union_arg( Dog(), False ) != 0:
+		return 4
+	return 0
+'''
+
+# --- item 14 (regression): an already-ASSIGNED union-argument dispatch call
+# --- is unaffected -----------------------------------------------------------
+
+_ASSIGNED_UNION_ARG_DISPATCH_CALL_STILL_CAPTURES_RESULT = '''
+class FeedError:
+	pass
+
+class Cat:
+	pass
+
+class Dog:
+	pass
+
+@overload
+def feed( pet: Cat, bad: bool ) -> Result[None,FeedError]: ...
+@overload
+def feed( pet: Dog, bad: bool ) -> Result[None,FeedError]: ...
+
+def feed( pet: Cat, bad: bool ) -> Result[None,FeedError]:
+	if bad:
+		return Result.Err( FeedError() )
+	return Result.Ok( None )
+
+def feed( pet: Dog, bad: bool ) -> Result[None,FeedError]:
+	if bad:
+		return Result.Err( FeedError() )
+	return Result.Ok( None )
+
+def main() -> i32:
+	pet: Cat|Dog = Cat()
+	r: Result[None,FeedError] = feed( pet, True )
+	if r.is_ok():
+		return 1
+	if not r.is_err():
+		return 2
+	pet2: Cat|Dog = Dog()
+	r2: Result[None,FeedError] = feed( pet2, False )
+	if r2.is_err():
+		return 3
+	return 0
+'''
+
+# --- item 15: bare discarded call requiring runtime UNION-RECEIVER dispatch
+# --- (v1 gap #2, other half - _lower_union_receiver_call never reached
+# --- _finish_call_result either) --------------------------------------------
+
+_BARE_DISCARDED_UNION_RECEIVER_DISPATCH_PROPAGATES_AND_DISPATCHES = '''
+class FeedError:
+	pass
+
+class Cat:
+	def feed( self, bad: bool ) -> Result[None,FeedError]:
+		if bad:
+			return Result.Err( FeedError() )
+		return Result.Ok( None )
+
+class Dog:
+	def feed( self, bad: bool ) -> Result[None,FeedError]:
+		if bad:
+			return Result.Err( FeedError() )
+		return Result.Ok( None )
+
+def propagate_union_receiver( pet: Cat|Dog, bad: bool ) -> Result[None,FeedError]:
+	pet.feed( bad ) # bare discarded call, runtime union-RECEIVER dispatch
+	return Result.Ok( None )
+
+def dispatch_union_receiver( pet: Cat|Dog, bad: bool ) -> i32:
+	result: i32 = 0
+	try:
+		pet.feed( bad ) # same, inside a covering try - dispatches
+	except FeedError:
+		result = 1
+	return result
+
+def main() -> i32:
+	match propagate_union_receiver( Cat(), True ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
+	match propagate_union_receiver( Dog(), False ):
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			return 2
+	if dispatch_union_receiver( Cat(), True ) != 1:
+		return 3
+	if dispatch_union_receiver( Dog(), False ) != 0:
+		return 4
+	return 0
+'''
+
+# --- item 16 (regression): an already-ASSIGNED union-receiver dispatch call
+# --- is unaffected -----------------------------------------------------------
+
+_ASSIGNED_UNION_RECEIVER_DISPATCH_CALL_STILL_CAPTURES_RESULT = '''
+class FeedError:
+	pass
+
+class Cat:
+	def feed( self, bad: bool ) -> Result[None,FeedError]:
+		if bad:
+			return Result.Err( FeedError() )
+		return Result.Ok( None )
+
+class Dog:
+	def feed( self, bad: bool ) -> Result[None,FeedError]:
+		if bad:
+			return Result.Err( FeedError() )
+		return Result.Ok( None )
+
+def main() -> i32:
+	pet: Cat|Dog = Cat()
+	r: Result[None,FeedError] = pet.feed( True )
+	if r.is_ok():
+		return 1
+	if not r.is_err():
+		return 2
+	pet2: Cat|Dog = Dog()
+	r2: Result[None,FeedError] = pet2.feed( False )
+	if r2.is_err():
+		return 3
+	return 0
+'''
+
+
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile auto-or_throw tests' )
 class AutoOrThrowBehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_checked_arithmetic_inside_try_except_dispatches( self ) -> None:
@@ -297,3 +549,90 @@ class AutoOrThrowBehaviorTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_chained_checked_arithmetic_propagates_and_is_catchable( self ) -> None:
 		self.assert_programs_run([ ( 'chained_checked_arith', _CHAINED_CHECKED_ARITHMETIC_PROPAGATES_AND_IS_CATCHABLE ) ])
+
+	def test_bare_discarded_generic_call_propagates_and_dispatches( self ) -> None:
+		self.assert_programs_run([ ( 'bare_discard_generic', _BARE_DISCARDED_GENERIC_CALL_PROPAGATES_AND_DISPATCHES ) ])
+
+	def test_assigned_generic_call_still_captures_result( self ) -> None:
+		self.assert_programs_run([ ( 'assigned_generic', _ASSIGNED_GENERIC_CALL_STILL_CAPTURES_RESULT ) ])
+
+	def test_bare_discarded_union_arg_dispatch_propagates_and_dispatches( self ) -> None:
+		self.assert_programs_run([ ( 'bare_discard_union_arg', _BARE_DISCARDED_UNION_ARG_DISPATCH_PROPAGATES_AND_DISPATCHES ) ])
+
+	def test_assigned_union_arg_dispatch_call_still_captures_result( self ) -> None:
+		self.assert_programs_run([ ( 'assigned_union_arg', _ASSIGNED_UNION_ARG_DISPATCH_CALL_STILL_CAPTURES_RESULT ) ])
+
+	def test_bare_discarded_union_receiver_dispatch_propagates_and_dispatches( self ) -> None:
+		self.assert_programs_run([ ( 'bare_discard_union_recv', _BARE_DISCARDED_UNION_RECEIVER_DISPATCH_PROPAGATES_AND_DISPATCHES ) ])
+
+	def test_assigned_union_receiver_dispatch_call_still_captures_result( self ) -> None:
+		self.assert_programs_run([ ( 'assigned_union_recv', _ASSIGNED_UNION_RECEIVER_DISPATCH_CALL_STILL_CAPTURES_RESULT ) ])
+
+
+class AutoOrThrowDiscardCheckCompileErrorTests( unittest.TestCase ):
+	''' compile-error coverage for case 1 (discarded-statement) auto-or_throw
+	at the two call-emission tails that used to bypass it entirely (generic
+	calls, runtime union-argument dispatch) - mirrors try_except_test.py's
+	own TryExceptCompileErrorTests pattern (Discovery/Compiler directly, no
+	C compiler needed). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_and_get_errors( self, code: str, fn_name: str ) -> list:
+		mod = self._import( code )
+		fn = mod.get_local( fn_name )
+		if fn.resolve is not None:
+			fn.resolve()
+		self.compiler._lower( fn )
+		return self.discovery.errors.errors
+
+	def test_bare_discarded_generic_call_with_insufficient_return_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class MyError: pass',
+			'',
+			'def try_insert[T]( key: T, bad: bool ) -> Result[None,MyError]:',
+			'	if bad:',
+			'		return Result.Err( MyError() )',
+			'	return Result.Ok( None )',
+			'',
+			'def run( bad: bool ) -> i32:',
+			'	try_insert( 5, bad )', # discarded, no try, i32 return can't cover MyError
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( errors, 'expected a compile error for the uncovered MyError leaf' )
+		self.assertTrue( any( 'MyError' in e for e in errors ), errors )
+
+	def test_bare_discarded_union_arg_dispatch_with_insufficient_return_is_a_compile_error( self ) -> None:
+		code = '\n'.join([
+			'class FeedError: pass',
+			'class Cat: pass',
+			'class Dog: pass',
+			'',
+			'@overload',
+			'def feed( pet: Cat, bad: bool ) -> Result[None,FeedError]: ...',
+			'@overload',
+			'def feed( pet: Dog, bad: bool ) -> Result[None,FeedError]: ...',
+			'',
+			'def feed( pet: Cat, bad: bool ) -> Result[None,FeedError]:',
+			'	if bad:',
+			'		return Result.Err( FeedError() )',
+			'	return Result.Ok( None )',
+			'',
+			'def feed( pet: Dog, bad: bool ) -> Result[None,FeedError]:',
+			'	if bad:',
+			'		return Result.Err( FeedError() )',
+			'	return Result.Ok( None )',
+			'',
+			'def run( pet: Cat|Dog, bad: bool ) -> i32:',
+			'	feed( pet, bad )', # discarded, no try, i32 return can't cover FeedError
+			'	return 0',
+		])
+		errors = self._lower_and_get_errors( code, 'run' )
+		self.assertTrue( errors, 'expected a compile error for the uncovered FeedError leaf' )
+		self.assertTrue( any( 'FeedError' in e for e in errors ), errors )
