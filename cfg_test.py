@@ -581,23 +581,29 @@ def foo() -> None:
 		return Variable( stem = stem, qualname = f'foo.{stem}', file = None, line = None, type = self.foo_cls )
 
 	def test_survivor_path_reuses_entry_not_a_duplicate( self ) -> None:
-		# bug 3 (FIXED): x predates the snapshot merge_if() compares
-		# against. manually_decreffed() replaces x's entry in place (by
-		# identity) in _epilogue_stack rather than mutating the original,
-		# so restore() - which never touches stack slots below its own
-		# snapshot's stack_depth - sees the SAME replacement object
-		# reestablish() must recognize instead of duplicating.
+		# bug 3 (FIXED, then re-fixed): x predates the snapshot merge_if()
+		# compares against. manually_decreffed() replaces x's entry in
+		# place (by identity) in _epilogue_stack rather than mutating the
+		# original - restore() now swaps that replacement back to the
+		# ORIGINAL entry object for any non-flag-guarded entry (see its own
+		# docstring), since the terminating (true) branch's own
+		# cancellation must never leak onto the surviving (false) path,
+		# which never actually decreffed x and still needs a normal
+		# release for it - x's REAL entry is once again the pristine
+		# original after restore(), not the terminated branch's own
+		# replacement, and reestablish() must recognize THAT (not
+		# duplicate it either).
 		x = self._local( 'x' )
 		self.state.assign( x, self._new_temp( self.foo_cls ), is_alias = False )
 		outer_entry = self.state.snapshot()
+		outer_entry_for_x = outer_entry.bindings['x'].entry
 		self.state.manually_decreffed( x )
-		true_entry = self.state.bindings['x'].entry
 		true_end = dict( self.state.bindings )
 		self.state.restore( outer_entry )
 		true_instrs, false_instrs, removed = self.state.merge_if(
 			outer_entry.bindings, true_end, dict( outer_entry.bindings ), 'foo', true_terminates = True,
 		)
-		survivors = [ e for e in self.state._epilogue_stack if e is true_entry ]
+		survivors = [ e for e in self.state._epilogue_stack if e is outer_entry_for_x ]
 		self.assertEqual( len( survivors ), 1, "x's entry must not be duplicated by reestablish()" )
 
 	def test_fresh_on_one_branch_yields_a_single_release( self ) -> None:

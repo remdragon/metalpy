@@ -8486,14 +8486,30 @@ class FunctionLowering:
 		# code after the if that expects x to still be a real name, then
 		# fails with a spurious "not a local variable"/"is not defined"
 		# instead of the correct per-path "not initialized on all code
-		# branches" _live already reports. Restored to entry between the two
-		# branches (mirrors entry_snapshot's own restore() below) and
-		# reconciled the same "never let a REMOVAL escape, only let a
-		# genuinely NEW name survive" way merge_if()'s own `removed` already
-		# is for RC bindings (see below) - a name deleted on either/both
-		# branches simply reverts to its entry state, a name newly declared
-		# on either branch survives.
+		# branches" _live already reports. Reconciled (both before lowering
+		# the false branch, and again at the very end) the same "never let a
+		# REMOVAL escape, only let a genuinely NEW name survive" way
+		# merge_if()'s own `removed` already is for RC bindings (see below):
+		# a name that predates the if simply reverts to its entry state
+		# regardless of which branch(es) del'd it, but a name FRESHLY
+		# declared inside one branch stays visible even to its own sibling -
+		# unlike a del'd removal, this is a real, established, already-
+		# tested shape (an explicit `x: T = ...` annotation is rejected as
+		# "already declared" if a SECOND, mutually-exclusive branch also
+		# declares it - deliberately, regardless of branch exclusivity, see
+		# lowering_test.py's test_annotated_redeclaration_across_branches_
+		# is_a_compile_error) that restoring fn.names wholesale back to
+		# entry before the false branch would silently break, by making the
+		# true branch's own fresh declaration invisible to the false
+		# branch's own _existing_local_or_none check.
 		entry_names = dict( fn.names )
+		def _reconcile_names( *branch_ends: dict ) -> None:
+			fn.names.clear()
+			fn.names.update( entry_names )
+			for branch_end in branch_ends:
+				for k, v in branch_end.items():
+					if k not in entry_names:
+						fn.names[k] = v
 		outer_instructions = self._instructions
 		self._instructions = []
 		# no special protection needed here for entries that SURVIVE this if
@@ -8536,8 +8552,10 @@ class FunctionLowering:
 
 		if node.orelse:
 			self._cfg.restore( entry_snapshot )
-			fn.names.clear()
-			fn.names.update( entry_names )
+			# only undoes a REMOVAL (del) the true branch made to a
+			# pre-existing name - true's own NEW declarations stay visible
+			# to the false branch (see entry_names' own comment above)
+			_reconcile_names( true_names_end )
 			self._instructions = []
 			self._cfg.enter_branch( entry_snapshot.stack_depth )
 			try:
@@ -8565,21 +8583,7 @@ class FunctionLowering:
 			false_terminates = False
 
 		self._cfg.restore( entry_snapshot )
-		# reconcile fn.names the same "never let a removal escape, only a
-		# genuinely new name survives" way as merge_if()'s own `removed`
-		# below - start from entry, then let each branch's own NEW
-		# declarations (never a name that was already in entry_names, del'd
-		# or not) back in. A name entry_names already had stays exactly as
-		# it was, regardless of whether either/both branches del'd it - see
-		# this method's own entry_names comment above.
-		fn.names.clear()
-		fn.names.update( entry_names )
-		for k, v in true_names_end.items():
-			if k not in entry_names:
-				fn.names[k] = v
-		for k, v in false_names_end.items():
-			if k not in entry_names:
-				fn.names[k] = v
+		_reconcile_names( true_names_end, false_names_end )
 		self._instructions = outer_instructions
 		try:
 			true_extra, false_extra, removed = self._cfg.merge_if(
