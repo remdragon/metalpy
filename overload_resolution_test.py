@@ -312,6 +312,103 @@ def get( x: str ) -> str:
 		branches, default = self._resolve( group, [ i32_cls ], {} )
 		self.assertIs( default, generic_impl )
 
+	def test_method_receiver_concrete_beats_generic( self ) -> None:
+		# every case above is a free function - a method's own `self` is
+		# excluded from Function.parameters (see mpy_types.py), so the
+		# wildcard-priority machinery never even sees it; this just confirms
+		# that holds for real, not just by absence-of-a-bug-report. Mirrors
+		# emitter_c_test.py's own OverloadRealCompileTests.
+		# concrete_overload_beats_generic_typevar_fallback case, which
+		# additionally proves the winning candidate actually MONOMORPHIZES
+		# and EXECUTES correctly for a method receiver - out of scope here
+		# (this module's own "pure function of types" docstring), so that
+		# real-compile case stays; this just covers the resolve_call-level
+		# pick for the same shape, fast.
+		mod = self._import( '''
+class str: pass
+class i32: pass
+
+class Box:
+	def get[T]( self, x: T ) -> str:
+		pass
+
+	def get( self, x: str ) -> str:
+		pass
+''' )
+		box = mod.get_local( 'Box' )
+		if box.resolve is not None:
+			box.resolve()
+		group = box.get_local( 'get' )
+		generic_impl, concrete_impl = group.implementations
+		str_cls = mod.get_local( 'str' )
+		i32_cls = mod.get_local( 'i32' )
+
+		branches, default = self._resolve( group, [ str_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, concrete_impl )
+
+		branches, default = self._resolve( group, [ i32_cls ], {} )
+		self.assertEqual( branches, [] )
+		self.assertIs( default, generic_impl )
+
+
+class StubCoversCallTests( unittest.TestCase ):
+	''' stub_covers_call - used by lowering.py's own overloaded-call return-
+	type narrowing: a resolved call's result may only be narrowed to a
+	stub's own (possibly more specific) declared return type when the
+	call's REAL arguments are entirely within that stub's declared domain -
+	never merely because the stub happens to be bound_to the resolved plain
+	implementation (a stub is bound to exactly one implementation
+	regardless of whether any given call actually matched the stub's own
+	narrower signature). Real motivating bug: Result[T,E].unwrap_or()'s
+	`default: T` stub is bound_to the plain `default: T|None = None` impl -
+	a zero-argument call only ever matches the impl's own broader
+	signature (default has a real default value), never the stub's (which
+	REQUIRES an argument) - narrowing anyway produced a real, confirmed
+	compile error ("function returns builtins.str, not
+	builtins.str|NoneType") for a genuine zero-arg call. See emitter_c_test.
+	py's own OverloadWithDefaultParameterRealCompileTests for the full
+	real-compile regression this was found through - kept alongside this
+	fast unit test, since two OTHER, genuinely codegen-level gaps (a
+	type_resolver.py narrowing-tracking gap, a real emitter_c.py KeyError)
+	were fixed alongside this one and can only be caught by real
+	compilation. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+
+	def _import( self, code: str ) -> Module:
+		return self.discovery.import_code( code, Path( '__main__.py' ), scope = None )
+
+	def _unwrap_or_group( self ):
+		mod = self._import( '''
+class str: pass
+
+@overload
+def unwrap_or( default: str ) -> str:
+	...
+
+def unwrap_or( default: str|None = None ) -> str|None:
+	pass
+''' )
+		group = mod.get_local( 'unwrap_or' )
+		stub = group.stubs[0]
+		# stub_covers_call, unlike resolve_call, doesn't resolve its own
+		# argument for you (resolve_call's callers always reach it via
+		# resolve_call first, which already resolved every member) - do it
+		# explicitly here since this test calls it directly
+		if stub.resolve is not None:
+			stub.resolve()
+		return stub, mod.get_local( 'str' )
+
+	def test_stub_requiring_an_argument_does_not_cover_a_zero_arg_call( self ) -> None:
+		stub, str_cls = self._unwrap_or_group()
+		self.assertFalse( OR.stub_covers_call( stub, [], {} ) )
+
+	def test_stub_requiring_an_argument_covers_a_real_matching_call( self ) -> None:
+		stub, str_cls = self._unwrap_or_group()
+		self.assertTrue( OR.stub_covers_call( stub, [ 0 ], { 0: ( str_cls, ) } ) )
+
 
 class TodoWorkedExampleTests( unittest.TestCase ):
 	''' TODO.txt's own worked-through examples (the design this module implements) - each @overload-decorated with a real body (metalpy's own flexibility beyond Python's @overload convention: multiple real-bodied @overload members are allowed, priority-ordered by declaration, no shared single implementation required) '''

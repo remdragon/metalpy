@@ -2990,39 +2990,14 @@ def main() -> None:
 		]))
 		self._assert_compiles( emitter_c.emit_c( self.compiler ))
 
-	def test_overload_call_on_generic_class_specialization_compiles( self ) -> None:
-		# regression test (see lowering_test.py's own identical-purpose
-		# test) for a real, pre-existing overload_resolution.py bug found
-		# while verifying Result-as-@union: candidate matching for an
-		# @overload group declared inside a generic class compared the
-		# call's real, concrete argument type directly against the
-		# group's own abstract, unsubstituted class TypeVar, so it never
-		# matched - affects real library code directly (builtins.Result
-		# [T,E].unwrap_or's own `default: T` stub). Uses a @union (not an
-		# RCClass) receiver deliberately - generic RCClass construction via
-		# plain ClassName(...) has its own, separate, unrelated gap (its
-		# __init__ never gets monomorphized when reached this way), not
-		# what this test is checking.
-		self.discovery.import_name( 'builtins' ) # self.tag == 0 is now an ordinary u8.__eq__ dunder call
-		self._run( '\n'.join([
-			'@union',
-			'class Box[T]:',
-			'	Some: T',
-			'',
-			'	@overload',
-			'	def get_or( self, default: T ) -> T:',
-			'		...',
-			'	def get_or( self, default: T ) -> T:',
-			'		if self.tag == 0:',
-			'			return self.data.v_Some',
-			'		return default',
-			'',
-			'def main() -> i32:',
-			'	b: Box[i32] = Box.Some( 5 )',
-			'	fallback: i32 = -1',
-			'	return b.get_or( fallback )',
-		]))
-		self._assert_compiles( emitter_c.emit_c( self.compiler ))
+# removed: test_overload_call_on_generic_class_specialization_compiles - a
+# real-C-compiler-invoking duplicate of lowering_test.py's own
+# test_overload_call_on_generic_class_specialization_substitutes_class_type_
+# params, which checks the SAME regression (an @overload group inside a
+# generic class needs the class's own type params substituted before
+# candidate matching) more rigorously (direct assertions on the resolved
+# call's substituted parameter/return types, not just "produces valid C")
+# and without spawning a C compiler at all.
 
 # routing RCClass construction through the REAL sys.alloc[T] means sys.alloc's
 # own body actually gets lowered end to end (unlike every other fixture in
@@ -13460,19 +13435,20 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
-			# a concrete overload sharing a name with a generic `[T]` one -
-			# real gap: overload_resolution.py's own box-subtraction matching
-			# treated a TypeVar-typed candidate's required leaves ([itself],
-			# per Type.leaves()' own base case) as structurally unmatchable
-			# against any real argument type, so the generic candidate could
-			# never be selected at all ("no matching overload" for the
-			# non-str call below). Fixed via _Candidate.wildcard (a bare-
-			# TypeVar slot matches everything, at lowest priority regardless
-			# of declaration order) plus lowering.py's _lower_overload_
-			# generic_call/_finish_generic_call (monomorphizing the winning
-			# generic candidate the same way a bare generic-function call
-			# already does - the emitter crashed on the still-abstract
-			# TypeVar parameter before that existed).
+			# a concrete overload sharing a name with a generic `[T]` one, for
+			# a METHOD receiver - overload_resolution.py's own resolve_call-
+			# level pick (_Candidate.wildcard: a bare-TypeVar slot matches
+			# everything, at lowest priority regardless of declaration order)
+			# is unit-tested directly and fast in overload_resolution_test.
+			# py's own GenericWildcardCandidateTests (including this exact
+			# method-receiver shape). What ONLY a real compile can prove is
+			# what happens AFTER the pick: lowering.py's own
+			# _lower_overload_generic_call/_finish_generic_call actually
+			# monomorphizing the winning generic candidate and it genuinely
+			# executing correctly for a method call (self bound, real string
+			# returned) - the emitter crashed on the still-abstract TypeVar
+			# parameter before that existed, a class of bug no pure-types
+			# unit test can catch.
 			( 'concrete_overload_beats_generic_typevar_fallback', '''
 class Box:
 	def get[T]( self, x: T ) -> str:
