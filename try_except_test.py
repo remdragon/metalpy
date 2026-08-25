@@ -599,6 +599,40 @@ def main() -> i32:
 	return 0
 '''
 
+# regression: an RC local declared in the try body (ABOVE the try's own
+# entry snapshot), never explicitly released before a later covered raise
+# dispatches past it, used to leak silently - a goto straight into a
+# handler never unwound anything on its own (merge_if() deliberately
+# doesn't clean up a terminating branch's own bindings - that's the
+# terminator's own job, same as return_()/unwind_to() already do for
+# return/break/continue). Fixed via ir.ThrowLeaf.epilogue/cfg.py's
+# unwind_confined().
+_TRY_BODY_LOCAL_RELEASED_BEFORE_COVERED_RAISE_DISPATCH = '''
+class Guard:
+	tag: i32
+
+class Boom:
+	tag: i32
+
+def run( bad: bool ) -> i32:
+	try:
+		g: Guard = Guard( tag = 111 )
+		if bad:
+			raise Boom( tag = 222 )
+		compiler.decref( g )
+	except Boom as e:
+		compiler.decref( e )
+		return -1
+	return 0
+
+def main() -> i32:
+	if run( False ) != 0:
+		return 1
+	if run( True ) != -1:
+		return 2
+	return 0
+'''
+
 # Change 2: raise EXPR caught by a tuple except-clause, `as e:` binding.
 _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING = '''
 class ErrorA:
@@ -1259,6 +1293,9 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_raise_caught_by_same_function_except_single_leaf_field_readable( self ) -> None:
 		self.assert_programs_run([ ( 'raise_single_leaf_field', _RAISE_CAUGHT_BY_SAME_FUNCTION_EXCEPT_SINGLE_LEAF_FIELD_READABLE ) ])
+
+	def test_try_body_local_released_before_covered_raise_dispatch( self ) -> None:
+		self.assert_programs_run([ ( 'raise_try_body_local', _TRY_BODY_LOCAL_RELEASED_BEFORE_COVERED_RAISE_DISPATCH ) ])
 
 	def test_raise_caught_by_tuple_except_clause_binding( self ) -> None:
 		self.assert_programs_run([ ( 'raise_tuple_except', _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING ) ])

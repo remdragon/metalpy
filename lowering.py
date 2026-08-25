@@ -1945,9 +1945,18 @@ class TryContext:
 	textually inside its own body, in the SAME function - an uncovered
 	leaf walks the WHOLE stack innermost-first, checking every textually
 	enclosing try's own handlers before falling back to propagating to
-	the caller. '''
+	the caller. `entry_stack_depth` is this try's own entry_snapshot.
+	stack_depth (the try body is UNCONFINED - see TryHandler's own
+	docstring - so this is the one place that boundary is still recorded):
+	a covered `raise`/or_throw() dispatch straight into this try's own
+	handler is a goto that never otherwise unwinds anything (see ir.
+	ThrowLeaf.epilogue's own docstring) - everything the try BODY pushed
+	since this depth is about to become unreachable from the handler and
+	must be released right before the jump, same as unwind_to() already
+	does for break/continue leaving a loop. '''
 	handlers: list[TryHandler]
 	end_label: str
+	entry_stack_depth: int
 
 
 class FunctionLowering:
@@ -5311,7 +5320,7 @@ class FunctionLowering:
 		entry_snapshot = self._cfg.snapshot()
 		outer_instructions = self._instructions
 		self._instructions = []
-		self._try_stack.append( TryContext( handlers = handlers, end_label = end_label ))
+		self._try_stack.append( TryContext( handlers = handlers, end_label = end_label, entry_stack_depth = entry_snapshot.stack_depth ))
 		try:
 			for stmt in node.body:
 				try:
@@ -5558,7 +5567,13 @@ class FunctionLowering:
 			)
 
 		all_leaves = self.lowering._type_resolver._atomic_leaves( error_cls )
-		dispatch, covered_leaves = self._dispatch_leaves_against_try_stack( all_leaves )
+		# a bare Temp's own exclusion is handled below (untrack_temp) - only
+		# a NAMED Variable raised directly (`raise x`) needs excluding HERE
+		# too, so unwind_confined() doesn't release it out from under the
+		# handler's own bind assignment just below it
+		dispatch, covered_leaves = self._dispatch_leaves_against_try_stack(
+			all_leaves, exclude = value if isinstance( value, Variable ) else None,
+		)
 
 		result_cls = self.lowering.discovery.find_name( 'Result', node )
 		self.lowering._type_resolver._require_or_throw_return(
@@ -15380,7 +15395,9 @@ class FunctionLowering:
 			return None
 		return ok_operand
 
-	def _dispatch_leaves_against_try_stack( self, all_leaves: list[Type] ) -> tuple[list[ir.ThrowLeaf],list[Type]]:
+	def _dispatch_leaves_against_try_stack(
+		self, all_leaves: list[Type], *, exclude: 'ir.Operand | None' = None,
+	) -> tuple[list[ir.ThrowLeaf],list[Type]]:
 		''' matches each of `all_leaves` against every enclosing try's own
 		handlers, innermost first (self._try_stack - see TryContext's own
 		docstring) - the first handler found across ANY try context on the
@@ -15393,18 +15410,33 @@ class FunctionLowering:
 		exactly one place. Sound without any new CFG machinery: see
 		_stmt_Try's own docstring for why an outer TryContext is still safe
 		to mutate mid-recursion, and why an inner try's goto reaching an
-		outer handler's label needs no extra confinement. '''
+		outer handler's label needs no extra confinement.
+
+		`exclude` is `raise EXPR`'s own raised value, when it's a plain
+		Variable (_stmt_Raise's own tracked_operand - None for or_throw(),
+		whose payload is a struct field of the receiver, never an
+		independently-tracked entry to begin with) - passed straight
+		through to each matched leaf's own unwind_confined() call below, so
+		its ownership transfers into the handler's bind instead of being
+		released twice. Each matched leaf gets its OWN epilogue, bounded to
+		the SPECIFIC ctx that covered it (see ir.ThrowLeaf.epilogue's own
+		docstring) - a nested try's outer handler catching a leaf the inner
+		try doesn't needs a DEEPER unwind (back to the outer try's own
+		entry) than a leaf the inner try catches itself. '''
 		dispatch: list[ir.ThrowLeaf] = []
 		covered_leaves: list[Type] = []
 		for leaf in all_leaves:
 			handler = None
+			covering_ctx = None
 			for ctx in reversed( self._try_stack ):
 				handler = next( ( h for h in ctx.handlers if leaf in h.leaves ), None )
 				if handler is not None:
+					covering_ctx = ctx
 					break
 			if handler is not None:
 				handler.matched = True
-				dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.raise_value_var, label = handler.label ))
+				epilogue = self._cfg.unwind_confined( covering_ctx.entry_stack_depth, exclude )
+				dispatch.append( ir.ThrowLeaf( leaf = leaf, bind = handler.raise_value_var, label = handler.label, epilogue = epilogue ))
 				covered_leaves.append( leaf )
 		return dispatch, covered_leaves
 
