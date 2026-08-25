@@ -4082,7 +4082,7 @@ def _emit_leaf_dispatch_case(
 	declaration lets both cases assign into the same `e`. '''
 	entry = next( ( d for d in dispatch if d.leaf.qualname == leaf_type.qualname ), None )
 	if entry is not None:
-		lines: list[str] = []
+		lines: list[str] = _emit_instructions( entry.epilogue, function = function, declared = declared )
 		if entry.bind is not None:
 			bind_c = _c_local_name( entry.bind )
 			if entry.bind.type.qualname == leaf_type.qualname:

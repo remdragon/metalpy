@@ -444,10 +444,22 @@ class ThrowLeaf:
 	compiler-synthesized one instead, needed for bare `raise` re-raise
 	support even without a user-facing name) - emitter_c.py assigns the
 	narrowed payload into it, as an ordinary already-registered local,
-	before jumping to `label`. '''
+	before jumping to `label`. `epilogue` replays whatever's still
+	pending CONFINED to the covering try's own body (RC decrefs, defer/
+	errdefer) - everything pushed since that try's own entry snapshot,
+	excluding the leaf's own payload (which transfers into `bind`
+	instead) - a goto straight into a handler never otherwise unwinds
+	any of that (unlike a real function-level return/propagation - see
+	ir.Raise's own docstring), so without this it silently leaks:
+	confirmed by a real repro, an ordinary RC local declared earlier in
+	the try body, never touched again, leaking every time a later
+	covered `raise`/or_throw() dispatches past it. Emitted (see
+	emitter_c.py's own _emit_leaf_dispatch_case) right before the
+	assignment into `bind`. '''
 	leaf: Type
 	bind: 'Variable|None'
 	label: str
+	epilogue: 'list[Instruction]' = field( default_factory = list )
 
 @dataclass( kw_only = True )
 class OrThrow( Instruction ):

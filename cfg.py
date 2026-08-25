@@ -1212,6 +1212,29 @@ class CFGState:
 			instructions += self._decref_instructions( entry.type, entry.operand ) # regenerated fresh, not entry.instructions - see Epilogue.type's docstring
 		return instructions
 
+	def unwind_confined( self, floor: int, exclude: 'ir.Operand | None' = None ) -> list[ir.Instruction]:
+		''' unwind_to()'s own exclusion-aware sibling - a covered `raise`/
+		or_throw() dispatch (lowering.py's _dispatch_leaves_against_try_
+		stack/ir.ThrowLeaf.epilogue) needs everything confined to the
+		covering try's own body released before its goto into the handler,
+		same as unwind_to() already does for break/continue leaving a loop
+		- EXCEPT the raised value's own entry, if it's a plain Variable
+		(`raise x`): that one's ownership is transferring INTO the handler's
+		own bind, not ending here (see ir.ThrowLeaf.epilogue's own
+		docstring). `floor` is the covering TryContext's own
+		entry_stack_depth, not necessarily the innermost try on the stack -
+		an outer handler catching a leaf the inner try doesn't cover has to
+		unwind everything back to ITS OWN entry, past the inner try's own
+		portion too. '''
+		instructions: list[ir.Instruction] = []
+		for entry in reversed( self._epilogue_stack[floor:] ):
+			if entry.cancelled or entry.is_flag_guarded:
+				continue
+			if exclude is not None and entry.operand is exclude:
+				continue
+			instructions += self._decref_instructions( entry.type, entry.operand )
+		return instructions
+
 	def check_loop_exit_unchecked_results( self, entry_results: set[str], ctx: str ) -> None:
 		''' break/continue's own unchecked-Result analogue of unwind_to() -
 		called alongside it, same call sites. Only a Result introduced
