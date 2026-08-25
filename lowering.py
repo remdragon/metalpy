@@ -4605,6 +4605,9 @@ class FunctionLowering:
 		if self.lowering._is_compiler_call( node.value ) == 'decref':
 			self._lower_compiler_decref( node.value )
 			return
+		if self.lowering._is_compiler_call( node.value ) == '__internal_decref__':
+			self._lower_compiler_internal_decref( node.value )
+			return
 		if self.lowering._is_compiler_call( node.value ) == 'incref':
 			self._lower_compiler_incref( node.value )
 			return
@@ -6495,6 +6498,18 @@ class FunctionLowering:
 		ptr = self._lower_expr( node.args[0], None )
 		self._emit( ir.DebugRawUntrack( ptr = ptr ))
 
+	def _lower_compiler_debug_quarantine( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
+		# compiler.__debug_quarantine__(ptr) -> same Ptr[T] as ptr - see
+		# ir.DebugQuarantine. Returns a value (unlike track/untrack above):
+		# the pit's own eviction result, which sys.free()'s debug branch
+		# needs to decide what (if anything) to actually free this call.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__debug_quarantine__(...) takes exactly one argument (ptr): {ast.unparse(node)}', node )
+		ptr = self._lower_expr( node.args[0], None )
+		dest = self._new_temp( ptr.type )
+		self._emit( ir.DebugQuarantine( dest = dest, ptr = ptr ))
+		return dest
+
 	def _lower_compiler_dump_live_objects( self, node: ast.Call ) -> None:
 		# compiler.dump_live_objects() - statement-only (mirrors compiler.
 		# incref/decref/atomic_store), see ir.DumpLiveObjects. A real compile
@@ -6816,6 +6831,57 @@ class FunctionLowering:
 		cls = getattr( self._current_fn, 'cls', None )
 		return isinstance( cls, Specialization )
 
+	def _internal_decref_var( self, var: Variable ) -> None:
+		''' compiler-internal-only equivalent of compiler.__internal_decref__(x)
+		(see its own docstring) for a caller that already has the real
+		Variable object in hand, bypassing AST synthesis + re-resolution
+		through _lower_expr entirely - required, not just a shortcut, for a
+		NARROWED union local (e.g. or_throw(mapper)'s recv_var, narrowed via
+		cfg.narrow() to its Err member just before): _lower_expr on a
+		synthesized ast.Name reference to it returns a freshly-EXTRACTED
+		ir.Temp (the narrowed payload), not the union Variable itself -
+		manually_decreffed() then silently takes its ir.Temp branch
+		(_temp_states, unrelated to self.bindings/_epilogue_stack) instead of
+        ever touching the Variable's own real binding, leaving THAT
+		untouched for whatever later unwind (e.g. a covered raise dispatch)
+		to redundantly release again. Confirmed via a real repro + trace:
+		compiler.__internal_decref__(recv_var) reached this exact class's
+		manually_decreffed(), but for the WRONG (Temp) operand - the
+		Variable-typed binding it needed to cancel was never touched. '''
+		for instr in self._cfg.decref( var.type, var ):
+			self._emit( instr )
+		for instr in self._cfg.manually_decreffed( var ):
+			self._emit( instr )
+
+	def _lower_compiler_internal_decref( self, node: ast.Call ) -> None:
+		# compiler.__internal_decref__(x) - NOT reachable from user source
+		# (no such name is exposed to user code; only THIS file's own AST
+		# synthesis ever spells it) - the compiler-internal-only counterpart
+		# of compiler.decref(x), for lowering code that needs to release a
+		# hidden local EARLY (before its own natural scope-exit epilogue
+		# would fire) and must stop that later epilogue from releasing it a
+		# second time: the for-loop iterator (obj_var, see _stmt_For),
+		# with-statement context managers (_lower_with_context_manager),
+		# or_throw(mapper)/or_return(mapper)'s receiver/extracted-error/
+		# mapper locals. Identical body to what compiler.decref(x) itself
+		# used to do before cfg.manually_decreffed()'s cancellation was
+		# removed from it (see _lower_compiler_decref's own comment on why:
+		# "lowering/emitter must not adjust automatic incref/decref behavior
+		# in the presence of a [USER-authored] manual compiler.decref()
+		# call" - a rule about not letting user source code secretly cancel
+		# its own epilogue, not about lowering's own bookkeeping for hidden
+		# locals it created and alone is responsible for tearing down).
+		# Simplified from compiler.decref(x)'s own version: no field-
+		# receiver/generic-class-method carve-outs - every caller here
+		# already has a real Variable of a real, already-resolved RC type in
+		# hand, never a bare .attr or a not-yet-monomorphized generic T.
+		assert len( node.args ) == 1 and isinstance( node.args[0], ast.Name ), f'compiler.__internal_decref__(...) is lowering-internal only, always exactly one ast.Name argument: {ast.unparse(node)}'
+		operand = self._lower_expr( node.args[0], None )
+		for instr in self._cfg.decref( operand.type, operand ):
+			self._emit( instr )
+		for instr in self._cfg.manually_decreffed( operand ):
+			self._emit( instr )
+
 	def _lower_compiler_decref( self, node: ast.Call ) -> None:
 		# compiler.decref(x) — emit the real Decref sequence for x, via
 		# cfg.py's own union-aware decref() (NOT a bare ir.Decref emitted
@@ -6906,18 +6972,30 @@ class FunctionLowering:
 		else:
 			operand = self._lower_expr( arg_node, None )
 		if operand.type is not None and cfg.rc_leaves( operand.type ):
+			# deliberately does NOT call cfg.manually_decreffed() (or
+			# anything else) to suppress operand's own scope-exit epilogue -
+			# lowering/emitter must not adjust automatic incref/decref
+			# behavior based on the mere PRESENCE of a manual
+			# compiler.decref() call; the epilogue's behavior is purely
+			# mechanical, driven by the variable's own scope/type, same as
+			# if this call weren't here at all. compiler.decref(x) is a
+			# REAL, independent, additional release - the caller (not this
+			# lowering) is responsible for making sure the total math works
+			# out, e.g. by never binding a manually-managed value to an
+			# ordinary owned local in the first place (see
+			# dict's own _release_key/_release_value in lib/builtins/
+			# __init__.py for the safe idiom: decref an inline expression -
+			# compiler.decref(compiler.cast(K, key_ptr)) - never a separately
+			# bound `existing: K = ...; compiler.decref(existing)`, which
+			# WOULD double-release once this local's own automatic epilogue
+			# runs too). A prior version of this DID suppress the epilogue
+			# here (cfg.manually_decreffed()) - removed after real,
+			# reproducible double-frees (compiler.__debug_quarantine__'s own
+			# detector) traced to that suppression silently not applying to
+			# union-typed operands, while callers had come to rely on it
+			# applying uniformly - exactly the "spooky action at a distance"
+			# this discipline avoids for good.
 			for instr in self._cfg.decref( operand.type, operand ):
-				self._emit( instr )
-			# stop the scope-exit epilogue from decref'ing operand a SECOND
-			# time - see cfg.py's manually_decreffed's own comment for why
-			# this is required, not optional (a real, always-on double
-			# Decref/use-after-free otherwise, confirmed with ASan). Usually
-			# returns nothing more to emit - only non-empty when operand's
-			# own entry was already captured by an earlier return, in which
-			# case this is the flag-disarm that keeps that earlier return's
-			# own shared-ladder decref from silently going missing (see
-			# manually_decreffed's own docstring)
-			for instr in self._cfg.manually_decreffed( operand ):
 				self._emit( instr )
 			return
 		if operand.type is not None and self._in_generic_class_method():
@@ -7911,7 +7989,7 @@ class FunctionLowering:
 			# _lower_with_context_manager's own identical _make_exit_stmt()
 			# and its own comment on why
 			call = ast.Call(
-				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__internal_decref__', ctx = ast.Load() ),
 				args = [ self.lowering._synth_name( obj_var.stem, node ) ], keywords = [],
 			)
 			ast.fix_missing_locations( ast.copy_location( call, node ))
@@ -8145,7 +8223,7 @@ class FunctionLowering:
 				# py's _desugar_iterator_for's identical situation (its own
 				# comment has the full reasoning)
 				decref_call = ast.Expr( value = ast.Call(
-					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__internal_decref__', ctx = ast.Load() ),
 					args = [ ast.Name( id = bind_name, ctx = ast.Load() ) ], keywords = [],
 				))
 				ast.copy_location( decref_call, node ); ast.copy_location( decref_call.value, node )
@@ -15301,6 +15379,16 @@ class FunctionLowering:
 			)
 			ast.copy_location( extract, node )
 			self._lower_stmt( extract )
+			# KNOWN GAP, not yet fixed: unlike or_throw_with_mapper's own
+			# err_thunk (recv_var/err_bind_name/mapper_var all explicitly
+			# released there - see its own comment/history), this arm
+			# releases none of them, leaking all three whenever this path is
+			# taken. Fixing it safely needs mapped_call's own result to stay
+			# a bare, never-named operand through to the final `return
+			# Result.Err(...)` (mirroring _raise_value's own "why a NAMED
+			# local doesn't work" constraint - binding it via ast.Assign
+			# first, as or_throw_with_mapper does, defeats that) - not yet
+			# implemented; see [[or_return_mapper_err_arm_leak]] memory.
 			mapped_call = ast.Call(
 				func = self.lowering._synth_name( mapper_var.stem, node ), args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
 			)
@@ -15446,7 +15534,7 @@ class FunctionLowering:
 		def err_thunk() -> bool:
 			self._cfg.narrow( recv_var.stem, err_member )
 			err_bind_name = f'__ot_err_{unique}'
-			self._declare_hidden_local( err_bind_name, error_cls, node )
+			err_bind_var = self._declare_hidden_local( err_bind_name, error_cls, node )
 			extract = ast.Assign(
 				targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
 			)
@@ -15472,14 +15560,31 @@ class FunctionLowering:
 			# bind_name by this point, so releasing recv_var here (its
 			# extraction already done, nothing else in err_thunk touches
 			# it again) is correct, not premature.
-			if receiver.type.is_rc():
-				recv_decref = ast.Expr( value = ast.Call(
-					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
-					args = [ self.lowering._synth_name( recv_var.stem, node ) ], keywords = [],
-				))
-				ast.copy_location( recv_decref, node ); ast.copy_location( recv_decref.value, node )
-				ast.copy_location( recv_decref.value.func, node ); ast.copy_location( recv_decref.value.func.value, node )
-				self._lower_stmt( recv_decref )
+			#
+			# _internal_decref_var(recv_var) directly - NOT a synthesized
+			# compiler.__internal_decref__(recv_var) ast.Call, which is what
+			# this used to be. recv_var was narrowed (cfg.narrow, above) to
+			# its Err member just before this point - re-resolving a
+			# synthesized ast.Name reference to it through _lower_expr,
+			# post-narrowing, returns a freshly-EXTRACTED ir.Temp (the
+			# narrowed payload itself), not the union Variable - so
+			# manually_decreffed() silently cancelled the wrong thing (an
+			# unrelated Temp, via its own _temp_states branch) while
+			# recv_var's REAL binding/epilogue-stack entry stayed live,
+			# left for the raise below to redundantly release a second
+			# time. Confirmed via a real repro + compiler-side trace.
+			# _internal_decref_var operates on the Variable object directly,
+			# bypassing that re-resolution entirely - see its own docstring.
+			#
+			# cfg.rc_leaves(receiver.type), NOT receiver.type.is_rc() -
+			# receiver.type is Result[_,_], a TaggedUnion struct, never a
+			# bare RC pointer itself (is_rc() is narrower than rc_leaves(),
+			# same "TaggedUnion with RC members" gap _lower_compiler_decref's
+			# own comment documents) - kept for consistency with every other
+			# guard of this shape in this file, though not itself what was
+			# broken here (both happened to agree on this specific type).
+			if cfg.rc_leaves( receiver.type ):
+				self._internal_decref_var( recv_var )
 			# the mapper call is lowered directly here (never embedded
 			# unevaluated inside a fresh ast.Raise, unlike a plain hand-
 			# written `raise mapper(err)`) - both err_bind_name and mapper_var
@@ -15512,13 +15617,7 @@ class FunctionLowering:
 				# container-owned value into a local, explicitly decref it"
 				# idiom list.__del__/dict's own _release_key/_release_value
 				# already use elsewhere in this stdlib
-				err_decref = ast.Expr( value = ast.Call(
-					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
-					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
-				))
-				ast.copy_location( err_decref, node ); ast.copy_location( err_decref.value, node )
-				ast.copy_location( err_decref.value.func, node ); ast.copy_location( err_decref.value.func.value, node )
-				self._lower_stmt( err_decref )
+				self._internal_decref_var( err_bind_var )
 			if mapper_var.type.is_rc():
 				# a real capturing closure (ClosureType is_rc()) - declared
 				# in the try body (before this branch even starts), so its
@@ -15535,13 +15634,7 @@ class FunctionLowering:
 				# path only (the Ok path's own real function-level `return`
 				# still correctly walks and releases it, since it never
 				# goes through a handler dispatch at all).
-				mapper_decref = ast.Expr( value = ast.Call(
-					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
-					args = [ self.lowering._synth_name( mapper_var.stem, node ) ], keywords = [],
-				))
-				ast.copy_location( mapper_decref, node ); ast.copy_location( mapper_decref.value, node )
-				ast.copy_location( mapper_decref.value.func, node ); ast.copy_location( mapper_decref.value.func.value, node )
-				self._lower_stmt( mapper_decref )
+				self._internal_decref_var( mapper_var )
 			self._raise_value( mapped_value, node )
 			return True
 
@@ -17077,6 +17170,10 @@ class FunctionLowering:
 
 			case 'refcount':
 				result = self._lower_compiler_refcount( node, expected_type )
+				return result if want_result else None
+
+			case '__debug_quarantine__':
+				result = self._lower_compiler_debug_quarantine( node, expected_type )
 				return result if want_result else None
 
 			case 'error':

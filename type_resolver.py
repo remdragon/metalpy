@@ -92,7 +92,7 @@ def _build_field_teardown_ast( field_expr: ast.Attribute, field_type: Type ) -> 
 					),
 					guard = None,
 					body = [ _expr_stmt( ast.Call(
-						func = ast.Attribute( value = _id('compiler'), attr = 'decref', ctx = ast.Load() ),
+						func = ast.Attribute( value = _id('compiler'), attr = '__internal_decref__', ctx = ast.Load() ),
 						args = [ _id( bind_name ) ], keywords = [],
 					)) ],
 				))
@@ -1618,7 +1618,7 @@ class TypeResolver:
 			# lowering) marks it consumed, so the loop's own back-edge
 			# reconciliation no longer tries a second time.
 			ok_case_body.append( _expr_stmt( ast.Call(
-				func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+				func = ast.Attribute( value = _id( 'compiler' ), attr = '__internal_decref__', ctx = ast.Load() ),
 				args = [ ast.Name( id = ok_bind_name, ctx = ast.Load() ) ], keywords = [],
 			)))
 		elem_type_name = self._type_annotation_ast( elem_type, node )
@@ -1702,7 +1702,7 @@ class TypeResolver:
 				]
 				if needs_promotion and leaf.is_rc():
 					leaf_body.append( _expr_stmt( ast.Call(
-						func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+						func = ast.Attribute( value = _id( 'compiler' ), attr = '__internal_decref__', ctx = ast.Load() ),
 						args = [ ast.Name( id = narrowed_name, ctx = ast.Load() ) ], keywords = [],
 					)))
 				inner_cases.append( build_leaf_case( leaf, narrowed_name, leaf_body ))
@@ -1916,7 +1916,7 @@ class TypeResolver:
 				# separate $$__resume__ call where this plain local no longer
 				# exists
 				forward_body.append( _expr_stmt( ast.Call(
-					func = ast.Attribute( value = _id( 'compiler' ), attr = 'decref', ctx = ast.Load() ),
+					func = ast.Attribute( value = _id( 'compiler' ), attr = '__internal_decref__', ctx = ast.Load() ),
 					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
 				)))
 			forward_body.append( forward_yield() )
@@ -3678,7 +3678,7 @@ class TypeResolver:
 			ok_annotation = ast.Name( id = '<$$__new__.result_type>', ctx = ast.Load() )
 			ok_annotation.resolved_type = return_type
 			decref_self_stmt = ast.Expr( ast.Call(
-				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+				func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = '__internal_decref__', ctx = ast.Load() ),
 				args = [ ast.Name( id = 'self', ctx = ast.Load() ) ], keywords = [],
 			))
 			body.append( ast.AnnAssign( target = ast.Name( id = 'ok', ctx = ast.Store() ), annotation = ok_annotation, value = ok_expr, simple = 1 ))

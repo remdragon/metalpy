@@ -349,11 +349,14 @@ class FastList[T]( Sized ):
 			return ptr[0]
 
 	def __del__( self ) -> None:
-		# Decref all RC elements before RawFastList frees the buffer
+		# Decref all RC elements before RawFastList frees the buffer. Never
+		# bound to a named local first (see lib/builtins/__init__.py's
+		# _release_key/_release_value for the identical concern) - a real
+		# double-free otherwise once this element's own last iteration's
+		# binding also got its own ordinary scope-exit release.
 		i: usize = 0
 		while i < self.__raw.len():
-			val: T = self._read_element( self.__raw._slot_ptr( i ))
-			compiler.decref( val )
+			compiler.decref( self._read_element( self.__raw._slot_ptr( i )))
 			with compiler.panic_arithmetic( 'FastList.__del__: overflow' ):
 				i += 1
 		# RawFastList.__del__ will free the raw buffers
@@ -385,22 +388,19 @@ class FastList[T]( Sized ):
 
 	# Remove by stable ID. Decrefs the removed element if T is RC.
 	def erase( self, id: usize ) -> Result[None, IndexError]:
-		val: T = self._read_element( self.__raw._get( id ).or_return())
-		compiler.decref( val )
+		compiler.decref( self._read_element( self.__raw._get( id ).or_return()))
 		return self.__raw._erase( id )
 
 	# Remove by data-buffer index. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
-		val: T = self._read_element( self.__raw._get_at( idx ).or_return())
-		compiler.decref( val )
+		compiler.decref( self._read_element( self.__raw._get_at( idx ).or_return()))
 		return self.__raw._erase_at( idx )
 
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> None:
 		i: usize = 0
 		while i < self.__raw.len():
-			val: T = self._read_element( self.__raw._slot_ptr( i ))
-			compiler.decref( val )
+			compiler.decref( self._read_element( self.__raw._slot_ptr( i )))
 			with compiler.panic_arithmetic( 'FastList.clear: overflow' ):
 				i += 1
 		self.__raw._clear()
