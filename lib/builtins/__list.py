@@ -203,6 +203,12 @@ class UnsafeList[T]( Sized ):
 	# compiler.is_rc(T) folds away entirely at compile time, so this stays
 	# one shared, readable method instead of scattering the distinction
 	# through every accessor below.
+	#
+	# Returns a BARE BORROW (no incref) - callers that want an owned copy
+	# incref it themselves right after calling this (__getitem__/get_at).
+	# NEVER pass this call's result straight into compiler.decref(...) -
+	# see _release_element below for why that's a real double-free, not
+	# just a style nit.
 	def _read_element( self, slot: Ptr[None] ) -> T:
 		if compiler.is_rc( T ):
 			handle_slot: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], slot )
@@ -210,6 +216,27 @@ class UnsafeList[T]( Sized ):
 		else:
 			ptr: Ptr[T] = compiler.cast( Ptr[T], slot )
 			return ptr[0]
+
+	# Releases the list's own reference to the (RC) element stored at slot -
+	# the release-side counterpart to _read_element, used everywhere an
+	# element is being removed/overwritten/torn down (__del__/__setitem__/
+	# erase_at/clear). Does the cast AND the compiler.decref(...) inside
+	# ONE function body rather than `compiler.decref(self._read_element(
+	# slot))` (what this used to be) - _read_element's return is a bare
+	# borrow, but ANY function call's RC-typed result still gets its own
+	# automatic release as an "owned" value (see _lower_slice_subscript's
+	# own comment on that general convention), on top of the explicit
+	# decref right here - a real double-free, confirmed via a real repro
+	# (list[str].append of a non-literal str, e.g. a slice result - a
+	# literal string's immortal refcount masked this everywhere existing
+	# tests only ever appended literals). Keeping the cast+decref together
+	# in one body, never returned across a call boundary, is the same bare-
+	# inline-cast idiom dict's own _release_key/_release_value already rely
+	# on for the identical reason.
+	def _release_element( self, slot: Ptr[None] ) -> None:
+		if compiler.is_rc( T ):
+			handle_slot: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], slot )
+			compiler.decref( compiler.cast( T, handle_slot[0] ))
 
 	# The write-side mirror of _read_element - RC objects are only ever a
 	# pointer wide, so writing one through is just overwriting the handle,
@@ -223,14 +250,12 @@ class UnsafeList[T]( Sized ):
 			ptr[0] = val
 
 	def __del__( self ) -> None:
-		# Decref all RC elements before RawList frees the buffer. Never
-		# bound to a named local first (see lib/builtins/__init__.py's
-		# _release_key/_release_value for the identical concern) - a real
-		# double-free otherwise once this element's own last iteration's
-		# binding also got its own ordinary scope-exit release.
+		# Decref all RC elements before RawList frees the buffer - see
+		# _release_element's own comment for why that must stay a single
+		# self-contained call, never compiler.decref(self._read_element(...)).
 		i: usize = 0
 		while i < self.__raw.len():
-			compiler.decref( self._read_element( self.__raw._slot_ptr( i )))
+			self._release_element( self.__raw._slot_ptr( i ))
 			with compiler.panic_arithmetic( 'list.__del__: overflow' ):
 				i += 1
 		# RawList.__del__ will free the raw buffer
@@ -279,7 +304,7 @@ class UnsafeList[T]( Sized ):
 	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
 		slot: Ptr[None] = self.__raw._ptr_at( idx ).or_return()
-		compiler.decref( self._read_element( slot ))
+		self._release_element( slot )
 		compiler.incref( val )
 		self._write_element( slot, val )
 		return Result.Ok( None )
@@ -287,14 +312,14 @@ class UnsafeList[T]( Sized ):
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
-		compiler.decref( self._read_element( self.__raw._ptr_at( idx ).or_return()))
+		self._release_element( self.__raw._ptr_at( idx ).or_return())
 		return self.__raw._remove_at( idx )
 
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> None:
 		i: usize = 0
 		while i < self.__raw.len():
-			compiler.decref( self._read_element( self.__raw._slot_ptr( i )))
+			self._release_element( self.__raw._slot_ptr( i ))
 			with compiler.panic_arithmetic( 'list.clear: overflow' ):
 				i += 1
 		self.__raw._clear()
