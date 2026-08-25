@@ -4144,6 +4144,16 @@ class TypeResolver:
 			# same as lowering.py's own _resolve_scalar_name does for the
 			# other two Scalar.names readers (_find_method/_find_dunder_for_arg)
 			found = self.monomorphizer.monomorphized_function( found )
+		if found is None:
+			# distinct from the "found something, but it's not callable"
+			# message just below (a real field/Variable, see e.g.
+			# test_non_callable_field_still_rejected_by_closure_call_
+			# recognizer) - this attr isn't a member AT ALL, which
+			# "is not callable on" used to also say, misleadingly implying
+			# a non-callable attribute by this name actually exists (e.g.
+			# re.Pattern.finditer - not a method at all, only a module-level
+			# free function; see lib/re.py's own finditer() docstring)
+			self.discovery.fail( f'{owner_type.qualname if owner_type else "?"} has no method {attr!r}', ctx )
 		if not isinstance( found, ( Function, Overload )):
 			self.discovery.fail( f'{attr!r} is not callable on {owner_type.qualname if owner_type else "?"}', ctx )
 		if isinstance( found, ( Function, Overload )):
