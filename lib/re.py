@@ -1812,11 +1812,28 @@ class Pattern:
 			case Result.Err( e ):
 				return Result.Err( e )
 
-	# No Pattern.finditer() METHOD - "a generator method is not supported
-	# yet" (confirmed directly). See the module-level finditer() function
-	# below for the free-function form and its own further limitation
-	# (confirmed unusable from any module other than this one - a general
-	# compiler bug, not specific to this API).
+	def finditer( self, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+		''' yields each successive non-overlapping match, scanning forward
+		from the end of the previous one (or by one codepoint, for a
+		zero-width match). Generator methods are now supported (self is
+		just another captured field on the generator's own backing class -
+		see PLAN_GENERATORS.md) - the module-level finditer(pattern, s)
+		free function below is now a thin `yield from` wrapper over this.
+
+		Same "yield as a direct, unnested statement of a single top-level
+		while loop" shape constraint as every other generator in this
+		file - see the module-level finditer()'s own docstring for why the
+		match itself is recomputed each iteration (pos/has_next as plain
+		scalar loop state) rather than carried across the yield. '''
+		slen: usize = s.byte_len()
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		while has_next:
+			m: Match = _require_next_match( self, s, pos, slen, max_steps )
+			pos = _advance_pos_after_match( m, s )
+			yield m
+			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
+		return
 
 	def findall( self, s: str, max_steps: usize = 65536 ) -> list[str]:
 		''' the whole (group 0) text of every non-overlapping match, in
@@ -2034,62 +2051,14 @@ def _require_next_match_memoryview( pattern: Pattern, s: memoryview, pos: usize,
 # overloads (str/bytes/memoryview) - see Pattern.search()'s own comment
 # above (task_85803192).
 def finditer( pattern: Pattern, s: str, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
-	''' yields each successive non-overlapping match, scanning forward
-	from the end of the previous one (or by one codepoint, for a
-	zero-width match). Externally consumable via a real for-loop as of
-	the compiler fix in 2cb18c4 ("Fix cross-module generator synthesis
-	resolving names in wrong module") - confirmed directly; previously
-	this only worked for same-module callers, which is why
-	findall/sub/subn/split below still don't call it internally (they
-	predate the fix and re-do the same scan-forward directly against
-	_find_next_match instead - no need to revisit now that it works,
-	but also no need to change working code just to share it).
-
-	A free function, not a Pattern method - confirmed directly that a
-	generator METHOD isn't supported yet, and separately that an
-	Iterator[T] value merely returned/passed through a non-generator
-	function (even a trivial `return other_generator(...)`, same
-	module) has no usable __next__ for the receiver - only a DIRECT
-	call to the actual generator function works as a for-loop's
-	iterable expression. There is also no module-level str-pattern
-	convenience overload here (unlike search/match/fullmatch/findall/
-	sub/subn/split below): a second `finditer(pattern: str, ...)`
-	generator that re-yields from this one via `for m in finditer(p,
-	...): yield m` was tried and produced nonsensical errors (undefined
-	names inside THIS function's own already-correct body) once two
-	same-named overloads were both generators - not investigated
-	further (this was before the cross-module fix landed; may be worth
-	retrying, but not revisited here since compile-then-call works
-	fine). Compile the pattern with re.compile() first, then call
-	finditer(pattern, s) with the result.
-
-	The generator body itself must also keep yield as a direct, unnested
-	statement of a single top-level while loop - nesting it inside an
-	if/else within the loop (the natural first-cut shape) is a separate,
-	unsupported combination from a bare top-level if/else containing
-	yield (confirmed directly), so the "is there a match" branching has
-	to live in the while loop's own CONDITION instead of its body. That
-	in turn means the loop can't carry a Match|None as its own persisted
-	state across the yield boundary either (confirmed directly -
-	promoting an Optional RC-typed local across a yield produces a type
-	mismatch in the synthesized state field, unlike a bare, non-Optional
-	RC-typed local, which Phase 9 of PLAN_GENERATORS.md's own generator
-	work does support) - so the loop state here is two plain scalars
-	(pos: usize, has_next: bool) instead, and the actual Match value is
-	recomputed fresh each iteration via _require_next_match rather than
-	carried across the yield. This costs an extra redundant _search_from
-	call per position (once to check has_next, once more to fetch the
-	value) - an accepted v1 inefficiency, not a correctness issue, since
-	matching is deterministic. '''
-	slen: usize = s.byte_len()
-	pos: usize = 0
-	has_next: bool = _has_match_at_or_after( pattern, s, pos, slen, max_steps )
-	while has_next:
-		m: Match = _require_next_match( pattern, s, pos, slen, max_steps )
-		pos = _advance_pos_after_match( m, s )
-		yield m
-		has_next = _has_match_at_or_after( pattern, s, pos, slen, max_steps )
-	return
+	''' free-function form, kept for callers that don't already have a
+	`match` binding named suggestively as a method receiver - a thin
+	`yield from` wrapper over the real implementation, now Pattern.
+	finditer() itself (generator methods are supported - see that
+	method's own docstring, PLAN_GENERATORS.md). `yield from` requires
+	an EXACT Result[T,E] shape match between the two generators, which
+	this trivially satisfies (both Iterator[Result[Match,StopIteration]]). '''
+	yield from pattern.finditer( s, max_steps )
 
 
 def finditer( pattern: Pattern, s: bytes, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:

@@ -112,6 +112,12 @@ class _GeneratorNameRenamer( ast.NodeTransformer ):
 	def visit_AsyncFunctionDef( self, node ): return node
 	def visit_Lambda( self, node ): return node
 	def visit_Name( self, node ):
+		if getattr( node, 'compiler_synthesized_generator_self', False ):
+			# _self_attr's own bare Name('self') - already means the backing
+			# instance directly, never the original method receiver (only
+			# relevant when 'self' is itself a rename target - a generator
+			# METHOD's own captured self, see _generator_self_parameter)
+			return node
 		if node.id in self.targets:
 			inner = ast.Name( id = 'self', ctx = ast.Load() )
 			ast.copy_location( inner, node )
@@ -300,7 +306,18 @@ class TypeResolver:
 		return any( isinstance( n, ( ast.Yield, ast.YieldFrom )) for n in self._walk_generator_body( fn.node.body ))
 
 	def _self_attr( self, name: str, node: ast.AST ) -> ast.Attribute:
+		''' `self` here ALWAYS means the generator's own backing-class
+		instance (this is the one place every compiler-synthesized
+		self.<field> access is built from) - tagged compiler_synthesized_
+		generator_self so _GeneratorNameRenamer's own rename pass (which
+		later sweeps up whatever's already sitting in fn.node.body, user
+		code and synthesized statements alike - see e.g. _rewrite_generator_
+		bare_returns's own docstring) leaves it alone even when a generator
+		METHOD's real `self` (the original receiver) is ALSO a rename
+		target (-> self.self.<x>, see _generator_self_parameter) - this
+		bare Name('self') is never that. '''
 		inner = ast.Name( id = 'self', ctx = ast.Load() )
+		inner.compiler_synthesized_generator_self = True
 		ast.copy_location( inner, node )
 		attr = ast.Attribute( value = inner, attr = name, ctx = ast.Load() )
 		ast.copy_location( attr, node )
@@ -1930,6 +1947,36 @@ class TypeResolver:
 				states.append( ( state, label ) )
 		return states
 
+	def _generator_self_parameter( self, fn: Function ) -> 'Parameter|None':
+		''' a generator METHOD's own `self` is architecturally just another
+		captured parameter (assigned once, at construction, never
+		reassigned mid-body) - excluded from fn.parameters entirely by
+		discovery.py's add_param (see lowering.py's own synthesis of it at
+		method-lowering time), so this rebuilds an equivalent Parameter
+		here the same way, for every generator-synthesis call site below
+		that otherwise iterates fn.parameters. None for a plain function
+		(fn.cls is None). Mirrors lowering.py's own self_type derivation
+		(RCClass self is the class itself; an @interface CStruct's self is
+		Ptr[T] - see that file's _make_function_resolver-equivalent). '''
+		if fn.cls is None:
+			return None
+		self_type: Type = fn.cls
+		if isinstance( fn.cls, CStruct ) and fn.cls.is_interface:
+			ptr_cls = self.discovery.get_intrinsics()['Ptr']
+			self_type = self.discovery._get_or_create_specialization( ptr_cls, [ fn.cls ] )
+		return Parameter( stem = 'self', qualname = f'{fn.qualname}.self', file = fn.file, line = fn.line, type = self_type )
+
+	def _generator_effective_parameters( self, fn: Function ) -> list[Parameter]:
+		''' fn.parameters, with a generator METHOD's own synthetic `self`
+		(see _generator_self_parameter) prepended - the single list every
+		generator-synthesis call site below should iterate instead of
+		fn.parameters directly, so self flows through the backing class's
+		fields/constructor/destructor exactly like any other captured
+		parameter, no separate machinery needed. '''
+		self_param = self._generator_self_parameter( fn )
+		params = list( fn.parameters or [] )
+		return ( [ self_param ] + params ) if self_param is not None else params
+
 	def _collect_generator_locals( self, fn: Function ) -> dict[str,Type]:
 		''' every local assigned anywhere in the body becomes a field - see
 		this section's own docstring above. A local's TYPE comes from its
@@ -1946,7 +1993,7 @@ class TypeResolver:
 		it once it's actually been assigned - the exact problem that made
 		v1 restrict this in the first place (an unconditional decref of a
 		not-yet-initialized field would touch garbage). '''
-		param_stems = { p.stem for p in fn.parameters or [] }
+		param_stems = { p.stem for p in self._generator_effective_parameters( fn ) }
 		locals_decl: dict[str,Type] = {}
 		for node in self._walk_generator_body( fn.node.body ):
 			if isinstance( node, ast.AnnAssign ) and isinstance( node.target, ast.Name ):
@@ -2013,7 +2060,7 @@ class TypeResolver:
 		state_attr = Variable( stem = '__state', qualname = f'{qualname}.__state', file = fn.file, line = fn.line, type = usize_cls )
 		param_attrs = [
 			Variable( stem = p.stem, qualname = f'{qualname}.{p.stem}', file = fn.file, line = fn.line, type = p.type )
-			for p in fn.parameters or []
+			for p in self._generator_effective_parameters( fn )
 		]
 		local_attrs = [
 			Variable( stem = stem, qualname = f'{qualname}.{stem}', file = fn.file, line = fn.line, type = t )
@@ -2293,7 +2340,7 @@ class TypeResolver:
 		a tagged synthesized exhaustion return, which wraps into
 		Result.Err(StopIteration()) instead - see _wrap_generator_next_
 		returns_in_ok. '''
-		rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() )
+		rename_targets = { p.stem for p in self._generator_effective_parameters( fn ) } | set( locals_decl.keys() )
 		renamer = _GeneratorNameRenamer( rename_targets )
 
 		rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
@@ -2630,14 +2677,16 @@ class TypeResolver:
 		# renames arbitrary user-authored statements - every OTHER
 		# statement here is built directly against self.<field>)
 		if defer_sites:
-			rename_targets = { p.stem for p in fn.parameters or [] } | set( locals_decl.keys() )
+			rename_targets = { p.stem for p in self._generator_effective_parameters( fn ) } | set( locals_decl.keys() )
 			dtor_renamer = _GeneratorNameRenamer( rename_targets )
 			rc_local_stems = { stem for stem, t in locals_decl.items() if t.is_rc() }
 			body.extend( self._rename_and_track_liveness( self._build_defer_replay_guards( defer_sites, fn.node ), dtor_renamer, rc_local_stems ))
 
-		# 1. captured parameters - unconditional, always valid from
-		# construction onward (unchanged from every earlier phase)
-		for p in fn.parameters or []:
+		# 1. captured parameters (a generator method's own synthetic self
+		# included - see _generator_effective_parameters) - unconditional,
+		# always valid from construction onward (unchanged from every
+		# earlier phase)
+		for p in self._generator_effective_parameters( fn ):
 			attr = backing_cls.get_local_or_raise( p.stem )
 			assert isinstance( attr, Variable )
 			body.extend( self._build_field_teardown_ast(
@@ -2759,7 +2808,7 @@ class TypeResolver:
 		here). '''
 		none_type = self.discovery.get_none_type()
 		keywords = [ ast.keyword( arg = '__state', value = ast.Constant( value = 0 ) ) ]
-		for p in fn.parameters or []:
+		for p in self._generator_effective_parameters( fn ):
 			name_node = ast.Name( id = p.stem, ctx = ast.Load() )
 			ast.copy_location( name_node, fn.node )
 			keywords.append( ast.keyword( arg = p.stem, value = name_node ) )
@@ -2895,8 +2944,19 @@ class TypeResolver:
 			# `gen[i32](...)` call site in the program, not just a
 			# genuinely unsupported shape
 			return
-		if fn.cls is not None:
-			self.discovery.fail( f'{fn.qualname}: a generator method is not supported yet - only a plain function may contain yield - see PLAN_GENERATORS.md', fn.node )
+		if fn.cls is not None and ( fn.is_static or fn.is_classmethod ):
+			# a plain instance method's own `self` is just another captured
+			# parameter (see _generator_self_parameter) - a static/classmethod
+			# generator has no such receiver to capture the same way (no
+			# forcing use case yet, unlike the instance-method case - see
+			# PLAN_GENERATORS.md)
+			self.discovery.fail( f'{fn.qualname}: a static/classmethod generator is not supported yet - see PLAN_GENERATORS.md', fn.node )
+		if fn.cls is not None and isinstance( fn.cls, CStruct ) and fn.cls.is_interface:
+			# an @interface CStruct's self is Ptr[T], not a plain RC-typed
+			# value - untested combination with the live-flag-less "always
+			# valid from construction" captured-parameter treatment below;
+			# narrower scope for now, no forcing use case yet either
+			self.discovery.fail( f'{fn.qualname}: a generator method on an @interface CStruct is not supported yet - see PLAN_GENERATORS.md', fn.node )
 		if not isinstance( fn.return_type, GeneratorType ):
 			self.discovery.fail( f'{fn.qualname} contains yield but is not declared -> Iterator[T]', fn.node )
 

@@ -23274,6 +23274,142 @@ def main() -> None:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( "type parameter 'T' is inferred as both", str( self.discovery.errors.errors[0] ))
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generator_method_programs_compile_and_run( self ) -> None:
+		''' generator METHODS - a class method containing `yield`, no
+		longer rejected (PLAN_GENERATORS.md's own "explicitly not planned"
+		list, lifted now there's a real forcing use case - lib/re.py's
+		Pattern.finditer). self is architecturally just another captured
+		parameter (see type_resolver.py's _generator_self_parameter/
+		_generator_effective_parameters) - assigned once at construction,
+		valid unconditionally for the generator's whole lifetime, torn down
+		via the ordinary unmodified $$__destructor__ cascade like any other
+		captured RC-typed parameter, no live-flag needed. '''
+		self.assert_programs_run([
+			( 'simple_generator_method_no_other_captures', '''
+class Counter:
+	limit: i32
+	def __init__( self, limit: i32 ) -> None:
+		self.limit = limit
+	def count( self ) -> Iterator[Result[i32, StopIteration]]:
+		i: i32 = 0
+		while i < self.limit:
+			yield i
+			with compiler.wrap_arithmetic:
+				i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		c = Counter( limit = 3 )
+		g = c.count()
+		total: i32 = 0
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( x ):
+					total += x
+		if total != 3: # 0 + 1 + 2
+			return 1
+		return 0
+''' ),
+			( 'generator_method_also_captures_other_locals_and_params', '''
+class Adder:
+	base: i32
+	def __init__( self, base: i32 ) -> None:
+		self.base = base
+	def added_range( self, count: i32, step: i32 ) -> Iterator[Result[i32, StopIteration]]:
+		i: i32 = 0
+		with compiler.wrap_arithmetic:
+			while i < count:
+				yield self.base + i * step
+				i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		a = Adder( base = 100 )
+		g = a.added_range( 3, 10 )
+		total: i32 = 0
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( x ):
+					total += x
+		if total != 330: # 100 + 110 + 120
+			return 1
+		return 0
+''' ),
+			( 'generator_method_mutates_field_on_self_across_a_yield', '''
+class Accumulator:
+	total: i32
+	def __init__( self ) -> None:
+		self.total = 0
+	def gen( self, count: i32 ) -> Iterator[Result[i32, StopIteration]]:
+		i: i32 = 0
+		with compiler.wrap_arithmetic:
+			while i < count:
+				self.total += i
+				yield self.total
+				i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		acc = Accumulator()
+		g = acc.gen( 3 )
+		last: i32 = -1
+		while True:
+			v = g.__next__()
+			match v:
+				case Result.Err( _ ):
+					break
+				case Result.Ok( x ):
+					last = x
+		# self.total observable through the ORIGINAL object too - proves
+		# self.<field> writes inside the generator method really land on
+		# the shared instance, not some disconnected copy
+		if acc.total != 3 or last != 3: # 0 + 1 + 2
+			return 1
+		return 0
+''' ),
+			( 'dropped_mid_iteration_decrefs_captured_self', '''
+class Box:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Holder:
+	b: Box
+	def __init__( self, b: Box ) -> None:
+		self.b = b
+	def gen( self ) -> Iterator[Result[i32, StopIteration]]:
+		yield self.b.v
+		yield self.b.v
+
+def make_and_partially_consume( h: Holder ) -> None:
+	g = h.gen()
+	first = g.__next__().is_ok() # only one of two yields ever consumed
+	if first: pass
+	# g goes out of scope here, still mid-iteration - the generator's own
+	# captured `self` (the Holder) must still release correctly, via the
+	# ordinary $$__destructor__ cascade, same as any other captured
+	# RC-typed parameter
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		b = Box( v = 42 )
+		h = Holder( b = b )
+		if compiler.refcount( h ) != 1:
+			return 1
+		make_and_partially_consume( h )
+		if compiler.refcount( h ) != 1:
+			return 2
+		return 0
+''' ),
+		])
+
 
 class DelRedeclareRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' del x fully removes x from the enclosing function's own scope
