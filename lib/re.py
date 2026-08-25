@@ -1835,6 +1835,39 @@ class Pattern:
 			has_next = _has_match_at_or_after( self, s, pos, slen, max_steps )
 		return
 
+	def finditer( self, s: bytes, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+		''' byte-mode sibling of the str finditer() above - same generator-
+		shape constraints, same accepted "recompute instead of carry across
+		yield" v1 inefficiency. Returned Match objects are byte-mode (their
+		own .group()/.groupdict()/.groups() panic if called - see Match's
+		own note); .span()/.start()/.end()/.regs/.lastindex all work
+		identically to the str case. '''
+		slen: usize = len( s )
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after_bytes( self, s, pos, slen, max_steps )
+		while has_next:
+			m: Match = _require_next_match_bytes( self, s, pos, slen, max_steps )
+			pos = _advance_pos_after_match_bytes( m, slen )
+			yield m
+			has_next = _has_match_at_or_after_bytes( self, s, pos, slen, max_steps )
+		return
+
+	def finditer( self, s: memoryview, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
+		''' memoryview sibling of the str finditer() above - same generator-
+		shape constraints, same byte-mode Match caveats (see the bytes
+		sibling's own docstring). This is the exact shape grap.mpy's own
+		port needs: `for m in pattern.finditer( mv[a:b] ):` over a
+		memoryview slice. '''
+		slen: usize = len( s )
+		pos: usize = 0
+		has_next: bool = _has_match_at_or_after_memoryview( self, s, pos, slen, max_steps )
+		while has_next:
+			m: Match = _require_next_match_memoryview( self, s, pos, slen, max_steps )
+			pos = _advance_pos_after_match_bytes( m, slen )
+			yield m
+			has_next = _has_match_at_or_after_memoryview( self, s, pos, slen, max_steps )
+		return
+
 	def findall( self, s: str, max_steps: usize = 65536 ) -> list[str]:
 		''' the whole (group 0) text of every non-overlapping match, in
 		order. Python's own findall() returns per-group tuples when the
@@ -2062,38 +2095,23 @@ def finditer( pattern: Pattern, s: str, max_steps: usize = 65536 ) -> Iterator[R
 
 
 def finditer( pattern: Pattern, s: bytes, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
-	''' byte-mode sibling of finditer() above - same generator-shape
-	constraints apply (see that docstring), same accepted "recompute
-	instead of carry across yield" v1 inefficiency. Returned Match objects
-	are byte-mode (their own .group()/.groupdict()/.groups() panic if
-	called - see Match's own note); .span()/.start()/.end()/.regs/
+	''' byte-mode sibling of finditer() above - a thin `yield from` wrapper
+	over Pattern.finditer(bytes) itself, same as the str overload. Returned
+	Match objects are byte-mode (their own .group()/.groupdict()/.groups()
+	panic if called - see Match's own note); .span()/.start()/.end()/.regs/
 	.lastindex all work identically to the str case, which is everything
 	grap.mpy's own port needs from this. '''
-	slen: usize = len( s )
-	pos: usize = 0
-	has_next: bool = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
-	while has_next:
-		m: Match = _require_next_match_bytes( pattern, s, pos, slen, max_steps )
-		pos = _advance_pos_after_match_bytes( m, slen )
-		yield m
-		has_next = _has_match_at_or_after_bytes( pattern, s, pos, slen, max_steps )
-	return
+	yield from pattern.finditer( s, max_steps )
 
 
 def finditer( pattern: Pattern, s: memoryview, max_steps: usize = 65536 ) -> Iterator[Result[Match, StopIteration]]:
-	''' memoryview sibling of finditer() above - same generator-shape
-	constraints, same byte-mode Match caveats (see the bytes sibling's own
-	docstring). This is the exact shape grap.mpy's own port needs:
-	`for m in re.finditer(pattern, mv[a:b]):` over a memoryview slice. '''
-	slen: usize = len( s )
-	pos: usize = 0
-	has_next: bool = _has_match_at_or_after_memoryview( pattern, s, pos, slen, max_steps )
-	while has_next:
-		m: Match = _require_next_match_memoryview( pattern, s, pos, slen, max_steps )
-		pos = _advance_pos_after_match_bytes( m, slen )
-		yield m
-		has_next = _has_match_at_or_after_memoryview( pattern, s, pos, slen, max_steps )
-	return
+	''' memoryview sibling of finditer() above - a thin `yield from` wrapper
+	over Pattern.finditer(memoryview) itself, same as the str overload.
+	This is the exact shape grap.mpy's own port needs: `for m in
+	re.finditer(pattern, mv[a:b]):` (or the equivalent
+	`pattern.finditer(mv[a:b])` method-call form) over a memoryview
+	slice. '''
+	yield from pattern.finditer( s, max_steps )
 
 
 def compile( pattern: str, flags: u32 = 0 ) -> Result[Pattern, PatternError]:

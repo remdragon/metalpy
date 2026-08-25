@@ -1032,6 +1032,85 @@ class RePhase9BehaviorTests( RealCompileMixin, unittest.TestCase ):
 			( 'memoryview', _RE_MEMORYVIEW ),
 		])
 
+	def test_pattern_finditer_overloads_combined_in_one_program( self ) -> None:
+		# regression, both confirmed via a real repro (grap.mpy calling
+		# Pattern.finditer(memoryview) after Pattern.finditer(bytes) had
+		# already been exercised elsewhere in the same program):
+		#
+		# 1) type_resolver.py's _build_generator_backing_class used bare
+		#    fn.qualname for the synthesized backing class - every member of
+		#    an @overload group (Pattern.finditer's own str/bytes/memoryview
+		#    overloads here) shares ONE qualname, so once more than one
+		#    overload was actually reached in the SAME compile unit, their
+		#    backing classes collided on the same C struct/vtable/__next__
+		#    symbol name - a genuine miscompilation (the two overloads' own
+		#    DIFFERENT state shapes silently merged into one struct), not
+		#    just a linker error.
+		# 2) _overload_call_return_type (used by `yield from` to resolve its
+		#    target's __next__) read an overload's .return_type without
+		#    first calling ensure_generator_synthesized on it, so the free
+		#    module-level finditer(pattern, bytes)/finditer(pattern,
+		#    memoryview) wrappers (`yield from pattern.finditer(s,
+		#    max_steps)`) failed to resolve __next__() at all - the bare,
+		#    unsynthesized Iterator[T] annotation has no such method.
+		#
+		# both bugs need TWO overloads of the SAME generator method actually
+		# reached in one program to reproduce - every other finditer test in
+		# this file exercises exactly one overload per isolated compile unit
+		# (assert_programs_run's own per-test separate-call convention),
+		# which is exactly why neither bug was ever caught before.
+		self.assert_programs_run([
+			( 'pattern_finditer_str_and_bytes_and_memoryview_combined', '''
+import re
+
+def main() -> i32:
+	pat: re.Pattern = re.compile( r'\\d+' ).unwrap( 'compile' )
+
+	# str, via the method directly
+	scount: i32 = 0
+	with compiler.wrap_arithmetic:
+		for m in pat.finditer( 'a12b345c' ):
+			scount += 1
+	if scount != 2:
+		return 1
+
+	# bytes, via the method directly
+	bcount: i32 = 0
+	with compiler.wrap_arithmetic:
+		for m in pat.finditer( b'a12b345c' ):
+			bcount += 1
+	if bcount != 2:
+		return 2
+
+	# bytes, via the module-level free-function wrapper (yield from)
+	fcount: i32 = 0
+	with compiler.wrap_arithmetic:
+		for m in re.finditer( pat, b'a12b345c' ):
+			fcount += 1
+	if fcount != 2:
+		return 3
+
+	# memoryview, via the module-level free-function wrapper (yield from)
+	buf: bytearray = bytearray( 8 )
+	src: bytes = b'a12b345c'
+	p: Ptr[u8] = buf.get_ptr()
+	sp: ConstPtr[u8] = src.get_const_ptr()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < 8:
+			p[i] = sp[i]
+			i += 1
+	mcount: i32 = 0
+	with memoryview( buf ) as mv:
+		with compiler.wrap_arithmetic:
+			for m in re.finditer( pat, mv ):
+				mcount += 1
+	if mcount != 2:
+		return 4
+	return 0
+''' ),
+		])
+
 	def test_pattern_error_str( self ) -> None:
 		# regression: re.PatternError had no __str__ at all - `f'{e}'`/
 		# str(e) on a compile-error payload was a hard compile error (found
