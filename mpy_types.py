@@ -33,6 +33,31 @@ class Name:
 	# error - the real one was already recorded at the point of failure.
 	broken: bool = False
 
+	def __deepcopy__( self, memo: dict ) -> 'Name':
+		''' Name/Type/Function/Variable/Module/... instances are identity-
+		based, process-wide-shared singletons (interned via Discovery.
+		_get_or_create_specialization and friends, or simply constructed
+		once at their own definition site) - a bare copy.deepcopy() call
+		elsewhere in the compiler that happens to reach one of these
+		(typically via an AST node's own cached resolved-reference tag,
+		e.g. node.resolved_callee) must never clone it: doing so silently
+		produces a SECOND, non-identical object with the same qualname,
+		corrupting every identity-keyed cache downstream. Confirmed via a
+		real repro: compiling two generic instantiations of one generator
+		sharing a match-subject promoted RC-typed field crashed with a
+		RecursionError inside TaggedUnion's own dataclass __eq__, comparing
+		two non-interned but qualname-identical Result[i32,IndexError]
+		objects - traced to type_resolver.py's _apply_live_flag_guards,
+		whose own copy.deepcopy(s) on the promoted field's assignment
+		statement swept along a resolved_callee-tagged Function reference
+		and deep-cloned its entire return-type graph (recursively
+		duplicating i32/IndexError themselves in the process). Returning
+		self unchanged is exactly the correct semantics for a value this
+		codebase already treats as immutable/interned everywhere else -
+		every AST node itself still deep-copies normally; only a Name (or
+		subclass) reached FROM one is short-circuited here. '''
+		return self
+
 @dataclass( kw_only = True, repr = False )
 class Type( Name ):
 	''' maybe only use this to distinguish types from values '''

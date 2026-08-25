@@ -1,9 +1,34 @@
 # Follow-ups from the `_sequence_iter` simplification attempt (2026-08-25)
 
-Two independent pieces of work were scoped but not implemented this session.
-Both start from a fresh `EnterWorktree` per CLAUDE.md.
+**UPDATE (same day, worktree `simplify-sequence-iter`): item 1's CRASH half
+is FIXED** — `mpy_types.py`'s `Name` gained a `__deepcopy__` returning `self`
+(every `Name`/`Type`/`Function`/`Variable`/`Module`/... instance is an
+identity-based singleton; `copy.deepcopy` reaching one via a cached
+AST-node tag like `resolved_callee` must never clone it). Root-caused via
+`compiler.py`'s crashing `unit not in self.tagged_unions` check: two
+non-identical-but-qualname-identical `Result[i32,IndexError]` TaggedUnion
+objects were being compared, traced to `type_resolver.py`'s
+`_apply_live_flag_guards` deep-copying a promoted field's own assignment
+statement (to build its "first assignment" branch) and sweeping along a
+`resolved_callee`-tagged `Function` reference, cloning its entire
+return-type graph — including supposedly-singleton scalars. **Full suite
+verified clean on clang/MSVC/gcc(WSL), 1830/1830, with 2 new regression
+tests in `mpy_types_test.py`'s `NameDeepcopyIdentityTestCase`.** Ready to
+commit/merge on its own — real, independently-justified fix, unrelated to
+whether `_sequence_iter` itself ever gets rewritten.
 
-## 1. Cross-instantiation match-subject promotion cache bug (real, confirmed, live on master)
+**Item 1's TYPE-LEAK half is NOT fixed** — seeSection "Remaining work"
+below: even with the crash gone, `_sequence_iter` rewritten with `match`
+still produces a real compile error (`expected Result[set.T,...], got
+Result[i32,...]`) when multiple `Sequence[T]` conformers share it in one
+program. This is a SEPARATE bug from the crash (different symptom, not
+yet root-caused) — do not assume the deepcopy fix resolves it.
+
+Two more independent pieces of work were scoped but not implemented this
+session (item 3, and item 1's remaining type-leak half). Start from a
+fresh `EnterWorktree` per CLAUDE.md.
+
+## 1. Cross-instantiation match-subject promotion cache bug (crash FIXED; a type-leak variant remains)
 
 **Symptom:** compiling a program that iterates two DIFFERENT concrete
 `Sequence[T]` conformers (e.g. `str` and `set[i32]`) through the SAME
@@ -60,11 +85,41 @@ than once in the same compiled program, is affected — not hypothetical,
 just never previously exercised (existing tests for the subject/binding
 promotion fixes used single-instantiation repros).
 
+**Attempts to build a minimal standalone repro for the TYPE-LEAK half (all
+tried this session, none reproduce it in isolation — the bug needs
+`_sequence_iter`'s REAL shape, not just "some generic generator, called
+twice"):**
+- A free generic helper `probe[T](v,ok)` called AS the match subject
+  inside `gen[T](v)` — does NOT reproduce the type-leak; instead hits a
+  SEPARATE, already-documented, deliberately-scoped limitation
+  (PLAN_GENERATORS.md Phase 7 point 5: a generic generator body calling
+  ANOTHER generic function via its own type param fails cleanly with
+  "cannot build a generator zero-placeholder value for ...probe.T"). Not
+  useful as a repro — it's a different, known gap.
+- A generic class `Box[T]` with its own method `probe(self,ok)->Result[T,
+  IndexError]`, called as the match subject inside `gen[T](b: Box[T])`,
+  instantiated as `Box[i32]` and `Box[i64]` in one program — compiles AND
+  RUNS CLEANLY (exit 0), both before and after the deepcopy fix. Does NOT
+  reproduce either half of the bug (not the old crash, not the type-leak).
+- Conclusion: whatever's special about `_sequence_iter`'s real trigger
+  isn't just "shared generic generator + match-with-yield + 2
+  instantiations" — something about ITS SPECIFIC shape matters (two type
+  params `[T, S: Sequence[T]]` with a PROTOCOL-parametrized bound, not
+  just one plain `[T]`; and/or being reached via ANOTHER generic class's
+  OWN method body — `set[T].__iter__` calling `_sequence_iter(self)` — as
+  opposed to a plain top-level call). The "set.T" in the real error
+  (`expected ...Result[builtins.set.T,...]`) strongly suggests the leak
+  specifically involves `set[T].__iter__`'s OWN still-abstract `T`
+  bleeding into `_sequence_iter`'s reservation, not just any generic T.
+  **Next attempt should start from a generic CLASS whose method calls a
+  SEPARATE generic function bound via a protocol-parametrized TypeVar
+  (`S: Sequence[T]`)** — closer to matching `_sequence_iter`'s exact
+  parametrization — rather than a single-type-param free function.
+
 **Where to start:**
-1. Get a MINIMAL 2-instantiation repro outside `_sequence_iter` (two calls
-   to one `def gen[T](...)` with different concrete `T`, each with the
-   match-with-yield shape) to isolate from Sequence[T]/Iterable[T]
-   protocol machinery entirely.
+1. Build the closer repro above (generic class method → separate function
+   with a protocol-parametrized TypeVar bound) to isolate the type-leak
+   half from `_sequence_iter` itself while still reproducing it.
 2. Trace whether `fn.node` is actually the SAME Python object across two
    Specializations of one generic Function (`id(fn1.node) == id(fn2.node)`)
    — if so, that's the structural root cause, and either (a) `_reserve_
