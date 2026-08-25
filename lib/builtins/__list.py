@@ -234,9 +234,25 @@ class UnsafeList[T]( Sized ):
 	# inline-cast idiom dict's own _release_key/_release_value already rely
 	# on for the identical reason.
 	def _release_element( self, slot: Ptr[None] ) -> None:
+		# compiler.decref(...) is reached unconditionally (both branches),
+		# not just the is_rc(T) one - compiler.is_rc(T) is deliberately
+		# is_rc_POINTER (storage-layout only, see __init__'s own comment),
+		# not "does T need RC bookkeeping at all" - a @union T whose RC leaf
+		# is a plain RCClass (e.g. builtin int) takes the value-typed branch
+		# below for STORAGE yet still owns a real reference through its
+		# tag-gated leaf that must be released here. compiler.decref(...)
+		# itself already no-ops for a genuinely non-RC T, so calling it
+		# unconditionally is safe - mirrors UnsafeDict's identical
+		# _release_key/_release_value fix (this file's own header comment).
+		# The value-typed branch's decref target stays a bare, never-bound-
+		# to-a-name expression (like UnsafeDict's) - binding it to a local
+		# would make it an ordinary OWNED local with its own auto-decref,
+		# double-releasing on top of the explicit call here.
 		if compiler.is_rc( T ):
 			handle_slot: Ptr[Ptr[None]] = compiler.cast( Ptr[Ptr[None]], slot )
 			compiler.decref( compiler.cast( T, handle_slot[0] ))
+		else:
+			compiler.decref( compiler.cast( Ptr[T], slot )[0] )
 
 	# The write-side mirror of _read_element - RC objects are only ever a
 	# pointer wide, so writing one through is just overwriting the handle,
