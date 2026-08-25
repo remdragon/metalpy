@@ -1464,6 +1464,36 @@ class TryExceptCompileErrorTests( unittest.TestCase ):
 		errors = self.discovery.errors.errors
 		self.assertTrue( any( 'generator' in e for e in errors ), errors )
 
+	def test_try_inside_generator_body_rejection_error_is_a_single_line( self ) -> None:
+		# regression: this diagnostic (and several sibling _stmt_Try ones)
+		# used to unparse the WHOLE ast.Try node (including its entire
+		# body/handlers/finally) instead of just naming the problem - a real
+		# repro (a multi-statement try body) produced a multi-line error
+		# message that buried the actual problem
+		code = '\n'.join([
+			'class ErrorA: pass',
+			'',
+			'def gen() -> Iterator[Result[i32,StopIteration]]:',
+			'	try:',
+			'		x: i32 = 1',
+			'		y: i32 = 2',
+			'		z: i32 = 3',
+			'		yield x + y + z',
+			'	except ErrorA:',
+			'		yield 2',
+			'',
+			'def main() -> i32:',
+			'	for x in gen():',
+			'		pass',
+			'	return 0',
+		])
+		self._import( code )
+		self.compiler.run()
+		errors = self.discovery.errors.errors
+		self.assertTrue( errors )
+		for error in errors:
+			self.assertNotIn( '\n', error )
+
 	def test_nested_result_in_ok_position_is_rejected( self ) -> None:
 		# Result[T,E] may never itself contain a Result (directly, or as a
 		# union leaf) - see discovery.py's visit_Subscript. This isn't just

@@ -147,6 +147,30 @@ class _GeneratorNameRenamer( ast.NodeTransformer ):
 		return result
 
 
+def _desugar_tuple_for_target( node: ast.For, fresh_name: str ) -> ast.For:
+	''' `for a, b in EXPR:` - node.target is an ast.Tuple, which nothing
+	downstream (range-for/general-for generator desugaring in TypeResolver,
+	lowering.py's own _stmt_For) understands directly; each of those sites
+	up to now flatly rejected it as "for loop target must be a plain name".
+	Rewrites in place to the single-Name-target shape every consumer
+	already handles: retargets the loop at a fresh synthetic name and
+	prepends `a, b = fresh_name` to the body, reusing the EXISTING,
+	already-correct tuple-unpacking-Assign machinery (lowering.py's own
+	_stmt_Assign Tuple-target branch - same restrictions apply here too:
+	plain-Name elements only, no starred/nested unpacking) rather than
+	teaching every for-loop consumer a second copy of that logic. A no-op
+	(returns node unchanged) when the target isn't a Tuple, so every
+	caller can call this unconditionally before its own target check. '''
+	if not isinstance( node.target, ast.Tuple ):
+		return node
+	unpack = ast.Assign( targets = [ node.target ], value = ast.Name( id = fresh_name, ctx = ast.Load() ))
+	ast.fix_missing_locations( ast.copy_location( unpack, node ))
+	node.target = ast.Name( id = fresh_name, ctx = ast.Store() )
+	ast.fix_missing_locations( ast.copy_location( node.target, node ))
+	node.body = [ unpack, *node.body ]
+	return node
+
+
 class TypeResolver:
 	'''
 	stage 1.5: sits between discovery.py (lazy name-binding + skeleton type
@@ -185,6 +209,7 @@ class TypeResolver:
 		# is reused by every monomorphized copy of a generic function (see
 		# resolve_function_body's own docstring)
 		self._body_resolved: set[int] = set()
+		self._for_tuple_target_id = 0 # _desugar_general_for's own fresh-name counter for a tuple for-loop target - see _desugar_tuple_for_target
 		# provenance tracking for --dep-report: id(unit) -> qualname of
 		# the unit being lowered at the time this one was scheduled
 		self._triggered_by: dict[int,str] = {}
@@ -1221,6 +1246,10 @@ class TypeResolver:
 		promoted local holds the ITERATOR, not the original Iterable) and
 		then drives the resulting generator the same way. Neither found,
 		or the type can't be determined at all, is a clear compile error. '''
+		if isinstance( node.target, ast.Tuple ):
+			unique = self._for_tuple_target_id
+			self._for_tuple_target_id += 1
+			node = _desugar_tuple_for_target( node, f'__for_tuple_{unique}' )
 		if not isinstance( node.target, ast.Name ):
 			self.discovery.fail( f'{fn.qualname}: for loop target must be a plain name: {ast.unparse(node.target)}', node )
 		if node.orelse:
@@ -7140,6 +7169,18 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		sees the name's ordinary declared type, safe, just not maximally
 		precise - identical tradeoff to _type_of_expr's own narrowed
 		lookup falling back for a multi-element set). '''
+		if isinstance( node.target, ast.Tuple ):
+			# `for a, b in EXPR:` - runs early enough (this pass runs
+			# before lowering.py ever sees the function body) that the
+			# rewrite below is the ONLY place ordinary (non-generator)
+			# tuple-target for-loops need to be taught about - lowering.py's
+			# own _stmt_For only ever sees the already-desugared, plain-Name
+			# shape from here on. See _desugar_tuple_for_target's own
+			# docstring for why this reuses ordinary unpacking-Assign rather
+			# than teaching the for-loop machinery its own second copy.
+			unique = self._label_id
+			self._label_id += 1
+			node = _desugar_tuple_for_target( node, f'__for_tuple_{unique}' )
 		case_entry_narrowed = dict( self._narrowed )
 		case_entry_locals = dict( self.locals )
 		try:

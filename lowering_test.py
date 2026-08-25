@@ -4259,6 +4259,26 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertIn( 'plain name', self.discovery.errors.errors[0] )
 
+	def test_for_target_must_be_a_plain_name_error_is_a_single_line( self ) -> None:
+		# regression: this diagnostic used to unparse the WHOLE ast.For node
+		# (target + entire body) instead of just the target - a real repro
+		# (a multi-statement for-loop body) produced a multi-line error
+		# message that buried the actual problem (an unsupported target)
+		# under the loop's own unrelated body text
+		code = '\n'.join([
+			'def main() -> None:',
+			'	xs: i32',
+			'	for xs[0] in range( 3 ):',
+			'		xs = 1',
+			'		xs = 2',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		error = self.discovery.errors.errors[0]
+		self.assertIn( 'for loop target must be a plain name', error )
+		self.assertNotIn( '\n', error )
+
 	def test_for_range_single_arg_shape( self ) -> None:
 		# for i in range(count): reuses `i` if it already exists (matching
 		# lib/builtins/__init__.py's str.concat, which pre-declares

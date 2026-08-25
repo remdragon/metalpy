@@ -10393,6 +10393,42 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# `for a, b in EXPR:` - a Tuple for-loop target, desugared
+			# (type_resolver.py's _desugar_tuple_for_target) into `for
+			# __for_tuple_N in EXPR: a, b = __for_tuple_N`, reusing the
+			# ordinary tuple-unpacking-Assign machinery this whole test
+			# class already exercises above rather than a second copy of it
+			( 'tuple_unpack_for_loop_target', '''
+def main() -> i32:
+	pairs: list[tuple[i32, i32]] = list[tuple[i32, i32]]()
+	pairs.append(( 1, 10 ))
+	pairs.append(( 2, 20 ))
+	pairs.append(( 3, 30 ))
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for i, j in pairs:
+			total += i + j
+	if total != 66:
+		return 1
+	return 0
+''' ),
+			# an RC element (str) destructured out of a for-loop's own tuple
+			# target, dropped without crashing - same shape as
+			# tuple_unpack_rc_element_dropped_without_crashing above, just
+			# reached via the for-loop desugar instead of a bare Assign
+			( 'tuple_unpack_for_loop_target_rc_element_dropped_without_crashing', '''
+def main() -> i32:
+	pairs: list[tuple[str, i32]] = list[tuple[str, i32]]()
+	pairs.append(( "a", 1 ))
+	pairs.append(( "bb", 2 ))
+	total: i32 = 0
+	with compiler.wrap_arithmetic:
+		for s, n in pairs:
+			total += n
+	if total != 3:
+		return 1
+	return 0
+''' ),
 			# t[a:b] on a homogeneous tuple - compile-time-constant bounds
 			# build a fresh, DIFFERENT fixed-arity tuple[T,...] via field
 			# copies (_lower_tuple_slice), not a runtime __getitem__(slice)

@@ -4911,7 +4911,11 @@ class FunctionLowering:
 
 	def _stmt_With( self, node: ast.With ) -> None:
 		if len( node.items ) != 1:
-			self.lowering.discovery.fail( f'unsupported with statement: {ast.unparse(node)}', node )
+			# NOT ast.unparse(node) here - that would dump this with-
+			# statement's entire BODY into the message too (a real repro:
+			# a multi-statement with-block produced a multi-line error
+			# message that buried the actual problem)
+			self.lowering.discovery.fail( f'unsupported with statement (only a single context manager is supported, got {len(node.items)})', node )
 		item = node.items[0]
 		context_expr = item.context_expr
 
@@ -4929,7 +4933,7 @@ class FunctionLowering:
 				mode = arithmetic_mode.ArithmeticSaturate()
 			elif self.lowering._is_compiler_call( context_expr ) == 'panic_arithmetic':
 				if len( context_expr.args ) != 1 or context_expr.keywords:
-					self.lowering.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(node)}', node )
+					self.lowering.discovery.fail( f'compiler.panic_arithmetic(...) takes exactly one argument: {ast.unparse(context_expr)}', node )
 				str_cls = self.lowering.discovery.find_name( 'str', node )
 				errmsg = self._lower_expr( context_expr.args[0], str_cls )
 				mode = arithmetic_mode.ArithmeticPanic( errmsg )
@@ -5020,15 +5024,20 @@ class FunctionLowering:
 		design or real Python's own `with` semantics (which also introduces
 		no new scope - NAME/x stay bound and alive for the rest of the
 		enclosing scope there too). '''
+		# neither message below unparses `node` itself - it's the whole
+		# with-statement INCLUDING its body, which would dump the entire
+		# block into the error message (a real repro: a multi-statement
+		# with-body produced a multi-line error that buried the actual
+		# problem); `node`'s own lineno (passed as the location) already
+		# pinpoints the with-statement precisely enough
 		if self._loop_depth > 0 and self._body_may_break_or_continue_to_enclosing_loop( node.body ):
 			self.lowering.discovery.fail(
 				'with-statement (context manager) is not allowed inside a loop when its body can break/continue out '
-				'of that loop - call another function and use the with-statement inside that instead: '
-				f'{ast.unparse(node)}', node,
+				'of that loop - call another function and use the with-statement inside that instead', node,
 			)
 		if self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
-				f'with-statement (context manager) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+				'with-statement (context manager) is not supported inside a generator body yet', node,
 			)
 
 		index = self._with_ctx_id
@@ -5047,7 +5056,7 @@ class FunctionLowering:
 		if self.lowering._find_method( ctx_type, '__enter__' ) is None or self.lowering._find_method( ctx_type, '__exit__' ) is None:
 			type_name = ctx_type.qualname if ctx_type is not None else '?'
 			self.lowering.discovery.fail(
-				f'with-statement requires {type_name} to define both __enter__(self) and __exit__(self): {ast.unparse(node)}', node,
+				f'with-statement requires {type_name} to define both __enter__(self) and __exit__(self): {ast.unparse(context_expr)}', node,
 			)
 
 		def _ctx_read() -> ast.Name:
@@ -5227,9 +5236,16 @@ class FunctionLowering:
 		clause whose TryHandler.matched never got set True by any
 		or_throw()/raise dispatch anywhere in this try's own body is
 		unreachable - a compile error. '''
+		# none of the messages below unparse `node`/`h` themselves - each is
+		# a compound statement with its own BODY (the whole try block, or
+		# a whole except handler), which would dump that entire block into
+		# the error message (a real repro: a multi-statement try/except
+		# produced a multi-line error that buried the actual problem); the
+		# node passed as the location (node/h/te) already pinpoints the
+		# right line precisely enough on its own
 		if self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
-				f'try-statement is not supported inside a generator body yet: {ast.unparse(node)}', node,
+				'try-statement is not supported inside a generator body yet', node,
 			)
 		if self._loop_depth > 0 and (
 			self._body_may_break_or_continue_to_enclosing_loop( node.body )
@@ -5238,13 +5254,13 @@ class FunctionLowering:
 		):
 			self.lowering.discovery.fail(
 				'try-statement is not allowed inside a loop when its body/else/except-handlers can break/continue out '
-				f'of that loop - call another function and use try/except inside that instead: {ast.unparse(node)}', node,
+				'of that loop - call another function and use try/except inside that instead', node,
 			)
 
 		handlers: list[TryHandler] = []
 		for h in node.handlers:
 			if h.type is None:
-				self.lowering.discovery.fail( f'bare `except:` is not supported - name the specific error class(es): {ast.unparse(node)}', h )
+				self.lowering.discovery.fail( 'bare `except:` is not supported - name the specific error class(es)', h )
 			type_exprs = h.type.elts if isinstance( h.type, ast.Tuple ) else [ h.type ]
 			leaves: list[Type] = []
 			for te in type_exprs:
@@ -5253,7 +5269,7 @@ class FunctionLowering:
 					self.lowering.discovery.fail( f'except clause must name a class: {ast.unparse(te)}', te )
 				if getattr( resolved, 'stem', None ) == 'Exception':
 					self.lowering.discovery.fail(
-						f'bare `except Exception:` is not supported - name the specific error class(es): {ast.unparse(node)}', h,
+						'bare `except Exception:` is not supported - name the specific error class(es)', h,
 					)
 				leaves.append( resolved )
 			label = self._new_label( 'except' )
@@ -5288,7 +5304,7 @@ class FunctionLowering:
 		if node.finalbody and self._body_contains_return( node.finalbody ):
 			self.lowering.discovery.fail(
 				'finally: return statements are not allowed inside a finally block - a return here would silently '
-				f'discard whatever the try/except was actually about to return: {ast.unparse(node)}', node,
+				'discard whatever the try/except was actually about to return', node,
 			)
 
 		exit_flag: Variable|None = None
@@ -5333,7 +5349,7 @@ class FunctionLowering:
 		for handler, h in zip( handlers, node.handlers ):
 			if not handler.matched:
 				self.lowering.discovery.fail(
-					f'except {ast.unparse(h.type)}: is unreachable - nothing in this try block ever throws it: {ast.unparse(node)}',
+					f'except {ast.unparse(h.type)}: is unreachable - nothing in this try block ever throws it',
 					h,
 				)
 
@@ -7504,7 +7520,15 @@ class FunctionLowering:
 
 	def _stmt_For( self, node: ast.For ) -> None:
 		if not isinstance( node.target, ast.Name ):
-			self.lowering.discovery.fail( f'for loop target must be a plain name: {ast.unparse(node)}', node )
+			# a Tuple target (`for a, b in EXPR:`) is desugared away by
+			# type_resolver.py's _ReferenceResolver.visit_For long before
+			# this ever runs - reaching here with one would mean that pass
+			# was skipped somehow, so this stays a hard failure rather than
+			# silently re-attempting the same desugar. NOT ast.unparse(node)
+			# - that would dump this for-loop's entire BODY into the message
+			# (a real repro: a multi-statement for-body produced a
+			# multi-line error that buried the actual problem)
+			self.lowering.discovery.fail( f'for loop target must be a plain name: {ast.unparse(node.target)}', node )
 		if node.orelse:
 			self.lowering.discovery.fail( 'for/else is not supported', node )
 		if self.lowering._is_range_call( node.iter ) is not None:
@@ -7806,7 +7830,7 @@ class FunctionLowering:
 		if shape is None or stop_iteration_cls is None or stop_iteration_cls not in self.lowering._type_resolver._atomic_leaves( shape[1] ):
 			self.lowering.discovery.fail(
 				f'for loop needs __next__() to return Result[T,E] (E including StopIteration) on '
-				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node)}',
+				f'{obj.type.qualname if obj.type else "?"}: {ast.unparse(node.iter)}',
 				node,
 			)
 		elem_type, full_error_type = shape
@@ -9298,10 +9322,20 @@ class FunctionLowering:
 		# no IR - a def only binds a name, same as Python
 		enclosing = self._current_fn
 		if enclosing is None:
-			self.lowering.discovery.fail( f'nested function def outside any function: {ast.unparse(node)}', node )
+			# neither message here unparses `node` itself - that would dump
+			# this nested function's entire BODY into the error (a real
+			# repro: a multi-statement nested def produced a multi-line
+			# error that buried the actual problem); node.name already
+			# identifies which def, and node's own lineno (the location
+			# passed to fail) already pinpoints it
+			self.lowering.discovery.fail( f'nested function def outside any function: {node.name}', node )
 		self.lowering._reject_generic_enclosing_scope( enclosing, node, 'nested function defs' )
 		if node.decorator_list:
-			self.lowering.discovery.fail( f'{node.name}: decorators are not supported on a nested function def: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail(
+				f'{node.name}: decorators are not supported on a nested function def: '
+				f'{", ".join( "@" + ast.unparse(d) for d in node.decorator_list )}',
+				node,
+			)
 
 		qualname = f'{enclosing.qualname}$$nested_{node.name}'
 		synthetic = Function(
@@ -9316,7 +9350,10 @@ class FunctionLowering:
 		parameters: list[Parameter] = []
 		def add_param( arg: ast.arg, default: ast.expr|None, **kind: bool ) -> None:
 			if arg.annotation is None:
-				self.lowering.discovery.fail( f'{qualname} parameter {arg.arg!r} has no type annotation: {ast.unparse(node)}', node )
+				# not ast.unparse(node) - qualname + the parameter name
+				# already identify this exactly; unparsing the whole nested
+				# function would dump its entire body into the message
+				self.lowering.discovery.fail( f'{qualname} parameter {arg.arg!r} has no type annotation', node )
 			param_type = self.lowering.discovery.visit( arg.annotation )
 			self.lowering.discovery._reject_bare_interface_value_type( param_type, arg, f'{qualname} parameter {arg.arg!r}' )
 			param = Parameter(
