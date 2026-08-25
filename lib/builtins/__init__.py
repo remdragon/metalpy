@@ -20,6 +20,23 @@ import threading
 # conforms to Iterable via key-iteration but isn't a Sequence - __getitem__
 # isn't usize-keyed) - see each's own docstring below.
 @protocol
+class Sized:
+	# real Python's own typing.Sized/collections.abc.Sized idiom - len(x)
+	# below is bound to this (not left duck-typed against a bare, unbound
+	# TypeVar) specifically so a type with no __len__ at all, or one with
+	# the wrong RETURN type, fails at the CALL SITE with a clear "does not
+	# conform to protocol Sized" diagnostic, instead of a confusing type
+	# mismatch reported from deep inside len[T]'s own @inline-spliced body
+	# (lib/builtins/__init__.py, not the caller's own file) with no
+	# indication of which call site or what T was - confirmed via a real
+	# repro (grap.mpy's own `count: i32 = len(some_list)`, which - once
+	# _lower_inline_call's own error-enrichment note pointed at it - turned
+	# out to be an ordinary i32-vs-usize call-site mismatch, not a real
+	# conformance gap, but the duck-typed len[T] had no way to distinguish
+	# the two failure modes at all until this protocol existed).
+	def __len__( self ) -> usize: ...
+
+@protocol
 class Sequence[T]:
 	# only __getitem__ is required, not __len__ - reaching the end is
 	# signaled by Err(IndexError) itself, so a conformer never needs to
@@ -337,7 +354,7 @@ def _bytes_endswith( haystack: bytes|bytearray, suffix: bytes|bytearray ) -> boo
 	return sys.memcmp( candidate, suffix.get_const_ptr(), suffix_len ) == 0
 
 
-class bytes( Sequence[u8], Iterable[u8] ):
+class bytes( Sequence[u8], Iterable[u8], Sized ):
 	__data: ConstPtr[u8]
 
 	__len: usize
@@ -438,7 +455,7 @@ class bytes( Sequence[u8], Iterable[u8] ):
 
 BYTEARRAY_INVALID: Ptr[u8] = 0 # this is a sentinel to indicate a bytearray was released - matches lib/windows/kernel32.py's own INVALID_HANDLE_VALUE convention (a literal assigned directly to its real pointer type, not a same-width integer alias needing its own cast at every comparison site)
 
-class bytearray( Sequence[u8], Iterable[u8] ):
+class bytearray( Sequence[u8], Iterable[u8], Sized ):
 	__data: Ptr[u8]
 	__len: usize
 	__cap: usize
@@ -604,7 +621,7 @@ class bytearray( Sequence[u8], Iterable[u8] ):
 				start = match_start + sep_len
 		return result
 
-class str( Sequence[str], Iterable[str] ):
+class str( Sequence[str], Iterable[str], Sized ):
 	__data: ConstPtr[u8]
 
 	__byte_size: usize # the number of bytes (code units) include the zero-terminater
@@ -2341,8 +2358,10 @@ def print( msg: str, end: str = '\n' ) -> None:
 # @inline (PLAN_INLINE.md) splices this straight to whatever T's own
 # __len__ is at each call site, so len(x) costs exactly what x.__len__()
 # would and no more - never a real Call/FuncStart/FuncEnd of its own.
+# T: Sized (not a bare, unbound T) - see Sized's own docstring above for
+# why: a real conformance error now surfaces at the call site itself.
 @inline
-def len[T]( t: T ) -> usize:
+def len[T: Sized]( t: T ) -> usize:
 	return t.__len__()
 
 def chr( cp: u32 ) -> str:
@@ -2489,7 +2508,7 @@ def ord( s: str ) -> u32:
 		sys.panic( 'ord(): expected a string of length 1, got a longer string' )
 	return cp
 
-class UnsafeDict[K, V]:
+class UnsafeDict[K, V]( Sized ):
 	''' see PLAN_CALLABLE.md. RawDict (lib/builtins/__RawDict.py) is
 	genuinely type-erased - it never decodes a key_ptr/value_ptr back to a
 	real K/V, never allocates/frees/increfs/decrefs one, never computes a
@@ -2822,7 +2841,7 @@ def _dict_key_iter[K, V]( d: dict[K, V] ) -> Generator[K, StopIteration]:
 		with compiler.wrap_arithmetic:
 			i += 1
 
-class dict[K, V]( Iterable[K] ):
+class dict[K, V]( Iterable[K], Sized ):
 	''' dict[K,V]: locked-by-default wrapper around UnsafeDict[K,V] - same
 	split as list[T]/UnsafeList[T] (see __list.py's own header comment):
 	dict[K,V] is the default most people reach for, so every operation

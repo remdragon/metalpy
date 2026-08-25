@@ -63,7 +63,7 @@ class HTTPError:
 def _header_name_eq( a: str, b: str ) -> bool:
 	return a.lower() == b.lower()
 
-class HTTPHeaders:
+class HTTPHeaders( Sized ):
 	# list[tuple[str,str]] rather than a dedicated (name,value) class - this
 	# used to fail discovery with "name 'tuple' is not defined" (a nested
 	# tuple[...] as an EXPLICIT generic type argument to another generic's

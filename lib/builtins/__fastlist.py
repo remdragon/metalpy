@@ -305,7 +305,7 @@ class FastListHandle[T]:
 # array/Python-list ordering semantics.
 # ---------------------------------------------------------------------------
 
-class FastList[T]:
+class FastList[T]( Sized ):
 	__raw: RawFastList
 
 	def __init__( self, initial_capacity: usize = 8 ) -> None:

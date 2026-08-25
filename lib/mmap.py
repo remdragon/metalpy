@@ -26,7 +26,7 @@ ACCESS_WRITE: i32 = 2
 ACCESS_COPY:  i32 = 3
 
 
-class mmap( Sequence[u8], Iterable[u8] ):
+class mmap( Sequence[u8], Iterable[u8], Sized ):
 	__ptr: Ptr[u8]
 	__len: usize
 

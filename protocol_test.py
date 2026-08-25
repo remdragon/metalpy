@@ -403,3 +403,138 @@ def main() -> i32:
 				'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ) )
 			import emitter_c
 			self._assert_compiles_and_runs( emitter_c.emit_c( compiler ), expected_exit = 0, compiler = compiler )
+
+
+class SizedProtocolTests( unittest.TestCase ):
+	''' builtins.len[T]'s own T: Sized bound (lib/builtins/__init__.py) -
+	real Python's own typing.Sized/collections.abc.Sized idiom. Before this,
+	len[T] left T completely unbound (duck-typed against `t.__len__()`
+	directly), so a type with no __len__ at all - or one with the wrong
+	RETURN type - failed with a confusing type mismatch reported from
+	deep inside len[T]'s own @inline-spliced body (lib/builtins/__init__.py,
+	never the caller's own file), with no indication of which call site or
+	what T even was. See lowering_test.py's own InlineTests for the
+	separate, complementary fix (that confusing report now at least names
+	the real call site + argument types) - this class covers the OTHER
+	half: a type simply missing __len__ altogether now fails immediately,
+	at the call site, with a clear protocol-conformance diagnostic instead
+	of ever reaching that confusing internal check at all. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _run( self, code: str ) -> None:
+		self.compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+
+	def test_type_without_len_is_a_clear_protocol_error_at_the_call_site( self ) -> None:
+		self._run( '''
+class Thing:
+	pass
+
+def main() -> i32:
+	t = Thing()
+	return len( t )
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		error = self.discovery.errors.errors[0]
+		self.assertIn( 'does not implement protocol', error )
+		self.assertIn( 'Sized', error )
+		self.assertIn( '__main__.py', error ) # the real call site, not len[T]'s own body
+
+	def test_type_with_len_but_not_declared_sized_is_still_rejected( self ) -> None:
+		# conformance is a NAME-only, explicitly-declared check (matches
+		# every other @protocol in this codebase - see e.g. IteratorProtocol
+		# [T]'s own docstring) - a structurally-matching __len__() with no
+		# `class Thing(Sized):` declaration still doesn't conform.
+		self._run( '''
+class Thing:
+	def __len__( self ) -> usize:
+		return usize( 0 )
+
+def main() -> i32:
+	t = Thing()
+	return len( t )
+''' )
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertIn( 'Sized', self.discovery.errors.errors[0] )
+
+	def test_declared_sized_conformance_compiles( self ) -> None:
+		self._run( '''
+class Thing( Sized ):
+	def __len__( self ) -> usize:
+		return usize( 7 )
+
+def main() -> i32:
+	t = Thing()
+	n: usize = len( t )
+	if n == usize( 7 ):
+		return 0
+	return 1
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_union_of_two_sized_conformers_satisfies_the_bound( self ) -> None:
+		# regression: TypeVar.bound_satisfied_by (mpy_types.py) checked the
+		# union type ITSELF against the protocol (a TaggedUnion never has
+		# its own .protocols populated - only a real leaf RCClass does), so
+		# a union argument was rejected unconditionally even when every one
+		# of its leaves individually conforms - confirmed via a real repro
+		# during this feature's own rollout: len(x: bytes|bytearray), used
+		# throughout lib/ (crc32.py, codecs/utf8.py, bitstream.py, ...),
+		# broke everywhere the instant len[T] gained a T: Sized bound, since
+		# bytes/bytearray each declare Sized individually but the union of
+		# the two was never checked per-leaf. Fixed by checking every leaf
+		# of a TaggedUnion argument against the bound instead of the bare
+		# union.
+		self._run( '''
+def describe( x: bytes|bytearray ) -> usize:
+	return len( x )
+
+def main() -> i32:
+	b: bytes = 'hi'.encode().unwrap( 'x' )
+	if describe( b ) != 2:
+		return 1
+	ba: bytearray = bytearray( 3 )
+	if describe( ba ) != 3:
+		return 2
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in self.discovery.errors.errors ) )
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class SizedProtocolRealCompileTests( test_support.RealCompileMixin, unittest.TestCase ):
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_len_still_works_on_every_conforming_builtin_shape( self ) -> None:
+		self.assert_programs_run([
+			( 'sized_conforming_builtins_and_union_arg', '''
+def describe( x: bytes|bytearray ) -> usize:
+	return len( x )
+
+def main() -> i32:
+	if len( 'hello' ) != 5:
+		return 1
+	xs: list[i32] = list[i32]()
+	xs.append( 1 )
+	xs.append( 2 )
+	if len( xs ) != 2:
+		return 2
+	d: dict[str,i32] = dict[str,i32]()
+	d[ 'a' ] = 1
+	if len( d ) != 1:
+		return 3
+	b: bytes = 'hi'.encode().unwrap( 'x' )
+	if describe( b ) != 2:
+		return 4
+	ba: bytearray = bytearray( 3 )
+	if describe( ba ) != 3:
+		return 5
+	return 0
+''' ),
+		])

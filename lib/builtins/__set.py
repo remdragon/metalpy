@@ -31,7 +31,7 @@
 # Iterator[T] or Iterable[T], no structural duck-typing - lowering.py's
 # _stmt_For), so __iter__ (below) delegates to _sequence_iter like list[T]'s
 # own does.
-class set[T]( Sequence[T], Iterable[T] ):
+class set[T]( Sequence[T], Iterable[T], Sized ):
 	__inner: dict[T, bool]
 
 	def __init__( self ) -> None:

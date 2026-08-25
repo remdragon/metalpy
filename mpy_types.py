@@ -348,6 +348,24 @@ class TypeVar( Type ):
 		if self.bound is None:
 			return True
 		base = concrete.base if isinstance( concrete, Specialization ) else concrete
+		if isinstance( base, TaggedUnion ):
+			# a union receiver (e.g. `t: bytes|bytearray`) has no .protocols
+			# of its own (TaggedUnion never populates that field - only a
+			# real RCClass leaf does), so falling straight through to the
+			# `not isinstance(base, RCClass): return False` check just below
+			# unconditionally rejected EVERY union argument at ANY protocol-
+			# bound generic call site, even when every one of its leaves
+			# individually conforms - confirmed via a real repro (len(x:
+			# bytes|bytearray) inside lib/builtins/__init__.py's own
+			# bytes.__init__, once len[T] gained a T: Sized bound: both
+			# leaves conform, the bare union doesn't, and used to fail
+			# outright instead of checking per-leaf). Mirrors how a union
+			# receiver's own METHOD dispatch (lowering.py's
+			# _lower_union_receiver_call) already requires every leaf to
+			# define the method, not the union as a whole - same principle,
+			# applied here to a TypeVar's own protocol bound instead of an
+			# attribute/method lookup.
+			return all( self.bound_satisfied_by( leaf, type_params, args, resolver ) for leaf in base.leaves() )
 		if isinstance( base, TupleType ):
 			# tuple[...] isn't an RCClass - its declared protocol
 			# conformance (for homogeneous tuples) lives on its lazily-
