@@ -158,10 +158,32 @@ def _set_current_deadline( deadline: f64 ) -> None:
 	if cur is not None:
 		cur.set_deadline( deadline )
 		return
+	# ThreadLocal[T].set() deliberately doesn't incref (its own "bookmark,
+	# not owner" contract - see fiber.py's _thread_fiber_handle for the
+	# identical pattern, first found there via a real reproducible UAF).
+	# Unlike that one (set once, never replaced), this box IS replaced/
+	# cleared on every timeout() enter/exit, so the OLD box's own slot-
+	# reference has to be released explicitly too when it's replaced -
+	# ONE compiler.decref(old) call, not two: `old`'s own declared type is
+	# T|None (a union, not a bare RC pointer), and a union-typed local's
+	# automatic scope-exit release fires regardless of any manual
+	# compiler.decref() calls on it in between (unlike a bare RC pointer
+	# local, where a manual decref DOES replace the automatic one) -
+	# confirmed directly in the generated C, and by a real double-free two
+	# manual decrefs here caused (compiler.__debug_quarantine__'s own
+	# detector: the automatic epilogue's own release was a genuine THIRD
+	# release on top of both manual ones). That automatic release is what
+	# balances get()'s own +1 below; this one call balances the slot's own
+	# +1 from when the box now being replaced was originally set.
+	old: _DeadlineBox|None = _thread_deadline.get()
 	if deadline == fiber.NO_DEADLINE:
 		_thread_deadline.clear()
 	else:
-		_thread_deadline.set( _DeadlineBox( deadline ))
+		box: _DeadlineBox = _DeadlineBox( deadline )
+		compiler.incref( box )
+		_thread_deadline.set( box )
+	if old is not None:
+		compiler.decref( old )
 
 def _ms_until( deadline: f64 ) -> i32:
 	''' deadline (a time.monotonic() reading) as a millisecond countdown

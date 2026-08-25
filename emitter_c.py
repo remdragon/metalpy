@@ -171,6 +171,35 @@ def _prologue_debug_list() -> str:
 		)
 		lock_acquire = f'\tAcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&__metalpy_debug_lock );\n'
 		lock_release = f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&__metalpy_debug_lock );\n'
+	# raw OS write + terminate for __metalpy_debug_poison_abort - hand-rolled
+	# rather than routed through the crash handler's own __metalpy_crash_write
+	# (defined later in emit_c's assembly order, see _object_header_prologue's
+	# own docstring on why this whole prologue comes first) or CRT fprintf
+	# (this list is walked even in --no-crt builds). Mirrors
+	# _prologue_debug_ops's own raw-write technique + the crash handler's own
+	# ExitProcess/_exit choice, just duplicated locally to avoid an ordering
+	# dependency on either.
+	if _target_os == 'windows':
+		poison_decl = (
+			'void* GetStdHandle( uint32_t nStdHandle );\n'
+			'bool WriteFile( void* hFile, const uint8_t* lpBuffer, uint32_t nNumberOfBytesToWrite, uint32_t* lpNumberOfBytesWritten, void* lpOverlapped );\n'
+			'_Noreturn void ExitProcess( uint32_t uExitCode );\n'
+		)
+		poison_write_body = '''\
+	void* h = GetStdHandle( (uint32_t)-12 ); // STD_ERROR_HANDLE
+	if ( h != (void*)(intptr_t)-1 && h != 0 ) {
+		uint32_t written = 0;
+		WriteFile( h, (const uint8_t*)s, len, &written, 0 );
+	}
+'''
+		poison_exit = '\tExitProcess( 3 );\n'
+	else:
+		# unistd.h, not a hand-declared prototype - see the crash handler's
+		# own identical comment on why (a hand-guessed write()/_exit() shape
+		# has bitten this file before).
+		poison_decl = '#include <unistd.h>\n'
+		poison_write_body = '\tssize_t __metalpy_debug_poison_unused = write( 2, s, len ); (void)__metalpy_debug_poison_unused;\n'
+		poison_exit = '\t_exit( 3 );\n'
 	return f'''\
 typedef struct __metalpy_debug_link {{
 	struct __metalpy_debug_link* prev;
@@ -192,6 +221,92 @@ static inline __metalpy_maybe_unused void __metalpy_debug_lock_acquire( void ) {
 static inline __metalpy_maybe_unused void __metalpy_debug_lock_release( void ) {{
 {lock_release}}}
 
+// splicing a link out doesn't free it (the caller's own object/entry memory
+// does), but re-splicing the SAME link a second time (a double free/double-
+// release - a real ref-count bug, not a leak-checker false positive) would
+// otherwise silently corrupt the list or crash on a stale/zeroed
+// prev/next with no indication of why. Poisoning here turns that into an
+// immediate, loud diagnostic instead.
+{poison_decl}
+// 0xCD repeated, not an arbitrary sentinel - this is the EXACT byte pattern
+// lib/sys.py's own mempoison() (called from free()'s debug-mode branch,
+// deep inside destroy()) already stamps across the whole freed block,
+// debug_link included. Writing anything else here would just get
+// overwritten by that later, real, poison pass - matching it means both
+// agree, so the check below keeps working across the whole window from
+// "refcount hit zero" through to actual quarantine eviction, not just the
+// narrow slice before destroy() gets around to running.
+#define __METALPY_DEBUG_POISON ((__metalpy_debug_link*)(uintptr_t)0xcdcdcdcdcdcdcdcdULL)
+
+static inline __metalpy_maybe_unused void __metalpy_debug_poison_write( const char* s, uint32_t len ) {{
+{poison_write_body}}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_poison_write_hex( uintptr_t v ) {{
+	char buf[] = "0x0000000000000000";
+	for ( int i = 17; i >= 2 && v; i-- ) {{
+		uint32_t nib = (uint32_t)( v & 0xF );
+		buf[i] = (char)( nib < 10 ? '0' + nib : 'a' + nib - 10 );
+		v >>= 4;
+	}}
+	uint32_t len = 0;
+	while ( buf[len] ) len++;
+	__metalpy_debug_poison_write( buf, len );
+}}
+
+static inline __metalpy_maybe_unused void __metalpy_debug_poison_write_cstr( const char* s ) {{
+	uint32_t len = 0;
+	while ( s[len] ) len++;
+	__metalpy_debug_poison_write( s, len );
+}}
+
+// what/alloc_loc for the just-destroyed object a debug_link belongs to,
+// recorded by __metalpy_debug_untrack (see _prologue_release) at the one
+// point they're still trustworthy - BEFORE destroy()/sys.free()'s own
+// mempoison() scrambles the whole block, debug_link included (confirmed:
+// without this, __METALPY_DEBUG_POISON itself has to match mempoison's own
+// 0xCD pattern for the very same reason). Bounded FIFO, same cap/shape as
+// the memory-retention pit (__metalpy_debug_pit) but a separate, simpler
+// structure - this one only ever needs to answer "what was this address",
+// not hold real memory alive.
+#define __METALPY_DEBUG_FREED_CAP 1000
+typedef struct {{ void* link; const char* type_name; const char* alloc_loc; }} __metalpy_debug_freed_info;
+static __metalpy_maybe_unused __metalpy_debug_freed_info __metalpy_debug_freed[__METALPY_DEBUG_FREED_CAP];
+static __metalpy_maybe_unused size_t __metalpy_debug_freed_head = 0;
+static __metalpy_maybe_unused size_t __metalpy_debug_freed_count = 0;
+
+static inline __metalpy_maybe_unused void __metalpy_debug_freed_record( void* link, const char* type_name, const char* alloc_loc ) {{
+	__metalpy_debug_lock_acquire();
+	__metalpy_debug_freed[__metalpy_debug_freed_head].link = link;
+	__metalpy_debug_freed[__metalpy_debug_freed_head].type_name = type_name;
+	__metalpy_debug_freed[__metalpy_debug_freed_head].alloc_loc = alloc_loc;
+	__metalpy_debug_freed_head = ( __metalpy_debug_freed_head + 1 ) % __METALPY_DEBUG_FREED_CAP;
+	if ( __metalpy_debug_freed_count < __METALPY_DEBUG_FREED_CAP ) __metalpy_debug_freed_count++;
+	__metalpy_debug_lock_release();
+}}
+
+static __metalpy_maybe_unused _Noreturn void __metalpy_debug_poison_abort( __metalpy_debug_link* link ) {{
+	static const char msg1[] = "\\nmpy: internal error: double free/release detected - object at ";
+	static const char msg2[] = " was already released once";
+	static const char msg_type[] = " (type=";
+	static const char msg_loc[] = ", alloc_loc=";
+	static const char msg_close[] = ")";
+	static const char msg3[] = " - check the ref-count logic on this object's destroy path\\n";
+	__metalpy_debug_poison_write( msg1, sizeof( msg1 ) - 1 );
+	__metalpy_debug_poison_write_hex( (uintptr_t)link );
+	__metalpy_debug_poison_write( msg2, sizeof( msg2 ) - 1 );
+	for ( size_t i = 0; i < __metalpy_debug_freed_count; i++ ) {{
+		if ( __metalpy_debug_freed[i].link == (void*)link ) {{
+			__metalpy_debug_poison_write( msg_type, sizeof( msg_type ) - 1 );
+			__metalpy_debug_poison_write_cstr( __metalpy_debug_freed[i].type_name ? __metalpy_debug_freed[i].type_name : "<unknown type>" );
+			__metalpy_debug_poison_write( msg_loc, sizeof( msg_loc ) - 1 );
+			__metalpy_debug_poison_write_cstr( __metalpy_debug_freed[i].alloc_loc ? __metalpy_debug_freed[i].alloc_loc : "<unknown location>" );
+			__metalpy_debug_poison_write( msg_close, sizeof( msg_close ) - 1 );
+			break;
+		}}
+	}}
+	__metalpy_debug_poison_write( msg3, sizeof( msg3 ) - 1 );
+{poison_exit}}}
+
 // _locked variants assume the caller already holds __metalpy_debug_lock -
 // needed by callers whose own critical section spans more than one list
 // operation (__metalpy_debug_raw_untrack's scan-then-splice,
@@ -208,8 +323,13 @@ static inline __metalpy_maybe_unused void __metalpy_debug_track_locked( __metalp
 }}
 
 static inline __metalpy_maybe_unused void __metalpy_debug_untrack_locked( __metalpy_debug_link* link ) {{
+	if ( link->prev == __METALPY_DEBUG_POISON || link->next == __METALPY_DEBUG_POISON ) {{
+		__metalpy_debug_poison_abort( link );
+	}}
 	link->prev->next = link->next;
 	link->next->prev = link->prev;
+	link->prev = __METALPY_DEBUG_POISON;
+	link->next = __METALPY_DEBUG_POISON;
 }}
 
 static inline __metalpy_maybe_unused void __metalpy_debug_track( __metalpy_debug_link* head, __metalpy_debug_link* link ) {{
@@ -222,6 +342,44 @@ static inline __metalpy_maybe_unused void __metalpy_debug_untrack( __metalpy_deb
 	__metalpy_debug_lock_acquire();
 	__metalpy_debug_untrack_locked( link );
 	__metalpy_debug_lock_release();
+}}
+
+// the pit: a just-destroyed object's own poisoned debug_link (above) only
+// stays a reliable double-free/UAF signal for as long as its memory is
+// still ours - handing it straight back to the allocator (the old behavior)
+// let a second, stale release silently land on already-reused memory
+// instead (confirmed directly: a real repro showed the SAME debug_link
+// going from poisoned to exactly zero between two untrack calls - the
+// allocator had already reused it). Quarantining here instead - holding
+// the object, not actually freeing it, until ~1000 newer destructions have
+// pushed it out - closes that window for all but the longest-lived races.
+// Bounded FIFO, not full history: a fixed array, no separate allocation of
+// its own (this runs on every single release, and must never be what
+// fails). void*, not ObjectHeader* - ObjectHeader isn't a complete type
+// yet at this point in the prologue (see _object_header_prologue's own
+// comment on why this whole file's text has to come first).
+#define __METALPY_DEBUG_PIT_CAP 1000
+static __metalpy_maybe_unused void* __metalpy_debug_pit[__METALPY_DEBUG_PIT_CAP];
+static __metalpy_maybe_unused size_t __metalpy_debug_pit_head = 0;
+static __metalpy_maybe_unused size_t __metalpy_debug_pit_count = 0;
+
+// self-locking (like track/untrack above, not their _locked variants) -
+// release_object calls this standalone, not nested inside another
+// critical section. Returns the object the pit had to evict to make room
+// (NULL if it wasn't full yet) - the caller, not this function, actually
+// destroys it: this function's only job is bookkeeping the FIFO itself.
+static inline __metalpy_maybe_unused void* __metalpy_debug_pit_push( void* obj ) {{
+	__metalpy_debug_lock_acquire();
+	void* evicted = 0;
+	if ( __metalpy_debug_pit_count == __METALPY_DEBUG_PIT_CAP ) {{
+		evicted = __metalpy_debug_pit[__metalpy_debug_pit_head];
+	}} else {{
+		__metalpy_debug_pit_count++;
+	}}
+	__metalpy_debug_pit[__metalpy_debug_pit_head] = obj;
+	__metalpy_debug_pit_head = ( __metalpy_debug_pit_head + 1 ) % __METALPY_DEBUG_PIT_CAP;
+	__metalpy_debug_lock_release();
+	return evicted;
 }}
 '''
 
@@ -465,16 +623,32 @@ static __metalpy_maybe_unused void __metalpy_dump_live_objects( void ) {{
 }}
 '''
 
-# only needed where an ir.Incref is actually emitted (see emit_c) - a
-# program that only ever gives up references (or never touches an RCClass
-# at all) never calls this
-_PROLOGUE_RETAIN = '''\
-static inline void retain_object( ObjectHeader* obj ) {
-	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
-		atomic_fetch_add( &obj->ref_count, 1 );
-	}
-}
-'''
+# only needed where an ir.Incref is actually emitted (see emit_c). A
+# FUNCTION (not a plain string constant), same reason as _prologue_release:
+# the debug-only pit check below depends on _target_debug, only known once
+# emit_c() has set it.
+def _prologue_retain() -> str:
+	# the leak tracker already poisons an object's own debug_link (prev/next
+	# -> __METALPY_DEBUG_POISON) the moment it's untracked/destroyed - see
+	# __metalpy_debug_untrack_locked. Asking it "is this pointer already in
+	# the pit?" here is just reading that same field back, no separate
+	# tracking structure needed. Checked before touching ref_count at all
+	# (not folded into the ref_count condition below), since ref_count
+	# itself lives on the same already-freed block otherwise.
+	pit_check = (
+		'\tif ( obj->debug_link.prev == __METALPY_DEBUG_POISON || obj->debug_link.next == __METALPY_DEBUG_POISON ) {\n'
+		'\t\t__metalpy_debug_poison_abort( &obj->debug_link );\n'
+		'\t}\n'
+	) if _target_debug else ''
+	return (
+		'static inline void retain_object( ObjectHeader* obj ) {\n'
+		'\tif ( !obj ) return;\n'
+		+ pit_check +
+		'\tif ( obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {\n'
+		'\t\tatomic_fetch_add( &obj->ref_count, 1 );\n'
+		'\t}\n'
+		'}\n'
+	)
 
 # only needed where an ir.Decref/DecrefDynamic is actually emitted (see
 # emit_c). A FUNCTION (not a plain string constant), same reason as
@@ -482,8 +656,34 @@ static inline void retain_object( ObjectHeader* obj ) {
 # _target_debug, only known once emit_c() has set it.
 def _prologue_release() -> str:
 	# debug-mode alloc tracking: untrack right when the refcount hits zero,
-	# BEFORE vtable->destroy runs (destroy may free the object's own storage)
-	untrack = '\t\t\t__metalpy_debug_untrack( &obj->debug_link );\n' if _target_debug else ''
+	# BEFORE vtable->destroy runs (destroy may free the object's own storage).
+	# destroy() itself still runs synchronously here, same as a release build
+	# - it releases nested RC fields too, and plenty of existing tests assert
+	# on THAT happening promptly (a compiler.refcount() check right after a
+	# reference drops). Only the object's own backing memory, freed at the
+	# very end of destroy() via sys.free(self), is what actually gets
+	# quarantined - see compiler.__debug_quarantine__/lib/sys.py's free().
+	# recorded BEFORE untrack/destroy - see __metalpy_debug_freed_record's own
+	# comment on why this has to happen here, not later (mempoison scrambles
+	# obj->vtable/alloc_loc themselves by the time destroy() finishes)
+	untrack = (
+		'\t\t\t__metalpy_debug_freed_record( &obj->debug_link, obj->vtable ? obj->vtable->type_name : 0, obj->alloc_loc );\n'
+		'\t\t\t__metalpy_debug_untrack( &obj->debug_link );\n'
+	) if _target_debug else ''
+	# same pit check retain_object does - see its own comment. release_object
+	# is the more likely of the two to see a double-release in practice (an
+	# extra decref past the real owner count, not an extra incref), so this
+	# is what actually caught the double-free this was built for.
+	pit_check = (
+		'\tif ( obj->debug_link.prev == __METALPY_DEBUG_POISON || obj->debug_link.next == __METALPY_DEBUG_POISON ) {\n'
+		'\t\t__metalpy_debug_poison_abort( &obj->debug_link );\n'
+		'\t}\n'
+	) if _target_debug else ''
+	destroy = (
+		'\t\t\tif ( obj->vtable && obj->vtable->destroy ) {\n'
+		'\t\t\t\tobj->vtable->destroy( obj );\n'
+		'\t\t\t}\n'
+	)
 	return (
 		'''\
 // the destructor was previously an explicit argument, passed as a compile-
@@ -499,14 +699,13 @@ def _prologue_release() -> str:
 // vtable pointer once @virtual dispatch needed one too, rather than
 // keeping the two as separate fields/mechanisms)
 static inline void release_object( ObjectHeader* obj ) {
-	if ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {
-		if ( atomic_fetch_sub( &obj->ref_count, 1 ) == 1 ) {
+	if ( !obj ) return;
 '''
-		+ untrack +
+		+ pit_check +
+		'\tif ( obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {\n'
+		'\t\tif ( atomic_fetch_sub( &obj->ref_count, 1 ) == 1 ) {\n'
+		+ untrack + destroy +
 		'''\
-			if ( obj->vtable && obj->vtable->destroy ) {
-				obj->vtable->destroy( obj );
-			}
 		}
 	}
 }
@@ -987,6 +1186,10 @@ _PROLOGUE_CRASH_HANDLER = '''\
 void* GetStdHandle( uint32_t nStdHandle );
 bool WriteFile( void* hFile, const uint8_t* lpBuffer, uint32_t nNumberOfBytesToWrite, uint32_t* lpNumberOfBytesWritten, void* lpOverlapped );
 _Noreturn void ExitProcess( uint32_t uExitCode );
+// NULL -> this process's own module (ASLR-slid base) - printed below so a
+// crash log alone gives RVA = address - base, with no debugger session
+// needed to symbolize it after the fact.
+void* GetModuleHandleA( const char* lpModuleName );
 // only the fields this handler actually reads - trailing real fields
 // (ExceptionInformation[15]) are omitted; safe, since nothing here takes
 // sizeof() or reads past NumberParameters, and the OS-owned struct these
@@ -1038,7 +1241,9 @@ static int32_t __metalpy_crash_filter( __metalpy_EXCEPTION_POINTERS* info ) {
 	__metalpy_crash_write_hex( code );
 	__metalpy_crash_write( " at address " );
 	__metalpy_crash_write_hex( (uint64_t)(uintptr_t)( info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : 0 ));
-	__metalpy_crash_write( "\\n" );
+	__metalpy_crash_write( " (module base " );
+	__metalpy_crash_write_hex( (uint64_t)(uintptr_t)GetModuleHandleA( 0 ));
+	__metalpy_crash_write( ")\\n" );
 	ExitProcess( code ? code : 1 );
 }
 
@@ -1363,7 +1568,7 @@ def _target_uses_pthread_lock() -> bool:
 # inside emit_c() itself, per that global's own docstring), so this always
 # reflects the Windows-shaped ObjectHeader (a `void* lock`) regardless of
 # whatever target a later real emit_c() call actually targets.
-PROLOGUE = _object_header_prologue() + _PROLOGUE_RETAIN + _prologue_release() + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE + _PROLOGUE_CRASH_HANDLER
+PROLOGUE = _object_header_prologue() + _prologue_retain() + _prologue_release() + _PROLOGUE_ARITH + _PROLOGUE_FLOAT_FORMAT + _PROLOGUE_FLOAT_PARSE + _PROLOGUE_CRASH_HANDLER
 
 def _global_lock_supported() -> bool:
 	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: Windows (SRWLOCK) and Linux
@@ -3685,6 +3890,12 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# comment (Lowering._lower_compiler_raw_free) on why this can't just
 		# rely on release_object's normal untrack
 		return [ f'\t__metalpy_debug_untrack( &(({_emit_operand(instr.value)})->$header.debug_link) );' ]
+	if isinstance( instr, ir.DebugQuarantine ):
+		# see ir.DebugQuarantine/__metalpy_debug_pit_push (_prologue_debug_
+		# list) - cast back to ptr's own declared type (void* on the C side,
+		# same as __metalpy_debug_pit_push's own signature) since the pit
+		# itself is untyped, one shared array for every kind of freed block
+		return [ f'\t{_emit_operand(instr.dest)} = ({c_type(instr.dest.type)})__metalpy_debug_pit_push( (void*){_emit_operand(instr.ptr)} );' ]
 
 	if isinstance( instr, ir.Incref ):
 		# a plain cast, not &(value)->$header - $header is always the FIRST
@@ -5282,7 +5493,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	if _target_debug:
 		parts.append( _prologue_debug_ops() )
 	if uses_incref:
-		parts.append( _PROLOGUE_RETAIN )
+		parts.append( _prologue_retain() )
 	if uses_decref:
 		parts.append( _prologue_release() )
 	if ( locked_globals or uses_field_lock ) and _global_lock_supported() and _target_os == 'windows':

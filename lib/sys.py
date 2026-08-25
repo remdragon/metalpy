@@ -140,6 +140,18 @@ def free( ptr: Ptr[u8] ) -> None:
 		size: usize = HeapSize( heap, 0, ptr )
 		if size != HEAP_SIZE_FAILED:
 			mempoison( ptr, size )
+		# don't actually hand `ptr` back to the allocator yet - the pit
+		# (compiler.__debug_quarantine__) holds it, poisoned, unreused, for
+		# ~1000 more frees, so a stale double-free/UAF touch lands on
+		# reliably-poisoned memory instead of memory the allocator has
+		# already reused for something unrelated (confirmed necessary by a
+		# real repro: without this, the SAME poisoned block silently went
+		# back to exactly-zero content between two frees). Only what the pit
+		# evicts to make room actually gets freed for real here.
+		evicted: Ptr[u8] = compiler.__debug_quarantine__( ptr )
+		if evicted is not None:
+			HeapFree( heap, 0, evicted )
+		return
 	HeapFree( heap, 0, ptr )
 
 @compiler.target( os = not 'windows' )
@@ -147,10 +159,14 @@ def free( ptr: Ptr[None] ) -> None:
 	from crt import free as _crt_free, malloc_usable_size as _crt_malloc_usable_size
 	if compiler.target.debug:
 		# see the Windows branch's own comment above - same untrack-then-
-		# mempoison-before-free sequence
+		# mempoison-then-quarantine sequence
 		compiler.__debug_raw_untrack__( ptr )
 		size: usize = _crt_malloc_usable_size( ptr )
 		mempoison( ptr, size )
+		evicted: Ptr[None] = compiler.__debug_quarantine__( ptr )
+		if evicted is not None:
+			_crt_free( evicted )
+		return
 	_crt_free(ptr)
 
 @compiler.target( os = 'windows' )

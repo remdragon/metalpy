@@ -936,6 +936,14 @@ class DebugRawUntrack( Instruction ): # compiler.__debug_raw_untrack__(ptr) -> N
 		return f'DebugRawUntrack( ptr={self.ptr!r} )'
 
 @dataclass( kw_only = True )
+class DebugQuarantine( Instruction ): # compiler.__debug_quarantine__(ptr) -> same Ptr[T] as ptr - the leak tracker's own pit (emitter_c.py's __metalpy_debug_pit_push): holds a just-freed block instead of handing it straight back to the allocator, so a double-free/UAF on it lands on reliably-poisoned memory instead of silently-reused memory. Returns whatever the pit evicted to make room for ptr (a genuine, no-longer-protected block the caller must now actually free) - null if the pit wasn't full yet. See lib/sys.py's free().
+	dest: Temp
+	ptr: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugQuarantine( dest={self.dest!r}, ptr={self.ptr!r} )'
+
+@dataclass( kw_only = True )
 class DumpLiveObjects( Instruction ): # compiler.dump_live_objects() - walks both debug-tracking lists (RC objects + raw sys.alloc buffers), aggregates by (type_name, alloc_loc), prints counts/bytes via _Stdout.write - see emitter_c.py's __metalpy_dump_live_objects
 	def test_repr( self ) -> str:
 		return 'DumpLiveObjects()'

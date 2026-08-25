@@ -223,11 +223,14 @@ class UnsafeList[T]( Sized ):
 			ptr[0] = val
 
 	def __del__( self ) -> None:
-		# Decref all RC elements before RawList frees the buffer
+		# Decref all RC elements before RawList frees the buffer. Never
+		# bound to a named local first (see lib/builtins/__init__.py's
+		# _release_key/_release_value for the identical concern) - a real
+		# double-free otherwise once this element's own last iteration's
+		# binding also got its own ordinary scope-exit release.
 		i: usize = 0
 		while i < self.__raw.len():
-			val: T = self._read_element( self.__raw._slot_ptr( i ))
-			compiler.decref( val )
+			compiler.decref( self._read_element( self.__raw._slot_ptr( i )))
 			with compiler.panic_arithmetic( 'list.__del__: overflow' ):
 				i += 1
 		# RawList.__del__ will free the raw buffer
@@ -276,25 +279,22 @@ class UnsafeList[T]( Sized ):
 	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
 		slot: Ptr[None] = self.__raw._ptr_at( idx ).or_return()
-		old: T = self._read_element( slot )
+		compiler.decref( self._read_element( slot ))
 		compiler.incref( val )
 		self._write_element( slot, val )
-		compiler.decref( old )
 		return Result.Ok( None )
 
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
-		val: T = self._read_element( self.__raw._ptr_at( idx ).or_return())
-		compiler.decref( val )
+		compiler.decref( self._read_element( self.__raw._ptr_at( idx ).or_return()))
 		return self.__raw._remove_at( idx )
 
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> None:
 		i: usize = 0
 		while i < self.__raw.len():
-			val: T = self._read_element( self.__raw._slot_ptr( i ))
-			compiler.decref( val )
+			compiler.decref( self._read_element( self.__raw._slot_ptr( i )))
 			with compiler.panic_arithmetic( 'list.clear: overflow' ):
 				i += 1
 		self.__raw._clear()
