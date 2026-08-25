@@ -5533,6 +5533,24 @@ class FunctionLowering:
 		else:
 			exc_node = node.exc
 		value = self._lower_expr( exc_node, None )
+		self._raise_value( value, node )
+
+	def _raise_value( self, value: ir.Operand, node: ast.AST ) -> None:
+		''' the dispatch/emission half of _stmt_Raise, split out so
+		or_throw(mapper) (_lower_or_throw_with_mapper) can raise an
+		ALREADY-COMPUTED operand directly - it needs the mapped error's
+		own value settled (mapper called, its argument decreffed) BEFORE
+		dispatch, which means the raised expression can't be a fresh
+		ast.Raise(exc=<call>) re-lowered from scratch here (that would
+		call the mapper a second time, or read the argument after it's
+		already been decreffed - see the caller's own comment). Keeping
+		`value` a bare, never-named ir.Temp (returned directly from
+		_lower_expr, never bound via ast.Assign) is what lets untrack_temp()
+		below correctly hand its ownership off with no separate unwind
+		needed - a NAMED Variable raised from inside a confined branch has
+		no such automatic path (see _lower_or_throw_with_mapper's own
+		manually_decreffed()-was-a-no-op history for why that alternative
+		doesn't work). '''
 		error_cls = value.type
 		if error_cls is None or not isinstance( error_cls, ( RCClass, CStruct, CUnion, TaggedUnion, CEnum )):
 			self.lowering.discovery.fail(
@@ -5551,6 +5569,20 @@ class FunctionLowering:
 			self._cfg.check_unchecked_results( value )
 		except CompileError as e:
 			self.lowering.discovery.fail( str( e ), node )
+
+		# `value`'s own reference always transfers out through the dispatch
+		# below - into the handler's raise_value_var (every handler has one,
+		# `as NAME` or not - TryHandler's own docstring; its own lifetime is
+		# the same manual-decref idiom as any other extracted RC element,
+		# e.g. list.__del__/dict's _release_key) or widened into a
+		# propagated Result - never simply dropped here, so it must never be
+		# released by the ordinary end-of-statement temp flush either.
+		# Confirmed by a real repro: `raise Boom(code=5)` / `except Boom as
+		# e: ...e.code...` previously read freed memory (release_object($t0)
+		# emitted before `e = $t0`) - the flush was unconditionally
+		# releasing `value` regardless of whether anything downstream still
+		# needed it.
+		self._cfg.untrack_temp( value )
 
 		all_covered = len( covered_leaves ) == len( all_leaves )
 		if all_covered:
@@ -15123,9 +15155,14 @@ class FunctionLowering:
 		docstring. Only the checks specific to the explicit `.or_throw()`
 		SYNTAX (no-args, generator-body rejection) live here - the @inline-
 		splice-prelude case is now generalized (ir.OrThrow.inline_exit),
-		same carve-out _emit_or_throw's own uncovered-leaf branch applies. '''
+		same carve-out _emit_or_throw's own uncovered-leaf branch applies.
+		or_throw(mapper): a single positional argument is a whole separate
+		shape (see _lower_or_throw_with_mapper) - dispatched here, before
+		any of the no-arg-specific validation below runs. '''
+		if len( node.args ) == 1 and not node.keywords:
+			return self._lower_or_throw_with_mapper( node, receiver, node.args[0], want_result, receiver_pending_start = receiver_pending_start )
 		if node.args or node.keywords:
-			self.lowering.discovery.fail( f'or_throw() takes no arguments: {ast.unparse(node)}', node )
+			self.lowering.discovery.fail( f'or_throw() takes no arguments, or a single error-mapping callable: {ast.unparse(node)}', node )
 		if self._current_fn is not None and self._current_fn.is_generator_next:
 			self.lowering.discovery.fail(
 				f'or_throw() is not supported inside a generator body yet - a generator body is a state machine '
@@ -15139,6 +15176,203 @@ class FunctionLowering:
 		return self._emit_or_throw(
 			node, receiver, want_result, alternatives = self.lowering._OR_THROW_ALTERNATIVES, receiver_pending_start = receiver_pending_start,
 		)
+
+	def _lower_or_throw_with_mapper(
+		self, node: ast.Call, receiver: ir.Operand, mapper_node: ast.expr, want_result: bool, *, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
+		''' <result_expr>.or_throw(mapper) - like or_return(mapper) above
+		(see its own docstring for the general shape: a real conditional
+		branch via _lower_binary_branch, the mapper call going through the
+		ordinary _lower_call dispatch via a synthesized ast.Call so a real
+		capturing closure works for free), but the Err arm ends in a real
+		`raise mapper(err)` statement (_stmt_Raise) instead of `return
+		Result.Err(mapper(err))` - dispatching the MAPPED error's own
+		leaves against any enclosing try's own handlers (innermost first),
+		falling back to or_return(mapper)'s own propagate-to-caller
+		behavior for any leaf left uncovered, exactly like a hand-written
+		`raise` already does. This is why the mapping happens BEFORE
+		dispatch, not after: `.or_throw(mapper)` means "convert this error,
+		THEN handle/propagate the converted one" - an enclosing `except
+		StopIteration:` next to `seq[i].or_throw(to_stop_iteration)` catches
+		the MAPPED type, never the receiver's own original error type,
+		which is never visible outside this call at all.
+
+		Same generator-body rejection as the no-arg form above (see its own
+		comment) - `raise` itself is independently rejected inside a
+		generator body too (_stmt_Raise's own identical check), so this
+		only needs its own explicit check to give a clearer, or_throw(mapper)-
+		specific message rather than surfacing _stmt_Raise's generic one
+		for a call site the user never wrote a literal `raise` at. '''
+		if self._current_fn is not None and self._current_fn.is_generator_next:
+			self.lowering.discovery.fail(
+				f'or_throw(mapper) is not supported inside a generator body yet: {ast.unparse(node)}', node,
+			)
+		shape = self.lowering._type_resolver._result_shape( receiver.type )
+		if shape is None:
+			self.lowering.discovery.fail( f'or_throw(mapper) receiver must be Result[_,_], got {receiver.type.qualname if receiver.type else "?"}', node )
+		result_ok_type, error_cls = shape
+		tagged_shape = self.lowering._type_resolver._tagged_union_shape( receiver.type )
+		assert tagged_shape is not None, 'internal compiler error: _result_shape succeeded but _tagged_union_shape did not'
+		_result_base, result_members = tagged_shape
+		err_member = next( a for a in result_members if a.stem == 'Err' )
+		ok_member = next( a for a in result_members if a.stem == 'Ok' )
+		concrete_result_union = self.lowering.monomorphize_class( receiver.type ) if isinstance( receiver.type, Specialization ) else receiver.type
+		tag_attr, _data_attr, _payload_cls, tags = self.lowering._union_storage.get( concrete_result_union )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+
+		is_alias = self.lowering._is_aliasing_expr( node.func.value, receiver )
+		if receiver_pending_start is not None:
+			self._flush_new_pending_temps( receiver_pending_start, receiver )
+		unique = self._label_id
+		self._label_id += 1
+		recv_var = self._declare_hidden_local( f'__ot_recv_{unique}', receiver.type, node )
+		self._cfg_assign( recv_var, receiver, is_alias = is_alias, node = node, track_result = False )
+
+		# see or_return_with_mapper's own identical comment on why the
+		# mapper is lowered here, once, into its own hidden local, rather
+		# than embedded directly in err_thunk's own synthesized ast.Call
+		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		mapper_ret_placeholder = TypeVar( stem = '_MapperRet', qualname = f'{self._current_fn.qualname}._MapperRet_{unique}', file = None, line = None )
+		mapper_callable_type = self.lowering.discovery._get_or_create_callable_type( [ error_cls ], mapper_ret_placeholder )
+		mapper_expected_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ mapper_callable_type ] )
+		mapper_operand = self._lower_expr( mapper_node, mapper_expected_type, strict = False )
+		mapper_var = self._declare_hidden_local( f'__ot_mapper_{unique}', mapper_operand.type, node )
+		mapper_is_alias = self.lowering._is_aliasing_expr( mapper_node, mapper_operand )
+		self._cfg_assign( mapper_var, mapper_operand, is_alias = mapper_is_alias, node = node )
+
+		tag_expr = ast.Attribute( value = self.lowering._synth_name( recv_var.stem, node ), attr = tag_attr.stem, ctx = ast.Load() )
+		ast.copy_location( tag_expr, node )
+		is_err_test = ast.Compare( left = tag_expr, ops = [ ast.Eq() ], comparators = [ ast.Constant( value = tags[ err_member.stem ] ) ] )
+		ast.copy_location( is_err_test, node )
+		is_err_cond = self._lower_expr( is_err_test, bool_cls )
+
+		ok_var_holder: list[Variable] = []
+
+		def err_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, err_member )
+			err_bind_name = f'__ot_err_{unique}'
+			self._declare_hidden_local( err_bind_name, error_cls, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = err_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			mapped_call = ast.Call(
+				func = self.lowering._synth_name( mapper_var.stem, node ), args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+			)
+			ast.copy_location( mapped_call, node )
+			# a GOTO-based ir.Raise (the all_covered case - every leaf
+			# dispatches straight into a handler, see _stmt_Raise's own
+			# short-circuit) never unwinds anything - unlike a real
+			# function-level return/propagation, which walks and replays
+			# the ENTIRE pending stack (cfg.return_()), a jump into a
+			# handler INSIDE the same function correctly leaves that to
+			# whatever scope it lands in. Every hidden local THIS call
+			# introduced (err_bind_name below, and recv_var itself - an
+			# OUTER local, but one this specific call is the only reason
+			# it's still holding a reference by this point) would then
+			# never get released on this specific path at all - confirmed
+			# via a real repro (both leaked, "-- live RC objects (2) --").
+			# recv_var's own payload is already safely aliased into err_
+			# bind_name by this point, so releasing recv_var here (its
+			# extraction already done, nothing else in err_thunk touches
+			# it again) is correct, not premature.
+			if receiver.type.is_rc():
+				recv_decref = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ self.lowering._synth_name( recv_var.stem, node ) ], keywords = [],
+				))
+				ast.copy_location( recv_decref, node ); ast.copy_location( recv_decref.value, node )
+				ast.copy_location( recv_decref.value.func, node ); ast.copy_location( recv_decref.value.func.value, node )
+				self._lower_stmt( recv_decref )
+			# the mapper call is lowered directly here (never embedded
+			# unevaluated inside a fresh ast.Raise, unlike a plain hand-
+			# written `raise mapper(err)`) - both err_bind_name and mapper_var
+			# themselves need explicit teardown BETWEEN the call and the
+			# raise (see below), and _stmt_Raise's own all_covered dispatch
+			# is an unconditional goto with no reachable code after it, so
+			# anything still needing to run has to happen BEFORE it, not
+			# after. Kept mapped_value a bare, never-named operand (never
+			# bound via ast.Assign - see _raise_value's own docstring)
+			# rather than a hidden Variable: a NAMED local raised from
+			# inside this confined Err branch has no natural unwind at all
+			# (a GOTO-based ir.Raise never walks back through
+			# _lower_binary_branch's own confinement - confirmed via a real
+			# repro, the mapper's own result permanently leaking even after
+			# trying cfg.manually_decreffed() on it, which only cancels an
+			# ALREADY-firing release, not one that would never fire to
+			# begin with). untrack_temp() inside _raise_value is what
+			# correctly hands a bare temp's ownership off instead.
+			#
+			# mapper_var.type is EITHER Ptr[Callable[...]] (a plain
+			# function/non-capturing lambda) or a bare ClosureType (a real
+			# capturing closure) - mirrors _expr_Lambda's own identical
+			# two-shape fallback for resolving fn_type
+			mapper_callable_type_resolved = self.lowering._type_resolver._callable_type_of( mapper_var.type )
+			if mapper_callable_type_resolved is None and isinstance( mapper_var.type, ClosureType ):
+				mapper_callable_type_resolved = mapper_var.type
+			mapped_value = self._lower_expr( mapped_call, mapper_callable_type_resolved.return_type )
+			if error_cls.is_rc():
+				# fully consumed as the mapper's own argument - same "read a
+				# container-owned value into a local, explicitly decref it"
+				# idiom list.__del__/dict's own _release_key/_release_value
+				# already use elsewhere in this stdlib
+				err_decref = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ ast.Name( id = err_bind_name, ctx = ast.Load() ) ], keywords = [],
+				))
+				ast.copy_location( err_decref, node ); ast.copy_location( err_decref.value, node )
+				ast.copy_location( err_decref.value.func, node ); ast.copy_location( err_decref.value.func.value, node )
+				self._lower_stmt( err_decref )
+			if mapper_var.type.is_rc():
+				# a real capturing closure (ClosureType is_rc()) - declared
+				# in the try body (before this branch even starts), so its
+				# own OWNED epilogue entry would normally survive to be
+				# released wherever the enclosing function actually returns
+				# (return_()'s own whole-stack walk). But _stmt_Try's own
+				# handler lowering restores the CFG back to the try's ENTRY
+				# snapshot before running ANY handler body (see _stmt_Try's
+				# own comment) - silently dropping, not releasing, every
+				# entry the try body itself pushed, mapper_var included.
+				# Confirmed via a real repro: OrThrowMapperTests.
+				# test_capturing_closure_mapper_rc_correct leaked exactly
+				# the closure + its own captured-env allocation, on the Err
+				# path only (the Ok path's own real function-level `return`
+				# still correctly walks and releases it, since it never
+				# goes through a handler dispatch at all).
+				mapper_decref = ast.Expr( value = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'compiler', ctx = ast.Load() ), attr = 'decref', ctx = ast.Load() ),
+					args = [ self.lowering._synth_name( mapper_var.stem, node ) ], keywords = [],
+				))
+				ast.copy_location( mapper_decref, node ); ast.copy_location( mapper_decref.value, node )
+				ast.copy_location( mapper_decref.value.func, node ); ast.copy_location( mapper_decref.value.func.value, node )
+				self._lower_stmt( mapper_decref )
+			self._raise_value( mapped_value, node )
+			return True
+
+		def ok_thunk() -> bool:
+			self._cfg.narrow( recv_var.stem, ok_member )
+			ok_bind_name = f'__ot_ok_{unique}'
+			ok_var = self._declare_hidden_local( ok_bind_name, result_ok_type, node )
+			extract = ast.Assign(
+				targets = [ ast.Name( id = ok_bind_name, ctx = ast.Store() ) ], value = self.lowering._synth_name( recv_var.stem, node ),
+			)
+			ast.copy_location( extract, node )
+			self._lower_stmt( extract )
+			ok_var_holder.append( ok_var )
+			return False
+
+		self._lower_binary_branch( is_err_cond, node, err_thunk, ok_thunk )
+		# err_thunk always terminates (a real `raise` - either a goto into
+		# a handler, or a real `return` when uncovered - never falls
+		# through to here) - ok_var is therefore always live whenever
+		# control actually reaches this point, exactly like or_return_
+		# with_mapper's own identical reasoning.
+		ok_operand = ok_var_holder[0]
+		if not want_result:
+			self._emit( ir.MarkUsed( operand = ok_operand ))
+			return None
+		return ok_operand
 
 	def _dispatch_leaves_against_try_stack( self, all_leaves: list[Type] ) -> tuple[list[ir.ThrowLeaf],list[Type]]:
 		''' matches each of `all_leaves` against every enclosing try's own
