@@ -53,7 +53,7 @@ class UrlParseError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"UrlParseError('{self.message}')"
+		return f"UrlParseError({self.message!r})"
 
 # ---------------------------------------------------------------------------
 # percent-encoding (RFC 3986) - quote()/quote_plus()

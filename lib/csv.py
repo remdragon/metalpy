@@ -53,7 +53,7 @@ class CsvError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"CsvError('{self.message}')"
+		return f"CsvError({self.message!r})"
 
 
 class MaybeRow:

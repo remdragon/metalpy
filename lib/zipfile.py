@@ -47,7 +47,7 @@ class ZipError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"ZipError('{self.message}')"
+		return f"ZipError({self.message!r})"
 
 
 @cstruct( packed = True )

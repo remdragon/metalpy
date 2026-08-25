@@ -44,7 +44,7 @@ class DeflateError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"DeflateError('{self.message}')"
+		return f"DeflateError({self.message!r})"
 
 
 BTYPE_STORED:  u32 = 0

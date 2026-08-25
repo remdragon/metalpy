@@ -25,7 +25,7 @@ class Base64Error:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"Base64Error('{self.message}')"
+		return f"Base64Error({self.message!r})"
 
 
 # 64-entry alphabets: 'A'-'Z', 'a'-'z', '0'-'9', then the two symbols that

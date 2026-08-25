@@ -92,7 +92,7 @@ class PatternError:
 		return self.message
 
 	def __repr__( self ) -> str:
-		return f"PatternError('{self.message}')"
+		return f"PatternError({self.message!r})"
 
 
 @enum( i32 )
