@@ -10729,6 +10729,24 @@ class FunctionLowering:
 		resolved_cls = self.lowering._ensure_resolved( target_cls )
 		assert isinstance( resolved_cls, ClassLike ), f'internal compiler error: {resolved_cls} is not constructible'
 		init = resolved_cls.get_local_or_raise( '__init__' )
+		if isinstance( init, Overload ):
+			# an overloaded __init__ (e.g. list[T]'s own capacity/iterator/
+			# iterable overloads) - this call site only ever constructs
+			# ZERO-argument (see this method's own docstring), so resolve_
+			# call naturally narrows to whichever ONE candidate accepts no
+			# arguments at all (every other candidate's own sole parameter
+			# has no default, so _translate_indices excludes it outright) -
+			# no move()/kwargs/literal-typing concern here, unlike the
+			# general ClassName(...) construction path, since there are
+			# never any real arguments to lower in the first place
+			try:
+				branches, init = overload_resolution.resolve_call(
+					init.stubs, init.implementations, [], {},
+					qualname = f'{resolved_cls.qualname}.__init__', same_type = self.lowering._type_resolver._same_type,
+				)
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
+			assert not branches, f'internal compiler error: {resolved_cls.qualname}.__init__() (zero-arg) resolved to a runtime dispatch, not a single candidate'
 		assert isinstance( init, Function ), f'internal compiler error: {resolved_cls.qualname} has no usable __init__'
 		self.lowering.schedule( resolved_cls )
 		self.lowering._ensure_resolved( init )
@@ -14611,6 +14629,44 @@ class FunctionLowering:
 				# RCCLASS ATTRIBUTE LIFETIME.md's own title) - falls through to
 				# the normal call path, same "not callable" as always
 				return None
+			if isinstance( init, Overload ):
+				# resolve to a single winning Function BEFORE everything
+				# below (fallibility detection, field=value sugar, RC
+				# attribute-lifetime tracking) - none of that needs to
+				# change, it just needs a concrete Function instead of an
+				# Overload group. Arguments are lowered TWICE for a generic
+				# target_cls (once here, probe-only, again inside _lower_
+				# generic_construction_args against the winning candidate's
+				# real declared types) - same "probe first, lower for real
+				# once the target is fixed" split the ordinary overloaded-
+				# call path (_lower_call, below) already uses, just not
+				# reusing its lowered operands directly (construction's own
+				# downstream generic-inference pass needs to re-lower
+				# against the WINNING candidate's parameter types anyway,
+				# unlike an ordinary call - see _lower_generic_construction_
+				# args). A runtime-dispatched winner (2+ candidates still
+				# tied after resolve_call) isn't supported here - construct-
+				# ion has no ConditionalDispatch machinery of its own.
+				candidates = [ *init.stubs, *init.implementations ]
+				if any( kw.arg is None for kw in node.keywords ):
+					self.lowering.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )
+				probe_args = [ self._lower_overload_arg( e, i, None, candidates, node ) for i, e in enumerate( node.args ) ]
+				probe_kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
+				try:
+					branches, resolved_init = overload_resolution.resolve_call(
+						init.stubs, init.implementations,
+						[ op.type for op in probe_args ], { name: op.type for name, op in probe_kwargs.items() },
+						qualname = f'{target_cls.qualname}.__init__', same_type = self.lowering._type_resolver._same_type,
+						protocol_conforms = self.lowering._type_conforms_to_protocol,
+					)
+				except CompileError as e:
+					self.lowering.discovery.fail( str( e ), node )
+				if branches:
+					self.lowering.discovery.fail(
+						f'{target_cls.qualname}.__init__: a runtime-dispatched overloaded constructor is not supported yet: {ast.unparse(node)}',
+						node,
+					)
+				init = resolved_init
 			if not isinstance( init, Function ):
 				self.lowering.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
 			# init may be target_cls's OWN __init__ or an INHERITED one
@@ -14766,6 +14822,21 @@ class FunctionLowering:
 		# body (parameters/return_type) was already resolved by the caller.
 		assert init.resolve is None, f'internal compiler error, {init.qualname} was not resolved before construction'
 		class_type_params = target_cls.type_params or []
+		# __init__ may declare its OWN extra type param(s) on top of
+		# target_cls's (e.g. list[T].__init__[S: IteratorProtocol[T]]) - S
+		# and T have to be inferred TOGETHER, in one combined pass, not two
+		# separate ones: T never appears directly in init's own (abstract)
+		# parameter list at all when init has its own S (only inside S's
+		# bound, e.g. IteratorProtocol[T]) - a class-type-params-ONLY unify
+		# pass never binds T in that shape, only _unify_type_param's own
+		# reverse-bound-unification (through S's parametrized protocol
+		# bound) ever does, and that only fires when T is in the SAME
+		# type_params list being unified as S itself. Same combined-list
+		# technique a free generic function with this identical shape
+		# already relies on (max[T, S: Iterable[T]]) - just extended here
+		# to cover a class's own type params too, not only a function's.
+		own_type_params = init.type_params or []
+		type_params = [ *class_type_params, *own_type_params ]
 		bindings: dict[int,Type] = {}
 		# expected_type pins target_cls's own args directly for a non-
 		# fallible __init__ (b: Box[i32] = Box(1)) - but for a FALLIBLE one,
@@ -14783,20 +14854,41 @@ class FunctionLowering:
 			for tv, arg in zip( class_type_params, pinning_type.args ):
 				bindings[ id( tv ) ] = arg
 
-		args, kwargs = self._lower_and_infer_call_args( node, init, class_type_params, bindings, target_cls.qualname )
+		args, kwargs = self._lower_and_infer_call_args( node, init, type_params, bindings, target_cls.qualname )
 
-		missing = [ tv.stem for tv in class_type_params if id( tv ) not in bindings ]
+		missing = [ tv.stem for tv in type_params if id( tv ) not in bindings ]
 		if missing:
 			self.lowering.discovery.fail(
 				f'{target_cls.qualname}(...): cannot infer type parameter(s) {", ".join(missing)} from these arguments or the surrounding expected type: {ast.unparse(node)}',
 				node,
 			)
 		concrete_args = [ bindings[id(tv)] for tv in class_type_params ]
-		self.lowering._check_type_param_bounds( node, class_type_params, concrete_args, target_cls.qualname )
+		own_concrete_args = [ bindings[id(tv)] for tv in own_type_params ]
+		self.lowering._check_type_param_bounds( node, type_params, [ *concrete_args, *own_concrete_args ], target_cls.qualname )
 		cls_spec = self.lowering.discovery._get_or_create_specialization( target_cls, concrete_args )
+		self.lowering._ensure_resolved( cls_spec )
+
+		if own_type_params:
+			# build the fully-concrete __init__ directly, substituting BOTH
+			# class and own args in one shot (_build_monomorphized_function
+			# zips type_params/args positionally, and doesn't care which
+			# came from the class vs the method itself) - mirrors
+			# Monomorphizer._partial_class_substituted_method's own
+			# substitution call, just skipping its "stay generic in S"
+			# half (result_type_params stays None/default here): S is
+			# already concrete by this point, unlike THAT method's own
+			# use case (an ordinary receiver-based method call, where S is
+			# only ever known later, at its own separate call site -
+			# construction has no such second call site, S is resolved
+			# right here from the SAME arguments T is)
+			qualname = f'{cls_spec.qualname}.{init.stem}'
+			monomorphized_init = self.lowering._monomorphizer._build_monomorphized_function(
+				init, type_params, [ *concrete_args, *own_concrete_args ], qualname, cls_spec,
+			)
+			return cls_spec, monomorphized_init, args, kwargs
+
 		init_spec = self.lowering.discovery._get_or_create_specialization( init, concrete_args )
-		self.lowering._ensure_resolved( cls_spec ) # also populates init_spec.monomorphized as a side effect - same (init, concrete_args) key monomorphize_class's own method-substitution loop uses
-		monomorphized_init = self.lowering._ensure_resolved( init_spec )
+		monomorphized_init = self.lowering._ensure_resolved( init_spec ) # concrete_cls's own build above (monomorphize_class's method-substitution loop) already populated init_spec.monomorphized as a side effect - same (init, concrete_args) key
 		return cls_spec, monomorphized_init, args, kwargs
 
 	def _try_lower_scalar_construct_call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand|None:
@@ -17363,6 +17455,7 @@ class FunctionLowering:
 				branches, resolved = overload_resolution.resolve_call(
 				target.stubs, target.implementations, arg_types, kwarg_types,
 				qualname = target.qualname, same_type = self.lowering._type_resolver._same_type,
+				protocol_conforms = self.lowering._type_conforms_to_protocol,
 			)
 			except CompileError as e:
 				# resolve_call is a pure function of types with no

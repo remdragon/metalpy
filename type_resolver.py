@@ -21,6 +21,21 @@ from union_storage import UnionStorage
 
 
 
+def _best_effort_protocol_conforms( concrete: Type, protocol: Type ) -> bool:
+	''' overload_resolution.resolve_call's protocol_conforms - same bare-
+	protocol-base membership check as lowering.py's Lowering._type_conforms_
+	to_protocol, duplicated here (not called into) since Lowering doesn't
+	exist yet at this pass. Only used by _overload_call_return_type's own
+	best-effort inference below, where "any doubt, return None" already
+	covers a wrong guess here - never load-bearing for a real compile
+	error, unlike lowering.py's own resolve_call call. '''
+	base = concrete.base if isinstance( concrete, Specialization ) else concrete
+	if isinstance( base, TupleType ):
+		base = base.backing
+	if not isinstance( base, RCClass ):
+		return False
+	return any( ( p.base if isinstance( p, Specialization ) else p ) is protocol for p in base.protocols )
+
 def _union_member_ast_path( union: TaggedUnion, member_stem: str ) -> ast.Attribute:
 	''' build an ast.Attribute path for a union's member reference in a
 	match-case pattern, e.g. builtins.MaybeFoo.Some — the union's own
@@ -219,7 +234,7 @@ class TypeResolver:
 		# once, lazily, the first time an RCClass actually needs one
 		self._sys_free_scheduled: bool = False
 		self._destructors_synthesized: set[int] = set()
-		self._constructors_synthesized: set[int] = set() # id(RCClass) -> $$__new__ already synthesized - see _synthesize_rcclass_constructor
+		self._constructors_synthesized: set[tuple[int,int]] = set() # (id(RCClass), id(init)) -> $$__new__ already synthesized - see _synthesize_rcclass_constructor
 		self._dtor_label_id = 0
 		self._sys_functions: dict[str,Function] = {}
 		# re-entrancy guard for _schedule_uniontype_storage: union_storage.
@@ -3486,9 +3501,19 @@ class TypeResolver:
 		it tried to mangle a TypeVar into a C type). '''
 		if cls.type_params:
 			return  # only concrete RCClasses get a constructor
-		if id( cls ) in self._constructors_synthesized:
+		# an overloaded __init__ means MULTIPLE, differently-shaped $$__new__
+		# wrappers can legitimately coexist for the SAME concrete cls (one
+		# per distinct __init__ candidate actually used at some real
+		# construction call site, e.g. list[Elem]() vs list(some_iterator))
+		# - id(cls) alone used to be a safe cache key/dedup because exactly
+		# one __init__ per class was the only shape this ever saw; keying by
+		# (cls, init) instead is the minimal fix, not a broader redesign -
+		# see the qualname suffix just below for the matching C-symbol half
+		# of this same fix.
+		cache_key = ( id( cls ), id( init ))
+		if cache_key in self._constructors_synthesized:
 			return
-		self._constructors_synthesized.add( id( cls ))
+		self._constructors_synthesized.add( cache_key )
 
 		if cls.resolve is not None:
 			cls.resolve()
@@ -3539,6 +3564,16 @@ class TypeResolver:
 				result_cls = self.discovery.find_name_or_none( 'Result' )
 
 		qualname = f'{cls.qualname}$$__new__'
+		if isinstance( cls.get_local( '__init__' ), Overload ):
+			# multiple $$__new__ wrappers coexist for this cls (see the
+			# cache-key comment above) - each needs its own distinct C
+			# symbol, or the second one synthesized would silently collide
+			# with/shadow the first's mangled name. init.line is stable and
+			# already unique per __init__ candidate within one file (two
+			# distinct defs can never share a line) - untouched for every
+			# non-overloaded class (the overwhelming common case), so this
+			# never changes an existing, already-stable $$__new__ symbol
+			qualname = f'{qualname}${init.line}'
 		new_params: list[Parameter] = []
 		for p in ( init.parameters or [] ):
 			new_params.append( Parameter(
@@ -5424,6 +5459,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			_, resolved = overload_resolution.resolve_call(
 				group.stubs, group.implementations, arg_types, kwarg_types,
 				qualname = group.qualname, same_type = self.resolver._same_type,
+				protocol_conforms = _best_effort_protocol_conforms,
 			)
 		except CompileError:
 			return None

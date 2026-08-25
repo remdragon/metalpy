@@ -339,9 +339,30 @@ class list[T]( Sequence[T], Iterable[T] ):
 	__inner:   UnsafeList[T]
 	__lock:    threading.FastLock
 
+	@overload
 	def __init__( self, initial_capacity: usize = 8 ) -> None:
 		self.__inner = UnsafeList[T]( initial_capacity )
 		self.__lock  = threading.FastLock()
+
+	# from an already-in-progress iterator (a generator, or any hand-written
+	# IteratorProtocol[T] conformer) - drains it eagerly, same as Python's
+	# own list(some_iterator).
+	@overload
+	def __init__[S: IteratorProtocol[T]]( self, iterator: S ) -> None:
+		self.__inner = UnsafeList[T]()
+		self.__lock  = threading.FastLock()
+		for item in iterator:
+			self.append( item )
+
+	# from any Iterable[T] (a Sequence, a dict's own key-iteration, ...) -
+	# goes through __iter__() first, then drains exactly like the
+	# IteratorProtocol[T] overload above.
+	@overload
+	def __init__[S: Iterable[T]]( self, iterable: S ) -> None:
+		self.__inner = UnsafeList[T]()
+		self.__lock  = threading.FastLock()
+		for item in iterable:
+			self.append( item )
 
 	def __len__( self ) -> usize:
 		with self.__lock:
