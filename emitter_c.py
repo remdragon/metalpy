@@ -394,7 +394,23 @@ static __metalpy_maybe_unused void __metalpy_dump_live_objects( void ) {{
 	// from another still-running thread must not be allowed to mutate
 	// either list mid-walk (see _prologue_debug_list's own comment)
 	__metalpy_debug_lock_acquire();
-	__metalpy_debug_write( "-- live RC objects --\\n" );
+	// the header carries the total live count (not just its own group
+	// breakdown below) so a test can assert "(0)" - a real, checkable
+	// zero-leaks result - rather than merely tolerating/ignoring whatever
+	// this prints, which is what its own presence still had to be treated
+	// as before this. A separate, cheap O(n) pass (this diagnostic is
+	// already O(n^2) below, one debug/leak-checking dump per program run,
+	// not a hot path) - the grouped walk further down still needs its own
+	// full traversal regardless, so there's no way to fold this into it
+	// without printing the header only after already knowing every group.
+	size_t __metalpy_live_rc_total = 0;
+	{{
+		__metalpy_debug_link* t = __metalpy_debug_list_head.next;
+		while ( t != &__metalpy_debug_list_head ) {{ __metalpy_live_rc_total++; t = t->next; }}
+	}}
+	__metalpy_debug_write( "-- live RC objects (" );
+	__metalpy_debug_write_udec( __metalpy_live_rc_total );
+	__metalpy_debug_write( ") --\\n" );
 	__metalpy_debug_link* l = __metalpy_debug_list_head.next;
 	while ( l != &__metalpy_debug_list_head ) {{
 		ObjectHeader* h = (ObjectHeader*)( (char*)l - offsetof( ObjectHeader, debug_link ));
