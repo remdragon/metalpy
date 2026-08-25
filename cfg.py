@@ -195,6 +195,7 @@ class CFGState:
 		self._any_shared_label_used: bool = False # see used_shared_epilogue_label()'s own docstring
 		self._cancel_flags: list[Variable] = [] # see _neutralize()/cancel_flags() - minted lazily, only for an entry that turns out to need one
 		self._confinement_depths: list[int] = [] # see enter_loop()/exit_loop() and enter_branch()/exit_branch()
+		self._try_protected: list[set[int]] = [] # see enter_try()/exit_try() - id()s of every entry a currently-lowering try's own body/handlers must NOT statically cancel
 		self._inline_scope_stack: list[InlineScope] = [] # see push_inline_scope()/pop_inline_scope()
 		self._break_narrowed_stack: list[list[dict[str,list[Variable]]]] = [] # one entry per currently-lowering loop (innermost last) - each entry collects a dict[str,list[Variable]] snapshot per break reached inside THAT loop specifically, see enter_loop()/exit_loop()/record_break_narrowed()/merge_loop_exits()
 		self._break_live_stack: list[list[set[str]]] = [] # the definite-assignment analogue of _break_narrowed_stack above - one set[str] snapshot per break, see record_break_live()
@@ -573,6 +574,41 @@ class CFGState:
 
 	def exit_branch( self ) -> None:
 		self._confinement_depths.pop()
+
+	def enter_try( self, floor: int ) -> None:
+		''' lowering.py's _stmt_Try - brackets the WHOLE body-through-
+		handlers window (wider than enter_branch()'s own per-handler
+		confinement: the try body itself stays unconfined, but every
+		SURVIVING entry below `floor` - index < floor, i.e. declared
+		BEFORE this try - is independently restore()'d back to the SAME
+		entry snapshot for the try body's own fall-through AND for each
+		handler in turn). Those entries' own Epilogue objects are shared
+		by reference, never copied per restore() (see restore()'s own
+		comment) - a manually_decreffed()/move()/deleted() call on one,
+		already-lowered sibling path (e.g. `compiler.decref(g)` on the try
+		body's own non-raising fall-through) would otherwise permanently
+		mutate the SAME object an earlier-taken, mutually-exclusive path
+		(a handler restored back to the try's own entry) still depends
+		on - confirmed by a real repro: an ordinary local declared before
+		a try, decref'd only on the non-raising fall-through, leaked on
+		the raising path instead, because the handler's own `return`
+		walked right past an entry a SIBLING path had already (wrongly,
+		from this path's own perspective) cancelled.
+
+		Recorded by id() (Epilogue is unhashable-by-default dataclass
+		identity, and entries can't be deep-copied - see Epilogue.type's
+		own docstring on why instructions are always regenerated fresh)
+		rather than by index: indices can still shift beneath a nested
+		try's own narrower protection. A stack (not a single set), same
+		shape as _confinement_depths, so nested trys compose - an entry
+		protected by an outer try stays protected for the whole time an
+		inner try is ALSO being lowered, popped back to the outer try's
+		own view once the inner one exits. See _neutralize()'s own use of
+		this. '''
+		self._try_protected.append({ id( e ) for e in self._epilogue_stack[:floor] })
+
+	def exit_try( self ) -> None:
+		self._try_protected.pop()
 
 	# --- union narrowing (compile-time only - see _narrowed's own comment) -
 
@@ -2315,8 +2351,17 @@ class CFGState:
 		branch (an already-flag-guarded entry must keep being replayed -
 		by build_epilogue_ladder()'s own "cancelled entries get no
 		instructions" rule, cancelling it too would just silently drop the
-		flag check itself). '''
-		if not entry.captured:
+		flag check itself).
+
+		enter_try()'s own protection is the SAME "must go through the flag
+		instead of a static cancel" situation, just without an actual
+		captured goto target - a try's own handler, restored back to this
+		SAME entry's snapshot, is a mutually-exclusive sibling path that
+		may independently still need this entry released, exactly like an
+		earlier captured return would. See enter_try()'s own docstring for
+		the real repro this fixes. '''
+		protected = any( id( entry ) in prot for prot in self._try_protected )
+		if not entry.captured and not protected:
 			entry.cancelled = True
 			return []
 		if entry.flag is None:

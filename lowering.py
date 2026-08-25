@@ -5337,132 +5337,156 @@ class FunctionLowering:
 		outer_instructions = self._instructions
 		self._instructions = []
 		self._try_stack.append( TryContext( handlers = handlers, end_label = end_label, entry_stack_depth = entry_snapshot.stack_depth ))
+		# every entry that SURVIVES this try (index < entry_snapshot.stack_
+		# depth) needs protecting for the whole body-through-handlers window
+		# below, not just torn down via _try_stack's own narrower try/
+		# finally: the try body and each handler are independently restore()
+		#'d back to this SAME entry_snapshot, but restore() only reverts
+		# STACK MEMBERSHIP, never an already-mutated Epilogue object's own
+		# .cancelled flag (shared by reference, not copied per snapshot) -
+		# an ordinary `compiler.decref(g)` on the try body's own fall-
+		# through path would otherwise permanently cancel g's SHARED entry,
+		# silently making every handler restored to entry_snapshot afterward
+		# see g as already-released even on paths that never touched it -
+		# confirmed by a real repro (an ordinary local declared before the
+		# try, decref'd only on the non-raising fall-through, leaked on the
+		# raising path instead - the handler's own `return` walked right
+		# past it). protect_try_entries()/cfg.py's own _neutralize() is the
+		# fix: any cancellation of a protected entry during this window goes
+		# through the SAME runtime-flag mechanism an already-captured
+		# entry's own cancellation already uses, rather than a static
+		# .cancelled that would silently corrupt every OTHER path sharing
+		# it.
+		self._cfg.enter_try( entry_snapshot.stack_depth )
 		try:
-			for stmt in node.body:
+			try:
+				for stmt in node.body:
+					try:
+						self._lower_stmt( stmt )
+					except CompileError:
+						continue
+			finally:
+				self._try_stack.pop()
+
+			for handler, h in zip( handlers, node.handlers ):
+				if not handler.matched:
+					self.lowering.discovery.fail(
+						f'except {ast.unparse(h.type)}: is unreachable - nothing in this try block ever throws it',
+						h,
+					)
+
+			for stmt in node.orelse:
 				try:
 					self._lower_stmt( stmt )
 				except CompileError:
 					continue
-		finally:
-			self._try_stack.pop()
-
-		for handler, h in zip( handlers, node.handlers ):
-			if not handler.matched:
-				self.lowering.discovery.fail(
-					f'except {ast.unparse(h.type)}: is unreachable - nothing in this try block ever throws it',
-					h,
-				)
-
-		for stmt in node.orelse:
-			try:
-				self._lower_stmt( stmt )
-			except CompileError:
-				continue
-
-		body_captured = self._instructions
-		body_end = self._cfg.snapshot()
-
-		tail = node.orelse if node.orelse else node.body
-		combined_terminates = bool( tail ) and self._stmt_diverges( tail[-1] )
-
-		combined_groups: list[list[ir.Instruction]] = [ body_captured ]
-		combined_end = body_end
-
-		for handler, h in zip( handlers, node.handlers ):
-			self._cfg.restore( entry_snapshot )
-			self._instructions = []
-			self._cfg.enter_branch( entry_snapshot.stack_depth )
-			try:
-				# the emitter unconditionally assigns handler.raise_value_var's
-				# own payload before jumping to this exact label (ir.OrThrow's/
-				# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
-				# definitely assigned on entry here, same reasoning
-				# _declare_hidden_local/@inline's own parameter binding
-				# already rely on mark_live() for (see its own docstring).
-				# Must happen INSIDE this branch-confined window (moved
-				# from the old unconfined lowering) so restore() below
-				# correctly tears it back down before the next handler. Always
-				# runs now (not just `as NAME` clauses) - a hidden hand-off
-				# variable exists for every handler, see TryHandler's own
-				# docstring.
-				self._cfg.mark_live( handler.raise_value_var.stem )
-				self._active_raise_values.append( handler.raise_value_var )
+	
+			body_captured = self._instructions
+			body_end = self._cfg.snapshot()
+	
+			tail = node.orelse if node.orelse else node.body
+			combined_terminates = bool( tail ) and self._stmt_diverges( tail[-1] )
+	
+			combined_groups: list[list[ir.Instruction]] = [ body_captured ]
+			combined_end = body_end
+	
+			for handler, h in zip( handlers, node.handlers ):
+				self._cfg.restore( entry_snapshot )
+				self._instructions = []
+				self._cfg.enter_branch( entry_snapshot.stack_depth )
 				try:
-					for stmt in h.body:
-						try:
-							self._lower_stmt( stmt )
-						except CompileError:
-							continue
+					# the emitter unconditionally assigns handler.raise_value_var's
+					# own payload before jumping to this exact label (ir.OrThrow's/
+					# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
+					# definitely assigned on entry here, same reasoning
+					# _declare_hidden_local/@inline's own parameter binding
+					# already rely on mark_live() for (see its own docstring).
+					# Must happen INSIDE this branch-confined window (moved
+					# from the old unconfined lowering) so restore() below
+					# correctly tears it back down before the next handler. Always
+					# runs now (not just `as NAME` clauses) - a hidden hand-off
+					# variable exists for every handler, see TryHandler's own
+					# docstring.
+					self._cfg.mark_live( handler.raise_value_var.stem )
+					self._active_raise_values.append( handler.raise_value_var )
+					try:
+						for stmt in h.body:
+							try:
+								self._lower_stmt( stmt )
+							except CompileError:
+								continue
+					finally:
+						self._active_raise_values.pop()
 				finally:
-					self._active_raise_values.pop()
-			finally:
-				self._cfg.exit_branch()
-			handler_captured = self._instructions
-			handler_end = self._cfg.snapshot()
-			# same sense as _stmt_If's own true_terminates: last stmt
-			# diverges (return/break/continue) -> this branch never reaches
-			# the join point at all.
-			handler_terminates = bool( h.body ) and self._stmt_diverges( h.body[-1] )
-
-			# restore to the TRY's own entry snapshot (not combined_end) -
-			# merge_if's own docstring documents its precondition as
-			# "self.bindings is clean of whatever either branch
-			# speculatively pushed" (i.e. exactly entry state); combined_end/
-			# handler_end are passed through as plain DATA parameters
-			# (true_end/false_end) below, entirely independent of whatever
-			# self.bindings currently holds. Restoring to combined_end
-			# instead (tried first) left a stale binding in self.bindings
-			# for any name merge_if's own "fresh on exactly one branch"
-			# path drops (it only ever WRITES self.bindings for a name it
-			# reestablishes - it never deletes one that was already there
-			# but isn't a survivor) - confirmed as a real double-
-			# release_object()/uninitialized-read bug via a real MSVC
-			# compile+run repro (C4700 "uninitialized local variable 'w'
-			# used", then a heap-corruption crash at runtime).
-			self._cfg.restore( entry_snapshot )
-			# merge_if() below can mint fresh temps (a name dropped on only
-			# one side needs its own decref computed here - see its own
-			# "fresh on exactly one branch" case) - _new_temp()'s DeclareTemp
-			# side effect lands in whatever self._instructions currently is,
-			# which must be the real, live outer list (matching _stmt_If's
-			# own identical merge_if() call site), NOT handler_captured
-			# (still assigned from the just-lowered handler body above) -
-			# otherwise the DeclareTemp ends up spliced into the handler's
-			# own block while the matching compute/use instructions
-			# (returned as plain data, appended into combined_groups/
-			# handler_captured below) end up somewhere else entirely -
-			# confirmed by a real repro ("use of undeclared identifier
-			# '$tN'": a named Result local declared directly inside a try
-			# body, dropped by the handler-loop's own restore() above).
-			self._instructions = outer_instructions
-			try:
-				combined_extra, handler_extra, removed = self._cfg.merge_if(
-					entry_snapshot.bindings, combined_end.bindings, handler_end.bindings, self._current_fn.qualname,
-					entry_results = entry_snapshot.results, true_end_results = combined_end.results, false_end_results = handler_end.results,
-					true_terminates = combined_terminates, false_terminates = handler_terminates,
-					true_end_narrowed = combined_end.narrowed, false_end_narrowed = handler_end.narrowed,
-					true_end_live = combined_end.live, false_end_live = handler_end.live,
-				)
-			except CompileError as e:
-				self.lowering.discovery.fail( str( e ), node )
-			# `removed` only drives Decref instructions already spliced into
-			# combined_extra/handler_extra above - see _stmt_If's own
-			# identical comment on why fn.names must NOT also be touched.
-
-			# combined_extra must land on EVERY physical block folded into
-			# the "combined" side so far - either could be the real runtime
-			# path (a name confined to just ONE prior handler still needs
-			# its own teardown spliced into THAT handler's own block, not
-			# just the most recently merged one).
-			for group in combined_groups:
-				group.extend( combined_extra )
-			handler_captured.extend( handler_extra )
-			combined_groups.append( handler_captured )
-
-			combined_terminates = combined_terminates and handler_terminates
-			combined_end = self._cfg.snapshot()
-
-		self._cfg.restore( combined_end )
+					self._cfg.exit_branch()
+				handler_captured = self._instructions
+				handler_end = self._cfg.snapshot()
+				# same sense as _stmt_If's own true_terminates: last stmt
+				# diverges (return/break/continue) -> this branch never reaches
+				# the join point at all.
+				handler_terminates = bool( h.body ) and self._stmt_diverges( h.body[-1] )
+	
+				# restore to the TRY's own entry snapshot (not combined_end) -
+				# merge_if's own docstring documents its precondition as
+				# "self.bindings is clean of whatever either branch
+				# speculatively pushed" (i.e. exactly entry state); combined_end/
+				# handler_end are passed through as plain DATA parameters
+				# (true_end/false_end) below, entirely independent of whatever
+				# self.bindings currently holds. Restoring to combined_end
+				# instead (tried first) left a stale binding in self.bindings
+				# for any name merge_if's own "fresh on exactly one branch"
+				# path drops (it only ever WRITES self.bindings for a name it
+				# reestablishes - it never deletes one that was already there
+				# but isn't a survivor) - confirmed as a real double-
+				# release_object()/uninitialized-read bug via a real MSVC
+				# compile+run repro (C4700 "uninitialized local variable 'w'
+				# used", then a heap-corruption crash at runtime).
+				self._cfg.restore( entry_snapshot )
+				# merge_if() below can mint fresh temps (a name dropped on only
+				# one side needs its own decref computed here - see its own
+				# "fresh on exactly one branch" case) - _new_temp()'s DeclareTemp
+				# side effect lands in whatever self._instructions currently is,
+				# which must be the real, live outer list (matching _stmt_If's
+				# own identical merge_if() call site), NOT handler_captured
+				# (still assigned from the just-lowered handler body above) -
+				# otherwise the DeclareTemp ends up spliced into the handler's
+				# own block while the matching compute/use instructions
+				# (returned as plain data, appended into combined_groups/
+				# handler_captured below) end up somewhere else entirely -
+				# confirmed by a real repro ("use of undeclared identifier
+				# '$tN'": a named Result local declared directly inside a try
+				# body, dropped by the handler-loop's own restore() above).
+				self._instructions = outer_instructions
+				try:
+					combined_extra, handler_extra, removed = self._cfg.merge_if(
+						entry_snapshot.bindings, combined_end.bindings, handler_end.bindings, self._current_fn.qualname,
+						entry_results = entry_snapshot.results, true_end_results = combined_end.results, false_end_results = handler_end.results,
+						true_terminates = combined_terminates, false_terminates = handler_terminates,
+						true_end_narrowed = combined_end.narrowed, false_end_narrowed = handler_end.narrowed,
+						true_end_live = combined_end.live, false_end_live = handler_end.live,
+					)
+				except CompileError as e:
+					self.lowering.discovery.fail( str( e ), node )
+				# `removed` only drives Decref instructions already spliced into
+				# combined_extra/handler_extra above - see _stmt_If's own
+				# identical comment on why fn.names must NOT also be touched.
+	
+				# combined_extra must land on EVERY physical block folded into
+				# the "combined" side so far - either could be the real runtime
+				# path (a name confined to just ONE prior handler still needs
+				# its own teardown spliced into THAT handler's own block, not
+				# just the most recently merged one).
+				for group in combined_groups:
+					group.extend( combined_extra )
+				handler_captured.extend( handler_extra )
+				combined_groups.append( handler_captured )
+	
+				combined_terminates = combined_terminates and handler_terminates
+				combined_end = self._cfg.snapshot()
+	
+			self._cfg.restore( combined_end )
+		finally:
+			self._cfg.exit_try()
 		self._instructions = outer_instructions
 		reachable = not combined_terminates
 

@@ -633,6 +633,49 @@ def main() -> i32:
 	return 0
 '''
 
+# regression: an RC local declared BEFORE the try (not confined to it at
+# all - the ordinary function-scope case) that's manually compiler.decref'd
+# on the try body's own non-raising fall-through used to corrupt memory (a
+# real double-free, not just a leak) on the RAISING path, whenever the
+# fall-through path had ALREADY run at least once first. restore() only
+# ever reverted STACK MEMBERSHIP, never an already-mutated Epilogue's own
+# .cancelled flag (shared by reference, never copied per snapshot) - the
+# fall-through's own compiler.decref(g) permanently cancelled g's SHARED
+# entry, so a LATER call's raise-then-handler path (independently restored
+# back to the same try-entry snapshot) treated g as already-released too,
+# even though THAT path never touched it - then g's real, still-live
+# reference got released a second time by the function's own closing
+# epilogue. Fixed via cfg.py's enter_try()/exit_try() (CFGState.
+# _try_protected) routing any manual cancellation of a try-predating entry
+# through the SAME runtime-flag mechanism an already-captured entry's own
+# cancellation already used, rather than statically (and irreversibly)
+# cancelling it.
+_LOCAL_BEFORE_TRY_SURVIVES_ACROSS_REPEATED_CALLS_REGARDLESS_OF_ORDER = '''
+class Guard:
+	tag: i32
+
+class Boom:
+	tag: i32
+
+def run( bad: bool ) -> i32:
+	g: Guard = Guard( tag = 111 )
+	try:
+		if bad:
+			raise Boom( tag = 222 )
+		compiler.decref( g )
+	except Boom as e:
+		compiler.decref( e )
+		return -1
+	return 0
+
+def main() -> i32:
+	if run( False ) != 0:
+		return 1
+	if run( True ) != -1:
+		return 2
+	return 0
+'''
+
 # Change 2: raise EXPR caught by a tuple except-clause, `as e:` binding.
 _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING = '''
 class ErrorA:
@@ -1296,6 +1339,9 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_try_body_local_released_before_covered_raise_dispatch( self ) -> None:
 		self.assert_programs_run([ ( 'raise_try_body_local', _TRY_BODY_LOCAL_RELEASED_BEFORE_COVERED_RAISE_DISPATCH ) ])
+
+	def test_local_before_try_survives_across_repeated_calls_regardless_of_order( self ) -> None:
+		self.assert_programs_run([ ( 'local_before_try_repeated', _LOCAL_BEFORE_TRY_SURVIVES_ACROSS_REPEATED_CALLS_REGARDLESS_OF_ORDER ) ])
 
 	def test_raise_caught_by_tuple_except_clause_binding( self ) -> None:
 		self.assert_programs_run([ ( 'raise_tuple_except', _RAISE_CAUGHT_BY_TUPLE_EXCEPT_CLAUSE_BINDING ) ])
