@@ -16262,6 +16262,11 @@ class FunctionLowering:
 		if want_result or result is None:
 			return result
 		if not cfg.is_result_type( result.type ) and result.type is not None and result.type.is_rc():
+			# a discarded plain (non-Result) RC return - the callee already
+			# constructed/returned it, nothing else will ever capture or
+			# release it otherwise (a straight leak, not an auto-or_throw
+			# case - _auto_or_throw itself just passes a non-Result value
+			# through unreleased)
 			for instr in self._cfg.decref( result.type, result ):
 				self._emit( instr )
 			self._cfg.untrack_temp( result )
@@ -17474,7 +17479,10 @@ class FunctionLowering:
 		# picks it up instead, so this call still needs a real dest to
 		# consume even though the CALLER's own want_result is False
 		force_result = not want_result and cfg.is_result_type( monomorphized.return_type )
-		if want_result or force_result:
+		# discarded plain (non-Result) RC return - see _lower_call's own
+		# identical discard_rc for why this still needs a real dest
+		discard_rc = not want_result and not force_result and monomorphized.return_type is not None and monomorphized.return_type.is_rc()
+		if want_result or force_result or discard_rc:
 			dest = self._new_temp( expected_type or monomorphized.return_type )
 			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 			return self._finish_call_result( node, dest, want_result )
@@ -18406,7 +18414,10 @@ class FunctionLowering:
 		# needs the identical force_result copy _emit_generic_call already
 		# carries for the generic-call tail
 		force_result = not want_result and cfg.is_result_type( default.return_type )
-		produce_result = want_result or force_result
+		# discarded plain (non-Result) RC return - see _lower_call's own
+		# identical discard_rc for why this still needs a real dest
+		discard_rc = not want_result and not force_result and default.return_type is not None and default.return_type.is_rc()
+		produce_result = want_result or force_result or discard_rc
 		dest = self._new_temp( expected_type or default.return_type ) if produce_result else None
 		end_label = self._new_label( 'dispatch_end' )
 		for branch in branches:
@@ -18550,7 +18561,10 @@ class FunctionLowering:
 		# copy _lower_conditional_dispatch's own identical fix needs, for
 		# the union-RECEIVER dispatch tail
 		force_result = not want_result and cfg.is_result_type( reference.return_type )
-		produce_result = want_result or force_result
+		# discarded plain (non-Result) RC return - see _lower_call's own
+		# identical discard_rc for why this still needs a real dest
+		discard_rc = not want_result and not force_result and reference.return_type is not None and reference.return_type.is_rc()
+		produce_result = want_result or force_result or discard_rc
 		dest = self._new_temp( expected_type or reference.return_type ) if produce_result else None
 		end_label = self._new_label( 'recv_dispatch_end' )
 		for i, ( member, fn ) in enumerate( dispatch.per_leaf ):
