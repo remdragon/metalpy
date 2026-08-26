@@ -1339,6 +1339,7 @@ class Lowering:
 		return obj, attrs[0]
 
 	_SUBSCRIPT_ALTERNATIVES = 'call .__getitem__(...) directly and consume its Result yourself instead'
+	_DELITEM_ALTERNATIVES = 'call .__delitem__(...) directly and consume its Result yourself instead'
 
 	_CMP_OPCODES: dict[type,'ir.CmpOp'] = {
 		ast.Eq: ir.CmpOp.EQ,
@@ -3413,17 +3414,21 @@ class FunctionLowering:
 		pass
 
 	def _stmt_Delete( self, node: ast.Delete ) -> None:
-		# del x - ends a local's lifetime early (see TODO.txt/RC MANAGEMENT.md:
-		# a local created inside one arm of an if can be referenced only
-		# within that arm unless it's del'd before the arm exits, matching
-		# the other arm's "never created it either" state). Only a single
-		# bare local name is supported - not del a.b, del a[i], or multiple
-		# targets. Removing it from fn.names is enough on its own to make a
-		# later reference fail (find_name won't find it) - the actual
-		# Decref emission is cfg.py's job, wired in alongside its other hooks
-		if len( node.targets ) != 1 or not isinstance( node.targets[0], ast.Name ):
-			self.lowering.discovery.fail( f'del only supports a single local variable name: {ast.unparse(node)}', node )
+		# del x / del a[i] - single target only, not del a.b or multiple
+		# targets (`del a, b`)
+		if len( node.targets ) != 1 or not isinstance( node.targets[0], ( ast.Name, ast.Subscript )):
+			self.lowering.discovery.fail( f'del only supports a single local variable name or subscript: {ast.unparse(node)}', node )
 		target = node.targets[0]
+		if isinstance( target, ast.Subscript ):
+			self._stmt_Delete_subscript( node, target )
+			return
+		# ends a local's lifetime early (see TODO.txt/RC MANAGEMENT.md: a
+		# local created inside one arm of an if can be referenced only
+		# within that arm unless it's del'd before the arm exits, matching
+		# the other arm's "never created it either" state). Removing it
+		# from fn.names is enough on its own to make a later reference
+		# fail (find_name won't find it) - the actual Decref emission is
+		# cfg.py's job, wired in alongside its other hooks
 		fn = self._current_fn
 		existing = fn.get_local_or_raise( target.id )
 		if not isinstance( existing, Variable ):
@@ -3435,6 +3440,26 @@ class FunctionLowering:
 		for instr in instructions:
 			self._emit( instr )
 		del fn.names[target.id]
+
+	def _stmt_Delete_subscript( self, node: ast.Delete, target: ast.Subscript ) -> None:
+		# del a[i] - dispatches to __delitem__ like `a[i] = v` dispatches to
+		# __setitem__ (see _stmt_Assign's Subscript branch); no raw-opcode
+		# fallback since there's no DeleteItem IR opcode - every type
+		# supporting del a[i] must declare __delitem__ (list/dict/set do)
+		obj = self._lower_expr( target.value, None )
+		delitem_fn = self.lowering._find_method( obj.type, '__delitem__' )
+		if delitem_fn is None:
+			self.lowering.discovery.fail( f'{obj.type} has no __delitem__, cannot del {ast.unparse(target)}', node )
+			return
+		self.lowering._ensure_resolved( delitem_fn )
+		self.lowering.schedule( delitem_fn.return_type )
+		index = self._lower_expr( target.slice, delitem_fn.parameters[0].type )
+		if delitem_fn.return_type is self.lowering.discovery.get_none_type():
+			self._emit( ir.Call( dest = None, target = delitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
+		else:
+			call_dest = self._new_temp( delitem_fn.return_type )
+			self._emit( ir.Call( dest = call_dest, target = delitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
+			self._maybe_consume_result( node, call_dest, self.lowering._DELITEM_ALTERNATIVES )
 
 	def _stmt_ImportFrom( self, node: ast.ImportFrom ) -> None:
 		# local (in-function) form of discovery.py's own visit_ImportFrom -

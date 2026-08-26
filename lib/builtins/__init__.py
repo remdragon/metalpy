@@ -2763,11 +2763,7 @@ class UnsafeDict[K, V]( Sized ):
 			key_ptr = compiler.cast( Ptr[None], compiler.addrof( key ))
 		return self.__raw._find_entry_idx( h, key_ptr, _key_eq ).is_ok()
 
-	# d[key] syntax (subscript del) isn't wired up - lowering.py's
-	# _stmt_Delete only accepts a bare local name - so this must be called
-	# directly (d.__delitem__(key)) for now, same situation as
-	# __contains__/`x in y`. The name is still right: Python convention,
-	# forward-compatible if subscript-del sugar is ever added.
+	# del d[key] syntax (lowering.py's _stmt_Delete)
 	def __delitem__( self, key: K ) -> Result[None, KeyError]:
 		h: u64 = self._hash_key( key )
 		key_ptr: Ptr[None] = 0

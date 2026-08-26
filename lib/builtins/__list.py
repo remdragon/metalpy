@@ -331,6 +331,10 @@ class UnsafeList[T]( Sized ):
 		self._release_element( self.__raw._ptr_at( idx ).or_return())
 		return self.__raw._remove_at( idx )
 
+	# del a[idx] syntax (lowering.py's _stmt_Delete)
+	def __delitem__( self, idx: usize ) -> Result[None, IndexError]:
+		return self.erase_at( idx )
+
 	# Erase all elements, decrefing each RC element first.
 	def clear( self ) -> None:
 		i: usize = 0
@@ -532,6 +536,11 @@ class list[T]( Sequence[T], Iterable[T], Sized ):
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
 	def erase_at( self, idx: usize ) -> Result[None, IndexError]:
+		with self.__lock:
+			return self.__inner.erase_at( idx )
+
+	# del a[idx] syntax (lowering.py's _stmt_Delete)
+	def __delitem__( self, idx: usize ) -> Result[None, IndexError]:
 		with self.__lock:
 			return self.__inner.erase_at( idx )
 
