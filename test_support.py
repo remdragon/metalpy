@@ -281,6 +281,7 @@ class RealCompileMixin:
 		compiler = self._compile_source( _merge_programs( cases ) )
 		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), timeout )
 		if result.returncode == 0:
+			self._split_off_leak_report( result.stdout )
 			return
 		code = result.returncode
 		if 0 < code < len( cases ) * _STRIDE:
