@@ -59,6 +59,28 @@ def _id( name: str ) -> ast.Name:
 	return ast.Name( id = name, ctx = ast.Load() )
 
 
+def _short_call_chain_repr( node: ast.expr ) -> str:
+	''' a short, non-recursively-expanded rendering of a call-chain
+	expression for error messages - see _describe_fallible_expr's own
+	docstring for why (narrowing "which call in a chain is the actually
+	fallible one" down from the whole, fully-expanded expression). A Call
+	renders as its own callee's short form + '(...)' - never its actual
+	ARGUMENTS, however deeply nested those are; an Attribute renders as
+	base.attr, its own base ALSO rendered short; a bare Name renders as
+	itself; anything else (a literal, BinOp, ...) is generic enough that
+	expanding it fully is still short and clear, so it falls back to a
+	plain unparse. `bytes(line[pos:i]).decode(utf8)` -> "bytes(...)
+	.decode(...)" this way - short, and unambiguous about which of the
+	two calls is which, without the noise of the full slice expression. '''
+	if isinstance( node, ast.Call ):
+		return f'{_short_call_chain_repr( node.func )}(...)'
+	if isinstance( node, ast.Attribute ):
+		return f'{_short_call_chain_repr( node.value )}.{node.attr}'
+	if isinstance( node, ast.Name ):
+		return node.id
+	return ast.unparse( node )
+
+
 def _expr_stmt( value: ast.expr ) -> ast.Expr:
 	return ast.Expr( value = value )
 
@@ -3994,6 +4016,24 @@ class TypeResolver:
 		members = self.monomorphizer.monomorphize_class( t ).attributes if isinstance( t, Specialization ) else base.attributes
 		return base, members
 
+	def _describe_fallible_expr( self, node: ast.AST ) -> str:
+		''' a short description of the unhandled-Result expression for
+		_require_result_return/_require_or_throw_return/_require_chained_
+		result_return's own error messages - narrows plain ast.unparse(node)
+		(which recursively expands EVERY nested subexpression) down to just
+		the outermost call for a chained method call, so `bytes(line[pos:i])
+		.decode(utf8)` reports as `bytes(...).decode(...)` instead of the
+		full chain - confirmed genuinely confusing in a real repro: the
+		unparsed text alone doesn't say whether bytes(...)'s own
+		construction or .decode()'s own call is the one actually producing
+		the unhandled Result (only .decode() is - bytes.__init__ returns
+		None, never a Result). Falls back to the ordinary full unparse for
+		anything that isn't a Call at all (arithmetic, subscript, ...) -
+		unchanged from before, there's no "outer call" to narrow to. '''
+		if isinstance( node, ast.Call ):
+			return _short_call_chain_repr( node )
+		return ast.unparse( node )
+
 	def _require_result_return( self, node: ast.AST, result_cls: ClassLike, error_cls: ClassLike, alternatives: str, fn: Function|None = None ) -> None:
 		# the enclosing function must return Result[_, E_fn] where E_fn COVERS
 		# the op/receiver's error type E_op (error_cls) - every leaf of E_op is
@@ -4015,7 +4055,7 @@ class TypeResolver:
 			want = ' | '.join( sorted( leaf.stem for leaf in self._atomic_leaves( error_cls )))
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
-				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
+				f'{self._describe_fallible_expr(node)} requires the enclosing function to return Result[_,{want}] '
 				f'(or a wider union covering it) ({where}) - {alternatives}',
 				node,
 			)
@@ -4041,7 +4081,7 @@ class TypeResolver:
 			want = ' | '.join( sorted( leaf.stem for leaf in wanted ))
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
-				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
+				f'{self._describe_fallible_expr(node)} requires the enclosing function to return Result[_,{want}] '
 				f'(or a wider union covering it) ({where}) - {alternatives}',
 				node,
 			)
@@ -4071,7 +4111,7 @@ class TypeResolver:
 			want = ' | '.join( sorted( { leaf.stem for leaf in wanted_leaves } ))
 			where = f'{fn.qualname} returns {return_type.qualname if return_type else None}' if fn is not None else 'this is not inside a function'
 			self.discovery.fail(
-				f'{ast.unparse(node)} requires the enclosing function to return Result[_,{want}] '
+				f'{self._describe_fallible_expr(node)} requires the enclosing function to return Result[_,{want}] '
 				f'(or a wider union covering it) ({where}) - {alternatives}',
 				node,
 			)
