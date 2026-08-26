@@ -277,10 +277,21 @@ class RealCompileMixin:
 		whose entry `def main() -> i32` returns 0 on success (or `-> None` for a
 		compile/run-only smoke test). A nonzero exit is decoded back to the
 		failing case name and its own sub-code. Do NOT use for programs that
-		depend on process-global one-time init - run those individually. '''
+		depend on process-global one-time init - run those individually.
+
+		Also asserts zero RC leaks on the success path, via the same debug-
+		build leak-check report _split_off_leak_report reads elsewhere
+		(__metalpy_deinit() runs unconditionally before main()'s own result
+		is returned - see emitter_c.py - so it's available here regardless
+		of which case's dispatch actually ran). Previously this was silent:
+		every caller of this method got exit-code coverage only, never a
+		check for a leaked/UAF'd object at teardown - a real except-bind
+		leak (try_except_test.py) went uncaught by this method's own
+		existing test cases until it was found via a different code path. '''
 		compiler = self._compile_source( _merge_programs( cases ) )
 		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), timeout )
 		if result.returncode == 0:
+			self._split_off_leak_report( result.stdout )
 			return
 		code = result.returncode
 		if 0 < code < len( cases ) * _STRIDE:
