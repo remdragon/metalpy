@@ -15731,6 +15731,94 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
+			# `if x is None: return` on a 3+-member union (T|U|None, not just
+			# T|None) used to leave x completely UNNARROWED past the if -
+			# visit_If's own is-None narrowing only ever recognized EXACTLY
+			# one non-None member, silently declining (no compile error, just
+			# no narrowing at all) whenever the union had more than one -
+			# confirmed via a real repro: calling a method BoxA and BoxB both
+			# define (but None doesn't) failed with "NoneType has no method
+			# ...", even though the None case had already returned. Now
+			# narrows to the proper SUBSET union (BoxA|BoxB here), not a
+			# single leaf - see cfg.py's narrow_many()/narrowed_members() and
+			# lowering.py's _resolve_callee (the union-receiver-dispatch
+			# member-list narrowing, not a value coercion - x's own operand
+			# is never retyped, only the SET of candidate methods considered)
+			( 'is_none_narrows_3plus_member_union_to_a_subset', '''
+class BoxA:
+	n: i32
+	def value( self ) -> i32:
+		return self.n
+
+class BoxB:
+	n: i32
+	def value( self ) -> i32:
+		return self.n
+
+def make( which: i32 ) -> BoxA|BoxB|None:
+	if which == 0:
+		return BoxA( n = 10 )
+	if which == 1:
+		return BoxB( n = 20 )
+	return None
+
+def describe( which: i32 ) -> i32:
+	x: BoxA|BoxB|None = make( which )
+	if x is None:
+		return -1
+	# x is narrowed to BoxA|BoxB here (not a single leaf, and not still
+	# BoxA|BoxB|None either) - .value() is defined by both remaining
+	# members, not by the excluded None
+	return x.value()
+
+def main() -> i32:
+	if describe( 0 ) != 10:
+		return 1
+	if describe( 1 ) != 20:
+		return 2
+	if describe( 2 ) != -1:
+		return 3
+	return 0
+''' ),
+			# same shape, RC-lifetime stress under repetition (same rigor as
+			# rc_lifetime_repeated_calls_no_leak above) - each narrowed read
+			# of x inside the loop body dispatches fresh every time (unlike
+			# the single-member case's O(1) field read, this is a real
+			# per-read tag dispatch - see _resolve_callee's own comment), so
+			# a missing/extra incref on the RECEIVER passed into the
+			# dispatched call would leak or double-free across iterations
+			( 'is_none_narrows_3plus_member_union_rc_lifetime_no_leak', '''
+class BoxA:
+	n: i32
+	def value( self ) -> i32:
+		return self.n
+
+class BoxB:
+	n: i32
+	def value( self ) -> i32:
+		return self.n
+
+def make( which: i32 ) -> BoxA|BoxB|None:
+	if which == 0:
+		return BoxA( n = 10 )
+	return BoxB( n = 20 )
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		which: i32 = 0
+		while i < 300:
+			x: BoxA|BoxB|None = make( which )
+			if x is None:
+				return 1
+			v1: i32 = x.value()
+			v2: i32 = x.value()
+			if v1 != v2:
+				return 2
+			which = 1 - which
+			i += 1
+		return 0
+''' ),
 		] )
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )

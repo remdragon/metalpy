@@ -4152,14 +4152,22 @@ class FunctionLowering:
 			target_name = node.targets[0]
 			assert isinstance( target_name, ast.Name )
 			attr_base = getattr( node, 'narrow_attr_base', None )
+			stems: list[str] = node.narrows_member_stems
 			if attr_base is not None:
 				# field-chain narrowing (type_resolver.py's visit_If) -
 				# target_name.id is a synthetic '::'-joined key, never a
 				# real local; _expr_Attribute consults the identical key.
-				member = self._resolve_narrow_attr_member( attr_base, node.narrow_attr_hops, node.narrows_member_stem, node )
+				members = [ self._resolve_narrow_attr_member( attr_base, node.narrow_attr_hops, stem, node ) for stem in stems ]
 			else:
-				member = self._resolve_narrow_member( target_name.id, node.narrows_member_stem, node )
-			self._cfg.narrow( target_name.id, member )
+				members = [ self._resolve_narrow_member( target_name.id, stem, node ) for stem in stems ]
+			if len( members ) == 1:
+				self._cfg.narrow( target_name.id, members[0] )
+			else:
+				# a 3+-member union's `is None` guard (type_resolver.py's
+				# visit_If) - the surviving path is proven to be ONE OF
+				# these members, not a single leaf. See cfg.narrow_many's
+				# own docstring.
+				self._cfg.narrow_many( target_name.id, members )
 			return
 		if len( node.targets ) != 1:
 			self.lowering.discovery.fail( f'multiple assignment targets not supported: {ast.unparse(node)}', node )
@@ -14167,6 +14175,24 @@ class FunctionLowering:
 			self.lowering._ensure_resolved( base )
 			direct = base.get_local_or_raise( func_node.attr )
 			if not isinstance( direct, ( Function, Overload )):
+				# receiver's own VALUE/TYPE is deliberately left exactly as
+				# lowered above (still the full, wide union) - only the SET OF
+				# CANDIDATE LEAVES this dispatches over narrows, when the
+				# receiver's own subject is proven (cfg.py's narrow_many(),
+				# e.g. a 3+-member T|U|None union's `is None` guard) to be one
+				# of fewer than the union's own full member list. Without
+				# this, `x.value()` (a method T and U both define, but None
+				# doesn't) unconditionally required EVERY member - including
+				# a member already PROVEN impossible here - to define it,
+				# rejecting an entirely reachable call. Any other read of the
+				# same name (e.g. a `type(x) is T` tag comparison) is
+				# untouched by this - it still sees receiver's own real,
+				# unmodified operand.
+				subject_key = self._attribute_chain_key( func_node.value )
+				if subject_key is not None:
+					narrowed = self._cfg.narrowed_members( subject_key )
+					if narrowed is not None and 0 < len( narrowed ) < len( members ):
+						members = narrowed
 				return self.lowering._type_resolver._resolve_union_receiver_members( base, members, func_node.attr, func_node ), receiver
 		target = self.lowering._type_resolver._attr_lookup_callable( receiver.type, func_node.attr, func_node )
 		return target, self._maybe_deref_arrow_receiver( receiver, target )

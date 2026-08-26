@@ -702,6 +702,34 @@ class CFGState:
 		soft-merge is what may later widen this to more than one. '''
 		self._narrowed[name] = [ member ]
 
+	def narrow_many( self, name: str, members: list[Variable] ) -> None:
+		''' like narrow(), but `name` is proven to be ONE OF several possible
+		members at once, not exactly one - e.g. a 3+-member T|U|None union's
+		`if x is None: return` guard: the surviving (non-None) path knows x
+		is T or U, never a single leaf. Reuses the SAME list-of-Variable
+		_narrowed representation merge_if's own soft-merge already produces
+		when two single-member narrow() calls on different branches
+		disagree (_merge_narrowed_soft's own docstring) - snapshot()/
+		restore()/merge_if() already handle an arbitrary-length list
+		correctly with no changes, since that's exactly the shape they
+		already reconcile today. narrowed_member() still only ever returns
+		something for the fully-collapsed (len==1) case - a caller wanting
+		this multi-member fact back reads narrowed_members() instead;
+		_expr_Name's own read-rewrite uses it to build a fresh, properly
+		re-tagged temp of the narrower union type on each read (see its own
+		comment - unlike the O(1) single-field read the len==1 case gets,
+		this is a real per-read dispatch, not free, but correct). '''
+		assert len( members ) > 0
+		self._narrowed[name] = list( members )
+
+	def narrowed_members( self, name: str ) -> list[Variable] | None:
+		''' the full set of members `name` is currently known to be ONE of,
+		regardless of length - None if not narrowed at all. Unlike
+		narrowed_member() (which only ever answers for the len==1 case),
+		this is for a caller that can make USE of a >1-length fact -
+		currently only _expr_Name's own multi-member dispatch-read path. '''
+		return self._narrowed.get( name )
+
 	def unnarrow( self, name: str ) -> None:
 		''' called whenever `name` is reassigned (ordinary Assign/AnnAssign)
 		- a fresh value invalidates whatever this name was previously

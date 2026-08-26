@@ -6962,18 +6962,25 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# docstring for why only its TRUTHY branch narrows
 			none_shape = self._bare_truthiness_narrowing_shape( node.test )
 		subject_name: str|None = None
-		narrow_member: Variable|None = None
+		narrow_members: list[Variable]|None = None
 		is_not = False
 		narrow_attr_base: str|None = None
 		narrow_attr_hops: list[str]|None = None
 		if none_shape is not None and isinstance( none_shape[0], ( ast.Name, ast.Attribute )):
 			subject_expr, _base, members, none_member, shape_is_not = none_shape
 			non_none = [ m for m in members if m is not none_member ]
-			if len( non_none ) == 1:
+			# ANY non-empty non_none narrows now, not just the single-member
+			# T|None case - a 3+-member union's `is None` guard proves the
+			# surviving path is ONE OF the remaining members (e.g. T|U|None
+			# narrows to [T,U]), not a single leaf, but that's still real,
+			# actionable information (a genuinely narrower union, not the
+			# full original one) - see _build_narrow_marker's own len>1
+			# handling and _expr_Name's own multi-member read-rewrite.
+			if len( non_none ) >= 1:
 				key = self._narrow_subject_key( subject_expr )
 				if key is not None:
 					subject_name, narrow_attr_base, narrow_attr_hops = key
-					narrow_member = non_none[0]
+					narrow_members = non_none
 				is_not = shape_is_not
 		# rewrite test BEFORE recursing into it, so the new BoolOp children
 		# (Name references, Compare, Call) are visited normally (unchanged
@@ -7000,7 +7007,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					result.append( visited )
 			return result
 
-		if narrow_member is None or subject_name is None:
+		if narrow_members is None or subject_name is None:
 			# self.locals is unscoped - a plain Assign inside either branch
 			# (visit_Assign) permanently overwrites it, so without saving/
 			# restoring around each branch a conditional reassignment (e.g.
@@ -7037,16 +7044,25 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				self.locals = merged
 			return node
 
+		# a single, real Type to report through self._narrowed/self.locals
+		# (both want exactly one type, whether it's a plain leaf or a
+		# union) - the plain leaf itself for the ordinary single-member
+		# case, or a freshly synthesized union of every surviving member
+		# otherwise. Same "one real type" contract _build_narrow_marker's
+		# own narrowed_type computes identically - kept separate here since
+		# this pass's OWN self._narrowed/self.locals bookkeeping needs it
+		# independently of building the marker itself.
+		narrowed_type = narrow_members[0].type if len( narrow_members ) == 1 else self.discovery._get_or_create_union( [ m.type for m in narrow_members ] )
 		narrowed_body = node.body if is_not else node.orelse
 		other_body = node.orelse if is_not else node.body
 		case_entry_narrowed = dict( self._narrowed )
-		self._narrowed[subject_name] = [ narrow_member.type ]
+		self._narrowed[subject_name] = [ narrowed_type ]
 		try:
 			narrowed_visited = _visit_stmts( narrowed_body )
 		finally:
 			self._narrowed = case_entry_narrowed
 		narrowed_visited = [
-			self._build_narrow_marker( subject_name, narrow_member, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
+			self._build_narrow_marker( subject_name, narrow_members, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
 			*narrowed_visited,
 		]
 		other_visited = _visit_stmts( other_body )
@@ -7064,8 +7080,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# one after a terminator would corrupt cfg.py's own terminates
 		# detection (which keys off the branch's LAST statement).
 		other_terminates = bool( other_body ) and isinstance( other_body[-1], ( ast.Return, ast.Break, ast.Continue, ast.Raise ))
-		if not other_terminates and self.locals.get( subject_name ) is narrow_member.type:
-			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_member, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ) ]
+		if not other_terminates and self.locals.get( subject_name ) is narrowed_type:
+			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_members, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ) ]
 		if other_terminates:
 			# the un-narrowed branch never reaches the join - every path that
 			# DOES (whatever follows this if-statement in the same enclosing
@@ -7077,7 +7093,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# bare generic call's own eager inference (_infer_generic_args ->
 			# _type_of_expr) - sees the narrowed type instead of the stale,
 			# still-unioned declared type.
-			self._narrowed[subject_name] = [ narrow_member.type ]
+			self._narrowed[subject_name] = [ narrowed_type ]
 		if is_not:
 			node.body, node.orelse = narrowed_visited, other_visited
 		else:
@@ -7198,7 +7214,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			self._narrowed = case_entry_narrowed
 		if body_member is not None and subject_name is not None:
 			node.body = [
-				self._build_narrow_marker( subject_name, body_member, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
+				self._build_narrow_marker( subject_name, [ body_member ], node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
 				*node.body,
 			]
 		if node.orelse:
@@ -7894,7 +7910,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				# its own) - override with a real narrow-marker targeting the
 				# DEDUCED other member, computed in the pre-pass above
 				wc_name, wc_attr_base, wc_attr_hops = wildcard_narrow_key
-				binds = [ self._build_narrow_marker( wc_name, wildcard_narrow_member, node, attr_base = wc_attr_base, attr_hops = wc_attr_hops ) ]
+				binds = [ self._build_narrow_marker( wc_name, [ wildcard_narrow_member ], node, attr_base = wc_attr_base, attr_hops = wc_attr_hops ) ]
 			# a narrowing arm (see _match_union_member's own narrow_marker)
 			# pushes name -> [its narrowed leaf type] into self._narrowed for
 			# exactly the span of THIS case's own body - every union-shaped
@@ -8343,22 +8359,30 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return next( ( attr for attr in members if attr.type is leaf_type ), None )
 		return None
 
-	def _build_narrow_marker( self, name: str, member: Variable, node: ast.AST, *, attr_base: str|None = None, attr_hops: list[str]|None = None ) -> ast.Assign:
+	def _build_narrow_marker( self, name: str, members: list[Variable], node: ast.AST, *, attr_base: str|None = None, attr_hops: list[str]|None = None ) -> ast.Assign:
 		''' the narrow-marker Assign shape - factored out of
 		_match_union_member (its own same-name-reuse branch) so
 		visit_Match's own wildcard/negation narrowing (Phase 6 - a
 		wildcard arm narrowed to the union's OTHER member, deduced from a
 		sibling case, rather than resolved from the pattern's own text)
-		can build the identical shape without duplicating it. `member.type`
-		must already be the resolved, concrete leaf type (both callers
-		force-resolve/monomorphize before reaching here) - lowering.py's
-		_stmt_Assign recognizes is_narrowing_bind and calls cfg.narrow(name,
-		member) instead of emitting an ordinary assignment; narrowed_type
-		is what _ReferenceResolver.__init__'s own self._narrowed uses to
-		keep THIS pass's own union-shaped rewrites in sync with cfg.py's
-		lowering-time narrowing (see its own comment). narrows_member_stem
-		carries only the STEM (a plain string), not the Variable object
-		itself - lowering.py re-resolves the real, substituted member
+		can build the identical shape without duplicating it. Each
+		member's own `.type` must already be the resolved, concrete leaf
+		type (every caller force-resolves/monomorphizes before reaching
+		here) - lowering.py's _stmt_Assign recognizes is_narrowing_bind and
+		calls cfg.narrow(name, member) (len(members)==1, the common case)
+		or cfg.narrow_many(name, members) (len>1 - e.g. a 3+-member T|U|
+		None union's `is None` guard, narrowed to [T,U]) instead of
+		emitting an ordinary assignment; narrowed_type is what
+		_ReferenceResolver.__init__'s own self._narrowed uses to keep THIS
+		pass's own union-shaped rewrites in sync with cfg.py's lowering-time
+		narrowing (see its own comment) - members[0].type directly when
+		there's exactly one, or a freshly synthesized union of every
+		member's own type otherwise (discovery._get_or_create_union - the
+		same "one real type to report" contract _type_of_expr's own
+		len(narrowed)==1 check relies on, whether that one type happens to
+		be a plain leaf or a union). narrows_member_stems carries only each
+		member's own STEM (plain strings), not the Variable objects
+		themselves - lowering.py re-resolves the real, substituted members
 		against the subject's own already-monomorphized type instead, same
 		pattern _coerce_into_union uses (member.type here may still be
 		reached via an ABSTRACT class with T/E still bare TypeVars).
@@ -8371,14 +8395,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		Real local names never set these two - lowering.py's _resolve_narrow_
 		member uses their presence to tell "look up a local by this name"
 		apart from "walk FIELD attr_hops off local attr_base". '''
+		assert len( members ) > 0
 		narrow_marker = ast.Assign(
 			targets = [ ast.Name( id = name, ctx = ast.Store() ) ],
 			value = ast.Constant( value = None ),
 		)
 		ast.copy_location( narrow_marker, node )
 		narrow_marker.is_narrowing_bind = True
-		narrow_marker.narrows_member_stem = member.stem
-		narrow_marker.narrowed_type = member.type
+		narrow_marker.narrows_member_stems = [ m.stem for m in members ]
+		narrow_marker.narrowed_type = members[0].type if len( members ) == 1 else self.discovery._get_or_create_union( [ m.type for m in members ] )
 		if attr_base is not None:
 			narrow_marker.narrow_attr_base = attr_base
 			narrow_marker.narrow_attr_hops = attr_hops
@@ -8449,7 +8474,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# None), unchanged from before.
 			key_info = self._narrow_subject_key( node.subject )
 			key, attr_base, attr_hops = key_info if key_info is not None else ( inner_pattern.name, None, None )
-			return test, [ self._build_narrow_marker( key, member, node, attr_base = attr_base, attr_hops = attr_hops ) ]
+			return test, [ self._build_narrow_marker( key, [ member ], node, attr_base = attr_base, attr_hops = attr_hops ) ]
 		payload_expr = ast.Attribute(
 			value = ast.Attribute( value = subj_expr, attr = data_attr.stem, ctx = ast.Load() ),
 			attr = f'v_{member.stem}',
