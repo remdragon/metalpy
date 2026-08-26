@@ -11939,6 +11939,17 @@ class FunctionLowering:
 		if receiver_pending_start is not None:
 			self._flush_new_pending_temps( receiver_pending_start, check_dest, extra )
 		unwrapped = self._new_temp( result_type )
+		# OrReturn/OrJump/Unwrap hand unwrapped a fresh, solely-owned copy of
+		# the Ok payload (moved out of check_dest, no incref) - registering it
+		# here, same as an ordinary Call/Allocate result, is what lets a
+		# discarded `<result>.or_return()` bare statement (_lower_or_return's
+		# own want_result=False path) actually release an RC-leaf payload
+		# nobody ever reads, instead of leaking it. A no-op for non-RC
+		# result_types. Every real consumer (assign/return_/field_value/
+		# untrack_temp) already pops this out of tracking as part of its own
+		# ordinary handling, so registering it doesn't disturb the "used
+		# further" path.
+		self._cfg.fresh_temp( unwrapped, result_type )
 		if extra is None:
 			if isinstance( check_dest, Variable ):
 				self._cfg.clear_result( check_dest.stem ) # this call IS the inspection of check_dest - clear it before the exit-path check below, or it'd wrongly flag itself
@@ -15398,10 +15409,12 @@ class FunctionLowering:
 			# shape (see _consume_checked_result) - can't be skipped even
 			# though a bare `expr.or_return()` statement (validate-only,
 			# error propagation is the only wanted effect) never reads it.
-			# Non-RC-leaf receivers (e.g. Result[u8,E]) get no decref of their
-			# own either, leaving a real -Wunused-but-set-variable - confirmed
-			# suite-wide (lib/urllib/parse.py's own _unquote_impl first-pass
-			# validation scan).
+			# _flush_pending_temps (via _consume_checked_result's own
+			# fresh_temp() registration) covers the RC-leaf release; this
+			# MarkUsed just silences a real -Wunused-but-set-variable for the
+			# non-RC case (e.g. Result[u8,E]) - confirmed suite-wide
+			# (lib/urllib/parse.py's own _unquote_impl first-pass validation
+			# scan).
 			self._emit( ir.MarkUsed( operand = unwrapped ))
 			return None
 		return unwrapped
