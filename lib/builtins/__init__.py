@@ -259,37 +259,52 @@ class slice:
 	# resolves ITS OWN correct default length in whatever unit is right for
 	# it (str's real __len__ is a codepoint count, wrong unit for its
 	# byte-offset slicing - see str.byte_len() vs str.__len__()). step is
-	# unsupported (rejected at the lowering layer), so no step field.
-	start: usize
-	stop: usize|None
+	# unsupported (rejected at the lowering layer), so no step field. isize,
+	# not usize - real Python slice bounds are signed: a negative bound
+	# (s[-3:-2]) means "offset from the end", resolved against the
+	# container's own real length in _resolve_slice_bounds below.
+	start: isize
+	stop: isize|None
 
 
 # Resolves a slice against a container's own real length, matching real
-# Python's own slice semantics EXACTLY: container[a:b] never raises -
-# out-of-range bounds silently clamp into [0, real_len], and start > stop
-# (after clamping) yields an empty range - rather than the stricter
-# Result[T,IndexError] convention every other __getitem__ in this codebase
-# uses for single-element access (container[i] DOES raise/Result::Err on an
-# out-of-range i). Slicing is a deliberately forgiving idiom in real Python,
-# worth preserving faithfully rather than picking the stricter convention.
-# Shared by every __getitem__(slice) overload (str, bytearray, memoryview,
-# UnsafeList[T], list[T]) so the clamping math itself lives in exactly one
-# place. No negative-index support (s[-1:] etc) - matches every existing
-# __getitem__ in this codebase, none of which support negative indices.
+# Python's own slice semantics EXACTLY: a negative bound counts back from
+# real_len (clamped to 0 if that still lands negative), an out-of-range
+# bound clamps into [0, real_len], and start > stop (after clamping) yields
+# an empty range - rather than the stricter Result[T,IndexError] convention
+# every other __getitem__ in this codebase uses for single-element access
+# (container[i] DOES raise/Result::Err on an out-of-range i). Slicing is a
+# deliberately forgiving idiom in real Python, worth preserving faithfully
+# rather than picking the stricter convention. Shared by every
+# __getitem__(slice) overload (str, bytearray, memoryview, UnsafeList[T],
+# list[T]) so the clamping math itself lives in exactly one place.
 def _resolve_slice_bounds( s: slice, real_len: usize ) -> tuple[usize,usize]:
-	stop_field: usize|None = s.stop
-	real_stop: usize = real_len
+	with compiler.panic_arithmetic( 'a real container length always fits isize' ):
+		len_i: isize = isize( real_len )
+	clamped_start_i: isize = _clamp_slice_bound( s.start, len_i )
+	stop_field: isize|None = s.stop
+	clamped_stop_i: isize = len_i
 	if stop_field is not None:
-		real_stop = stop_field
-	clamped_start: usize = s.start
-	if clamped_start > real_len:
-		clamped_start = real_len
-	clamped_stop: usize = real_stop
-	if clamped_stop > real_len:
-		clamped_stop = real_len
-	if clamped_start > clamped_stop:
-		clamped_stop = clamped_start
-	return ( clamped_start, clamped_stop )
+		clamped_stop_i = _clamp_slice_bound( stop_field, len_i )
+	if clamped_start_i > clamped_stop_i:
+		clamped_stop_i = clamped_start_i
+	with compiler.panic_arithmetic( 'both bounds already clamped into [0, len_i]' ):
+		return ( usize( clamped_start_i ), usize( clamped_stop_i ) )
+
+
+# one bound (start or stop) of _resolve_slice_bounds, resolved against the
+# container's own real length (as isize) - negative counts back from the
+# end, then both directions clamp into [0, len_i].
+def _clamp_slice_bound( bound: isize, len_i: isize ) -> isize:
+	resolved: isize = bound
+	if resolved < 0:
+		with compiler.wrap_arithmetic: # len_i is a real container length, never large enough to overflow isize
+			resolved = resolved + len_i
+		if resolved < 0:
+			resolved = 0
+	elif resolved > len_i:
+		resolved = len_i
+	return resolved
 
 
 

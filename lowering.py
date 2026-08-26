@@ -11204,6 +11204,53 @@ class FunctionLowering:
 			self._emit( ir.Call( dest = None, target = add_fn, receiver = dest, args = [ operand ], kwargs = {} ))
 		return dest
 
+	# every ordinary signed-int literal default (i32) and the usual
+	# usize-returning sources (len(), .find(), another index computation)
+	# a slice bound sees in practice - isize itself passes through
+	# _lower_slice_bound's own `operand.type is isize_cls` short-circuit,
+	# never reaching this set
+	_SLICE_BOUND_WIDENABLE_STEMS = ( 'usize', 'i8', 'i16', 'i32', 'i64' )
+
+	def _lower_slice_bound( self, expr: ast.expr, isize_cls: Type ) -> ir.Operand:
+		''' one slice bound (x[EXPR:...] / x[...:EXPR]) - isize, but a plain
+		usize expression (overwhelmingly the common case: len(), .find(),
+		another slice/index computation, ...), or an ordinary signed-int
+		literal (which defaults to i32, not isize - see _expr_Constant's own
+		literal-inference rule), is widened to isize here implicitly, unlike
+		everywhere else in this language (SYNTAX.md's "no implicit
+		conversion" rule - see _is_safe_scalar_widening's own docstring for
+		why isize/usize are deliberately EXCLUDED from the GENERAL safe-
+		widening set: a usize value near u64::MAX would silently corrupt
+		going through isize). A slice bound is different: real container/
+		string lengths never approach that range in practice, and requiring
+		every existing `s[nbytes:]`/`s[idx+9:]` call site (nbytes/idx already
+		usize, e.g. from len()/.find()) to write `s[isize(nbytes):]` by hand
+		would make ordinary, positive-only slicing needlessly verbose just to
+		support the new negative-index case.
+
+		Lowered with expected_type=None (natural type), NOT isize_cls -
+		passing isize_cls through would make _lower_expr correctly infer a
+		bare literal as isize, but it ALSO propagates into any @inline
+		splice reached along the way (e.g. bare `len(t)` - len[T] is
+		@inline), whose own internal return-expression lowering always
+		uses strict=True regardless of what strict this call passed,
+		rejecting t.__len__()'s natural usize return against isize before
+		control ever returns here - confirmed via a real repro
+		(mmap.mmap's own len(t) inside a slice bound). Lowering as the
+		operand's own natural type sidesteps that entirely; the widening
+		below (a manual CastWrap, not the general safe-widening mechanism -
+		isize/usize aren't members of _SIGNED_INT_WIDENING_ORDER at all) is
+		this method's own private coercion rule, scoped to slice bounds
+		only. '''
+		operand = self._lower_expr( expr, None )
+		if operand.type is isize_cls:
+			return operand
+		if isinstance( operand.type, Scalar ) and operand.type.stem in self._SLICE_BOUND_WIDENABLE_STEMS:
+			dest = self._new_temp( isize_cls )
+			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
+			return dest
+		return self._coerce_or_check_operand( operand, isize_cls, expr )
+
 	def _lower_slice_subscript( self, node: ast.Subscript, obj: ir.Operand ) -> ir.Operand:
 		''' x[a:b] / x[:b] / x[a:] - dispatches through an ordinary
 		__getitem__(slice) overload (slice: a start/stop range
@@ -11240,22 +11287,22 @@ class FunctionLowering:
 			)
 		self.lowering._ensure_resolved( getitem_fn )
 		self.lowering.schedule( getitem_fn.return_type )
-		usize_cls = self.lowering.discovery.get_intrinsics()['usize']
+		isize_cls = self.lowering.discovery.get_intrinsics()['isize']
 		start_field = self.lowering._find_field( slice_cls, 'start' )
 		stop_field = self.lowering._find_field( slice_cls, 'stop' )
 		assert start_field is not None and stop_field is not None, 'internal compiler error: slice missing start/stop fields'
 		if node_slice.lower is not None:
-			start = self._lower_expr( node_slice.lower, start_field.type )
+			start = self._lower_slice_bound( node_slice.lower, isize_cls )
 		else:
-			start = ir.Const( type = usize_cls, value = 0 )
+			start = ir.Const( type = isize_cls, value = 0 )
 		if node_slice.upper is not None:
-			# lowered against the concrete leaf type (usize), not the union
+			# lowered against the concrete leaf type (isize), not the union
 			# (stop_field.type) directly - a bare int literal defaults to
 			# i32 against a union expected_type (_expr_Constant's own
 			# literal-vs-union exemption), which then fails to coerce into
-			# usize|None (i32 isn't one of its leaves) - coerce the already
-			# usize-typed operand into the union explicitly instead
-			stop_value = self._lower_expr( node_slice.upper, usize_cls )
+			# isize|None (i32 isn't one of its leaves) - coerce the already
+			# isize-typed operand into the union explicitly instead
+			stop_value = self._lower_slice_bound( node_slice.upper, isize_cls )
 			stop = self._coerce_or_check_operand( stop_value, stop_field.type, node_slice.upper )
 		else:
 			# no upper bound given - slice.stop is nullable specifically
@@ -11286,11 +11333,13 @@ class FunctionLowering:
 		clamped exactly like every other slice's own out-of-range tolerance
 		(_resolve_slice_bounds, lib/builtins/__init__.py) - never a compile
 		error, an out-of-range/inverted bound just yields a shorter (possibly
-		empty) result, same as real Python; negative literal bounds aren't
-		reachable here at all (`-1` parses as ast.UnaryOp(USub,...), not
-		ast.Constant, so it's rejected below as "not constant" - consistent
-		with usize-only slice.start/stop everywhere else in this codebase,
-		which has no negative-index support anywhere to match). '''
+		empty) result, same as real Python. Unlike the runtime slice cstruct
+		(start/stop: isize, negative-index-aware), a negative bound here
+		isn't supported: `-1` parses as ast.UnaryOp(USub,...), not
+		ast.Constant, so it's rejected below as "not constant" - tuple
+		slicing needs fully compile-time-constant bounds (the result's own
+		TYPE depends on them), and const_bound() only ever unwraps a bare
+		ast.Constant, never evaluates a general constant expression. '''
 		node_slice = node.slice
 		assert isinstance( node_slice, ast.Slice )
 		if node_slice.step is not None:
