@@ -5456,16 +5456,14 @@ class FunctionLowering:
 				# the emitter unconditionally assigns handler.raise_value_var's
 				# own payload before jumping to this exact label (ir.OrThrow's/
 				# ir.Raise's dispatch - see _emit_leaf_dispatch_case) -
-				# definitely assigned on entry here, same reasoning
-				# _declare_hidden_local/@inline's own parameter binding
-				# already rely on mark_live() for (see its own docstring).
-				# Must happen INSIDE this branch-confined window (moved
-				# from the old unconfined lowering) so restore() below
-				# correctly tears it back down before the next handler. Always
-				# runs now (not just `as NAME` clauses) - a hidden hand-off
-				# variable exists for every handler, see TryHandler's own
-				# docstring.
-				self._cfg.mark_live( handler.raise_value_var.stem )
+				# definitely assigned AND owned on entry here, hence
+				# declare_exception_bind (not bare mark_live). Must happen
+				# INSIDE this branch-confined window (moved from the old
+				# unconfined lowering) so restore() below correctly tears it
+				# back down before the next handler. Always runs now (not
+				# just `as NAME` clauses) - a hidden hand-off variable exists
+				# for every handler, see TryHandler's own docstring.
+				self._cfg.declare_exception_bind( handler.raise_value_var )
 				self._active_raise_values.append( handler.raise_value_var )
 				try:
 					for stmt in h.body:

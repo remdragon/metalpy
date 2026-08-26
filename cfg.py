@@ -752,6 +752,24 @@ class CFGState:
 		self being seeded live from function entry in __init__/enter_self. '''
 		self._live.add( name )
 
+	def declare_exception_bind( self, dest: Variable ) -> None:
+		''' registers an except-handler's bind (named `as e`, or the hidden
+		raise_value_var every handler gets - see _stmt_Try) as a fresh OWNED
+		RC binding, exactly like assign()'s own final "fresh, non-aliasing
+		RC value" case (its `else: self._push(...)` branch) - but takes no
+		`src` operand and emits no instructions, since the actual C
+		assignment happens separately, in _emit_leaf_dispatch_case's own
+		ir.ThrowLeaf handling (a raw move out of the Result's Err payload -
+		already owned, no incref needed there either).
+		Without this, `dest` was only ever mark_live()'d - never given an
+		epilogue entry - so a caught exception the handler body doesn't
+		re-raise/return/otherwise consume leaked unconditionally: neither a
+		fallthrough decref nor merge_if's own branch-confined teardown ever
+		fired for it, since bindings had no entry to reconcile. '''
+		self._live.add( dest.stem )
+		if rc_leaves( dest.type ):
+			self._push( dest, dest.type, OwnState.OWNED )
+
 	def unmark_live( self, name: str ) -> None:
 		''' the inverse of mark_live() - lets a caller that temporarily
 		marks a name live (inline parameter binding, which shadows-and-

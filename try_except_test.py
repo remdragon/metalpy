@@ -21,6 +21,7 @@ import unittest
 
 from compiler import Compiler
 from discovery import Discovery
+import emitter_c
 import test_support
 from test_support import RealCompileMixin
 
@@ -320,6 +321,66 @@ def main() -> i32:
 		return 2
 	if run( 2 ) != -2:
 		return 3
+	return 0
+'''
+
+# Regression: an except-clause bind (named `as e`, or the hidden per-handler
+# value when there's no `as NAME`) that the handler body never re-raises,
+# returns, or otherwise consumes used to leak unconditionally - it was only
+# ever mark_live()'d (definite-assignment bookkeeping), never registered as
+# an OWNED RC binding with its own decref-at-scope-exit epilogue entry (see
+# cfg.py's declare_exception_bind). Covers three shapes: a single-leaf bind
+# left unused, a multi-leaf tuple-except union bind left unused, and the
+# no-`as NAME` hidden bind (still owns the payload even with nothing to
+# name it). assert_programs_run's own leak-check output ("-- live RC objects
+# (0) --") is what actually catches a regression here.
+_UNUSED_EXCEPT_BIND_DOES_NOT_LEAK = '''
+class ErrorA:
+	code: i32
+
+class ErrorB:
+	code: i32
+
+def risky( which: i32 ) -> Result[i32, ErrorA | ErrorB]:
+	if which == 1:
+		return Result.Err( ErrorA( code = 1 ) )
+	if which == 2:
+		return Result.Err( ErrorB( code = 2 ) )
+	return Result.Ok( which )
+
+def run_single_leaf_unused( which: i32 ) -> i32:
+	try:
+		return risky( which ).or_throw()
+	except ErrorA as e:
+		return -1
+	except ErrorB as e:
+		return -1
+
+def run_tuple_leaf_unused( which: i32 ) -> i32:
+	try:
+		return risky( which ).or_throw()
+	except ( ErrorA, ErrorB ) as e:
+		return -2
+
+def run_no_as_name_unused( which: i32 ) -> i32:
+	try:
+		return risky( which ).or_throw()
+	except ErrorA:
+		return -3
+	except ErrorB:
+		return -3
+
+def main() -> i32:
+	if run_single_leaf_unused( 1 ) != -1:
+		return 1
+	if run_single_leaf_unused( 0 ) != 0:
+		return 2
+	if run_tuple_leaf_unused( 1 ) != -2:
+		return 3
+	if run_tuple_leaf_unused( 2 ) != -2:
+		return 4
+	if run_no_as_name_unused( 1 ) != -3:
+		return 5
 	return 0
 '''
 
@@ -1316,6 +1377,18 @@ class TryExceptRealCompileTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_rc_local_reassigned_across_two_handlers( self ) -> None:
 		self.assert_programs_run([ ( 'handler_rc_reassigned', _HANDLER_RC_LOCAL_REASSIGNED_ACROSS_TWO_HANDLERS ) ])
+
+	def test_unused_except_bind_does_not_leak( self ) -> None:
+		# relies on the debug build's own automatic leak-check report
+		# (_split_off_leak_report), not assert_programs_run's plain exit-code
+		# check (see ClosureCallResultFreshTempTests' own identical note in
+		# or_return_rc_test.py) - the original bug (declare_exception_bind's
+		# own docstring) never crashed or produced a wrong exit code, only a
+		# permanently-live except-bind object at teardown.
+		compiler = self._compile_source( _UNUSED_EXCEPT_BIND_DOES_NOT_LEAK )
+		result = self._build_and_run( compiler, emitter_c.emit_c( compiler ), None )
+		self.assertEqual( result.returncode, 0, f'exe exited {result.returncode} (stderr: {result.stderr})' )
+		self._split_off_leak_report( result.stdout )
 
 	def test_three_handler_chain_broadcasts_teardown_to_all_prior_blocks( self ) -> None:
 		self.assert_programs_run([ ( 'three_handler_chain_broadcast', _THREE_HANDLER_CHAIN_BROADCASTS_TEARDOWN_TO_ALL_PRIOR_BLOCKS ) ])
