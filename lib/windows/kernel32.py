@@ -551,6 +551,10 @@ def ConvertThreadToFiber(
 ) -> Ptr[None]:
 	...
 
+@extern('kernel32', 'ConvertFiberToThread')
+def ConvertFiberToThread() -> bool:
+	...
+
 
 # ---------------------------------------------------------------------------
 # TLS (thread-local storage) - lib/threading.py's own ThreadLocal[T].
