@@ -145,15 +145,10 @@ def main() -> i32:
 		return 2
 	return 0
 ''' ),
-			# bytes.from_memoryview() - a copying conversion out of a
+			# bytes(some_memoryview) - a copying conversion out of a
 			# memoryview slice (a no-copy VIEW), matching real Python's own
-			# bytes(some_memoryview) support. A named alternative
-			# constructor rather than a 3rd bytes.__init__ union member -
-			# __init__ overloading isn't supported yet, and widening
-			# __init__ itself broke every existing bytes|bytearray-typed
-			# caller (this codebase has no general "narrower union coerces
-			# into a wider superset union" mechanism - confirmed via a real
-			# repro, lib/zipfile.py's own _compress_payload).
+			# bytes(some_memoryview) support - bytes.__init__ takes
+			# bytes|bytearray|memoryview.
 			( 'bytes_from_memoryview_slice', '''
 def main() -> i32:
 	b: bytearray = bytearray( 5 )
@@ -165,7 +160,7 @@ def main() -> i32:
 	p[4] = 5
 	with memoryview( b ) as mv:
 		piece: memoryview = mv[1:4]
-		copy: bytes = bytes.from_memoryview( piece )
+		copy: bytes = bytes( piece )
 		if len( copy ) != 3:
 			return 1
 		if copy.__getitem__( 0 ).unwrap( 'idx' ) != 2:

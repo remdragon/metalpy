@@ -8956,6 +8956,53 @@ class FunctionLowering:
 					for instr in self._cfg.decref( pre_coerce.type, pre_coerce ):
 						self._emit( instr )
 					self._cfg.untrack_temp( pre_coerce )
+			else:
+				# operand's WHOLE type isn't one of expected_union's own
+				# leaves (the check just above) - but operand can still be
+				# ITSELF an anonymous union (e.g. bytes|bytearray) whose
+				# INDIVIDUAL leaves are each covered by expected_union's own
+				# wider leaf set (e.g. bytes|bytearray|memoryview) - real
+				# Python has no static type system to hit this at all, but
+				# this codebase's own callers regularly narrow-then-widen
+				# (e.g. lib/zipfile.py's own bytes|bytearray-typed parameter
+				# flowing into a bytes|bytearray|memoryview-typed one) -
+				# confirmed as a real, previously-unsupported gap: silently
+				# ACCEPTED at compile time with no coercion at all whenever
+				# operand happened to already look union-shaped in some
+				# OTHER, unrelated way, or rejected outright otherwise.
+				# file is None restricts this to a synthesized ANONYMOUS
+				# union specifically (discovery.py's _get_or_create_union) -
+				# a NOMINAL `@union class Foo:` stays a single opaque leaf
+				# instead (the check above already covers "Foo itself is one
+				# of expected_union's own members verbatim"); exploding a
+				# nominal union's own internal variants against an unrelated
+				# wider union's leaf set would be wrong (same distinction
+				# emitter_c.py's own _emit_widen_error already draws for the
+				# identical reason, on the Result[T,E] error-widening side).
+				operand_shape = self.lowering._type_resolver._tagged_union_shape( operand.type )
+				if (
+					operand_shape is not None and operand_shape[0].file is None
+					and all(
+						any(
+							self.lowering._type_resolver._same_type( member.type, attr.type )
+							or self._is_rcclass_upcast( member.type, attr.type )
+							for attr in expected_union.attributes
+						)
+						for member in operand_shape[1]
+					)
+				):
+					was_fresh = self._cfg.is_fresh_temp( operand )
+					pre_coerce = operand
+					operand = self._coerce_union_subset( operand, operand_shape, expected_union, node )
+					if was_fresh:
+						# same "cancel the ctor's own extra incref back out"
+						# convention as the plain-leaf coercion case just
+						# above - see its own comment for the full reasoning
+						# (_coerce_union_subset's per-branch _coerce_into_
+						# union call takes the identical incref).
+						for instr in self._cfg.decref( pre_coerce.type, pre_coerce ):
+							self._emit( instr )
+						self._cfg.untrack_temp( pre_coerce )
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C
 		# rejects without an explicit cast. A CastWrap is ordinarily a borrowed
@@ -9250,6 +9297,63 @@ class FunctionLowering:
 		# original, pre-coercion expression) looked like to a caller that
 		# only has the ast around, not this operand
 		dest.is_union_coerce_result = True
+		return dest
+
+	def _coerce_union_subset( self, operand: ir.Operand, operand_shape: 'tuple[TaggedUnion,list[Variable]]', expected_union: TaggedUnion, node: ast.AST ) -> ir.Operand:
+		''' operand is ITSELF an anonymous union (e.g. bytes|bytearray) whose
+		every leaf also appears among expected_union's own leaves (e.g.
+		bytes|bytearray|memoryview) - the general "narrower union flows into
+		a wider superset union" coercion, distinct from _coerce_into_union's
+		own "operand is a bare leaf, or IS one nominal member verbatim"
+		cases just above (neither applies here: operand's WHOLE type isn't
+		itself one of expected_union's leaves, its own INDIVIDUAL leaves
+		are). Builds a runtime tag dispatch over operand's own members (the
+		same GetAttr-tag/Cmp/JumpIfFalse shape _emit_eq_dispatch_tree already
+		uses), extracting each member's payload as a bare borrow
+		(_extract_union_payload) and re-wrapping it through
+		_coerce_into_union AGAINST expected_union - reusing that method's
+		own leaf-matching (incl. RCClass-upcast) and ctor-call machinery
+		verbatim rather than duplicating it, so a subclass leaf or an
+		RC/non-RC payload is handled identically to the ordinary bare-leaf
+		coercion path. Every branch merges into one shared dest via
+		_flush_branch_temps + Assign, the exact same multi-branch-to-one-
+		dest pattern _emit_eq_dispatch_tree's own per-cell handling already
+		uses - reused here rather than reinvented since getting temp
+		lifetime right across branch boundaries is exactly what that
+		pattern was hardened against (see _flush_branch_temps' own
+		docstring: an earlier, ad hoc version of this shape crashed reading
+		an uninitialized branch's own garbage tag/payload). RC ownership:
+		operand itself is only ever READ here (bare GetAttr extraction,
+		never decref'd/moved) - _coerce_into_union's own ctor call increfs
+		each extracted payload independently, so operand keeps its own
+		original reference throughout; the caller (_coerce_or_check_operand)
+		already decrefs operand afterward when it was a fresh temp, the
+		same "cancel the ctor's extra incref back out" convention the
+		ordinary bare-leaf coercion case already relies on. '''
+		op_base, op_members = operand_shape
+		op_tag_attr, op_data_attr, op_payload_cls, op_tags = self.lowering._union_storage.get( op_base )
+		bool_cls = self.lowering.discovery.find_name( 'bool', node )
+		dest = self._new_temp( expected_union )
+		end_label = self._new_label( 'union_widen_end' )
+		for i, member in enumerate( op_members ):
+			is_last = ( i == len( op_members ) - 1 )
+			if not is_last:
+				next_label = self._new_label( 'union_widen_next' )
+				tag_dest = self._new_temp( op_tag_attr.type )
+				self._emit( ir.GetAttr( dest = tag_dest, obj = operand, attr = op_tag_attr.stem ))
+				match = self._new_temp( bool_cls )
+				self._emit( ir.Cmp( dest = match, op = ir.CmpOp.EQ, left = tag_dest, right = ir.Const( type = op_tag_attr.type, value = op_tags[member.stem] )))
+				self._emit( ir.JumpIfFalse( cond = match, target = next_label ))
+			cell_start = len( self._pending_temps )
+			payload = self._extract_union_payload( operand, op_data_attr, op_payload_cls, member )
+			value = self._coerce_into_union( payload, expected_union, node )
+			self._flush_branch_temps( cell_start, dest, value )
+			self._emit( ir.Assign( dest = dest, src = value ))
+			self._emit( ir.Jump( target = end_label ))
+			if not is_last:
+				self._emit( ir.Label( name = next_label ))
+		self._emit( ir.Label( name = end_label ))
+		self._cfg.fresh_temp( dest, expected_union )
 		return dest
 
 	def _build_generator_zero_value( self, t: Type, node: ast.AST ) -> ir.Operand:
