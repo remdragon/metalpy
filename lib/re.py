@@ -1616,12 +1616,15 @@ class Match:
 		return ( s, e )
 
 	@property
-	def regs( self ) -> list[tuple[i32,i32]]:
+	def regs( self ) -> list[tuple[isize,isize]]:
 		''' one (start,end) pair per group, group 0 (the whole match) first
 		- matching Python's own Match.regs. An unset (optional/alternated-
-		away) group reports (-1,-1), the same sentinel Python uses (i32, not
-		usize, specifically to be able to represent that sentinel). '''
-		out: list[tuple[i32,i32]] = list[tuple[i32,i32]]()
+		away) group reports (-1,-1), the same sentinel Python uses (isize,
+		not usize, specifically to be able to represent that sentinel) -
+		isize (64-bit), not i32, to match every other offset type in this
+		codebase (start()/end()/span() are usize) rather than capping match
+		offsets to ~2 billion for no real reason. '''
+		out: list[tuple[isize,isize]] = list[tuple[isize,isize]]()
 		with compiler.panic_arithmetic( 're: Match.regs: unreachable (dividing by the constant 2)' ):
 			count: usize = len( self.__slot_values ) // 2
 		i: usize = 0
@@ -1632,10 +1635,10 @@ class Match:
 			if self.__slot_set.__getitem__( lo_slot ).unwrap( 're: Match.regs slot_set' ):
 				lo: usize = self.__slot_values.__getitem__( lo_slot ).unwrap( 're: Match.regs slot' )
 				hi: usize = self.__slot_values.__getitem__( hi_slot ).unwrap( 're: Match.regs slot' )
-				with compiler.panic_arithmetic( 're: Match.regs: offset does not fit in i32' ):
-					out.append(( i32( lo ), i32( hi )))
+				with compiler.panic_arithmetic( 're: Match.regs: offset does not fit in isize' ):
+					out.append(( isize( lo ), isize( hi )))
 			else:
-				out.append(( i32( -1 ), i32( -1 )))
+				out.append(( isize( -1 ), isize( -1 )))
 			with compiler.wrap_arithmetic:
 				i += 1
 		return out

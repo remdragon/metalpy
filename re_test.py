@@ -751,13 +751,13 @@ def main() -> i32:
 	if li != 1:
 		return 20
 
-	regs: list[tuple[i32,i32]] = m.regs
+	regs: list[tuple[isize,isize]] = m.regs
 	if len( regs ) != 2:
 		return 3
-	r0: tuple[i32,i32] = regs.__getitem__( 0 ).unwrap( 'idx' )
+	r0: tuple[isize,isize] = regs.__getitem__( 0 ).unwrap( 'idx' )
 	if r0[0] != 2 or r0[1] != 7:
 		return 4
-	r1: tuple[i32,i32] = regs.__getitem__( 1 ).unwrap( 'idx' )
+	r1: tuple[isize,isize] = regs.__getitem__( 1 ).unwrap( 'idx' )
 	if r1[0] != 3 or r1[1] != 6:
 		return 5
 
@@ -788,8 +788,8 @@ def main() -> i32:
 	m3: re.Match = p2.search( b'ac' ).unwrap( 'search3' )
 	if m3.lastindex is not None:
 		return 12
-	regs3: list[tuple[i32,i32]] = m3.regs
-	r3: tuple[i32,i32] = regs3.__getitem__( 1 ).unwrap( 'idx' )
+	regs3: list[tuple[isize,isize]] = m3.regs
+	r3: tuple[isize,isize] = regs3.__getitem__( 1 ).unwrap( 'idx' )
 	if r3[0] != -1 or r3[1] != -1:
 		return 13
 
