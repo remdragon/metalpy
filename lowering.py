@@ -16242,9 +16242,30 @@ class FunctionLowering:
 		docstring): a discarded (want_result=False) Result gets implicitly
 		.or_throw()'d instead of the old hard "returns a Result that is
 		discarded here" compile error. A non-Result, or an already-wanted,
-		result passes straight through unchanged. '''
+		result passes straight through unchanged.
+
+		A discarded NON-Result RC value (e.g. `xs.pop().unwrap(msg) -> str`
+		called as a bare statement - unwrap() already extracted the Ok
+		payload, its own return type is plain str, never Result-shaped) is
+		the other half of "produced, immediately discarded, never bound to
+		a name": every call-emission tail that widens its own dest-creation
+		condition to also cover this case (force_result's sibling,
+		`discard_rc` - grep for it) still needs SOMETHING to actually
+		release the object once it has a dest at all, or creating that dest
+		only moved the leak from "never captured" to "captured, never
+		released". Handled centrally here rather than duplicated at each of
+		those call sites: release it in place, exactly like any other
+		discarded-fresh-temp cleanup elsewhere in this file (e.g.
+		_coerce_or_check_operand's own "was_fresh: decref+untrack" pattern).
+		Confirmed as a real leak via `xs.pop().unwrap(msg)` as a bare
+		statement (also hit for real by lib/os.py's normpath()). '''
 		if want_result or result is None:
 			return result
+		if not cfg.is_result_type( result.type ) and result.type is not None and result.type.is_rc():
+			for instr in self._cfg.decref( result.type, result ):
+				self._emit( instr )
+			self._cfg.untrack_temp( result )
+			return None
 		self._auto_or_throw( node, result, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = False )
 		return None
 
@@ -18252,8 +18273,19 @@ class FunctionLowering:
 		# receiver dispatch) - so this is no longer a gap, just this tail's
 		# own copy of a check every call-lowering path shares
 		force_result = not want_result and cfg.is_result_type( target.return_type )
+		# same "produce a dest so there's something to auto-consume" idea,
+		# but for a discarded NON-Result RC return (e.g. `xs.pop().unwrap(msg)
+		# -> str` as a bare statement) - _finish_call_result's own release
+		# path (see its docstring) needs a real dest to release; without
+		# this the `else` branch below passes dest=None, so the callee still
+		# constructs and returns the object, it's just never captured -
+		# confirmed as a real leak via that exact repro.
+		discard_rc = (
+			not want_result and not force_result
+			and target.return_type is not None and target.return_type.is_rc()
+		)
 
-		if want_result or force_result:
+		if want_result or force_result or discard_rc:
 			target_return_type = target.return_type
 			# a Specialization of a TaggedUnion base (e.g. an unmonomorphized
 			# Result[usize,IndexError]) is just as "already the expected
