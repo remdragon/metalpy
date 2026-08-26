@@ -21301,6 +21301,8 @@ def main() -> i32:
 				return 8
 		if compiler.refcount( b ) != 3:
 			return 9
+		compiler.decref( b ) # local's own release (suppresses the automatic one - see
+		compiler.decref( b ) # _lower_compiler_decref) + defer's own extra incref
 		return 0
 ''' ),
 		# --- Phase 5 (roadmap Phase 5, the last roadmap item): RC-typed
@@ -21597,6 +21599,8 @@ def main() -> i32:
 				return 7
 		if compiler.refcount( b ) != 3:
 			return 8
+		compiler.decref( b ) # local's own release (suppresses the automatic one - see
+		compiler.decref( b ) # _lower_compiler_decref) + defer's own extra incref
 		return 0
 ''' ),
 			( 'defer_replays_exactly_once_at_bare_return_exit', '''
@@ -21638,6 +21642,8 @@ def main() -> i32:
 				return 4
 		if compiler.refcount( b ) != 3:
 			return 5
+		compiler.decref( b ) # local's own release (suppresses the automatic one - see
+		compiler.decref( b ) # _lower_compiler_decref) + defer's own extra incref
 		return 0
 ''' ),
 			( 'defer_replays_exactly_once_on_abandonment_via_destructor', '''
@@ -21671,6 +21677,8 @@ def main() -> i32:
 		make_and_partially_consume( b )
 		if compiler.refcount( b ) != 2: # captured param released, defer's own incref remains
 			return 2
+		compiler.decref( b ) # local's own release (suppresses the automatic one - see
+		compiler.decref( b ) # _lower_compiler_decref) + defer's own extra incref
 		return 0
 ''' ),
 			( 'two_defer_sites_replay_in_lifo_order', '''
@@ -21711,6 +21719,10 @@ def main() -> i32:
 			return 3
 		if compiler.refcount( c ) != 3: # captured param + c's own armed defer
 			return 4
+		compiler.decref( b ) # each local's own release (suppresses the automatic one -
+		compiler.decref( b ) # see _lower_compiler_decref) + its own defer's extra incref
+		compiler.decref( c )
+		compiler.decref( c )
 		return 0
 ''' ),
 			# --- Mechanism 2 (PLAN_GENERATORS.md's defer/errdefer phase) -
@@ -21784,6 +21796,8 @@ def main() -> i32:
 				return 7
 		if compiler.refcount( b ) != 3:
 			return 9
+		compiler.decref( b ) # local's own release (suppresses the automatic one - see
+		compiler.decref( b ) # _lower_compiler_decref) + errdefer's own extra incref
 		return 0
 ''' ),
 			( 'defer_and_errdefer_both_fire_on_same_error_exit', '''
@@ -21834,6 +21848,10 @@ def main() -> i32:
 			return 3
 		if compiler.refcount( c ) != 3: # errdefer fired here too
 			return 4
+		compiler.decref( b ) # each local's own release (suppresses the automatic one -
+		compiler.decref( b ) # see _lower_compiler_decref) + its own defer's extra incref
+		compiler.decref( c )
+		compiler.decref( c )
 		return 0
 ''' ),
 			( 'defer_does_not_replay_again_when_generator_later_dropped', '''
@@ -21872,6 +21890,8 @@ def main() -> i32:
 		drain_fully( b, 2 )
 		if compiler.refcount( b ) != 2: # captured param released, defer fired EXACTLY once (not twice)
 			return 2
+		compiler.decref( b ) # local's own release (suppresses the automatic one - see
+		compiler.decref( b ) # _lower_compiler_decref) + defer's own extra incref
 		return 0
 ''' ),
 		])
