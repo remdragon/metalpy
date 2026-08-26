@@ -381,6 +381,29 @@ class bytes( Sequence[u8], Iterable[u8], Sized ):
 		self.__data = data
 
 	@staticmethod
+	def from_memoryview( src: memoryview ) -> bytes:
+		# a NAMED alternative constructor, not a 3rd __init__ union member -
+		# __init__ overloading isn't supported yet (see memoryview's own
+		# __init__ comment), and widening __init__'s own copy_from to
+		# bytes|bytearray|memoryview instead broke every existing bytes|
+		# bytearray-typed caller (confirmed via a real repro: this codebase
+		# has no general "narrower union coerces into a wider superset
+		# union" mechanism - only a single LEAF coercing into a union
+		# containing it is supported - so a bytes|bytearray-typed value
+		# no longer satisfied a bytes|bytearray|memoryview-typed parameter
+		# at all, a straight regression for lib/zipfile.py's own
+		# _compress_payload). Matches real Python's own bytes(some_
+		# memoryview) support, just spelled as a named constructor here -
+		# same shape as from_bytearray just above. get_const_ptr()/
+		# __len__() are identically named on all three buffer types, same
+		# trick memoryview's own __init__ uses for its bytearray|mmap
+		# source.
+		length: usize = len( src )
+		data = sys.alloc[u8]( length )
+		sys.memcpy( data, src.get_const_ptr(), length )
+		return bytes.__allocate__( __data = data, __len = length )
+
+	@staticmethod
 	def from_bytearray( src: move[bytearray] ) -> bytes:
 		length: usize = len( src )
 		match src.release():
