@@ -5630,12 +5630,20 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 			already_tagged.add( name )
 			keyword = 'union' if isinstance( referenced, CUnion ) else 'struct'
 			parts.append( f'{keyword} {name};' )
+	# CEnum has no opaque-tag forward-declaration option (it's a typedef to
+	# a plain scalar, not a struct/union tag) - unlike the pointer-only types
+	# the forward-tag loops above handle, a vtable slot can reference an enum
+	# BY VALUE, so its full typedef must exist before the vtable struct
+	# bodies below, not after (confirmed via a real clang "unknown type
+	# name" error once an @enum-typed parameter appeared in an @interface's
+	# own vtable slot signature). emit_cenum() has no dependency on anything
+	# else emitted in this pass, so moving it earlier is always safe.
+	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
+		parts.append( emit_cenum( cls ))
 	for owner in vtbl_owners.values():
 		parts.append( emit_interface_vtbl_struct( owner ))
 	for owner in rcclass_vtbl_owners.values():
 		parts.append( emit_rcclass_vtbl_struct( owner ))
-	for cls in compiler.cenums: # CEnum is never generic - no type_params field exists on it at all
-		parts.append( emit_cenum( cls ))
 	parts.extend( _emit_value_type_bodies( compiler ))
 	for lf in compiler.functions:
 		# skip @extern prototypes when the header that declares them is

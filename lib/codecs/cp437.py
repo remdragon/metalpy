@@ -1,5 +1,5 @@
 import sys
-from . import Codec, CodecError
+from . import Codec, CodecError, DecodeErrors
 
 DECODE_TABLE: list[u16] = [
 	0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
@@ -150,3 +150,9 @@ class cp437( Codec ):
 		sys.memcpy( new_buf, out_ptr, out_idx )
 		new_buf[out_idx] = 0
 		return str._from_owned_cstr( new_buf, buf_size )
+
+	@virtual
+	def decode_lossy( self, b: bytes|bytearray, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		# DECODE_TABLE covers all 256 possible byte values - decode() can
+		# never fail, `errors` has nothing to act on
+		return self.decode( b ).unwrap( 'cp437 decode() is infallible: DECODE_TABLE covers every byte value' )

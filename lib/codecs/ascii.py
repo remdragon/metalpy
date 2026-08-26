@@ -1,5 +1,5 @@
 import sys
-from . import Codec, CodecError
+from . import Codec, CodecError, DecodeErrors, _emit_lossy_unit
 
 class ascii( Codec ):
 	@virtual
@@ -59,3 +59,31 @@ class ascii( Codec ):
 		sys.memcpy( new_buf, ptr, length )
 		new_buf[length] = 0
 		return str._from_owned_cstr( new_buf, buf_size )
+
+	@virtual
+	def decode_lossy( self, b: bytes|bytearray, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		length: usize = len( b )
+		ptr: ConstPtr[u8] = b.get_const_ptr()
+
+		with compiler.panic_arithmetic( 'irrational byte length' ):
+			out = bytearray( length * 4 )
+		out_ptr: Ptr[u8] = out.get_ptr()
+		out_idx: usize = 0
+
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by length, cannot overflow' ):
+			while i < length:
+				byte: u8 = ptr[i]
+				if byte > 0x7F:
+					out_idx = _emit_lossy_unit( out_ptr, out_idx, byte, errors )
+				else:
+					out_ptr[out_idx] = byte
+					out_idx += 1
+				i += 1
+
+		with compiler.panic_arithmetic( 'irrational byte length' ):
+			buf_size: usize = out_idx + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( buf_size )
+		sys.memcpy( new_buf, out_ptr, out_idx )
+		new_buf[out_idx] = 0
+		return str._from_owned_cstr( new_buf, buf_size ).unwrap( 'decode_lossy always produces valid utf-8 by construction' )

@@ -19,6 +19,8 @@ analogous thing via its exporter's buffer-refcount protocol.
 
 import compiler
 from mmap import mmap
+from codecs import Codec, CodecError, DecodeErrors
+from codecs.utf8 import utf8
 
 class memoryview( Sequence[u8], Iterable[u8], Sized ):
 	__ptr: Ptr[u8]
@@ -69,6 +71,14 @@ class memoryview( Sequence[u8], Iterable[u8], Sized ):
 
 	def get_const_ptr( self ) -> ConstPtr[u8]:
 		return self.__ptr
+
+	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
+		# Codec.decode() only accepts bytes|bytearray - copy the view first,
+		# same as `bytes(some_memoryview)` elsewhere
+		return codec.decode( bytes( self ))
+
+	def decode_lossy( self, codec: Codec = utf8, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		return codec.decode_lossy( bytes( self ), errors )
 
 	@private
 	def _byte_slice( self, start: usize, end: usize ) -> memoryview:

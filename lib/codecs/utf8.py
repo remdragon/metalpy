@@ -1,5 +1,5 @@
 import sys
-from . import Codec, CodecError
+from . import Codec, CodecError, DecodeErrors, _emit_lossy_unit
 
 class Utf8( Codec ):
 	@virtual
@@ -33,6 +33,63 @@ class Utf8( Codec ):
 		sys.memcpy( new_buf, b.get_const_ptr(), length )
 		new_buf[length] = 0
 		return str._from_owned_cstr( new_buf, buf_size )
+
+	@virtual
+	def decode_lossy( self, b: bytes|bytearray, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		''' same sequence-validity scan as decode()/_from_owned_cstr, but
+		malformed bytes are handled one at a time per `errors` instead of
+		bailing on the first bad byte - so this can't just delegate to
+		_from_owned_cstr, it has to build the output itself. '''
+		length: usize = len( b )
+		ptr: ConstPtr[u8] = b.get_const_ptr()
+
+		# worst case: every byte is malformed and backslash-escaped (4 out bytes each)
+		with compiler.panic_arithmetic( 'irrational byte length' ):
+			out = bytearray( length * 4 )
+		out_ptr: Ptr[u8] = out.get_ptr()
+		out_idx: usize = 0
+
+		i: usize = 0
+		with compiler.panic_arithmetic( 'bounded by length, cannot overflow' ):
+			while i < length:
+				byte1 = ptr[i]
+				seq_len: usize = 0
+
+				if ( byte1 & 0x80 ) == 0x00:
+					seq_len = 1
+				elif ( byte1 & 0xE0 ) == 0xC0 and byte1 >= 0xC2 \
+						and i + 1 < length and ( ptr[i + 1] & 0xC0 ) == 0x80:
+					seq_len = 2
+				elif ( byte1 & 0xF0 ) == 0xE0 and i + 2 < length \
+						and ( ptr[i + 1] & 0xC0 ) == 0x80 and ( ptr[i + 2] & 0xC0 ) == 0x80 \
+						and not ( byte1 == 0xE0 and ptr[i + 1] < 0xA0 ) \
+						and not ( byte1 == 0xED and ptr[i + 1] >= 0xA0 ):
+					seq_len = 3
+				elif ( byte1 & 0xF8 ) == 0xF0 and byte1 <= 0xF4 and i + 3 < length \
+						and ( ptr[i + 1] & 0xC0 ) == 0x80 and ( ptr[i + 2] & 0xC0 ) == 0x80 and ( ptr[i + 3] & 0xC0 ) == 0x80 \
+						and not ( byte1 == 0xF0 and ptr[i + 1] < 0x90 ) \
+						and not ( byte1 == 0xF4 and ptr[i + 1] >= 0x90 ):
+					seq_len = 4
+
+				if seq_len == 0:
+					out_idx = _emit_lossy_unit( out_ptr, out_idx, byte1, errors )
+					i += 1
+					continue
+
+				j: usize = 0
+				with compiler.panic_arithmetic( 'seq_len bounded by loop condition above' ):
+					while j < seq_len:
+						out_ptr[out_idx] = ptr[i + j]
+						out_idx += 1
+						j += 1
+				i += seq_len
+
+		with compiler.panic_arithmetic( 'irrational byte length' ):
+			buf_size: usize = out_idx + 1
+		new_buf: Ptr[u8] = sys.alloc[u8]( buf_size )
+		sys.memcpy( new_buf, out_ptr, out_idx )
+		new_buf[out_idx] = 0
+		return str._from_owned_cstr( new_buf, buf_size ).unwrap( 'decode_lossy always produces valid utf-8 by construction' )
 
 # Utf8 is stateless (no __init__, no fields) - one shared instance is safe
 # and avoids constructing a fresh one at every default-parameter-value site

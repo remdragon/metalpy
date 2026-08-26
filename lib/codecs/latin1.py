@@ -1,5 +1,5 @@
 import sys
-from . import Codec, CodecError
+from . import Codec, CodecError, DecodeErrors
 
 class latin1( Codec ):
 	@virtual
@@ -97,3 +97,9 @@ class latin1( Codec ):
 		sys.memcpy( new_buf, out_ptr, out_idx )
 		new_buf[out_idx] = 0
 		return str._from_owned_cstr( new_buf, buf_size )
+
+	@virtual
+	def decode_lossy( self, b: bytes|bytearray, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		# every byte 0x00..0xFF is a valid Latin-1 codepoint - decode() can
+		# never fail, `errors` has nothing to act on
+		return self.decode( b ).unwrap( 'latin1 decode() is infallible: every byte is a valid codepoint' )

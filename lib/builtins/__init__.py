@@ -1,4 +1,4 @@
-from codecs import Codec, CodecError
+from codecs import Codec, CodecError, DecodeErrors
 from codecs.utf8 import utf8
 import compiler
 import sys
@@ -412,7 +412,10 @@ class bytes( Sequence[u8], Iterable[u8], Sized ):
 		return self.__data
 
 	def decode( self, codec: Codec = utf8 ) -> Result[str,CodecError]:
-		return utf8.decode( self )
+		return codec.decode( self )
+
+	def decode_lossy( self, codec: Codec = utf8, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		return codec.decode_lossy( self, errors )
 
 	def find( self, sub: bytes|bytearray, start: usize = 0 ) -> isize:
 		return _bytes_find_at( self, sub, start )
@@ -587,7 +590,12 @@ class bytearray( Sequence[u8], Iterable[u8], Sized ):
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.decode() called after release()'
 		return codec.decode( self )
-	
+
+	def decode_lossy( self, codec: Codec = utf8, errors: DecodeErrors = DecodeErrors.BackslashReplace ) -> str:
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.decode_lossy() called after release()'
+		return codec.decode_lossy( self, errors )
+
 	@move
 	def release( self ) -> Result[Ptr[u8],sys.OwnershipError[bytearray]]:
 		if compiler.refcount( self ) != 1:
