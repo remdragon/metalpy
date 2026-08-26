@@ -7795,6 +7795,35 @@ def main() -> i32:
 			i += 1
 	return 0
 ''' ),
+			# a property returning a generic/compound RC type (list[tuple[
+			# isize,isize]]) read into a local declared with the SAME
+			# (correctly matching) type - regression guard alongside
+			# lowering_test.py's own compile-error rejection test: a
+			# genuinely-matching declared type must still compile and
+			# produce the real value, not just get rejected/silently
+			# mistyped
+			( 'property_returning_generic_compound_type', '''
+class Bag:
+	@property
+	def pairs( self ) -> list[tuple[isize,isize]]:
+		xs: list[tuple[isize,isize]] = []
+		xs.append( ( isize( 2 ), isize( 7 ) ))
+		xs.append( ( isize( 3 ), isize( 6 ) ))
+		return xs
+
+def main() -> i32:
+	b: Bag = Bag()
+	ps: list[tuple[isize,isize]] = b.pairs
+	if len( ps ) != 2:
+		return 1
+	p0: tuple[isize,isize] = ps.__getitem__( 0 ).unwrap( 'idx' )
+	if p0[0] != 2 or p0[1] != 7:
+		return 2
+	p1: tuple[isize,isize] = ps.__getitem__( 1 ).unwrap( 'idx' )
+	if p1[0] != 3 or p1[1] != 6:
+		return 3
+	return 0
+''' ),
 		] )
 
 

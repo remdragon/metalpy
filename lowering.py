@@ -10846,7 +10846,24 @@ class FunctionLowering:
 				# dunder-dispatch BinOp/Compare paths above resolve their own
 				# method before ever reading .return_type)
 				self.lowering._ensure_resolved( method )
-				return self._lower_method_call( obj, node.attr, [], expected_type or method.return_type, node )
+				# _lower_method_call's own `result_type` param TYPES dest
+				# directly (`self._new_temp(result_type)`) rather than
+				# checking it against anything - every other caller (f-string
+				# dunder dispatch) always passes the callee's own known
+				# return type, so that's safe there. Passing expected_type
+				# straight through here instead was a real, confirmed type-
+				# safety bug: `expected_type` is only a HINT from the
+				# assignment context (e.g. `regs: list[tuple[i32,i32]] =
+				# some_property_returning_list[tuple[isize,isize]]`), not a
+				# fact about what the getter actually returns - dest ended up
+				# typed (and emitted) as the WRONG C struct, silently
+				# accepted by the C compiler as a mismatched pointer
+				# assignment, corrupting every read through it. method.
+				# return_type is always the real, correct type here; coerce
+				# the result against expected_type afterward, the same way
+				# an ordinary call's own shared tail does.
+				result = self._lower_method_call( obj, node.attr, [], method.return_type, node )
+				return self._coerce_or_check_operand( result, expected_type, node )
 			return self._lower_bound_method_closure( node, obj, method, expected_type )
 		attr_var = self.lowering._attr_lookup( obj.type, node.attr, node )
 		self._check_field_visibility( obj.type, attr_var, node.attr, node )

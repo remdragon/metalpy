@@ -5253,6 +5253,35 @@ class Tests( unittest.TestCase ):
 		self.assertIsNotNone( calls[0].receiver )
 		self.assertFalse( any( isinstance( i, ir.GetAttr ) and i.attr == 'bar' for i in fn.instructions ))
 
+	def test_property_result_type_mismatch_is_rejected( self ) -> None:
+		# regression guard: _expr_Attribute's is_property branch used to hand
+		# expected_type straight through to _lower_method_call's own
+		# result_type param, which TYPES the call's dest directly rather than
+		# checking anything - a declared local type that didn't actually
+		# match the getter's real return type silently compiled into a
+		# mismatched C struct assignment (confirmed via a real repro: a
+		# list[tuple[i32,i32]] local reading a list[tuple[isize,isize]]-
+		# returning property compiled clean, then read garbage values at
+		# runtime - the two tuple element types have different widths, so
+		# the generated C was a genuinely wrong pointer-type assignment, not
+		# just numerically imprecise). An ordinary (non-property) call
+		# already rejects this same shape; a property must too.
+		code = '\n'.join([
+			'class Foo:',
+			'	@property',
+			'	def bar( self ) -> i64:',
+			'		return 1',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo()',
+			'	x: i32 = f.bar',
+			'	return',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertNotEqual( self.discovery.errors.errors, [] )
+		self.assertTrue( any( 'expected' in str( e ) and 'i32' in str( e ) and 'i64' in str( e ) for e in self.discovery.errors.errors ))
+
 	def test_plain_field_still_lowers_to_getattr( self ) -> None:
 		# regression guard alongside the property test above: a plain
 		# (non-@property) field access must keep using GetAttr, not get
