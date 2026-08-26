@@ -581,6 +581,25 @@ class Worker:
 		# watched, never removed
 		self.__poller.register( self.__wake_fd, True, False ).unwrap( 'Worker.__init__: poller register (wake fd) failed' )
 
+	def __del__( self ) -> None:
+		''' every fiber left in __idle_pool once THIS Worker itself is going
+		away ran to completion and is sitting there cleanly IDLE, guaranteed
+		never to run again (this Worker, its only possible driver, is being
+		destroyed) - exactly release_trampoline_identity()'s own contract
+		(see its docstring for why that extra reference exists and needs an
+		explicit release at all). Not done for __waiting/__ready_to_unpark:
+		reaching THIS destructor with either non-empty would mean a Worker
+		was dropped mid-drain (some fiber still genuinely mid-task, real
+		locals live on its own suspended stack) - a different, unhandled
+		situation, not the clean post-shutdown one every current caller
+		(Reactor.shutdown()'s own drain-to-completion contract) guarantees. '''
+		while True:
+			match self.__idle_pool.pop():
+				case Result.Ok( f ):
+					f.release_trampoline_identity()
+				case Result.Err( _ ):
+					return
+
 	def _attach_reactor_state( self, state: _ReactorState ) -> None:
 		''' internal - Reactor.__init__ calls this once per worker, right
 		after constructing it, so drain_fully() can tell "nothing queued on
@@ -1112,7 +1131,17 @@ class Worker:
 		blocks for a short, bounded interval (_QUIESCENCE_RECHECK_MS, not
 		infinite - see _ReactorState's own docstring for why this is a
 		periodic recheck rather than a wake broadcast) and loops back to
-		pick up either fresh local work or the eventual global-zero. '''
+		pick up either fresh local work or the eventual global-zero.
+
+		Calls fiber.disable_current_thread() right before actually
+		returning (every exit path below runs through __drain_fully_body
+		then falls through to it here) - this worker's own OS thread is
+		about to end for real, the one and only guarantee
+		disable_current_thread() itself needs (see its own docstring). '''
+		self.__drain_fully_body()
+		fiber.disable_current_thread()
+
+	def __drain_fully_body( self ) -> None:
 		while True:
 			if self.run_until_idle( 0 ):
 				continue

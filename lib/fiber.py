@@ -42,7 +42,7 @@ import sys
 import threading
 
 if compiler.target.os == 'windows':
-	from windows.kernel32 import CreateFiber, ConvertThreadToFiber, SwitchToFiber, DeleteFiber
+	from windows.kernel32 import CreateFiber, ConvertThreadToFiber, ConvertFiberToThread, SwitchToFiber, DeleteFiber
 	FiberHandle: TypeAlias = Ptr[None]   # LPVOID from CreateFiber/ConvertThreadToFiber
 else:
 	from posix.pthread import ucontext_t, getcontext, makecontext, swapcontext
@@ -199,6 +199,29 @@ class Fiber:
 		munmap( self.__base, self.__guard_and_stack )
 		sys.free( compiler.cast( Ptr[None], self.__handle ))
 
+	def release_trampoline_identity( self ) -> None:
+		''' releases the ONE extra, permanent self-reference __init__'s own
+		compiler.incref(self) gave the running trampoline (see its own
+		comment) - normally only balanced by _run_loop() itself returning,
+		which never happens (the trampoline loops forever; on Windows a
+		fiber function returning is undefined behavior, hence the loop in
+		the first place - see this module's own header comment). Without
+		this, that reference is never released, so this Fiber's refcount
+		can never reach zero and __del__ (DeleteFiber/munmap) never runs -
+		a real, permanent leak, not an intentional one.
+		ONLY safe to call on an IDLE fiber that's GUARANTEED to never run
+		again (e.g. its owning Worker's pool is itself being torn down for
+		good, see reactor.py's Worker.__del__) - deleting/munmap'ing an
+		abandoned, cleanly-finished fiber's OS resources needs no
+		cooperation from its own (already fully unwound) stack, unlike a
+		PARKED one still mid-task with live locals on its OWN suspended
+		stack that this does NOT attempt to unwind (a genuinely different,
+		out-of-scope problem: an aborted mid-task fiber, not a finished
+		idle one). '''
+		if self.__state != FiberState.IDLE:
+			sys.panic( 'Fiber.release_trampoline_identity: only safe on an IDLE fiber guaranteed never to run again' )
+		compiler.decref( self )
+
 	def state( self ) -> FiberState:
 		''' lets a driver (e.g. a Worker's scheduling loop) tell what to do
 		with this fiber once control returns to it: IDLE means the task
@@ -281,6 +304,21 @@ class Fiber:
 			task: Closure[[], None] = compiler.cast( Closure[[], None], self.__pending )
 			self.__pending = None
 			task()
+			# manual decref HERE, not left to task's own automatic scope-exit
+			# release (which - like Fiber.start()'s own incref comment above
+			# explains - a manual compiler.decref() replaces for a bare,
+			# non-union RC-pointer local like this one): that automatic
+			# release is only reached by control actually falling through to
+			# the bottom of THIS loop iteration, which for a fiber that's
+			# never switched back INTO again (e.g. parked forever in a
+			# Worker's idle pool once nothing left ever reuses it before
+			# process exit) never happens - _switch_out() below leaves via a
+			# raw context switch, not a real C return, so nothing past it
+			# ever runs again for that iteration. Confirmed via a real leak:
+			# a Reactor's own accept-loop task closure (and everything it
+			# transitively captured) stayed live forever after shutdown()
+			# even though the task itself had already run to completion.
+			compiler.decref( task )
 			self._switch_out( FiberState.IDLE )
 
 	def __resolve_caller( self, prev: Fiber|None ) -> Ptr[None]:
@@ -422,4 +460,31 @@ def enable_current_thread() -> None:
 
 @compiler.target( os = not 'windows' )
 def enable_current_thread() -> None:
+	pass
+
+def disable_current_thread() -> None:
+	''' undoes enable_current_thread() on THIS thread - call once this
+	thread is done driving fibers for good (e.g. a Worker's own OS thread,
+	right before drain_fully() returns and the thread itself exits), never
+	while a fiber might still be switched INTO on this thread. Releases the
+	one permanent extra reference enable_current_thread() gave
+	_thread_fiber_handle's own box (see its own comment) - without this,
+	that box (and the real ConvertThreadToFiber resources it wraps, on
+	Windows) leaks for every thread that ever called enable_current_thread(),
+	for the rest of the process's life. No-op if this thread was never
+	enabled (nothing to undo) - safe to call defensively. '''
+	box: _ThreadFiberHandle|None = _thread_fiber_handle.get()
+	if box is None:
+		return
+	_thread_fiber_handle.clear()
+	_disable_current_thread_platform()
+	compiler.decref( box )
+
+@compiler.target( os = 'windows' )
+def _disable_current_thread_platform() -> None:
+	if not ConvertFiberToThread():
+		sys.panic( 'fiber.disable_current_thread: ConvertFiberToThread failed' )
+
+@compiler.target( os = not 'windows' )
+def _disable_current_thread_platform() -> None:
 	pass

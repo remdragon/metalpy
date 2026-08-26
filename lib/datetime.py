@@ -262,7 +262,12 @@ class date:
 		see today()'s own docstring. '''
 		with compiler.wrap_arithmetic:
 			epoch_seconds: i64 = i64( t )
-		offset: i32 = ( tz or localtz() ).utcoffset( epoch_seconds )
+		# bound to a local, not `( tz or localtz() ).utcoffset(...)` directly -
+		# an `or` temporary used straight as a method-call receiver never gets
+		# its own decref emitted (confirmed compiler bug, not yet fixed at
+		# the lowering level - see task notes); binding it first sidesteps it.
+		resolved_tz: ZoneInfo = tz or localtz()
+		offset: i32 = resolved_tz.utcoffset( epoch_seconds )
 		with compiler.wrap_arithmetic:
 			local_seconds: i64 = epoch_seconds + i64( offset )
 		epoch_day: i64 = floordiv_i64( local_seconds, _SECONDS_PER_DAY )
