@@ -18356,6 +18356,17 @@ class FunctionLowering:
 			# over the freed bytes, invisible under a build that happened
 			# to leave the freed memory untouched)
 			self._emit( ir.Incref( value = dest ))
+			# dest is now a genuinely owned reference (the Incref above), but
+			# a bare GetAttr dest is never auto-registered as fresh (_emit's
+			# own rule: only Call/Allocate results are) - without this, a
+			# caller that consumes dest via assign()/return/etc. still works
+			# (that machinery adopts ownership regardless of fresh_temp
+			# registration), but one that uses it inline and unbound (e.g.
+			# `x.unwrap_or(default) == y`) leaked this Incref's own reference
+			# outright - nothing ever tracked it to flush/decref. Confirmed
+			# via a real repro (str.__getitem__(i).unwrap_or('') == ':' leaked
+			# a str every call).
+			self._cfg.fresh_temp( dest, target_type )
 		return dest
 
 	def _lower_union_receiver_call( self, node: ast.Call, dispatch: _ReceiverDispatch, receiver: ir.Operand, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
