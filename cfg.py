@@ -2276,23 +2276,30 @@ class CFGState:
 			# own eventual DeleteTemp doesn't ALSO decref the same object
 			self._temp_states.pop( src.id, None )
 		elif isinstance( src, Variable ):
-			# is_alias=False but src is a full Variable (not ir.Temp) - only
-			# reached via a hidden-local "result" a lowering helper hands
-			# back as its own fresh owned value (e.g. or_throw(mapper)'s own
-			# ok_thunk: `w: T = recv.or_throw(mapper)` binds w straight to
-			# the synthesized __ot_ok_N local, not a Temp copy of it).
-			# src's own binding/epilogue entry has to be neutralized here
-			# the same way a Temp's tracking is untracked above - dest's
-			# fresh _push() below is now the ONE owner - otherwise src's own
-			# still-live entry AND dest's new one both release the same
-			# object at scope exit. Confirmed by a real repro (or_throw(
-			# mapper)'s Ok arm, "already released once"). No-op for a
-			# BORROWED/already-MOVED src (nothing here to cancel).
-			src_binding = self.bindings.get( src.stem )
-			if src_binding is not None and src_binding.entry is not None and src_binding.state == OwnState.OWNED:
-				new_entry, neutralize_instructions = self._neutralize( src_binding.entry )
-				instructions += neutralize_instructions
-				self.bindings[src.stem] = _Binding( operand = src_binding.operand, type = src_binding.type, state = OwnState.MOVED, entry = new_entry )
+			# is_alias=False but src is a full Variable (not ir.Temp) - a
+			# lowering helper handed back an already-fresh owned value bound
+			# to a real Variable rather than an ir.Temp (e.g. @inline
+			# splicing's `return self`, str(s)'s own identity-conversion
+			# repro: _incref_aliasing_return already gave src its own
+			# independent +1). src keeps its own binding/epilogue entry -
+			# dest's fresh _push() below establishes an INDEPENDENT second
+			# owner, exactly like an ordinary aliasing read would, not a
+			# transfer.
+			#
+			# NOT the same shape as or_throw(mapper)/or_return(mapper)'s own
+			# hidden __ot_ok_N/__or_ok_N locals - those are moved out via
+			# their own explicit manually_decreffed() call at the point
+			# they're produced (see ok_thunk in both), so by the time such a
+			# src reaches here its binding is already MOVED, not OWNED; a
+			# previous version of this branch additionally neutralized an
+			# OWNED src here too, on the assumption that ANY Variable
+			# reaching this branch was necessarily one of those hidden,
+			# single-use locals - wrong for a real outer-scope local like
+			# str(s)'s `s`, which caused a leak (s's own epilogue entry was
+			# cancelled, leaving only t's to release one of the two live
+			# references). Confirmed via or_throw_mapper_test.py/
+			# or_return_mapper_test.py still passing without this.
+			pass
 		if dest.is_global:
 			# a global's storage isn't scoped to THIS function's own
 			# epilogue at all - whatever gets stored now must persist for
