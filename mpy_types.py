@@ -1401,6 +1401,21 @@ class Function( Type, ScopeMixin ):
 	# prologue dispatches on.
 	is_generator_next: bool = False
 
+	# stems of this function's own parameters that a `defer`/`errdefer`
+	# block somewhere in its body conditionally incref's (see cfg.py's
+	# push_defer) - populated lazily, during THIS function's own lowering,
+	# not known up front. A caller passing one of ITS OWN locals into one
+	# of these parameter positions may get an extra, compiler-invisible
+	# reference back on return - see lowering.py's own Call-site check
+	# (mark_possibly_retained) and cfg.py's manually_decreffed().
+	errdefer_retained_params: set[str] = field( default_factory = set )
+	# lowering.py's _ensure_errdefer_retained_params is lazy (an AST scan,
+	# not IR-derived - reachability-ordered lowering means a callee may not
+	# have been lowered yet when a caller's own Call needs this, see its
+	# own comment) - this distinguishes "not computed yet" from "computed,
+	# genuinely empty" so it only ever scans once.
+	errdefer_retained_params_computed: bool = False
+
 	# implementations only (never set on a stub - stubs are never scheduled
 	# as real compile units, so they never need a C symbol of their own) -
 	# the Overload group this Function was appended to group.implementations

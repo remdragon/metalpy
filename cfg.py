@@ -253,6 +253,7 @@ class CFGState:
 		self.prologue_instructions: list[ir.Instruction] = []
 		self._construction_self: Variable | None = None # set by enter_construction() - which self param (if any) is still under construction
 		self._construction_required: list[Variable] = [] # __init__'s own attributes that must all be initialized before self can escape/construction can complete
+		self._possibly_retained: set[str] = set() # stems of OWNED locals passed as an argument into a call whose own errdefer/defer conditionally retains that PARAMETER (Function.errdefer_retained_params, set by push_defer below) - see mark_possibly_retained()/manually_decreffed()'s own use of this
 		for param in ( fn.parameters or [] ) if fn is not None else []:
 			self._enter_parameter( param )
 
@@ -345,6 +346,25 @@ class CFGState:
 		self._epilogue_stack.append( Epilogue(
 			instructions = instructions, name = self._new_label( 'epilogue' ), flag = flag, is_err_only = is_err_only,
 		))
+
+	def mark_possibly_retained( self, operand: ir.Operand ) -> None:
+		''' called by lowering.py's own _emit() (_mark_errdefer_retained_args)
+		for a Call whose target's errdefer_retained_params (an AST-derived
+		fact - see Lowering._ensure_errdefer_retained_params) says one of
+		THIS call's own arguments may come back with an extra, compiler-
+		invisible reference already attached: a bare `errdefer(compiler.
+		incref(param))`/`defer(compiler.incref(param))` inside the callee
+		conditionally hands param's OWN object an extra reference that
+		nothing in the callee's own scope ever releases - by design, it's
+		meant for the CALLER to release by hand (compiler.refcount()/
+		compiler.decref()). operand is the caller's own argument occupying
+		that parameter position. A no-op for anything but a plain Variable
+		(a Temp/literal argument has no binding for manually_decreffed() to
+		later consult anyway). Sticky for the rest of the binding's
+		lifetime, same as OwnState itself - a SECOND call through the same
+		parameter position only needs to have set this once. '''
+		if isinstance( operand, Variable ):
+			self._possibly_retained.add( operand.stem )
 
 	def push_inline_scope( self ) -> str:
 		''' called once by lowering.py's own _splice_multi_statement_inline_
@@ -2739,12 +2759,23 @@ class CFGState:
 		decides to allow, not rejected here. Returns whatever _neutralize()
 		itself needs emitted (empty unless x's own entry was already
 		captured by an earlier return - see its own docstring) -
-		lowering.py must emit these right after its own explicit Decref. '''
+		lowering.py must emit these right after its own explicit Decref.
+
+		x's own entry is deliberately left UNCANCELLED (and _neutralize()
+		never called) when x is in self._possibly_retained: some earlier
+		call passed x into a parameter an errdefer/defer conditionally
+		incref's (see push_defer()/mark_possibly_retained()) - x's object
+		may therefore carry an extra reference this decref() call is only
+		balancing, on top of (not instead of) x's own binding-owned
+		reference, which still needs its own ordinary scope-exit release. '''
 		if isinstance( operand, Variable ):
 			binding = self.bindings.get( operand.stem )
 			if binding is None or binding.entry is None:
 				return []
 			if binding.state != OwnState.OWNED:
+				return []
+			if operand.stem in self._possibly_retained:
+				self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = binding.entry )
 				return []
 			new_entry, instructions = self._neutralize( binding.entry )
 			self.bindings[operand.stem] = _Binding( operand = binding.operand, type = binding.type, state = OwnState.MOVED, entry = new_entry )

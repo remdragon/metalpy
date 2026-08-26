@@ -988,6 +988,57 @@ class Lowering:
 			return node.func.id
 		return None
 
+	def _ensure_errdefer_retained_params( self, fn: Function ) -> set[str]:
+		''' fn.errdefer_retained_params (mpy_types.py), computed lazily from
+		fn's own AST the first time anyone asks. A plain IR-derived fact
+		(scanning cfg.py's own push_defer as it registers each defer/
+		errdefer body) would seem simpler, but reachability-ordered lowering
+		(compiler.py starts from main() and lowers callees only once first
+		discovered reachable) means a callee can easily still be UNLOWERED
+		- this field still empty - at the exact moment a caller's own Call
+		to it needs the answer; an IR-derived version would silently miss
+		exactly the "caller lowered before callee" ordering our own 4-test
+		repro cluster hits. The AST is available for every Function up
+		front regardless of lowering order, so scan that instead.
+
+		Finds every `defer(EXPR)`/`errdefer(EXPR)` call-form statement and
+		every `with defer:`/`with errdefer:` block anywhere in fn's body
+		(ast.walk, so nested inside an if/while is still found), then scans
+		each one's own registered body for a bare `compiler.incref(<name>)`
+		whose <name> is one of fn's own parameters - see cfg.py's
+		manually_decreffed()/mark_possibly_retained() for what this list is
+		actually used for. Deliberately narrow (a single-level Name, not a
+		field/subscript/whatever an incref could in principle be pointed at
+		- no test needs more, and a false negative here just means a real
+		leak stays undetected-by-this-mechanism, not a new one). '''
+		if fn.errdefer_retained_params_computed:
+			return fn.errdefer_retained_params
+		fn.errdefer_retained_params_computed = True
+		param_stems = { p.stem for p in ( fn.parameters or [] ) }
+		if not param_stems or fn.node is None:
+			return fn.errdefer_retained_params
+		for stmt in ast.walk( fn.node ):
+			defer_body: list[ast.stmt] | None = None
+			if isinstance( stmt, ast.Expr ) and self._defer_kind_of_call( stmt.value ) is not None and stmt.value.args:
+				defer_body = [ ast.Expr( value = stmt.value.args[0] ) ]
+			elif (
+				isinstance( stmt, ast.With ) and len( stmt.items ) == 1 and stmt.items[0].optional_vars is None
+				and self._defer_kind_of_with( stmt.items[0].context_expr ) is not None
+			):
+				defer_body = stmt.body
+			if defer_body is None:
+				continue
+			for sub in defer_body:
+				for call in ast.walk( sub ):
+					if (
+						isinstance( call, ast.Call ) and isinstance( call.func, ast.Attribute )
+						and isinstance( call.func.value, ast.Name ) and call.func.value.id == 'compiler'
+						and call.func.attr == 'incref' and len( call.args ) == 1
+						and isinstance( call.args[0], ast.Name ) and call.args[0].id in param_stems
+					):
+						fn.errdefer_retained_params.add( call.args[0].id )
+		return fn.errdefer_retained_params
+
 	def _body_may_fall_off_the_end( self, body: list[ast.stmt] ) -> bool:
 		# a simple, deliberately narrow check (not full terminator analysis):
 		# true whenever the LAST top-level statement isn't itself a `return`
@@ -2809,7 +2860,34 @@ class FunctionLowering:
 			instr.loc = f'{self._current_fn.file}:{self._current_lineno}'
 		if self._current_fn is not None:
 			self._check_self_escape_in( instr )
+		if self._current_fn is not None and isinstance( instr, ir.Call ):
+			self._mark_errdefer_retained_args( instr )
 		self._instructions.append( instr )
+
+	def _mark_errdefer_retained_args( self, instr: ir.Call ) -> None:
+		# instr.target's own errdefer_retained_params (Lowering.
+		# _ensure_errdefer_retained_params, an AST-derived fact - computed
+		# here, lazily, since reachability-ordered lowering means the
+		# callee itself may not have been lowered yet) says one of ITS
+		# parameters gets conditionally incref'd by a defer/errdefer
+		# somewhere in its body - if THIS call passes one of the CALLER's
+		# own plain locals into that exact parameter position, that local
+		# may come back with an extra, compiler-invisible reference
+		# attached. Flagging it (cfg.mark_possibly_retained) is what stops
+		# a later compiler.decref(...) on it from being mistaken for the
+		# release of its own separately-tracked binding - see
+		# manually_decreffed()'s own use of this. self/cls receivers are
+		# excluded from Function.parameters entirely (see ir.Call's own
+		# comment) - not handled here, no test currently needs it.
+		retained = self.lowering._ensure_errdefer_retained_params( instr.target )
+		if not retained:
+			return
+		for param, arg in zip( instr.target.parameters or [], instr.args ):
+			if param.stem in retained:
+				self._cfg.mark_possibly_retained( arg )
+		for name, arg in instr.kwargs.items():
+			if name in retained:
+				self._cfg.mark_possibly_retained( arg )
 
 	def _check_self_escape_in( self, instr: ir.Instruction ) -> None:
 		# self can only be used as the receiver of `self.attr`
