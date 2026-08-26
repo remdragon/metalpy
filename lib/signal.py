@@ -220,4 +220,13 @@ class context:
 			tls[self.__sig] = prev
 		else:
 			tls.__delitem__( self.__sig ).unwrap( 'context.__exit__: own entry unexpectedly missing' )
+			if tls.__len__() == 0:
+				# last registration on this thread just went away - release
+				# the permanent extra reference __enter__'s first-ever call
+				# added (see its own comment) and clear the slot, so this
+				# thread leaves no trace once it stops using signal.context()
+				# entirely; a later context() on the same thread just
+				# recreates it via the same is-None branch.
+				_TlsSignalHandler.clear()
+				compiler.decref( tls )
 		self.__installed = False
