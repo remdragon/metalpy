@@ -8868,33 +8868,44 @@ class FunctionLowering:
 					self._cfg.untrack_temp( pre_coerce )
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C
-		# rejects without an explicit cast. A CastWrap is a borrowed reinterpret
-		# (its temp is never RC-registered - see _lower_bound_method_closure's own
-		# note), so this adds no incref/decref, exactly right for passing the
-		# SAME object under its base type. Restricted to a genuine strict-subclass
-		# relationship so it never masks an unrelated type mismatch.
+		# rejects without an explicit cast. A CastWrap is ordinarily a borrowed
+		# reinterpret (its temp is never RC-registered - see
+		# _lower_bound_method_closure's own note), so this adds no incref/decref,
+		# exactly right for passing the SAME object under its base type.
+		# Restricted to a genuine strict-subclass relationship so it never masks
+		# an unrelated type mismatch.
 		elif ( expected_type is not None and operand.type is not expected_type
 				and self._is_rcclass_upcast( operand.type, expected_type ) ):
-			if self._cfg.is_fresh_temp( operand ):
-				# ownership is moving into the CastWrap's own dest below,
-				# which is deliberately never RC-registered (see the comment
-				# just above) - untrack the PRE-cast temp here so its own
-				# end-of-statement flush doesn't ALSO decref/free the very
-				# object the cast just handed off, out from under it. Same
-				# "was_fresh" guard the union-coercion branch above already
-				# needs, just transferring ownership silently instead of
-				# decref'ing (that branch fixes a double-incref/leak; this one
-				# fixes the opposite - a temp left registered with nothing
-				# left to consume it, later swept as if abandoned). Confirmed
-				# via a real compile-and-run use-after-free: `o: Ops =
-				# RealOps()` (Ops a base class, RealOps a subclass) segfaulted
-				# - the fresh RealOps object was released() immediately after
-				# construction, right after being upcast into the base-typed
-				# local, while `o` still pointed at the same (now-freed)
-				# memory.
+			was_fresh = self._cfg.is_fresh_temp( operand )
+			if was_fresh:
+				# ownership is moving into the CastWrap's own dest below -
+				# untrack the PRE-cast temp here so its own end-of-statement
+				# flush doesn't ALSO decref/free the very object the cast just
+				# handed off, out from under it. Same "was_fresh" guard the
+				# union-coercion branch above already needs, just transferring
+				# ownership silently instead of decref'ing. Confirmed via a real
+				# compile-and-run use-after-free: `o: Ops = RealOps()` (Ops a
+				# base class, RealOps a subclass) segfaulted - the fresh
+				# RealOps object was released() immediately after construction,
+				# right after being upcast into the base-typed local, while `o`
+				# still pointed at the same (now-freed) memory.
 				self._cfg.untrack_temp( operand )
 			dest = self._new_temp( expected_type )
 			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
+			if was_fresh:
+				# re-register the SAME ownership under dest's own id, rather
+				# than dropping it - a declaration target's own assign() pops
+				# it right back out unconditionally (net: identical to the old
+				# untrack-and-forget), but a use with no downstream consumer at
+				# all (e.g. `handler.setFormatter( TagFormatter() )`, the fresh
+				# value upcast straight into a plain call argument) previously
+				# left NOTHING to release it - a confirmed real leak, not a
+				# hypothetical: the object's own single reference was
+				# permanently stranded, only ever reachable by whichever borrow
+				# convention the callee used, never freed. Tracking dest here
+				# lets the ordinary end-of-statement _flush_pending_temps cover
+				# that case exactly like any other never-consumed fresh temp.
+				self._cfg.fresh_temp( dest, expected_type )
 			operand = dest
 		# a same-signedness, strictly-wider scalar (i32 -> i64, u8 -> u32,
 		# f32 -> f64) is a safe, value-preserving widening - allowed
