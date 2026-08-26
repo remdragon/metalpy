@@ -5803,10 +5803,33 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	main_has_wrapper = main_lf is not None and not main_lf.function.parameters
 	deinit_enabled = _target_debug and leak_check and main_has_wrapper
 	if deinit_enabled:
-		rc_globals_reverse = [
-			g.variable for g in reversed( _topologically_sort_globals( compiler ))
-			if g.variable.type.is_rc()
+		ordered_globals = _topologically_sort_globals( compiler )
+		ordered_qualnames = { g.variable.qualname for g in ordered_globals }
+		# a global whose OWN initializer is trivial (_is_trivial_global_init/
+		# _global_init_is_all_zero_value_type, e.g. `_cache: Foo|None = None`)
+		# never gets a call from __metalpy_init() and so never enters
+		# ordered_globals above - correct for INIT (nothing to call), but
+		# WRONG to then also skip it here: reassigned_outside_init means some
+		# function writes it via `global` (a lazy-singleton cache, e.g.
+		# datetime.localtz()'s own `__localtz`) - it can absolutely hold a
+		# real RC value by the time main() returns even though its own
+		# static initializer was trivial. Appended AFTER the topologically-
+		# ordered ones (not interleaved): these were never part of that
+		# dependency graph in the first place (a trivial initializer has no
+		# init-time dependency edges to order against), so there's no real
+		# construction order to reverse for them - decreffing them last is
+		# as good an order as any and keeps the graph's own ordering exact
+		# for everything that WAS actually in it.
+		lazy_rc_globals = [
+			g.variable for g in compiler.globals
+			if g.variable.qualname not in ordered_qualnames
+			and g.variable.reassigned_outside_init
+			and g.variable.type.is_rc()
 		]
+		rc_globals_reverse = [
+			g.variable for g in reversed( ordered_globals )
+			if g.variable.type.is_rc()
+		] + lazy_rc_globals
 		# reuses cfg.py's own union-aware decref() (via Lowering.
 		# lower_deinit_epilogue) - identical dispatch to an ordinary local/
 		# field release, so a global wrapping a nested-union RC leaf gets
