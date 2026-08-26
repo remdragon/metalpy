@@ -4610,7 +4610,19 @@ class FunctionLowering:
 					# __setitem__ is skipped entirely: this is the concrete
 					# fix for needing two separately-covered Results (one
 					# from __getitem__, one from __setitem__) for what's
-					# conceptually one fallible operation
+					# conceptually one fallible operation.
+					# When the Result was fallible, _maybe_consume_result's
+					# own or_throw() extraction incref's this owned copy but
+					# (unlike get_dest's Call dest, auto-registered by _emit)
+					# never registers IT as a fresh_temp - it's normally handed
+					# straight to a Variable's Assign, whose own lifetime
+					# absorbs the ownership. Here it's only ever passed as the
+					# iplace call's receiver, so without this explicit
+					# registration nothing ever decrefs it - a leaked Counter
+					# confirmed via the leak-check epilogue. Idempotent when
+					# `old` is still just get_dest (non-fallible __getitem__),
+					# already registered by its own Call emission.
+					self._cfg.fresh_temp( old, elem_type )
 					self._emit_iplace_dunder_call( node, iplace_method, old, right )
 					return
 				set_shape = self.lowering._type_resolver._result_shape( setitem_fn.return_type )
