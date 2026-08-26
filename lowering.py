@@ -8869,32 +8869,48 @@ class FunctionLowering:
 		# a derived RCClass value flowing into a base-class context (arg, return,
 		# assignment) is an upcast: struct Derived* -> struct Base*, which C
 		# rejects without an explicit cast. A CastWrap is a borrowed reinterpret
-		# (its temp is never RC-registered - see _lower_bound_method_closure's own
-		# note), so this adds no incref/decref, exactly right for passing the
-		# SAME object under its base type. Restricted to a genuine strict-subclass
-		# relationship so it never masks an unrelated type mismatch.
+		# (its temp is never RC-registered for a borrowed operand - see
+		# _lower_bound_method_closure's own note), so this adds no incref/decref,
+		# exactly right for passing the SAME object under its base type.
+		# Restricted to a genuine strict-subclass relationship so it never masks
+		# an unrelated type mismatch.
 		elif ( expected_type is not None and operand.type is not expected_type
 				and self._is_rcclass_upcast( operand.type, expected_type ) ):
-			if self._cfg.is_fresh_temp( operand ):
-				# ownership is moving into the CastWrap's own dest below,
-				# which is deliberately never RC-registered (see the comment
-				# just above) - untrack the PRE-cast temp here so its own
-				# end-of-statement flush doesn't ALSO decref/free the very
-				# object the cast just handed off, out from under it. Same
-				# "was_fresh" guard the union-coercion branch above already
-				# needs, just transferring ownership silently instead of
-				# decref'ing (that branch fixes a double-incref/leak; this one
-				# fixes the opposite - a temp left registered with nothing
-				# left to consume it, later swept as if abandoned). Confirmed
-				# via a real compile-and-run use-after-free: `o: Ops =
-				# RealOps()` (Ops a base class, RealOps a subclass) segfaulted
-				# - the fresh RealOps object was released() immediately after
+			was_fresh = self._cfg.is_fresh_temp( operand )
+			if was_fresh:
+				# ownership is moving into the CastWrap's own dest below -
+				# untrack the PRE-cast temp here so its own end-of-statement
+				# flush doesn't ALSO decref/free the very object the cast
+				# just handed off, out from under it. Same "was_fresh" guard
+				# the union-coercion branch above already needs, just
+				# transferring ownership silently instead of decref'ing
+				# (that branch fixes a double-incref/leak; this one fixes
+				# the opposite - a temp left registered with nothing left to
+				# consume it, later swept as if abandoned). Confirmed via a
+				# real compile-and-run use-after-free: `o: Ops = RealOps()`
+				# (Ops a base class, RealOps a subclass) segfaulted - the
+				# fresh RealOps object was released() immediately after
 				# construction, right after being upcast into the base-typed
 				# local, while `o` still pointed at the same (now-freed)
 				# memory.
 				self._cfg.untrack_temp( operand )
 			dest = self._new_temp( expected_type )
 			self._emit( ir.CastWrap( dest = dest, operand = operand ) )
+			if was_fresh:
+				# re-register the ownership on `dest` (not `operand`, dropped
+				# above) so it isn't just silently dropped when nothing
+				# downstream (assign()/field_value()/move()) claims it - e.g.
+				# a fresh upcast used directly as an ordinary (non-move[T])
+				# call argument, never bound to a name at all. Without this,
+				# the single reference from construction ends up owned by
+				# nobody: neither the pre-cast temp (untracked above) nor
+				# dest (never registered) - a real leak, not just a
+				# bookkeeping gap, confirmed via a debug-build live-object
+				# report. A downstream consumer that DOES claim it still
+				# untracks dest itself (assign()'s is_alias=False branch,
+				# field_value(), etc - the same discipline as any other
+				# fresh temp), so this is a no-op for that path.
+				self._cfg.fresh_temp( dest, expected_type )
 			operand = dest
 		# a same-signedness, strictly-wider scalar (i32 -> i64, u8 -> u32,
 		# f32 -> f64) is a safe, value-preserving widening - allowed
