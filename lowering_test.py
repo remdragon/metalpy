@@ -9740,6 +9740,65 @@ class TryExceptOrThrowLoweringTests( unittest.TestCase ):
 			'expected a MarkUsed of the hidden except-value local',
 		)
 
+# --- generic construction from an overloaded __init__ (probe/real split) ---
+
+class OverloadedGenericConstructionProbeTests( unittest.TestCase ):
+	''' _lower_call's own construction-sugar path for `Cls(...)` where Cls is
+	generic AND __init__ is an Overload group: the winning candidate has to
+	be resolved BEFORE _lower_generic_construction_args can lower the real
+	args against its concrete parameter types, so the args are lowered once
+	here purely to learn their TYPES (overload_resolution.resolve_call needs
+	real operand.type values, not bare AST), then lowered AGAIN for real
+	against the winner. The first ("probe") lowering used to leave its own
+	emitted instructions in the output permanently - a real, observable
+	instruction-level duplication for any argument with a side effect (a
+	generator-returning call increfs its own captured receiver as part of
+	construction), not just wasted compile-time work. Real repro: grap.mpy's
+	`list( r_pattern.finditer( mv ) )` left r_pattern with one extra,
+	never-released reference (re.Pattern.finditer is called twice, only one
+	generator ever consumed). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ) )
+
+	def test_generator_returning_argument_lowered_exactly_once( self ) -> None:
+		code = '\n'.join([
+			'class Item:',
+			'	v: i32',
+			'',
+			'class Foo:',
+			'	x: i32',
+			'	def gen( self, n: usize ) -> Generator[Item, StopIteration]:',
+			'		i: usize = 0',
+			'		with compiler.wrap_arithmetic:',
+			'			while i < n:',
+			'				m: Item = Item( v = self.x )',
+			'				yield m',
+			'				i += 1',
+			'',
+			'def main( f: Foo ) -> usize:',
+			'	items: list[Item] = list( f.gen( 3 ) )',
+			'	return len( items )',
+		])
+		mod = self._import( code )
+		main_fn = mod.get_local( 'main' )
+		if main_fn.resolve is not None:
+			main_fn.resolve()
+		fn = self.compiler._lower( main_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		gen_calls = [
+			i for i in fn.instructions
+			if isinstance( i, ir.Call ) and i.target.qualname == '__test__.Foo.gen'
+		]
+		self.assertEqual(
+			len( gen_calls ), 1,
+			f'expected exactly one call to Foo.gen (the probe/real split must not leave a duplicate), got {len(gen_calls)}: {gen_calls!r}',
+		)
+
 # --- @inline (PLAN_INLINE.md) -------------------------------------------
 
 class InlineTests( unittest.TestCase ):
