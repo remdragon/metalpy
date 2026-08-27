@@ -9042,8 +9042,7 @@ class FunctionLowering:
 			for instr in false_extra:
 				self._emit( instr )
 			self._emit( ir.Label( name = end_label ))
-		else:
-			self._emit( ir.Label( name = else_label ))
+		elif false_extra:
 			# false_extra used to always be empty here (merge_if's "fresh on
 			# exactly one branch" case can only ever populate
 			# false_instructions when a real ast.orelse existed, since
@@ -9052,11 +9051,25 @@ class FunctionLowering:
 			# ownership-disagreement flag reconciliation (the "if x is
 			# None: x = Owned(...)" idiom, no else needed) DOES need to land
 			# a disarm Assign on exactly this implicit "condition was
-			# false" path - dropping it here would silently leave the flag
-			# permanently armed, decref'ing a merely-borrowed value at the
-			# eventual epilogue.
+			# false" path. Needs the SAME Jump-over-else the real-orelse
+			# branch above already has: true_captured/true_extra fall
+			# straight through into else_label with no separating Jump, so
+			# WITHOUT one, this disarm ran on BOTH paths unconditionally -
+			# not just the "condition was false" one it's actually meant
+			# for - permanently disarming the flag regardless of which
+			# branch ran, silently leaking whatever the if-branch's own
+			# reassignment made owned (confirmed via a real repro: `if not
+			# ys: ys = make()`, ys a parameter, leaked the list make()
+			# returns on the path that reassigns it - flag defaults armed,
+			# but this unconditional disarm cancelled it either way).
+			end_label = self._new_label( 'if_end' )
+			self._emit( ir.Jump( target = end_label ))
+			self._emit( ir.Label( name = else_label ))
 			for instr in false_extra:
 				self._emit( instr )
+			self._emit( ir.Label( name = end_label ))
+		else:
+			self._emit( ir.Label( name = else_label ))
 
 	# --- expressions -----------------------------------------------------------
 

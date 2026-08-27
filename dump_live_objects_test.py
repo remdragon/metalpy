@@ -374,5 +374,67 @@ class FallibleGlobalInitializerLeakTests( RealCompileMixin, unittest.TestCase ):
 		self.assertIn( 'count=1', foo_lines[0], f'the Result[Foo,MyError] intermediate must not leak a second Foo reference:\n{out}' )
 
 
+# lowering.py's _stmt_If - `if cond: x = Owned(...)` with NO explicit else,
+# x a borrowed parameter reassigned to a fresh owned value only inside the
+# if-body: merge_if()'s own ownership-disagreement reconciliation mints a
+# cancel flag for x's new epilogue-release obligation, default-armed True
+# at function entry, meant to be DISARMED (set False) only on the implicit
+# "condition was false" path (x stays borrowed, nothing to release). The
+# disarm Assign is correctly emitted right at else_label - but _stmt_If's
+# own no-explicit-orelse branch never emitted a Jump to SKIP else_label
+# from the end of the if-body's own code, so the if-body fell straight
+# through into the disarm unconditionally, on BOTH paths - permanently
+# disarming the flag even when the if-branch DID run and DID make x owned,
+# leaking whatever it was reassigned to. Confirmed via a real repro:
+# grap.mpy's own `if not filespecs: filespecs = ['*']`.
+_BORROWED_PARAM_REASSIGNED_IN_IF_LEAK = '''
+import sys
+
+class Foo:
+	x: i32
+	def __init__(self, x: i32) -> None:
+		self.x = x
+
+def make() -> Foo:
+	return Foo( 99 )
+
+def helper( y: Foo ) -> i32:
+	if y.x == 0:
+		y = make()
+	return y.x
+
+def main() -> i32:
+	y: Foo = Foo( 0 )
+	result = helper( y )
+	sys.dump_live_objects() # BEFORE returning - y (the caller's own borrowed original) is still live; make()'s own Foo must not also still be live
+	with compiler.wrap_arithmetic:
+		return 0 if result == 99 else 1
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class BorrowedParamReassignedInIfLeakTests( RealCompileMixin, unittest.TestCase ):
+	def test_reassigning_a_borrowed_param_inside_an_elseless_if_does_not_leak( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( _BORROWED_PARAM_REASSIGNED_IN_IF_LEAK, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ))
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 10 )
+		self.assertEqual( result.returncode, 0,
+			f'program crashed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}'
+			f'{test_support.c_source_on_failure( c_source )}' )
+		out = result.stdout.decode( 'utf-8', errors = 'replace' )
+		# only main()'s own `y` (Foo(0)) should survive to be reported -
+		# helper()'s own local reassignment (y = make()) must be fully
+		# released before helper() returns; a leak there would show a
+		# SECOND __main__.Foo group (make()'s own instance, never released)
+		foo_lines = [ line for line in out.splitlines() if '__main__.Foo @' in line ]
+		self.assertEqual( len( foo_lines ), 1, f'expected exactly 1 __main__.Foo group (main\'s own y), got:\n{out}' )
+		self.assertIn( 'count=1', foo_lines[0], f'helper()\'s own reassigned y (make()\'s Foo) must not leak:\n{out}' )
+
+
 if __name__ == '__main__':
 	unittest.main()
