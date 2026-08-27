@@ -11018,15 +11018,32 @@ class FunctionLowering:
 			if isinstance( names, dict ):
 				name_obj = names.get( attr )
 				if isinstance( name_obj, Variable ):
-					# module-level `_x`/`__x` privacy (SYNTAX.md) - a safe
-					# no-op unless name_obj is a genuine module-level global
-					# (is_global) - see check_module_visibility's own
-					# docstring. A class attribute reached this same way
-					# (obj a ClassLike, not a Module) is unaffected.
-					if id( name_obj ) not in self._inline_param_alias_ids:
-						self.lowering.discovery.check_module_visibility( name_obj, node, self._owning_module )
-					self.lowering._ensure_resolved( name_obj )
-					return name_obj
+					# `Foo.flag` (obj resolved to the CLASS itself) where
+					# `flag` is an ordinary per-instance field (is_global is
+					# False for anything class-scoped, since scope is the
+					# class, not the module - see is_global's assignment)
+					# reaches this same names dict, so it must be excluded
+					# here rather than at the isinstance(obj, RCClass, ...)
+					# check below, which never runs otherwise: an instance
+					# field's Variable lives on each OBJECT, never on the
+					# class as a standalone value the way a real
+					# module-level global does. Give a specific, actionable
+					# message instead of falling through to _expr_Name's own
+					# generic "'Foo' is not a value" (which still fires
+					# below, but only names the CLASS, not the actual
+					# attribute the user was trying to reach).
+					if name_obj.is_global:
+						# module-level `_x`/`__x` privacy (SYNTAX.md)
+						if id( name_obj ) not in self._inline_param_alias_ids:
+							self.lowering.discovery.check_module_visibility( name_obj, node, self._owning_module )
+						self.lowering._ensure_resolved( name_obj )
+						return name_obj
+			if isinstance( obj, ( RCClass, CStruct, TaggedUnion, CUnion ) ):
+				self.lowering.discovery.fail(
+					f'{ast.unparse(node)}: class attribute access is not supported - read {attr!r} through an instance instead '
+					f'(e.g. some_{obj.stem.lower()}.{attr})',
+					node,
+				)
 		obj = self._lower_expr( node.value, None )
 		# worker.run used as a VALUE (no call parens) - _attr_lookup below
 		# only ever finds a Variable (a real field); a method is a
