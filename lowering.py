@@ -2123,6 +2123,11 @@ class FunctionLowering:
 		# own Parameter exists (not yet constructed this early).
 		self._ever_declared_stems: set[str] = { p.stem for p in ( fn.parameters or [] )} if fn is not None else set()
 		self._current_fn = fn
+		# set for real in run()/run_global()/run_deinit_epilogue(), right
+		# before each starts lowering anything - None here only covers the
+		# brief window before any of those runs (never actually observed by
+		# _emit(), same as _owning_module just below)
+		self._cfg: 'cfg.CFGState|None' = None
 		# ambient "line we're currently lowering", refreshed at the top of
 		# _lower_stmt/_lower_expr - debug-info only (Allocate.loc, see _emit),
 		# never save/restored, doesn't need to be exact for nested sub-exprs
@@ -2614,10 +2619,26 @@ class FunctionLowering:
 				for instr in self._cfg.assign_global_initializer( var ):
 					self._emit( instr )
 				self._emit( ir.Assign( dest = var, src = operand ))
+				# operand is now owned by var - untrack it (no Decref) BEFORE
+				# the flush below, same as _stmt_Return's identical hand-off
+				# pattern, so _flush_pending_temps' own delete_temp(operand)
+				# correctly no-ops instead of releasing the value just
+				# stored. Without this, any OTHER still-pending temp from
+				# lowering var.init (e.g. a fallible initializer's own raw
+				# Result[T,E], still holding its own internal reference to
+				# the SAME payload after .unwrap()'s narrowed extraction)
+				# was never flushed at all - the previous bare DeleteTemp-
+				# only loop below never called _cfg.delete_temp() to begin
+				# with, silently skipping every real Decref a fallible
+				# global initializer's own scaffolding needed. Confirmed via
+				# a real repro: `r_eol: re.Pattern = re.compile(...).unwrap(
+				# ...)` at module scope left the compile()'s own raw Result
+				# permanently retaining the Pattern it had already handed
+				# off, one leaked reference for the whole process lifetime.
+				self._cfg.untrack_temp( operand )
 				if cfg.rc_leaves( var.type ):
 					self._emit( ir.ReleaseGlobalLock( var = var ))
-				for t in reversed( self._pending_temps ):
-					self._emit( ir.DeleteTemp( temp = t ))
+				self._flush_pending_temps()
 
 		return self._instructions
 
@@ -2924,12 +2945,24 @@ class FunctionLowering:
 		# for any RC-typed indirect/closure call result, regardless of
 		# what consumes it (not specific to or_return(mapper) - the same
 		# repro leaks with a bare `return Result.Err(closure())`, no
-		# generator/or_return involved at all). Gated on self._current_fn -
-		# lower_global() never constructs a CFGState at all, and self._cfg
-		# would otherwise be whatever function was lowered most recently
-		# (this Lowering instance is reused across units), a strictly worse
-		# outcome than just skipping it for globals
-		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.CallIndirect, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
+		# generator/or_return involved at all). Gated on self._cfg, not
+		# self._current_fn (STALE reasoning here used to say lower_global()
+		# never constructs a CFGState at all, leaving self._cfg pointing at
+		# whatever function was lowered most recently - no longer true:
+		# run_global()/run_deinit_epilogue() both build their own fresh
+		# CFGState up front, same as run() does for a real function, so
+		# self._cfg is exactly as reliable a signal there as self._current_
+		# fn is for an ordinary function body). The self._current_fn-gated
+		# version left every module-level global's own initializer
+		# expression completely untracked - any intermediate RC temp NOT
+		# equal to the final stored value (e.g. a fallible initializer's own
+		# raw Result[T,E], still holding its own internal reference after
+		# .unwrap()'s narrowed extraction) was silently never registered for
+		# release at all, not merely un-flushed. Confirmed via a real repro:
+		# `r_eol: re.Pattern = re.compile(...).unwrap(...)` at module scope
+		# leaked the compile()'s own Result permanently, for the whole
+		# process lifetime, not just past one statement's end.
+		if self._cfg is not None and isinstance( instr, ( ir.Call, ir.CallIndirect, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
 			self._cfg.fresh_temp( instr.dest, instr.dest.type )
 		if self._current_fn is not None and isinstance( instr, ir.Allocate ):
 			if self._current_fn.stem == '$$__new__':

@@ -311,5 +311,68 @@ class AutomaticLeakCheckEpilogueTests( RealCompileMixin, unittest.TestCase ):
 			self.assertIn( 'count=1', foo_lines[0], f'globals must be excluded from the leak report:\n{out}' )
 
 
+# lowering.py's Lowering.run_global()/FunctionLowering._emit() - a module-
+# level global's own initializer expression is lowered with fn=None (no
+# enclosing function - run_global()'s own "no fn/self/construction of its
+# own" comment), but DOES build a real CFGState up front, same as an
+# ordinary function body. _emit()'s own fresh_temp() registration (needed
+# for ANY intermediate RC temp - e.g. a fallible initializer's own raw
+# Result[T,E], still holding its own internal reference after .unwrap()'s
+# narrowed extraction - to ever get flushed/released) used to be gated on
+# self._current_fn is not None instead of self._cfg is not None, a stale
+# leftover from before run_global() built its own CFGState - silently
+# skipped fresh_temp() registration for EVERY module-level global
+# initializer in the program, leaking any such intermediate temp
+# permanently (not just past one statement - for the whole process
+# lifetime, since nothing ever flushed it). Real repro: `R_EOL: Foo =
+# make_fallible().unwrap('msg')` at module scope.
+_FALLIBLE_GLOBAL_INITIALIZER_LEAK = '''
+import compiler
+import sys
+
+class Foo:
+	x: i32
+	def __init__(self, x: i32) -> None:
+		self.x = x
+
+class MyError:
+	pass
+
+def make_fallible() -> Result[Foo, MyError]:
+	return Result.Ok( Foo( 7 ))
+
+R: Foo = make_fallible().unwrap( 'should not fail' )
+
+def main() -> i32:
+	ok = R.x == 7
+	sys.dump_live_objects() # BEFORE returning - R itself is still live, only the Result's own intermediate payload reference should be gone
+	with compiler.wrap_arithmetic:
+		return 0 if ok else 1
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class FallibleGlobalInitializerLeakTests( RealCompileMixin, unittest.TestCase ):
+	def test_fallible_initializer_leaves_no_intermediate_result_alive( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( _FALLIBLE_GLOBAL_INITIALIZER_LEAK, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ))
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 10 )
+		self.assertEqual( result.returncode, 0,
+			f'program crashed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}'
+			f'{test_support.c_source_on_failure( c_source )}' )
+		out = result.stdout.decode( 'utf-8', errors = 'replace' )
+		# a leaked intermediate Foo (the Result's own internal payload
+		# reference, never released) would show up here too, count=2 -
+		# only R's own single, final instance should survive to be reported
+		foo_lines = [ line for line in out.splitlines() if '__main__.Foo @' in line ]
+		self.assertEqual( len( foo_lines ), 1, f'expected exactly 1 __main__.Foo group (R itself), got:\n{out}' )
+		self.assertIn( 'count=1', foo_lines[0], f'the Result[Foo,MyError] intermediate must not leak a second Foo reference:\n{out}' )
+
+
 if __name__ == '__main__':
 	unittest.main()
