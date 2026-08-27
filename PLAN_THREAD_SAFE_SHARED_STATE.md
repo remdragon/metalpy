@@ -13,9 +13,8 @@ all previously-blocking bugs fixed, verified under real concurrent stress
 to master.**
 
 **Performance follow-ons (the "Cost mitigations" section below) - status
-update: staged into 4 sessions, Stages 1-3 landed and merged (see Cost
-mitigations #1/#2/#3's own status updates for the full writeups), Stage 4
-not yet started.**
+update: staged into 4 sessions, all 4 stages landed and merged (see Cost
+mitigations #1/#2/#3/#4's own status updates for the full writeups).**
 
 What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
 mirroring Part A's global-lock markers, keyed on the receiver operand
@@ -1194,6 +1193,64 @@ issue.)
    sizing tradeoff as B.2. Worth prototyping once A/B land, not a
    precondition for landing them.
 
+   **Status update: implemented and merged (Stage 4).** `ir.AcquireGlobalLock`/
+   `ReleaseGlobalLock`/`AcquireFieldLock`/`ReleaseFieldLock` all gained a new
+   `exclusive: bool = True` operand (default True - the SAFE choice for any
+   call site not updated, since a write mistakenly marked exclusive is only
+   slower, never unsound). Every read-side emission site (cfg.py's `assign()`
+   own `is_alias` branch, `lowering.py`'s `_expr_Attribute`, the AugAssign
+   "retain old" critical section, `compiler.decref(obj.field)`'s bypass
+   lowering, the narrowed-union-global extraction) now passes
+   `exclusive = False`; every write-side site (the global/field reassignment
+   branches, the AugAssign replace/write critical section) keeps the default.
+   Windows: `AcquireSRWLockShared`/`ReleaseSRWLockShared` (real Win32
+   exports, natively supported by the same `SRWLOCK` A.3/B.2 already use) -
+   close to free, exactly as this question predicted. POSIX: **not**
+   `pthread_rwlock_t` (that would reintroduce the real-init-call,
+   larger-than-a-plain-word cost Stage 3 just eliminated) - a hand-rolled RW
+   spinlock on top of Stage 3's own `_Atomic uint32_t` word instead, bit 31
+   as a writer flag, the low 31 bits as a live reader count, CAS-based both
+   ways (`_PROLOGUE_POSIX_SPINLOCK` in `emitter_c.py`). No fairness
+   guarantee either direction - accepted, matching this item's own
+   "worth prototyping... not committed" framing, given how short every
+   critical section this protects actually is. `acquire_field_lock`/
+   `release_field_lock` (Part B's own one-place functions) gained a `bool
+   exclusive` parameter rather than splitting into four separately-named
+   functions - the C ternary `exclusive ? f() : g()` (both `void`) is valid
+   standard C (C11 6.5.15p3), not a GNU extension.
+
+   **B.4 reentrancy re-examination (required by this stage, not deferred):**
+   confirmed against real generated C under real concurrent load, not just
+   re-read comments - `thread_safe_fields_test.py`'s new
+   `test_field_reentrancy_stress` exercises the exact hazard shape
+   (`self.box.a = self.box.get_b()` - a setter whose own value expression
+   calls a getter reading a DIFFERENT field on the SAME receiver) under 8
+   writer + 16 reader threads, 2000 iterations each, with an explicit short
+   timeout (15s, not this file's usual 30s) so a genuine self-deadlock would
+   fail the test cleanly instead of hanging the suite. Passes clean - by
+   construction, a critical section never spans more than one field access
+   (B.3's own "lock the access, not the statement" design, unchanged by this
+   stage), so no nested acquire on the same object's `$header.lock` was ever
+   possible in the first place; this test is the confirming evidence, not a
+   fix.
+
+   **Sabotage-and-confirm:** forcing `__metalpy_spinlock_acquire_shared` to
+   silently take no lock at all (while its own paired `_release_shared`
+   still unconditionally decrements the reader count) corrupted the shared
+   word's low bits into looking permanently writer-held after the first
+   reader completed - not a crash, but a genuine, reproduced **hang**
+   (`test_concurrent_read_write_stress`/`test_concurrent_field_read_write_
+   stress` both timed out at their own 30s bound rather than completing),
+   confirming the sabotage is load-bearing; restored immediately after
+   confirming that. Full 3-compiler suite clean, including
+   `METALPY_RUN_LOAD_TESTS=1` on WSL/gcc.
+
+   With Stage 4 landed, all four items originally staged from this
+   document's own "Cost mitigations"/"Open questions" sections are now
+   implemented and merged (Cost mitigation #5/item 5's retain-on-read
+   elision is the sole exception, investigated twice and explicitly
+   NOT pursued - see its own status update above).
+
 ## Relationship to `Lazy[T]`/`Once[T]`
 
 This document and the (separately proposed, not yet built) `threading.
@@ -1290,6 +1347,11 @@ a lazy-init site and a crash.
    any other language with fine-grained locks," but say so.
 4. **Read-write lock semantics** (cost mitigation #4) — prototype and
    measure before committing either way.
+
+   **Status update: implemented and merged - see Cost mitigation #4's own
+   status update above for the full writeup** (Windows SRWLOCK shared/
+   exclusive, a hand-rolled POSIX RW spinlock, the B.4 reentrancy
+   re-examination this stage was also required to close).
 5. **Whether the whole-program on/off switch (cost mitigation #1) should
    itself be user-overridable** (e.g. a compiler flag to force it on for
    a program that spawns threads via some path the compiler can't see,

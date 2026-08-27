@@ -1466,12 +1466,17 @@ def _global_lock_name( var: Variable ) -> str:
 # emitted here silently stops matching the struct's own real declaration.
 _SRWLOCK_STRUCT_NAME = mangle_qualname( 'windows.kernel32.SRWLOCK' )
 
-def _global_lock_acquire( lock_name: str ) -> str:
+def _global_lock_acquire( lock_name: str, exclusive: bool = True ) -> str:
+	''' `exclusive` (Cost mitigation #4) selects which of the two real
+	primitives to call - see ir.AcquireGlobalLock's own docstring for what
+	determines the caller's choice. Defaults True (matching
+	ir.AcquireGlobalLock's own default) so any caller not yet updated for
+	RW semantics keeps today's always-exclusive behavior. '''
 	if _target_uses_posix_lock():
-		# Cost mitigation #3's CAS spinlock, not lib/threading.py's own
-		# FastLock and not a real pthread_mutex_t either (see
+		# Cost mitigation #3/#4's CAS (RW) spinlock, not lib/threading.py's
+		# own FastLock and not a real pthread_mutex_t either (see
 		# _global_lock_name's storage declaration site) - __metalpy_
-		# spinlock_acquire/_release (_PROLOGUE_POSIX_SPINLOCK) are
+		# spinlock_acquire_exclusive/_shared (_PROLOGUE_POSIX_SPINLOCK) are
 		# force-emitted whenever any locked global/object exists on this
 		# target (see emit_c()'s own assembly, mirroring the Windows
 		# forward-declaration block just below), so they're always already
@@ -1480,13 +1485,17 @@ def _global_lock_acquire( lock_name: str ) -> str:
 		# that's already been survived (or this is a unit test exercising
 		# the string-building logic directly without going through the
 		# real gate - see this file's own tests).
-		return f'\t__metalpy_spinlock_acquire( &{lock_name} );'
-	return f'\tAcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
+		fn = '__metalpy_spinlock_acquire_exclusive' if exclusive else '__metalpy_spinlock_acquire_shared'
+		return f'\t{fn}( &{lock_name} );'
+	fn = 'AcquireSRWLockExclusive' if exclusive else 'AcquireSRWLockShared'
+	return f'\t{fn}( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
-def _global_lock_release( lock_name: str ) -> str:
+def _global_lock_release( lock_name: str, exclusive: bool = True ) -> str:
 	if _target_uses_posix_lock():
-		return f'\t__metalpy_spinlock_release( &{lock_name} );'
-	return f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
+		fn = '__metalpy_spinlock_release_exclusive' if exclusive else '__metalpy_spinlock_release_shared'
+		return f'\t{fn}( &{lock_name} );'
+	fn = 'ReleaseSRWLockExclusive' if exclusive else 'ReleaseSRWLockShared'
+	return f'\t{fn}( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
 def _field_lock_prologue() -> str:
 	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part B: acquire_field_lock/
@@ -1512,20 +1521,24 @@ def _field_lock_prologue() -> str:
 	exclusion for field access to be safe UNLESS something actually
 	reassigns that field concurrently - immortal objects in this codebase
 	are exactly the ones nothing does that to (compile-time constants), so
-	this stays sound, not just convenient. '''
+	this stays sound, not just convenient. A `bool exclusive` parameter
+	(Cost mitigation #4), not two separately-named function pairs - every
+	call site already computes its own mode as a plain bool (ir.
+	AcquireFieldLock.exclusive), so branching once here is simpler than
+	branching once per call site on which NAME to call. '''
 	if _target_uses_posix_lock():
-		lock_expr = '__metalpy_spinlock_acquire( &obj->lock )'
-		unlock_expr = '__metalpy_spinlock_release( &obj->lock )'
+		lock_expr = 'exclusive ? __metalpy_spinlock_acquire_exclusive( &obj->lock ) : __metalpy_spinlock_acquire_shared( &obj->lock )'
+		unlock_expr = 'exclusive ? __metalpy_spinlock_release_exclusive( &obj->lock ) : __metalpy_spinlock_release_shared( &obj->lock )'
 	else:
-		lock_expr = f'AcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
-		unlock_expr = f'ReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
+		lock_expr = f'exclusive ? AcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock ) : AcquireSRWLockShared( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
+		unlock_expr = f'exclusive ? ReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock ) : ReleaseSRWLockShared( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
 	return (
-		f'static inline void acquire_field_lock( ObjectHeader* obj ) {{\n'
+		f'static inline void acquire_field_lock( ObjectHeader* obj, bool exclusive ) {{\n'
 		f'\tif ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {{\n'
 		f'\t\t{lock_expr};\n'
 		f'\t}}\n'
 		f'}}\n'
-		f'static inline void release_field_lock( ObjectHeader* obj ) {{\n'
+		f'static inline void release_field_lock( ObjectHeader* obj, bool exclusive ) {{\n'
 		f'\tif ( obj && obj->ref_count != METALPY_IMMORTAL_REFCOUNT ) {{\n'
 		f'\t\t{unlock_expr};\n'
 		f'\t}}\n'
@@ -1667,38 +1680,67 @@ def _field_lock_exempt( field: 'Variable|None' ) -> bool:
 # number of times - only a full body can't be repeated) - safe to emit
 # unconditionally here regardless of whether lib/threading.py's FastLock
 # is used anywhere else in this program.
+# AcquireSRWLockShared/ReleaseSRWLockShared (Cost mitigation #4) sit
+# alongside the pre-existing Exclusive pair - real, documented Win32
+# exports (SRWLOCK natively supports both modes), not something this
+# codebase invents - see _global_lock_acquire/_field_lock_prologue's own
+# comments for which call each `exclusive` value dispatches to.
 _PROLOGUE_GLOBAL_LOCK_WINDOWS = f'''\
 struct {_SRWLOCK_STRUCT_NAME};
 void AcquireSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
 void ReleaseSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
+void AcquireSRWLockShared( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
+void ReleaseSRWLockShared( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
 '''
 
 # the POSIX counterpart of _PROLOGUE_GLOBAL_LOCK_WINDOWS above - Cost
-# mitigation #3's CAS spinlock, shared verbatim by BOTH Part A's per-global
-# lock and Part B's per-object $header.lock (_global_lock_acquire/_release,
-# _field_lock_prologue all call these same two functions), the same "one
-# shared primitive, not two copy-pasted ones" reasoning
-# _target_uses_posix_lock's own docstring already applies to the OS check.
-# atomic_compare_exchange_weak (not _strong): this is a retry LOOP anyway
-# (a spurious failure just costs one extra iteration), and _weak compiles to
-# a tighter loop on the architectures that distinguish the two (a real,
-# documented tradeoff, not a shortcut - see C11's own 7.17.7.4). sched_yield
-# (<sched.h>, not a busy-only spin) after a failed attempt, matching this
-# repo's own "very short critical sections, spin instead of descheduling to
-# a futex is fine here" sizing decision (PLAN_THREAD_SAFE_SHARED_STATE.md's
-# own Cost mitigation #3 writeup) while still yielding the CPU to whoever's
-# actually holding the lock, rather than pegging a core the whole time.
+# mitigation #3's CAS spinlock, extended by Cost mitigation #4 into a real
+# (if simple, writer-preferring-nothing/first-come-first-served-only-by-
+# accident) reader-writer spinlock, shared verbatim by BOTH Part A's
+# per-global lock and Part B's per-object $header.lock (_global_lock_
+# acquire/_release, _field_lock_prologue all call these same four
+# functions), the same "one shared primitive, not two copy-pasted ones"
+# reasoning _target_uses_posix_lock's own docstring already applies to the
+# OS check. Single word encoding (same `_Atomic uint32_t` Cost mitigation
+# #3 already sized this field for - no growth): bit 31 (_WRITER_BIT) set
+# means a writer holds it, the low 31 bits are a live reader count -
+# mutually exclusive by construction (the writer CAS only ever succeeds
+# from a fully-zero word, i.e. no readers AND no writer, and a reader's own
+# CAS only ever succeeds when _WRITER_BIT is clear). atomic_compare_
+# exchange_weak (not _strong) throughout - see Cost mitigation #3's own
+# identical reasoning (a retry loop already tolerates a spurious failure,
+# and _weak compiles to a tighter loop on the architectures that
+# distinguish the two - C11 7.17.7.4). sched_yield() between attempts,
+# same short-critical-section sizing decision Cost mitigation #3 made.
+# No fairness/starvation guarantee for either role (a steady stream of
+# readers can starve a waiting writer, or vice versa) - not attempted here,
+# matching the plan doc's own "worth prototyping... not committed" framing
+# for this whole stage; acceptable given how short every critical section
+# this protects actually is.
 _PROLOGUE_POSIX_SPINLOCK = '''\
 #include <sched.h>
-static inline void __metalpy_spinlock_acquire( _Atomic uint32_t* lock ) {
+#define __METALPY_RWSPINLOCK_WRITER_BIT ((uint32_t)0x80000000u)
+static inline void __metalpy_spinlock_acquire_exclusive( _Atomic uint32_t* lock ) {
 	uint32_t expected = 0;
-	while ( !atomic_compare_exchange_weak( lock, &expected, 1 ) ) {
+	while ( !atomic_compare_exchange_weak( lock, &expected, __METALPY_RWSPINLOCK_WRITER_BIT ) ) {
 		expected = 0;
 		sched_yield();
 	}
 }
-static inline void __metalpy_spinlock_release( _Atomic uint32_t* lock ) {
+static inline void __metalpy_spinlock_release_exclusive( _Atomic uint32_t* lock ) {
 	atomic_store( lock, 0 );
+}
+static inline void __metalpy_spinlock_acquire_shared( _Atomic uint32_t* lock ) {
+	for ( ;; ) {
+		uint32_t expected = atomic_load( lock );
+		if ( !( expected & __METALPY_RWSPINLOCK_WRITER_BIT ) ) {
+			if ( atomic_compare_exchange_weak( lock, &expected, expected + 1 ) ) return;
+		}
+		sched_yield();
+	}
+}
+static inline void __metalpy_spinlock_release_shared( _Atomic uint32_t* lock ) {
+	atomic_fetch_sub( lock, 1 );
 }
 '''
 
@@ -4010,19 +4052,19 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# race regardless of what this global does - a pure no-op
 			# either way, not a partial/best-effort lock
 			return []
-		return [ _global_lock_acquire( _global_lock_name( instr.var ))]
+		return [ _global_lock_acquire( _global_lock_name( instr.var ), instr.exclusive )]
 	if isinstance( instr, ir.ReleaseGlobalLock ):
 		if not ( instr.var.reassigned_outside_init and _global_lock_supported() and _program_uses_threads ):
 			return []
-		return [ _global_lock_release( _global_lock_name( instr.var ))]
+		return [ _global_lock_release( _global_lock_name( instr.var ), instr.exclusive )]
 	if isinstance( instr, ir.AcquireFieldLock ):
 		if not ( _global_lock_supported() and _program_uses_threads ) or _field_lock_exempt( instr.field ):
 			return [] # unsupported target, no thread ever spawned, or a provably write-once-in-__init__ __private field (Cost mitigation #2) - see the relevant helpers' own docstrings
-		return [ f'\tacquire_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
+		return [ f'\tacquire_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}), {"true" if instr.exclusive else "false"} );' ]
 	if isinstance( instr, ir.ReleaseFieldLock ):
 		if not ( _global_lock_supported() and _program_uses_threads ) or _field_lock_exempt( instr.field ):
 			return []
-		return [ f'\trelease_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
+		return [ f'\trelease_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}), {"true" if instr.exclusive else "false"} );' ]
 	if isinstance( instr, ir.DecrefDynamic ):
 		# instr.value is Ptr[None] (type-erased) - $header is always the
 		# FIRST member of every RCClass struct (emit_rcclass's own field-
@@ -5493,6 +5535,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		# windows.kernel32 for anything else.
 		compiler.extern_libs.setdefault( 'kernel32', set() ).update((
 			'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive',
+			'AcquireSRWLockShared', 'ReleaseSRWLockShared', # Cost mitigation #4
 		))
 	# Cost mitigation #3: POSIX no longer needs an equivalent force-
 	# registration block here - the CAS spinlock (_PROLOGUE_POSIX_SPINLOCK)

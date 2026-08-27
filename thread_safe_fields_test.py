@@ -449,6 +449,99 @@ def main() -> i32:
 '''
 
 
+# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #4's own required B.4
+# reentrancy re-examination, confirmed against real generated C under real
+# concurrent load, not just re-read comments. Writer.run's own
+# `self.box.a = self.box.get_b()` is the exact shape B.4 worries about: the
+# ASSIGNMENT's own write-side critical section (self.box.a) is opened only
+# AFTER its value expression (self.box.get_b()) has FULLY lowered and
+# RELEASED its own internal read-side critical section (self.b, inside
+# get_b) - if that boundary were ever wrong (a nested acquire on the SAME
+# object's $header.lock before the first is released), a real non-reentrant
+# RW spinlock would either self-deadlock (caught by this test's own
+# timeout, not a hang forever) or, if the encoding let a shared+exclusive
+# pair silently coexist, corrupt state (caught by saw_bad below, same as
+# every other stress test in this file).
+_FIELD_REENTRANCY_STRESS = '''
+import compiler
+import threading
+
+class Payload:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Box:
+	a: Payload
+	b: Payload
+	def __init__( self, a: Payload, b: Payload ) -> None:
+		self.a = a
+		self.b = b
+	def get_b( self ) -> Payload:
+		return self.b
+
+class Writer:
+	box: Box
+	def __init__( self, box: Box ) -> None:
+		self.box = box
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 2000:
+			self.box.a = self.box.get_b()
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+class Reader:
+	box: Box
+	saw_bad: bool
+	def __init__( self, box: Box ) -> None:
+		self.box = box
+		self.saw_bad = False
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 2000:
+			p: Payload = self.box.get_b()
+			if p.v != 7:
+				self.saw_bad = True
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+def main() -> i32:
+	box: Box = Box( Payload( 1 ), Payload( 7 ) )
+	readers: list[Reader] = list[Reader]()
+	threads: list[threading.Thread] = list[threading.Thread]()
+	i: i32 = 0
+	while i < 16:
+		r: Reader = Reader( box )
+		readers.append( r )
+		threads.append( threading.Thread( r.run ) )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	i = 0
+	while i < 8:
+		w: Writer = Writer( box )
+		threads.append( threading.Thread( w.run ) )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	k: usize = 0
+	nt: usize = threads.__len__()
+	while k < nt:
+		th: threading.Thread = threads.__getitem__( k ).unwrap( 'index in bounds' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			k += 1
+	j: usize = 0
+	nr: usize = readers.__len__()
+	while j < nr:
+		r2: Reader = readers.__getitem__( j ).unwrap( 'index in bounds' )
+		if r2.saw_bad:
+			return 1
+		with compiler.wrap_arithmetic:
+			j += 1
+	return 0
+'''
+
+
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile tests' )
 class ThreadSafeFieldsTests( RealCompileMixin, unittest.TestCase ):
 	def test_while_condition_field_read_refcount_stable( self ) -> None:
@@ -490,6 +583,17 @@ class ThreadSafeFieldsTests( RealCompileMixin, unittest.TestCase ):
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
 		self.assert_programs_run([ ( 'narrowed_field_read_concurrent_stress', _NARROWED_FIELD_READ_CONCURRENT_STRESS ) ], timeout = 30.0 )
+
+	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part B only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
+	def test_field_reentrancy_stress( self ) -> None:
+		# own executable: real OS threads, must not be merged with other
+		# cases via assert_programs_run - PLAN_THREAD_SAFE_SHARED_STATE.md
+		# Cost mitigation #4's own required B.4 reentrancy re-examination
+		# (see the source's own header comment above). A short, explicit
+		# timeout (not the file's usual 30s) - a real self-deadlock here
+		# would otherwise hang the whole suite instead of failing cleanly.
+		self.assert_programs_run([ ( 'field_reentrancy_stress', _FIELD_REENTRANCY_STRESS ) ], timeout = 15.0 )
 
 
 if __name__ == '__main__':

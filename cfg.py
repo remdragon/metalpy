@@ -2296,7 +2296,7 @@ class CFGState:
 				# global that turns out to never actually be reassigned
 				# anywhere.
 				if isinstance( src, Variable ) and src.is_global:
-					instructions.append( ir.AcquireGlobalLock( var = src ))
+					instructions.append( ir.AcquireGlobalLock( var = src, exclusive = False )) # Cost mitigation #4: a read, safe to run concurrently with other readers
 				instructions += self._incref_instructions( dest.type, src ) # bump the new value first - safe even if src and dest already alias the same object
 		elif isinstance( src, ir.Temp ):
 			# ownership transfers from the temp's own (momentary) tracking

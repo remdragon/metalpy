@@ -3726,7 +3726,7 @@ class FunctionLowering:
 			# matching Acquire - confirmed as a real bug via
 			# lowering_test.py's own test_reads_module_global, which
 			# expects a plain `Assign`, nothing else, for exactly this case.
-			self._emit( ir.ReleaseGlobalLock( var = src ))
+			self._emit( ir.ReleaseGlobalLock( var = src, exclusive = False ))
 
 	def _stmt_AnnAssign( self, node: ast.AnnAssign ) -> None:
 		if not isinstance( node.target, ast.Name ):
@@ -4658,11 +4658,11 @@ class FunctionLowering:
 				# owned reference that this statement's own pending_temps
 				# cleanup balances at the end (see _new_temp/fresh_temp) -
 				# two owners in, two decrefs out, whichever branch below runs.
-				self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var ))
+				self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var, exclusive = False )) # Cost mitigation #4: a read
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
 				for instr in self._cfg.incref( attr_var.type, old ):
 					self._emit( instr )
-				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
+				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var, exclusive = False ))
 				self._cfg.fresh_temp( old, attr_var.type )
 			else:
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
@@ -7260,12 +7260,20 @@ class FunctionLowering:
 			if is_real_field:
 				self._check_field_visibility( field_obj.type, field_var, arg_node.attr, arg_node )
 			if is_real_field and cfg.rc_leaves( field_var.type ):
-				self._emit( ir.AcquireFieldLock( obj = field_obj, field = field_var ))
+				# Cost mitigation #4: a bare read of the field's CURRENT
+				# pointer value (the field's own storage is never
+				# overwritten here, only its pointee's refcount) - shared is
+				# sufficient; two concurrent compiler.decref(obj.field) calls
+				# racing each other is a caller-level double-decref trap
+				# independent of this lock's mode (both would decref the
+				# identical value regardless of exclusivity), same trust
+				# model compiler.decref()'s own docstring already documents.
+				self._emit( ir.AcquireFieldLock( obj = field_obj, field = field_var, exclusive = False ))
 				raw = self._new_temp( field_var.type )
 				self._emit( ir.GetAttr( dest = raw, obj = field_obj, attr = arg_node.attr ))
 				for instr in self._cfg.decref( field_var.type, raw ):
 					self._emit( instr )
-				self._emit( ir.ReleaseFieldLock( obj = field_obj, field = field_var ))
+				self._emit( ir.ReleaseFieldLock( obj = field_obj, field = field_var, exclusive = False ))
 				self._cfg.untrack_temp( raw )
 				return
 			# either a non-RC field (nothing to decref - falls into the
@@ -9696,13 +9704,13 @@ class FunctionLowering:
 				# window between this extraction and that later incref, in
 				# which a concurrent writer could free the very object being
 				# extracted.
-				self._emit( ir.AcquireGlobalLock( var = name ))
+				self._emit( ir.AcquireGlobalLock( var = name, exclusive = False )) # Cost mitigation #4: a read
 				payload_dest = self._new_temp( payload_cls )
 				self._emit( ir.GetAttr( dest = payload_dest, obj = name, attr = data_attr.stem ))
 				leaf_dest = self._new_temp( member.type )
 				self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
 				self._emit( ir.Incref( value = leaf_dest ))
-				self._emit( ir.ReleaseGlobalLock( var = name ))
+				self._emit( ir.ReleaseGlobalLock( var = name, exclusive = False ))
 				self._cfg.fresh_temp( leaf_dest, member.type )
 				return leaf_dest
 			payload_dest = self._new_temp( payload_cls )
@@ -11187,7 +11195,7 @@ class FunctionLowering:
 		# nothing here owns) - only obj's FIELD needs protecting.
 		attr_is_rc = bool( cfg.rc_leaves( attr_var.type )) and self._is_real_field_receiver( obj.type )
 		if attr_is_rc:
-			self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var ))
+			self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var, exclusive = False )) # Cost mitigation #4: a read
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		if is_narrowed:
 			base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
@@ -11198,13 +11206,13 @@ class FunctionLowering:
 			self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
 			if attr_is_rc:
 				self._emit( ir.Incref( value = leaf_dest ))
-				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
+				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var, exclusive = False ))
 				self._cfg.fresh_temp( leaf_dest, member.type )
 			return leaf_dest
 		if attr_is_rc:
 			for instr in self._cfg.incref( attr_var.type, dest ):
 				self._emit( instr )
-			self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
+			self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var, exclusive = False ))
 			self._cfg.fresh_temp( dest, attr_var.type )
 		# a pointer-typed field passed into a differently-typed pointer parameter
 		# (e.g. sys.memcpy( ..., self.__metadata, ... ) where src is ConstPtr[u8])
