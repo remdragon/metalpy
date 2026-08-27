@@ -17448,7 +17448,26 @@ def main() -> i32:
 		# Specialization-vs-monomorphized-type gap would most likely hide (a
 		# generic parameter's declared type stays an unresolved
 		# Specialization until substituted) - confirmed working end to end
-		# with a real substituted i32/i32 call.
+		# with a real substituted i32/i32 call. apply_or_default[i32,i32](...),
+		# explicit type args - not a bare inferred call with a bare literal
+		# 21/0 for x/default. A bare int literal's own natural type is now
+		# builtins.int, not i32 (see lowering.py's _expr_Constant), and
+		# nothing structurally links x/default's own types back to T/K
+		# without going through `key`'s own type (Ptr[Callable[[T],K]]|None,
+		# wrapped in a union type_resolver.py's own speculative pre-pass
+		# deliberately declines to drill into - see _unify_type_param's own
+		# TaggedUnion branch), so a bare 21/0 is a genuine ambiguity now
+		# that needs EITHER an explicit i32(...) cast on x/default (which,
+		# in turn, exposed a separate, real, pre-existing gap in lowering.
+		# py's own from-scratch generic inference for this exact "K only
+		# ever resolvable through a nullable Callable argument, with no
+		# type_resolver.py pre-tagging to lean on" shape - confirmed via a
+		# real repro: K reached emitter_c.py as a still-bare, unsubstituted
+		# TypeVar, "c_type: unsupported type" - not fixed here, a separate,
+		# deeper investigation) OR, taken here instead as the simpler,
+		# already-well-supported fix: spell the type arguments out
+		# explicitly, sidestepping implicit inference (and its two
+		# separate, unrelated gaps) entirely.
 		self._run( '''
 def apply_or_default[T,K]( x: T, key: Ptr[Callable[[T],K]]|None, default: K ) -> K:
 	if key is not None:
@@ -17461,7 +17480,7 @@ def double( x: i32 ) -> i32:
 
 def main() -> i32:
 	k: Ptr[Callable[[i32],i32]] = double
-	result: i32 = apply_or_default( 21, k, 0 )
+	result: i32 = apply_or_default[i32,i32]( 21, k, 0 )
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 42
 	return diff

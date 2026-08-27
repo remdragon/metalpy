@@ -5739,41 +5739,22 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		Lowering._expr_Constant's expected_type-is-None branch - deliberately
 		NOT the same mapping _type_of_expr's Constant branch uses (that one
 		means what an ANNOTATION spelling would: `int` the arbitrary-precision
-		class, `float` an alias for f32). Only for _infer_generic_args' own
-		trust_literals path below, where the question is what type the
-		argument literal will actually be lowered as.
-
-		NOTE: as of the bare-literal-defaults-to-builtins.int change,
-		Lowering._expr_Constant's own expected_type-is-None branch for a
-		bare int now ALSO sugars into builtins.int, not intrinsics.i32 -
-		this method's own int branch deliberately has NOT been updated to
-		match yet (still returns i32). Updating it surfaces a REAL, but
-		GENERAL and PRE-EXISTING (confirmed reproducible on a clean master
-		checkout, with no generics, no int, and no literal at all involved -
-		just `try_insert(MyError(), bad)` as a bare discarded statement
-		whose Result gets auto-or_throw'd via an early return) RC leak: a
-		discarded call's own fresh RC-typed ARGUMENT operand is a pending
-		temp that the statement's own NORMAL end-of-statement cleanup
-		would release, but _emit_or_throw's early-return/propagate branch
-		(lowering.py) jumps straight to the function's epilogue instead,
-		skipping that release entirely - every early-return-capable
-		construct (or_throw, or_return, checked arithmetic, ...) is
-		presumably affected identically, this is NOT a generics- or int-
-		specific bug at all. Reverted here rather than fixed alongside the
-		literal-default change - real leak, but its own separate,
-		substantially deeper investigation (CFG pending-temp release on the
-		early-return path), unrelated to what this method's own docstring
-		is about. Left stale/inconsistent on purpose in the meantime;
-		several hardcoded-i32 unit tests (type_resolver_test.py's
-		TypeResolutionTests, emitter_c_test.py's CallableTests) and this
-		method's own real callers still assume the OLD i32 mapping too. '''
+		class, `float` an alias for f32 - now the SAME mapping as this
+		method for a bare int, coincidentally, but kept as two separate
+		methods since their contracts are still conceptually distinct and
+		float/int-as-annotation still diverge). Only for _infer_generic_args'
+		own trust_literals path below, where the question is what type the
+		argument literal will actually be lowered as. '''
 		intrinsics = self.discovery.get_intrinsics()
 		if node.value is None:
 			return self.discovery.get_none_type()
 		if isinstance( node.value, bool ):
 			return intrinsics['bool']
 		if isinstance( node.value, int ):
-			return intrinsics['i32']
+			# a bare int literal with no expected type sugars into a real
+			# int(literal) construction now (Lowering._expr_Constant) - see
+			# this method's own docstring
+			return self.discovery.find_name_or_none( 'int' )
 		if isinstance( node.value, float ):
 			return intrinsics['f64']
 		if isinstance( node.value, str ):
@@ -5979,7 +5960,55 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			actual_spec = self.resolver._as_specialization( actual )
 			if actual_spec is not None and declared.base is actual_spec.base:
 				return all( self._unify_type_param( type_params, d, a, bindings ) for d, a in zip( declared.args, actual_spec.args ))
+		if isinstance( declared, TaggedUnion ):
+			# a union-typed parameter (e.g. `key: Ptr[Callable[[T],K]]|None`)
+			# CAN mention type_params inside one of its own leaves - figuring
+			# out which leaf `actual` should match needs real per-leaf
+			# narrowing this speculative pass has no business doing (that's
+			# lowering.py's own job, at real argument-lowering time, via a
+			# different mechanism entirely). If any leaf could mention a
+			# type param, decline this WHOLE speculative resolution (False)
+			# rather than silently treat this argument position as "carries
+			# no information" the way falling through to the trailing
+			# `return True` below would - confirmed by a real repro: with
+			# that silent skip, TWO other, unrelated bare-literal arguments
+			# fully satisfied this pass's own completeness check on their
+			# own, so this union-typed argument's real type was NEVER
+			# actually consulted, and the (wrong) literal-only binding got
+			# eagerly tagged onto the call site regardless - lowering.py
+			# then trusted that pre-tagged resolution outright, later
+			# failing with a confusing mismatch against the ARGUMENT
+			# variable instead of ever re-inferring correctly itself.
+			if any( self._type_mentions_any_param( leaf, type_params ) for leaf in declared.leaves() ):
+				return False
+			return True
 		return True # this parameter position doesn't mention any of type_params - nothing to infer here
+
+	def _type_mentions_any_param( self, t: Type|None, type_params: list[TypeVar] ) -> bool:
+		''' does `t` contain any of `type_params` anywhere inside it, walking
+		the SAME structural shapes _unify_type_param itself knows how to
+		recurse through (Specialization.args, TaggedUnion.leaves) - used
+		only to decide whether _unify_type_param's own union branch must
+		decline (see its own comment); deliberately broader than lowering.
+		py's sibling _type_mentions_param (which excludes TaggedUnion for
+		its own, different reason - PLAN_RETURN_INFERENCE.md's return-only
+		inference never needs to see through a union there). '''
+		if t is None:
+			return False
+		if any( t is tv for tv in type_params ):
+			return True
+		if isinstance( t, Specialization ):
+			return any( self._type_mentions_any_param( a, type_params ) for a in t.args )
+		if isinstance( t, TaggedUnion ):
+			return any( self._type_mentions_any_param( leaf, type_params ) for leaf in t.leaves() )
+		if isinstance( t, CallableType ):
+			return (
+				any( self._type_mentions_any_param( a, type_params ) for a in t.arg_types )
+				or self._type_mentions_any_param( t.return_type, type_params )
+			)
+		if isinstance( t, TupleType ):
+			return any( self._type_mentions_any_param( e, type_params ) for e in t.elem_types )
+		return False
 
 	def _instanceof_args( self, expr: ast.expr ) -> tuple[ast.expr,ast.expr]|None:
 		''' does `expr` have the shape `instanceof(x, T)`? Returns (x, T),

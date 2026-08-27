@@ -746,14 +746,22 @@ class TypeResolutionTests( unittest.TestCase ):
 		# the exact shape from ARCHITECTURE's own generic-function example -
 		# foo('hello') and foo(42) each get their own monomorphized foo,
 		# distinguished by argument type alone (no explicit foo[T]). foo(42)
-		# infers intrinsics.i32 - a bare int literal's own natural type
-		# (matching what Lowering._expr_Constant will actually tag it as),
-		# NOT this module's own locally-defined `int` class (a literal
-		# argument's inferred type must never depend on what name happens to
-		# be bound to 'int' in scope - see _natural_literal_type)
+		# infers builtins.int - a bare int literal's own natural type
+		# (matching what Lowering._expr_Constant will actually tag it as: a
+		# real int(literal) construction, not intrinsics.i32 - see
+		# _natural_literal_type's own comment). Deliberately NOT shadowing
+		# `int` with a locally-defined class here (unlike this file's own
+		# test_repeated_call_with_same_inferred_type_reuses_the_same_callee,
+		# just below) - since a bare literal now sugars into a real,
+		# ordinary NAME lookup + construction call, it genuinely DOES
+		# resolve through whatever `int` means in scope, same as any other
+		# explicit `int(...)` cast would (confirmed via a real repro: a
+		# local `class int: pass` here makes 42's own construction resolve
+		# to THAT shadow, not builtins.int, and fail to construct - a
+		# correctness constraint from the OLD i32-default design that
+		# doesn't hold, or need to hold, under this one)
 		mod = self._import( '\n'.join([
 			'class str: pass',
-			'class int: pass',
 			'',
 			'def foo[T]( t: T ) -> T:',
 			'	return t',
@@ -768,9 +776,47 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertIsNotNone( str_callee )
 		self.assertIsNotNone( int_callee )
 		self.assertEqual( str_callee.qualname, '__test__.foo[__test__.str]' )
-		self.assertEqual( int_callee.qualname, '__test__.foo[intrinsics.i32]' )
+		self.assertEqual( int_callee.qualname, '__test__.foo[builtins.int]' )
 		self.assertIsNot( str_callee, int_callee )
 		self.assertIsNot( str_callee.node, int_callee.node ) # independent, deep-copied bodies - not the shared abstract one
+
+	def test_implicit_generic_call_declines_when_a_type_param_only_appears_inside_a_union( self ) -> None:
+		# _unify_type_param used to treat a union-typed parameter position
+		# (e.g. `key: Ptr[Callable[[T],K]]|None`) as "doesn't mention any
+		# type param at all" whenever it couldn't drill into which leaf the
+		# real argument matched - a silent no-op, not a decline. That let
+		# OTHER, unrelated bare-literal arguments (here: x/default) fully
+		# satisfy this pass's own completeness check on their own, so
+		# `key`'s own real type was NEVER actually consulted - this pass
+		# then eagerly (and, once bare literals stopped always defaulting
+		# to i32, WRONGLY) tagged the call anyway. Confirmed via a real
+		# repro: this exact shape reached lowering.py with T/K pre-tagged
+		# as builtins.int, later failing with a confusing "k: expected
+		# NoneType|Ptr[Callable[[builtins.int],builtins.int]], got
+		# Ptr[Callable[[intrinsics.i32],intrinsics.i32]]" - blaming the
+		# ARGUMENT variable instead of ever correctly declining up front.
+		# This pass must now decline outright (resolved_callee stays None)
+		# whenever a union-typed parameter position could structurally
+		# involve a still-unbound type param, deferring the whole
+		# resolution to lowering.py's own (correct, IR-level) inference -
+		# not a wrong eager tag.
+		mod = self._import( '\n'.join([
+			'def apply_or_default[T,K]( x: T, key: Ptr[Callable[[T],K]]|None, default: K ) -> K:',
+			'	if key is not None:',
+			'		return key( x )',
+			'	return default',
+			'',
+			'def double( x: i32 ) -> i32:',
+			'	return x',
+			'',
+			'def main() -> None:',
+			'	k: Ptr[Callable[[i32],i32]] = double',
+			'	apply_or_default( 21, k, 0 )',
+		]))
+		fn = self._resolved_fn( mod, 'main' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		[ callee ] = self._resolved_callees( fn )
+		self.assertIsNone( callee ) # declined - never wrongly tagged
 
 	def test_explicit_generic_call_tags_resolved_callee( self ) -> None:
 		mod = self._import( '\n'.join([
@@ -815,11 +861,11 @@ class TypeResolutionTests( unittest.TestCase ):
 		# lowering_test.py's GenericCallDefaultParameterTests), confirmed via
 		# a real repro before this branch was added. Each element's inferred
 		# type must match what Lowering._expr_Tuple will ACTUALLY tag it as
-		# (intrinsics.i32, this pass's own _natural_literal_type mapping),
-		# not this class's own annotation-style bare-Constant mapping
-		# (builtins.int) just above - using the wrong one would tag this
-		# call with a DIFFERENT tuple[...] specialization than the one real
-		# lowering builds
+		# (builtins.int, this pass's own _natural_literal_type mapping - a
+		# bare int literal sugars into a real int(literal) construction now,
+		# not intrinsics.i32 - see _natural_literal_type's own comment) -
+		# using the WRONG mapping would tag this call with a DIFFERENT
+		# tuple[...] specialization than the one real lowering builds
 		mod = self._import( '\n'.join([
 			'def take[S]( seq: S ) -> i32:',
 			'	return 0',
@@ -832,7 +878,7 @@ class TypeResolutionTests( unittest.TestCase ):
 		self.assertEqual( self.discovery.errors.errors, [] )
 		[ callee ] = self._resolved_callees( fn )
 		self.assertIsNotNone( callee )
-		self.assertEqual( callee.qualname, '__test__.take[tuple[intrinsics.i32,intrinsics.i32,intrinsics.i32]]' )
+		self.assertEqual( callee.qualname, '__test__.take[tuple[builtins.int,builtins.int,builtins.int]]' )
 
 	def test_generic_call_on_receiver_local_is_left_untagged( self ) -> None:
 		# x.method() where x is a plain local - fn.names only gains local
