@@ -2694,6 +2694,20 @@ def _emit_const( c: ir.Const ) -> str:
 		return str( c.value )
 	if c.value is None:
 		return '0' # NOTE: we would like to put 'nullptr' or 'NULL' here but its causing issues
+	if isinstance( c.value, str ) and not ( isinstance( c.type, RCClass ) and c.type.qualname in _STRING_LITERAL_RCCLASS_QUALNAMES ):
+		# a RAW (non-RC) string constant, e.g. type_resolver.py's
+		# synthesized $$__new__ passing its own hidden __alloc_loc argument
+		# (ConstPtr[u8]-typed - see its own comment on why not real str) at
+		# each real construction call site - baked as a plain inline C
+		# string literal, unlike the RC str/bytes case just below: no
+		# pooling/dedup needed (this Const only ever occurs once per real
+		# call site, same as ir.Allocate.loc's own ordinary, non-shared
+		# case), so no static object elsewhere in the translation unit to
+		# point at. Cast to the operand's own declared type (c_type(c.type),
+		# e.g. `const uint8_t*`) - a bare string literal is plain `char*` in
+		# C, a real -Wpointer-sign/C4090 mismatch against ConstPtr[u8]'s own
+		# unsigned element type otherwise.
+		return f'({c_type(c.type)}){_c_string_literal(c.value.encode("utf-8"))}'
 	if isinstance( c.value, ( str, bytes )):
 		# a str/bytes literal is RCClass-typed (_expr_Constant lowers it
 		# directly to ir.Const(type=<builtins.str-or-bytes RCClass>,
@@ -4199,9 +4213,21 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 				lines.append( f'\t({dest})->$header.lock = 0;' )
 			if _target_debug:
 				# debug-mode alloc-site tracking (dump_live_objects) -
-				# instr.loc is stamped centrally by Lowering._emit
-				loc = instr.loc or '<unknown>'
-				lines.append( f'\t({dest})->$header.alloc_loc = {_c_string_literal(loc.encode("utf-8"))};' )
+				# instr.loc is stamped centrally by Lowering._emit. A plain
+				# str: an ordinary, single-call-site Allocate - bake the
+				# literal directly (no pooling needed, it's already unique
+				# per call site). An Operand: this Allocate lives inside a
+				# synthesized, SHARED $$__new__ (every real Foo(...) call
+				# site reuses the one compiled function) - the REAL call-
+				# site location is a genuine runtime value, the wrapper's own
+				# hidden __alloc_loc parameter, not a compile-time constant
+				# this ONE function body could ever bake in for itself.
+				if isinstance( instr.loc, str ) or instr.loc is None:
+					loc = instr.loc or '<unknown>'
+					loc_expr = _c_string_literal( loc.encode( 'utf-8' ))
+				else:
+					loc_expr = f'(const char*)({_emit_operand(instr.loc)})'
+				lines.append( f'\t({dest})->$header.alloc_loc = {loc_expr};' )
 				lines.append( f'\t({dest})->$header.alloc_size = sizeof(*({dest}));' )
 				lines.append( f'\t__metalpy_debug_track( &__metalpy_debug_list_head, &(({dest})->$header.debug_link) );' )
 			for name, value in instr.fields.items():

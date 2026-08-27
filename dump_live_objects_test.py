@@ -7,17 +7,14 @@
 # grouped line with the right count, a dropped reference must vanish from
 # the dump, and a different CLASS must report as its own separate group.
 #
-# Known granularity limitation (see the plan's own report): ir.Allocate.loc
-# is stamped from the ambient line the Lowering pass happens to be on when
-# it emits that ONE Allocate instruction - for an ordinary `Foo(...)` this is
-# inside Foo's own synthesized $$__new__/__init__ constructor, which is
-# built ONCE per class and called from every `Foo(...)` site in the whole
-# program. So alloc_loc ends up naming the CLASS's own constructor location,
-# not each individual textual call expression - confirmed directly against
-# the generated C (a single `$header.alloc_loc = "...";` line assigned from
-# two separate call sites below). Real, useful info (still separates
-# distinct classes and still counts+aggregates correctly), just coarser
-# than "per call site" for user RCClass construction specifically.
+# Per-call-site attribution: an ordinary `Foo(...)` allocates through Foo's
+# own synthesized $$__new__/__init__ constructor, built ONCE per class and
+# shared by every `Foo(...)` call site in the whole program - $$__new__'s
+# own hidden __alloc_loc parameter (type_resolver.py's
+# _synthesize_rcclass_constructor) is what lets alloc_loc still name the
+# REAL textual call site rather than $$__new__'s own (useless - shared by
+# every caller) location, baked in per call by lowering.py's
+# _try_lower_construct_call.
 
 from pathlib import Path
 import subprocess
@@ -51,12 +48,12 @@ def make_three() -> list[Foo]:
 	i: i32 = 0
 	with compiler.panic_arithmetic( 'test bound, cannot overflow' ):
 		while i < 3:
-			result.append( Foo( i )) # loop - three more live Foo instances, same alloc_loc as the one below (see this file's own top comment)
+			result.append( Foo( i )) # loop - ONE call site, 3 live instances, must still aggregate into ONE group (count=3)
 			i += 1
 	return result
 
 def main() -> i32:
-	a = Foo( 1 ) # same alloc_loc as make_three's loop - both must aggregate into ONE Foo group
+	a = Foo( 1 ) # a DIFFERENT call site than make_three's loop - own separate group now (see this file's own top comment)
 	items = make_three()
 	dropped = Foo( 2 ) # dropped before the dump, must not inflate the live count
 	del dropped
@@ -98,15 +95,17 @@ class DumpLiveObjectsTests( RealCompileMixin, unittest.TestCase ):
 			f'{test_support.c_source_on_failure( c_source )}' )
 		out = result.stdout.decode( 'utf-8', errors = 'replace' )
 
-		# exactly ONE __main__.Foo group (both call sites share one alloc_loc
-		# - see this file's own top comment) with count=4: the 1 top-level
-		# instance + the 3 built inside make_three's loop - proves the loop
-		# instances really do aggregate together (not 3 separate entries),
-		# and that the already-dropped instance is correctly excluded (would
-		# be count=5 otherwise)
+		# TWO __main__.Foo groups now (per-call-site attribution) - main's
+		# own `a = Foo(1)` (count=1) and make_three's loop (count=3: one
+		# call SITE, 3 runtime instances, proving same-site instances still
+		# aggregate together rather than becoming 3 separate entries). The
+		# already-dropped `dropped = Foo(2)` instance (main's own, a
+		# DIFFERENT call site than `a`'s) is correctly excluded entirely -
+		# a real leak there would show as a spurious THIRD Foo group.
 		foo_lines = [ line for line in out.splitlines() if '__main__.Foo @' in line ]
-		self.assertEqual( len( foo_lines ), 1, f'expected exactly 1 __main__.Foo group, got:\n{out}' )
-		self.assertIn( 'count=4', foo_lines[0], f'expected count=4 (1 + the loop instances=3, dropped instance excluded):\n{out}' )
+		self.assertEqual( len( foo_lines ), 2, f'expected exactly 2 __main__.Foo groups (one per real call site), got:\n{out}' )
+		counts = sorted( int( line.rsplit( 'count=', 1 )[1].split()[0] ) for line in foo_lines )
+		self.assertEqual( counts, [ 1, 3 ], f'expected one group of 1 (main\'s own `a`) and one of 3 (make_three\'s loop):\n{out}' )
 
 		# Bar is a DIFFERENT class - must be its own separate group, not
 		# merged with Foo's
@@ -114,13 +113,17 @@ class DumpLiveObjectsTests( RealCompileMixin, unittest.TestCase ):
 		self.assertEqual( len( bar_lines ), 1, f'expected exactly 1 __main__.Bar group, got:\n{out}' )
 		self.assertIn( 'count=1', bar_lines[0] )
 
-		# each __main__.Foo instance is the same size - byte total must be
-		# an exact 4x multiple of a single instance's own size (not pinning
-		# an exact ObjectHeader layout size here)
+		# each __main__.Foo instance is the same size - a group's own byte
+		# total must be an exact multiple of its own count (not pinning an
+		# exact ObjectHeader layout size here), and every group must agree
+		# on the SAME per-instance size (all Foo, regardless of call site)
 		def _bytes_of( line: str ) -> int:
 			return int( line.rsplit( 'bytes=', 1 )[1].strip() )
-		self.assertEqual( _bytes_of( foo_lines[0] ) % 4, 0 )
-		self.assertGreater( _bytes_of( foo_lines[0] ), 0 )
+		def _count_of( line: str ) -> int:
+			return int( line.rsplit( 'count=', 1 )[1].split()[0] )
+		per_instance_sizes = { _bytes_of( line ) // _count_of( line ) for line in foo_lines }
+		self.assertEqual( len( per_instance_sizes ), 1, f'expected every Foo group to agree on the same per-instance size:\n{out}' )
+		self.assertGreater( next( iter( per_instance_sizes )), 0 )
 
 		# a live raw sys.alloc buffer group is present too (list[Foo]'s own
 		# backing storage, ... - see lib/sys.py's alloc[T])

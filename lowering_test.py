@@ -7308,10 +7308,17 @@ class Tests( unittest.TestCase ):
 		# constructs a Box - can't look it up until after _lower_main()
 		new_fn = box_cls.get_local( '$$__new__' )
 		t0 = ir.Temp( type = box_cls, id = 0 )
+		# $$__new__'s own hidden __alloc_loc kwarg (see its synthesis
+		# comment in type_resolver.py) - the real per-call-site location
+		# `G = Box()` itself, baked in by _try_lower_construct_call
+		u8_cls = self.discovery.get_intrinsics()['u8']
+		const_ptr_cls = self.discovery.get_intrinsics()['ConstPtr']
+		alloc_loc_type = self.discovery._get_or_create_specialization( const_ptr_cls, [ u8_cls ] )
+		alloc_loc_const = ir.Const( type = alloc_loc_type, value = '__test__.py:9' )
 		self._assert_ir( fn, [
 			ir.FuncStart( name = 'main', params = [], return_type = none_type ),
 			ir.DeclareTemp( temp = t0 ),
-			ir.Call( dest = t0, target = new_fn, receiver = None, args = [], kwargs = {} ),
+			ir.Call( dest = t0, target = new_fn, receiver = None, args = [], kwargs = { '__alloc_loc': alloc_loc_const } ),
 			ir.AcquireGlobalLock( var = g ),
 			ir.Decref( value = g ),
 			ir.Assign( dest = g, src = t0 ),

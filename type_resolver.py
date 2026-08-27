@@ -3763,6 +3763,26 @@ class TypeResolver:
 		)
 		ast.fix_missing_locations( node )
 
+		# hidden trailing param, never forwarded to __init__ (init_call above
+		# was already built from new_params before this append) - exists
+		# purely so lowering.py's _emit() has something to point Allocate.loc
+		# at instead of $$__new__'s own synthesized (and therefore useless -
+		# every real Foo(...) call site in the program shares this ONE
+		# wrapper) file:line. The caller (_try_lower_construct_call) always
+		# supplies it explicitly as a real kwarg, never relying on a
+		# parameter default - see its own comment on why. ConstPtr[u8], not
+		# str: this class is synthesized even when import_builtins=False
+		# (str isn't available), and the underlying alloc_loc field is a
+		# raw `const char*` anyway, not a real (RC-managed) str object.
+		u8_cls = self.discovery.get_intrinsics()['u8']
+		const_ptr_cls = self.discovery.get_intrinsics()['ConstPtr']
+		alloc_loc_type = self.discovery._get_or_create_specialization( const_ptr_cls, [ u8_cls ] )
+		alloc_loc_param = Parameter(
+			stem = '__alloc_loc', qualname = f'{qualname}.__alloc_loc',
+			file = cls.file, line = cls.line, type = alloc_loc_type, is_kwonly = True,
+		)
+		new_params.append( alloc_loc_param )
+
 		fn = Function(
 			stem = '$$__new__', qualname = qualname,
 			file = cls.file, line = cls.line,

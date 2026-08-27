@@ -2932,7 +2932,22 @@ class FunctionLowering:
 		if self._current_fn is not None and isinstance( instr, ( ir.Call, ir.CallIndirect, ir.Allocate )) and isinstance( instr.dest, ir.Temp ):
 			self._cfg.fresh_temp( instr.dest, instr.dest.type )
 		if self._current_fn is not None and isinstance( instr, ir.Allocate ):
-			instr.loc = f'{self._current_fn.file}:{self._current_lineno}'
+			if self._current_fn.stem == '$$__new__':
+				# a synthesized, SHARED constructor - every real Foo(...) call
+				# site in the program reuses this one compiled function (see
+				# type_resolver.py's _synthesize_rcclass_constructor), so
+				# self._current_fn.file/self._current_lineno here are just
+				# this wrapper's own synthesized (class-definition) location,
+				# useless for telling apart which of possibly many real call
+				# sites allocated a given live object. The wrapper's own
+				# hidden __alloc_loc parameter carries the REAL caller's
+				# location instead, baked in as a real per-call-site literal
+				# by _try_lower_construct_call - point Allocate.loc at that
+				# parameter (a runtime operand, not a static string) instead.
+				alloc_loc_param = next( p for p in self._current_fn.parameters or [] if p.stem == '__alloc_loc' )
+				instr.loc = alloc_loc_param
+			else:
+				instr.loc = f'{self._current_fn.file}:{self._current_lineno}'
 		if self._current_fn is not None:
 			self._check_self_escape_in( instr )
 		if self._current_fn is not None and isinstance( instr, ir.Call ):
@@ -15676,6 +15691,21 @@ class FunctionLowering:
 		assert isinstance( new_fn, Function ), f'internal compiler error: {concrete_cls.qualname} has no synthesized $$__new__'
 		self.lowering.schedule( new_fn.return_type )
 		dest = self._new_temp( new_fn.return_type )
+		# new_fn's own hidden __alloc_loc param (see its own synthesis
+		# comment) - THIS call site (node) is the real, per-construction-
+		# call-site location dump_live_objects needs; new_fn's own body
+		# can't know it (one shared compiled function, every real Foo(...)
+		# in the program reuses it). Built directly here, not via the
+		# ordinary default-parameter-filling path _lower_call_args already
+		# ran above (that matched args/kwargs against `init`'s own
+		# parameter list, never new_fn's) - same file/line source
+		# _fold_caller_location's own caller_file/caller_line use.
+		alloc_loc_module = self.lowering.discovery.module_stack[-1] if self.lowering.discovery.module_stack else None
+		alloc_loc_file = str( alloc_loc_module.file ) if alloc_loc_module is not None else '<unknown>'
+		u8_cls = self.lowering.discovery.get_intrinsics()['u8']
+		const_ptr_cls = self.lowering.discovery.get_intrinsics()['ConstPtr']
+		alloc_loc_type = self.lowering.discovery._get_or_create_specialization( const_ptr_cls, [ u8_cls ] )
+		kwargs['__alloc_loc'] = ir.Const( type = alloc_loc_type, value = f'{alloc_loc_file}:{node.lineno}' )
 		self._emit( ir.Call( dest = dest, target = new_fn, receiver = None, args = args, kwargs = kwargs ))
 		return dest
 

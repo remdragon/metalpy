@@ -640,7 +640,14 @@ class Allocate( Instruction ): # Foo.__allocate__( field = value, ... )
 	dest: Temp
 	cls: ClassLike
 	fields: dict[str,Operand]
-	loc: str|None = None # 'file:line' of the allocating source, debug-mode object tracking only (see emitter_c.py's dump_live_objects support) - set centrally by Lowering._emit, not by individual construction sites
+	# 'file:line' of the allocating source, debug-mode object tracking only
+	# (see emitter_c.py's dump_live_objects support) - set centrally by
+	# Lowering._emit, not by individual construction sites. A plain str for
+	# an ordinary, single-call-site Allocate; an Operand (the hidden
+	# __alloc_loc parameter) for one lowered inside a synthesized, SHARED
+	# $$__new__ - see Lowering._emit's own comment on why that case can't
+	# be a compile-time-constant string at all
+	loc: str|Operand|None = None
 
 	def test_repr( self ) -> str:
 		return f'Allocate( dest={self.dest!r}, cls={self.cls.qualname!r}, fields={self.fields!r} )'
