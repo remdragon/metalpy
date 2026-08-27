@@ -208,6 +208,34 @@ def main() -> i32:
 	return 0
 '''
 
+# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #3's own regression
+# guard - confirms $header.lock is genuinely the small CAS spinlock
+# (`_Atomic uint32_t`, 4 bytes) and not a real `pthread_mutex_t` (40 bytes
+# on glibc x86_64 alone), via a REAL compiled-and-run compiler.sizeof()
+# call, not just reading the generated C text. assert_programs_run always
+# builds debug (see this file's own RealCompileMixin usage) - a debug
+# ObjectHeader (ref_count+vtable+lock+alloc_loc+alloc_size+debug_link) is
+# 56 bytes with the spinlock, confirmed directly via a real compiled-and-
+# run program (sizeof(Box) == 64, one i32 field + alignment); a real
+# pthread_mutex_t in .lock's place would push that past 96. The bound below
+# sits comfortably between the two - well above the real 64 (room for
+# incidental future header growth) but well below what a pthread_mutex_t
+# regression would produce.
+_POSIX_SPINLOCK_SIZE_BOUND_CHECK = '''
+import compiler
+
+class Box:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+def main() -> i32:
+	sz: usize = compiler.sizeof( Box )
+	if sz > usize( 88 ):
+		return 1
+	return 0
+'''
+
 # a plain scalar field (no RC leaves at all) written via SetAttr from many
 # threads - regression guard for the field-shaped version of Part A's own
 # "no RC leaves -> no lock, ever" early return (cfg.rc_leaves(attr_var.type)
@@ -448,6 +476,10 @@ class ThreadSafeFieldsTests( RealCompileMixin, unittest.TestCase ):
 		# Cost mitigation #2's own sabotage target (see the source's own
 		# header comment above)
 		self.assert_programs_run([ ( 'private_field_reassigned_outside_init_stress', _PRIVATE_FIELD_REASSIGNED_OUTSIDE_INIT_STRESS ) ], timeout = 30.0 )
+
+	@unittest.skipUnless( sys.platform == 'linux', 'Cost mitigation #3 only changes POSIX ($header.lock) codegen' )
+	def test_posix_spinlock_is_small( self ) -> None:
+		self.assert_programs_run([ ( 'posix_spinlock_is_small', _POSIX_SPINLOCK_SIZE_BOUND_CHECK ) ])
 
 	def test_scalar_field_unaffected( self ) -> None:
 		self.assert_programs_run([ ( 'scalar_field_unaffected', _SCALAR_FIELD_UNAFFECTED ) ])

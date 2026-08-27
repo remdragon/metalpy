@@ -13,8 +13,8 @@ all previously-blocking bugs fixed, verified under real concurrent stress
 to master.**
 
 **Performance follow-ons (the "Cost mitigations" section below) - status
-update: staged into 4 sessions, Stages 1-2 landed and merged (see Cost
-mitigations #1/#2's own status updates for the full writeups), Stages 3-4
+update: staged into 4 sessions, Stages 1-3 landed and merged (see Cost
+mitigations #1/#2/#3's own status updates for the full writeups), Stage 4
 not yet started.**
 
 What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
@@ -1047,6 +1047,28 @@ issue.)
    choose, per-program, whether to emit the retain-on-read Incref/
    fresh_temp pair AT ALL - not something to reattempt with the current
    emission-time-only architecture.
+
+   **Follow-up investigated and closed: don't build the pre-pass.** Stage 1
+   (shipped) already eliminates the expensive part of this cost - lock
+   acquisition, mutex init, syscalls - for any non-threaded program; what's
+   left is only a couple of atomic incref/decref instructions, no lock. The
+   existing `@extern(spawns_thread=True)` detection can't be reused for a
+   lowering-time gate (`Compiler.spawns_threads` is only final after the
+   whole call graph drains, but a lowering-time gate needs the answer
+   before the first function is lowered) - a real pre-pass would need its
+   own eager, whole-file, nested-function-descending AST walk plus its own
+   import-graph resolution, a second, permanent, must-stay-conservative-
+   forever detection mechanism running parallel to Discovery's real one.
+   To stay sound against aliased imports, cross-module reexports, and
+   closure/function-pointer indirection, it can't do call-site matching
+   either - it would have to degrade to "any reachable file imports
+   threading/posix.pthread/windows.kernel32 at all," a real regression from
+   the already-shipped mechanism's "catches every wrapper for free via one
+   syscall choke point" property. Not a good trade for a speculative perf
+   win against a demonstrated soundness-risk pattern (this exact class of
+   idea already caused one confirmed double-free, above) - revisit only
+   with real profiling numbers showing the residual incref/decref traffic
+   is an actual measurable cost on a real non-threaded program.
 2. **Write-once-after-`__init__` exemption — only sound for `__private`
    fields, and only once the "Prerequisite" section above actually ships.**
    A field assigned only in `__init__` and never reassigned by any other
@@ -1082,6 +1104,28 @@ issue.)
    reassigned from within its own defining class?) wasn't confirmed during
    this investigation and needs checking before assuming A.1's global
    exemption is as unconditionally cheap as stated there.
+
+   **Follow-up investigated and closed: A.1 is sound, on two independent
+   grounds - no bug found.** (1) Module-level `__private` privacy IS real,
+   enforced infrastructure - `Discovery.check_module_visibility`
+   (`discovery.py:707-835`) hard-errors on any cross-module reference to a
+   `__`-prefixed global, wired into `visit_ImportFrom` and both
+   attribute/value-position resolution in `lowering.py` - the field-privacy
+   analogy above holds. (2) A.1's flag is sound *regardless* of (1), because
+   this is a whole-program AOT compiler where each global is exactly one
+   shared `Variable` object (`mpy_types.py:528-536`) referenced, never
+   cloned, by every importing module - `cfg.assign()`'s global-write branch
+   (`cfg.py:2331-2363`) flips `reassigned_outside_init` on that ONE object's
+   identity, with every real write path (`_stmt_Assign`, `_stmt_AugAssign`,
+   tuple/pattern/for-loop targets) funneling through it; cross-module
+   `global X` reassignment is only possible via `from module_a import X`
+   aliasing the identical object, so there is no disconnected copy the flag
+   flip could miss. Confirms A.1 (already merged) has no latent soundness
+   gap - closes this open question cleanly, no follow-up fix needed. If
+   the write-once exemption above is ever extended to `_protected`/public
+   fields, this confirms the underlying "is privacy actually enforced"
+   question doesn't need re-litigating for globals - only for the field
+   tiers still out of scope.
 
    **Status update: implemented and merged, `__private` fields only, exactly
    the scope described above.** `ir.AcquireFieldLock`/`ReleaseFieldLock`
@@ -1189,6 +1233,37 @@ a lazy-init site and a crash.
    futex-based spinlock/mutex, sized like a plain `_Atomic int`) purpose-
    built for this, rather than reusing `pthread_mutex_t` as-is. This is
    the single biggest cost unknown in the whole proposal.
+
+   **Status update: implemented and merged (Cost mitigation #3), a plain
+   CAS spinlock, not a real futex.** `_Atomic uint32_t` (0 = unlocked, 1 =
+   locked), covering BOTH Part A's per-global lock and Part B's per-object
+   `$header.lock` uniformly (a single shared `__metalpy_spinlock_acquire`/
+   `_release` pair, `_PROLOGUE_POSIX_SPINLOCK` in `emitter_c.py`) - deliberately
+   narrower than this question's own "futex-based" wording: the doc's own
+   sizing target ("like a plain `_Atomic int`") is satisfied by a spinlock
+   alone, `ir.AtomicCompareExchange` codegen was already wired end-to-end
+   and tested (`lib/atomic.py`'s `Atomic[T]`) so this reuses existing
+   machinery rather than adding new syscall-wrapper codegen a real
+   `futex(2)` mutex would need, and the critical sections this protects are
+   extremely short (one `GetAttr`/`SetAttr`-width access), where a
+   spinlock's worst case (busy-wait instead of descheduling, mitigated with
+   `sched_yield()` between attempts) matters far less than in the general
+   case futexes are built for. A real futex remains a legitimate future
+   upgrade if profiling under real contention ever shows spinning is a
+   problem. Zero-init-safe exactly the way Windows' `SRWLOCK` already was
+   (0 is a valid unlocked spinlock) - this REMOVES `pthread_mutex_init()`
+   entirely on POSIX (both Part A's and Part B's call sites), collapsing
+   A.3's own documented Windows/POSIX asymmetry rather than merely
+   shrinking it, and drops the `-lpthread`/`<pthread.h>` force-link this
+   mechanism used to need (a program that doesn't itself import
+   `lib/posix/pthread.py`/`lib/threading.py` no longer links pthread at
+   all just for Part A/B's own lock). Confirmed via a real compiled-and-run
+   `compiler.sizeof()` check (`thread_safe_fields_test.py`'s
+   `test_posix_spinlock_is_small`) and a sabotage test (a no-op spinlock
+   acquire reproduced real double-free/corruption crashes in the existing
+   Part A/B stress tests, restored after confirming that). Full 3-compiler
+   suite clean, including `METALPY_RUN_LOAD_TESTS=1` on WSL/gcc (the
+   primary leg for this POSIX-only change).
 2. **Does the reentrancy hazard in B.4 actually occur** in real generated
    code once GetAttr/SetAttr access is genuinely single-instruction-wide,
    or only in a hypothetical inlined/optimized shape? Needs to be
