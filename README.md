@@ -118,3 +118,10 @@ body of the unused function.
 MetalPy tries very hard to avoid msvcrt on Windows builds, but if users need
 to link to it for whatever reason, MetalPy doesn't prevent, it just doesn't
 need it for the stdlib (yet).
+
+License:
+
+MetalPy itself is licensed under Apache 2.0 (see LICENSE/NOTICE). Programs
+compiled by MetalPy may bundle third-party runtime components (e.g. Tcl/Tk,
+zlib) under their own licenses - see licenses/ and the generated
+dist/THIRD-PARTY-LICENSES.txt for those.
