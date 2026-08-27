@@ -203,5 +203,63 @@ class ListInitOverloadMultipleGeneratorSpecializationsTests( RealCompileMixin, u
 			( 'list_init_multiple_generator_specializations', _LIST_INIT_MULTIPLE_GENERATOR_SPECIALIZATIONS ),
 		])
 
+# _synthesize_rcclass_constructor's own $$__new__ cache used to be keyed by
+# id(cls), id(init) - but for an __init__ overload leaf with its OWN type
+# param (list[T].__init__[S: IteratorProtocol[T]] vs the sibling
+# __init__[S: Iterable[T]]), `init` is a FRESH monomorphized Function built
+# per construction call site (_lower_generic_construction_args), never kept
+# alive afterward. Once a call site returns, nothing references that Function
+# any more, so CPython is free to recycle its id() for the NEXT one built -
+# which, alternating between the two overload leaves below, is reliably the
+# OTHER leaf's own monomorphization. The id()-keyed cache then false-hit,
+# returning the wrong leaf's $$__new__ wrapper (different parameter
+# name/count) for a call whose args/kwargs were built against the real,
+# correct leaf - KeyError('iterator') in emitter_c._emit_call_args (a real
+# crash, isolated from C:\cvs\itas\grap\grap.mpy combining map()/finditer()/
+# list() constructions in one compile unit). Fixed by keying the cache
+# structurally (init.line + substituted parameter qualnames) instead of by
+# raw object identity.
+_LIST_INIT_ALTERNATING_OVERLOAD_LEAVES = '''
+class Elem:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+def gen_elems( n: i32 ) -> Iterator[Result[Elem,StopIteration]]:
+	with compiler.wrap_arithmetic:
+		i: i32 = 0
+		while i < n:
+			yield Elem( v = i )
+			i += 1
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		src: list[Elem] = list[Elem]()
+		src.append( Elem( v = 9 ) )
+		src.append( Elem( v = 10 ) )
+
+		a: list[Elem] = list( gen_elems( 2 ) )  # IteratorProtocol[Elem] leaf
+		b: list[Elem] = list( src )             # Iterable[Elem] leaf
+		c: list[Elem] = list( gen_elems( 3 ) )  # IteratorProtocol[Elem] leaf again
+		d: list[Elem] = list( src )             # Iterable[Elem] leaf again
+
+		if len( a ) != 2 or a.__getitem__( 0 ).unwrap( 'a0' ).v != 0 or a.__getitem__( 1 ).unwrap( 'a1' ).v != 1:
+			return 1
+		if len( b ) != 2 or b.__getitem__( 0 ).unwrap( 'b0' ).v != 9 or b.__getitem__( 1 ).unwrap( 'b1' ).v != 10:
+			return 2
+		if len( c ) != 3 or c.__getitem__( 2 ).unwrap( 'c2' ).v != 2:
+			return 3
+		if len( d ) != 2 or d.__getitem__( 1 ).unwrap( 'd1' ).v != 10:
+			return 4
+	return 0
+'''
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class ListInitAlternatingOverloadLeavesTests( RealCompileMixin, unittest.TestCase ):
+	def test_alternating_iterator_and_iterable_leaves_dont_collide( self ) -> None:
+		self.assert_programs_run([
+			( 'list_init_alternating_overload_leaves', _LIST_INIT_ALTERNATING_OVERLOAD_LEAVES ),
+		])
+
 if __name__ == '__main__':
 	unittest.main()

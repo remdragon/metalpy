@@ -3539,25 +3539,47 @@ class TypeResolver:
 		it tried to mangle a TypeVar into a C type). '''
 		if cls.type_params:
 			return None  # only concrete RCClasses get a constructor
+		if not isinstance( init, Function ):
+			return None  # an Overload - lowering.py's _try_lower_construct_call already rejects this case with its own error message
+		if cls.resolve is not None:
+			cls.resolve()
+		if init.resolve is not None:
+			init.resolve()
 		# an overloaded __init__ means MULTIPLE, differently-shaped $$__new__
 		# wrappers can legitimately coexist for the SAME concrete cls (one
 		# per distinct __init__ candidate actually used at some real
-		# construction call site, e.g. list[Elem]() vs list(some_iterator))
-		# - id(cls) alone used to be a safe cache key/dedup because exactly
-		# one __init__ per class was the only shape this ever saw; keying by
-		# (cls, init) instead is the minimal fix, not a broader redesign -
-		# see the qualname suffix just below for the matching C-symbol half
-		# of this same fix.
-		cache_key = ( id( cls ), id( init ))
+		# construction call site, e.g. list[Elem]() vs list(some_iterator)) -
+		# id(cls) alone used to be a safe cache key/dedup because exactly one
+		# __init__ per class was the only shape this ever saw.
+		#
+		# The key is init's own (line, substituted-parameter-qualnames) -
+		# NOT id(init) (confirmed via two real repros: a KeyError('iterator')
+		# in emitter_c.py's _emit_call_args, and a "redefinition of ..."
+		# clang error - see list_init_overload_test.py's own
+		# ListInitAlternatingOverloadLeavesTests). For an __init__ overload
+		# leaf with its OWN type param (list[T].__init__[S:
+		# IteratorProtocol[T]]), `init` here is a FRESH monomorphized
+		# Function built per construction call site
+		# (_lower_generic_construction_args), never interned/deduplicated
+		# anywhere - two calls that resolve to the exact same concrete leaf
+		# (e.g. two `list(gen_elems(...))` calls) get two DIFFERENT init
+		# objects with different ids, so an id()-keyed cache never
+		# recognizes them as the same wrapper and synthesizes $$__new__
+		# TWICE under the identical (deterministic, sig-based) qualname -
+		# a straight duplicate-definition. Worse, since `init` is never kept
+		# alive past its own call site, CPython is free to recycle a freed
+		# init's id() for a LATER, UNRELATED monomorphization (e.g. the
+		# sibling Iterable[T] leaf) - an id()-keyed cache then false-hits,
+		# returning the wrong leaf's $$__new__ (mismatched parameters) for
+		# a call whose args/kwargs were built against the real, different
+		# leaf. `sig` (below) already exists for the matching C-symbol
+		# disambiguation - reused here as the cache key too, since it's
+		# exactly the structural identity that actually matters.
+		sig = ','.join( p.type.qualname for p in ( init.parameters or [] ) if p.type is not None )
+		cache_key = ( id( cls ), init.line, sig )
 		if cached := self._constructors_synthesized.get( cache_key ):
 			return cached
 
-		if cls.resolve is not None:
-			cls.resolve()
-		if not isinstance( init, Function ):
-			return None  # an Overload - lowering.py's _try_lower_construct_call already rejects this case with its own error message
-		if init.resolve is not None:
-			init.resolve()
 		if any( p.is_vararg or p.is_kwarg or p.is_move or p.is_copy for p in ( init.parameters or [] )):
 			# no real __init__ in this codebase declares any of these -
 			# forwarding them correctly (re-spelling *args/**kwargs
@@ -3614,13 +3636,9 @@ class TypeResolver:
 			# substituted copy, so two DISTINCT S instantiations (e.g.
 			# map()'s own generator vs a set's own _sequence_iter generator)
 			# still share the same originating .line, and init.line alone
-			# collides between them (confirmed via a real repro: both ended
-			# up emitted under the same C symbol with conflicting parameter
-			# types). Fold in each (already-substituted, fully concrete)
-			# parameter's own qualname too - unique per distinct signature,
-			# stable for the overwhelming common case (one $$__new__ per
-			# init.line) where every param there is untouched.
-			sig = ','.join( p.type.qualname for p in ( init.parameters or [] ) if p.type is not None )
+			# collides between them. `sig` (already computed above, for the
+			# cache key itself) folds in each substituted parameter's own
+			# qualname too - unique per distinct signature.
 			qualname = f'{qualname}${init.line}${sig}'
 		new_params: list[Parameter] = []
 		for p in ( init.parameters or [] ):
