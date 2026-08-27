@@ -17032,12 +17032,28 @@ class FunctionLowering:
 			return self._fold_caller_location( intrinsic, param, node )
 		saved_owning_module = self._owning_module
 		self._owning_module = self.lowering._find_module_for( target )
+		# self._current_lineno gets the SAME "reads as the caller's" bug
+		# self._owning_module's own comment above documents, but there's no
+		# matching override to switch it TO here - it's only ever paired
+		# with self._current_fn.file (Allocate.loc's own stamping, see
+		# _emit), which never changes for the rest of this whole
+		# FunctionLowering pass, so a default value's own line (target's
+		# defining module, e.g. list[T]'s own `initial_capacity: usize = 8`)
+		# permanently corrupts _current_lineno into a real line number from
+		# a DIFFERENT file than self._current_fn.file names - confirmed via
+		# a real repro: a bare list-literal's own $$__new__-bypassing
+		# Allocate (_construct_generic_instance) reported "grap.mpy:408",
+		# grap.mpy being the caller's file but 408 only a real line in
+		# lib/builtins/__list.py (list[T].__init__'s own default value).
+		# Save/restore around the SAME _lower_expr call as _owning_module.
+		saved_lineno = self._current_lineno
 		try:
 			with self.lowering.discovery.module_context( self._owning_module ):
 				with self.lowering.discovery.scope_context( target ):
 					return self._lower_expr( param.default, param.type )
 		finally:
 			self._owning_module = saved_owning_module
+			self._current_lineno = saved_lineno
 
 	def _lower_call_args( self, target: Function, node: ast.Call, *, receiver_fills_first_param: bool = False ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
 		# shared by the plain call path (_lower_call's own else branch) and

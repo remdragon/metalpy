@@ -11774,6 +11774,36 @@ class ListLiteralTests( unittest.TestCase ):
 		# own add() handling
 		self.assertTrue( all( c.dest is None for c in append_calls ) )
 
+	def test_alloc_loc_names_the_real_call_site_not_list_init_own_default( self ) -> None:
+		# _construct_generic_instance always calls list[T]'s own zero-arg
+		# __init__(initial_capacity: usize = 8) - the OMITTED default gets
+		# lowered via _lower_parameter_default, which pushes/pops
+		# self._owning_module for the duration (correctly scoped to
+		# list[T]'s own declaring module) but used to leave self._current_
+		# lineno permanently clobbered with THAT default value's own line
+		# (a real line in lib/builtins/__list.py) after returning - the
+		# very next instruction emitted (_construct_generic_instance's own
+		# ir.Allocate, back in the CALLER's module) then stamped Allocate.
+		# loc as "__test__.py:<__list.py's own line>", a real file/line
+		# mismatch. Confirmed via a real repro (grap.mpy's own dump_live_
+		# objects() report: "grap.mpy:408", 408 only a real line in
+		# lib/builtins/__list.py, grap.mpy itself under 340 lines total).
+		self._import( '\n'.join([
+			'def main() -> None:',
+			"	x: list[str] = [ 'a' ]",
+			'	return',
+		]))
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		allocs = [ i for i in fn.instructions if isinstance( i, ir.Allocate ) and getattr( i.cls, 'stem', None ) == 'list' ]
+		self.assertEqual( len( allocs ), 1 )
+		# the file component alone isn't enough to catch this - discovery.
+		# module_stack is correctly scoped regardless, only self._current_
+		# lineno itself gets corrupted (to a real line in __list.py, e.g.
+		# 408, paired with the CORRECT __test__.py) - must check the exact
+		# line, not just that SOME __test__.py:N string came back
+		self.assertEqual( allocs[0].loc, '__test__.py:2', f'expected the real call site (line 2), got {allocs[0].loc!r}' )
+
 	def test_empty_list_literal_is_construction_only( self ) -> None:
 		fn = self._assert_accepted( '\n'.join([
 			'def main() -> None:',
