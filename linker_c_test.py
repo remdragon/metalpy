@@ -299,6 +299,58 @@ class CstrlenNtdllUcrtCollisionRealCompileTests( unittest.TestCase ):
 		self._compile_and_run( no_crt_forced = True, expected_exit = 0 )
 
 
+@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found' )
+class StripLinkFlagRealCompileTests( unittest.TestCase ):
+	''' CcTool.link(strip=True) - plain -s is a compile-stage flag to clang's
+	own driver; this link() call only ever runs a link (objs are already-
+	compiled .o files, no cc1 invocation happens here), so on native Windows
+	(clang driving lld-link) the driver never got a chance to consume it and
+	warned "argument unused during compilation" instead of forwarding it
+	anywhere - confirmed via a real repro (`mpy --release --strip`). -Wl,-s
+	fixes GNU ld (POSIX) but lld-link doesn't understand -s either (LNK4044
+	"unrecognized option"), so native Windows needs -Wl,/OPT:REF /OPT:ICF
+	instead (the same "closest real analog" the 'cl' branch already used).
+	Real end-to-end regression: build+link+run with strip=True must produce
+	no linker warnings at all, on whichever compiler this test env has. '''
+
+	def test_strip_produces_no_linker_warnings_and_still_runs( self ) -> None:
+		code = '\n'.join([
+			'def main() -> i32:',
+			'	return 0',
+		])
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( code, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [] )
+
+		no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
+		c_source = emitter_c.emit_c( compiler, no_crt = no_crt )
+
+		with tempfile.TemporaryDirectory() as tmp:
+			src_path = Path( tmp ) / 'generated.c'
+			obj_path = Path( tmp ) / 'generated.o'
+			exe_path = Path( tmp ) / 'test_exe.exe'
+			src_path.write_text( c_source, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src_path, obj_path, no_crt = no_crt )
+			self.assertEqual( cc_result.returncode, 0, f'{_CC.name} compile failed:\n{cc_result.stdout}{test_support.c_source_on_failure( c_source )}' )
+
+			ldflags = ''
+			for lib in sorted( compiler.extern_libs ):
+				if lib == 'c':
+					continue
+				flag = linker_c.resolve_lib_ldflag( _CC, lib, compiler.extern_libs[lib], no_crt = no_crt )
+				ldflags = ldflags + f' {flag}' if ldflags else flag
+
+			link_result = _CC.link( exe_path, [ obj_path ], ldflags = ldflags, no_crt = no_crt, strip = True )
+			self.assertEqual( link_result.returncode, 0, f'{_CC.name} link failed:\n{link_result.stdout}' )
+			self.assertEqual( link_result.stdout.strip(), '', f'{_CC.name} strip link produced unexpected warnings:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe_path ) ], capture_output = True )
+			self.assertEqual( result.returncode, 0, f'exe exited {result.returncode} (stderr: {result.stderr})' )
+
+
 class FindDllTests( unittest.TestCase ):
 	''' linker_c.find_dll() - PATH-order lookup by bare filename, feeding
 	mpy.py's post-link bundling step for @extern(..., dll=...)

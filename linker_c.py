@@ -353,7 +353,23 @@ class CcTool:
 				# just at compile time
 				cmd += [ '-fsanitize=address' ]
 			if strip:
-				cmd += [ '-s' ]
+				if os.name == 'posix':
+					# real GNU ld (gcc, or clang under WSL) - -Wl,-s forwards
+					# -s straight to the linker, bypassing the driver's own
+					# flag interpretation (plain -s is a compile-stage flag to
+					# clang's own driver, silently dropped with "argument
+					# unused during compilation" on an objs-only link, which
+					# never runs a cc1 compile step to consume it)
+					cmd += [ '-Wl,-s' ]
+				else:
+					# clang on native Windows drives lld-link (MSVC-compatible,
+					# see the no_crt branch above) - -s means nothing there
+					# either way (LNK4044 "unrecognized option", confirmed via
+					# a real repro), same as the 'cl' branch's own comment: PE
+					# has no ELF-style symbol table to strip in the first
+					# place, /OPT:REF /OPT:ICF (dead-code elim + identical-
+					# COMDAT folding) is the closest real analog
+					cmd += [ '-Wl,/OPT:REF', '-Wl,/OPT:ICF' ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,
