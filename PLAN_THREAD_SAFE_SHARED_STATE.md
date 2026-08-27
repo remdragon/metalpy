@@ -1405,6 +1405,59 @@ a lazy-init site and a crash.
    but must be resolved, and verified against `linker_c.py`'s actual
    flag set on all three compilers, before that upgrade is ever attempted.
 
+   **Status update: investigated (design-only, no code) whether the whole
+   double-width-CAS upgrade is worth building at all, now that Stages 1-4
+   have landed. Recommendation: not now - the benefit is real but modest,
+   and it's gated on a much bigger prerequisite than this open question's
+   own framing ("just wire in a flag") suggests.**
+
+   What it would actually buy: today's RW spinlock (Stage 3/4) still makes
+   a reader do a bounded but real CAS-retry-loop against a SHARED word,
+   contending with a writer's own CAS on that same word - genuinely
+   lock-free only in the sense that no thread can be blocked forever, not
+   in the sense that a reader never spins. The double-width scheme this
+   question is about goes further: pack `[pointer, in-flight-reader-count]`
+   into one 128-bit word so a reader's "reserve" is a single atomic RMW
+   that never contends with a writer's own CAS the way today's shared
+   word does, and a writer never blocks waiting for a lock, only for the
+   count to drain - strictly less contention, and removes the spin
+   entirely from the read path. Given B.3's own "extremely short critical
+   sections" sizing (one `GetAttr`/`SetAttr`-width access) already makes
+   today's spin cost small, this is a real but narrow win, not a
+   qualitative one - no evidence exists that today's Stage 3/4 spinlock is
+   an actual measured bottleneck on any real program.
+
+   What it would cost, beyond the flag itself: `lib/atomic.py`'s
+   `Atomic[T]` only supports plain scalars and raw pointers today (its own
+   module docstring) - no packed 16-byte `[pointer, count]` value type
+   exists anywhere in this compiler. Confirmed directly against
+   `emitter_c.py`'s current `ir.AtomicCompareExchange` codegen: it emits a
+   single, generic `atomic_compare_exchange_strong((_Atomic(T)*)ptr, ...)`
+   call for whatever scalar/pointer `T` is - MSVC's own
+   `_InterlockedCompareExchange128` has a genuinely different calling
+   shape (an in/out `int64_t Comparand[2]` array, not a value parameter),
+   so this needs real new emitter machinery, not a parameter tweak to the
+   existing one. It also has zero use without A.2's own "split reference
+   counting" representation work, which this document explicitly says
+   isn't built yet ("a legitimate lock-free upgrade path once that
+   representation work lands... recorded here as a real option, not
+   attempted in this pass") - the `-mcx16` flag alone unlocks nothing on
+   its own. And the flag itself is a genuine footgun, not just a checkbox:
+   forgetting it doesn't fail to compile or degrade gracefully - it
+   silently falls back to a libatomic-backed *lock* for the 128-bit CAS,
+   which is worse than today's own per-object spinlock (a global,
+   address-keyed lock table, not even per-object), so a missed flag would
+   make the "upgrade" a regression nobody would notice without explicitly
+   checking generated assembly or linked libraries for it - this would
+   need its own dedicated build-time verification step (confirmed absent
+   today: `linker_c.py`/`emitter_c.py` currently reference no `-mcx16`,
+   `libatomic`, or `cmpxchg16b` anywhere, grep-confirmed).
+
+   Net: worth reconsidering only alongside A.2's own representation work,
+   not as a standalone flag-wiring task, and only with real profiling
+   evidence that Stage 3/4's existing spinlock is an actual bottleneck
+   under real contention - not pursued further for now.
+
 ## Verification plan for any future attempt
 
 1. Work in a fresh `EnterWorktree` worktree (never reuse this one or any
