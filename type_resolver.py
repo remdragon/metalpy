@@ -4558,6 +4558,22 @@ class TypeResolver:
 				_record( self )
 				return
 			if isinstance( unit.base, ( RCClass, CStruct, CUnion, TaggedUnion )):
+				if not self.monomorphizer._is_concrete( unit ):
+					# a Specialization still mentioning a TypeVar (e.g. the
+					# abstract `Ptr[Callable[[T],K]]` reached via union_
+					# storage.py's own UnionStorage._ensure_resolved, itself
+					# a caller that (unlike this class's own ensure_resolved,
+					# just below) never had this same concreteness guard) is
+					# not a real compile unit - queuing it anyway reached
+					# emitter_c.py with a still-bare TypeVar field. Every
+					# OTHER path into schedule() already relies on its own
+					# caller pre-filtering via ensure_resolved's identical
+					# check; enforced here too so a caller that forgets to
+					# (confirmed by a real repro: a generic function with a
+					# nullable-Callable parameter, narrowed with `is not
+					# None` inside its own still-abstract body) can't leak
+					# an abstract unit into real emission either.
+					return
 				with self._seen_lock:
 					if id( unit ) in self._seen:
 						return
@@ -4580,6 +4596,22 @@ class TypeResolver:
 		if isinstance( unit, RCClass ):
 			self._schedule_rcclass_destructor_deps( unit )
 		if isinstance( unit, TaggedUnion ):
+			if unit.file is None and not self.monomorphizer._is_concrete( unit ):
+				# an anonymous union built from a still-generic function's OWN
+				# abstract, unsubstituted parameter/return annotation (e.g.
+				# `key: Ptr[Callable[[T],K]]|None`, visited by resolve_
+				# function_body's "is not None" narrowing rewrite against the
+				# SHARED abstract body, before any call site ever substitutes
+				# T/K) still mentions a bare TypeVar - never a real,
+				# instantiable compile unit, unlike the Specialization+
+				# ClassLike branch above (which already guards on _is_concrete
+				# via ensure_resolved before ever reaching here). Scheduling
+				# it anyway queued a union with a bare TypeVar field straight
+				# through to emitter_c.py - "c_type: unsupported type" -
+				# confirmed by a real repro (a generic function with a
+				# nullable-Callable parameter, narrowed with `is not None`
+				# inside its own body).
+				return
 			self._schedule_uniontype_storage( unit )
 		with self._seen_lock:
 			if id( unit ) in self._seen:

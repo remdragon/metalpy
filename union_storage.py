@@ -6,7 +6,7 @@ from typing import Callable
 
 # local imports:
 from discovery import Discovery
-from mpy_types import Variable, Parameter, Function, TaggedUnion, CUnion, Type
+from mpy_types import Variable, Parameter, Function, TaggedUnion, CUnion, Type, TypeVar, Specialization, CallableType
 
 '''
 Synthesizes and memoizes the real runtime representation of every TaggedUnion
@@ -15,6 +15,30 @@ lowering.py since it has no dependency on statement/expression lowering or
 CFG state, only on Discovery (for resolving/scheduling) - see UnionStorage's
 own docstring.
 '''
+
+def _mentions_typevar( t: Type|None ) -> bool:
+	''' true if a bare TypeVar occurs anywhere inside `t` - same structural
+	recursion monomorphize.py's own _is_concrete/substitute_type_params use,
+	duplicated here (rather than depending on Monomorphizer, which itself
+	depends on UnionStorage - see this module's own docstring) to guard
+	UnionStorage.get()'s own payload_cls scheduling below. An ANONYMOUS
+	union (X|Y, synthesized by discovery.py's own _get_or_create_union)
+	never carries type_params of its OWN, even when one of its leaves
+	still mentions a foreign, still-unbound TypeVar borrowed from an
+	enclosing generic function/class (e.g. `key: Ptr[Callable[[T],K]]|None`)
+	- "union.type_params is empty" alone is not proof of concreteness for
+	that shape, confirmed by a real repro (get()'s own payload_cls schedule
+	call below queued exactly this for real emission, reaching emitter_c.py
+	with a still-bare TypeVar field). '''
+	if isinstance( t, TypeVar ):
+		return True
+	if isinstance( t, Specialization ):
+		return any( _mentions_typevar( a ) for a in t.args )
+	if isinstance( t, CallableType ):
+		return any( _mentions_typevar( a ) for a in t.arg_types ) or _mentions_typevar( t.return_type )
+	if isinstance( t, TaggedUnion ) and t.file is None:
+		return any( _mentions_typevar( attr.type ) for attr in t.attributes )
+	return False
 
 @dataclass( kw_only = True )
 class ReceiverDispatch:
@@ -301,11 +325,15 @@ class UnionStorage:
 		# `data` field embeds BY VALUE never lands in compiler.cunions,
 		# leaving that field's type incomplete. Skipped when `union` is
 		# itself still generic (type_params set, i.e. this is the abstract
-		# base of something like Result[T,E]): payload_fields carry bare
-		# TypeVars in that case, not a real emittable C type - only a
+		# base of something like Result[T,E]) OR when an anonymous union's
+		# own leaf still mentions a foreign, still-unbound TypeVar
+		# (_mentions_typevar - see its own docstring; a union.type_params-
+		# only check misses this shape entirely, since an anonymous union
+		# never carries type_params of its own): payload_fields carry bare
+		# TypeVars in either case, not a real emittable C type - only a
 		# CONCRETE specialization's own substituted payload_cls (built by
 		# Lowering.monomorphize_class) is ever a real compile unit.
-		if not union.type_params:
+		if not union.type_params and not any( _mentions_typevar( f.type ) for f in payload_fields ):
 			self.schedule( payload_cls )
 		result = ( tag_attr, data_attr, payload_cls, tags )
 		self._cache[ id( union ) ] = result
