@@ -44,6 +44,35 @@ def _collect_reachable_returns( stmts: list[ast.stmt] ) -> list[ast.Return]:
 		collector.visit( stmt )
 	return returns
 
+def _collect_direct_self_attribute_assigns( stmts: list[ast.stmt] ) -> list[ast.Assign]:
+	''' every ast.Assign anywhere within `stmts` (if/for/while/with/try/
+	match bodies included) whose sole target is `self.X`, NOT descending
+	into a nested def/lambda/class - mirrors _collect_reachable_returns'
+	identical scoping rule, just above. Feeds Discovery._infer_init_
+	attributes' implicit-attribute-declaration scan. '''
+	found: list[ast.Assign] = []
+	class _SelfAssignCollector( ast.NodeVisitor ):
+		def visit_FunctionDef( self, fd: ast.FunctionDef ) -> None:
+			pass
+		def visit_AsyncFunctionDef( self, fd: ast.AsyncFunctionDef ) -> None:
+			pass
+		def visit_Lambda( self, lam: ast.Lambda ) -> None:
+			pass
+		def visit_ClassDef( self, cd: ast.ClassDef ) -> None:
+			pass
+		def visit_Assign( self, node: ast.Assign ) -> None:
+			if (
+				len( node.targets ) == 1
+				and isinstance( node.targets[0], ast.Attribute )
+				and isinstance( node.targets[0].value, ast.Name )
+				and node.targets[0].value.id == 'self'
+			):
+				found.append( node )
+	collector = _SelfAssignCollector()
+	for stmt in stmts:
+		collector.visit( stmt )
+	return found
+
 def _find_inline_body_reserved_name_reassignment( stmts: list[ast.stmt], reserved_names: set[str] ) -> ast.Name|None:
 	''' PLAN_INLINE.md multi-statement generalization: a Store-context
 	reference to `self` or a declared parameter name anywhere within
@@ -2127,6 +2156,8 @@ class Discovery( ast.NodeVisitor ):
 					for node in body:
 						self._check_supported_statement( node )
 						self.visit( node )
+					if isinstance( class_obj, RCClass ):
+						self._infer_init_attributes( class_obj )
 					if isinstance( class_obj, RCClass ) and class_obj.protocols:
 						# needs class_obj still on scope_stack/module on
 						# module_stack - a missing default gets spliced in
@@ -2139,6 +2170,144 @@ class Discovery( ast.NodeVisitor ):
 		def resolve() -> None:
 			self._resolve_guarded( class_obj, body_fn )
 		return resolve
+
+	def _infer_init_attributes( self, class_obj: RCClass ) -> None:
+		''' __init__ may implicitly declare a NEW class attribute via
+		`self.x = expr` for an `x` never declared in the class body - the
+		type is inferred from expr through a small, permanent allowlist (see
+		_infer_simple_expr_type), never a general expression evaluator.
+		__init__-only, permanently, not a v1 scope to widen later: an
+		object's attribute set must be fully fixed by the time __init__
+		finishes, so no other method gets this treatment - `self.x = ...`
+		there for an undeclared x stays the ordinary "no attribute" error
+		(lowering.py's _attr_lookup). Runs once per class, synchronously,
+		right after this class's own body has been fully visited (own
+		.attributes/.names only reflect explicit declarations at this
+		point) and before _validate_no_attribute_shadowing, so a name
+		inferred here that collides with an ancestor's own attribute/method
+		hits that same shadowing check for free. '''
+		init_fn = class_obj.names.get( '__init__' )
+		if not isinstance( init_fn, Function ):
+			return # no __init__ (or it's an Overload group, not supported here) - nothing to infer
+		if init_fn.resolve is not None:
+			# parameters/return_type are otherwise resolved lazily, on first
+			# real use (_make_function_resolver) - forced here since the
+			# parameter-name allowlist branch below needs real Parameter
+			# objects with a real .type already populated, same "resolve it
+			# right here" idiom _validate_protocol_conformance already uses
+			# for a protocol's own .resolve
+			init_fn.resolve()
+		for assign in _collect_direct_self_attribute_assigns( init_fn.node.body ):
+			target = assign.targets[0]
+			assert isinstance( target, ast.Attribute ) # guaranteed by the collector
+			name = target.attr
+			existing = class_obj.names.get( name )
+			if isinstance( existing, Variable ):
+				continue # already declared (explicitly, or inferred from an earlier statement in this same __init__) - ordinary reassignment, nothing new to register
+			if existing is not None:
+				self.fail_loc(
+					f'{class_obj.qualname}.__init__: self.{name} collides with {existing.qualname} - an '
+					f"implicitly declared attribute can't reuse an existing method's name",
+					class_obj.file, assign.lineno,
+				)
+			if class_obj.base is not None:
+				# own .names has no entry (checked above) - still need to
+				# check the ANCESTOR chain before treating this as NEW: a
+				# subclass's own __init__ assigning to a field it INHERITS
+				# (never redeclared in its own body) is the ordinary case
+				# (test_subclass_own_init_is_not_shadowing), not a fresh
+				# attribute to infer. NOT class_obj.chain_lookup(name) -
+				# class_obj's own .resolve is still live on the call stack
+				# right now (same reasoning _validate_protocol_conformance's
+				# own comment gives) - walk .base directly, a separate
+				# object whose own .resolve is safe to trigger
+				base = class_obj.base
+				if isinstance( base, Specialization ):
+					base = base.base
+				inherited = base.chain_lookup( name )
+				if isinstance( inherited, Variable ):
+					continue # inherited field - ordinary assignment, nothing new to register
+				# inherited is a Function/other (or None) - fall through;
+				# a real collision with an inherited METHOD is caught by
+				# _validate_no_attribute_shadowing once this gets registered
+			inferred_type = self._infer_simple_expr_type( assign.value, class_obj, init_fn )
+			if inferred_type is None:
+				self.fail_loc(
+					f"{class_obj.qualname}.__init__: cannot infer the type of 'self.{name}' from its initializer "
+					f"- expression too complex for implicit attribute inference; declare '{name}: <type>' "
+					f'explicitly in the class body',
+					class_obj.file, assign.lineno,
+				)
+			var_obj = Variable(
+				stem = name,
+				qualname = f'{class_obj.qualname}.{name}',
+				file = class_obj.file,
+				line = assign.lineno,
+				type = inferred_type,
+			)
+			class_obj.names[name] = var_obj
+			class_obj.attributes.append( var_obj )
+
+	def _infer_simple_expr_type( self, node: ast.expr, class_obj: RCClass, init_fn: Function ) -> Type|None:
+		''' the narrow, permanent allowlist backing _infer_init_attributes -
+		deliberately NOT a general expression-type inferencer (that's
+		type_resolver.py's own best-effort _type_of_expr, which is stateful
+		and runs too late in the pipeline for this - Stage 2/3 are
+		interleaved per-unit, so a class's OTHER methods can lower before
+		__init__ does, with no ordering guarantee). Returns None for
+		anything outside the allowlist; the caller turns that into an
+		actionable "declare it explicitly" error rather than guessing. '''
+		if isinstance( node, ast.Constant ):
+			# mirrors _natural_literal_type's exact mapping (type_resolver.py) -
+			# what Lowering._expr_Constant actually gives this RHS with no
+			# expected type, NOT _type_of_expr's own annotation-style
+			# Constant mapping (those two diverge for float: builtins.float
+			# alias vs intrinsics.f64)
+			if node.value is None:
+				return self.get_none_type()
+			if isinstance( node.value, bool ):
+				return self.get_intrinsics()['bool']
+			if isinstance( node.value, int ):
+				return self.find_name_or_none( 'int' )
+			if isinstance( node.value, float ):
+				return self.get_intrinsics()['f64']
+			if isinstance( node.value, str ):
+				return self.find_name_or_none( 'str' )
+			if isinstance( node.value, bytes ):
+				return self.find_name_or_none( 'bytes' )
+			return None
+		if isinstance( node, ast.Name ):
+			# an __init__ parameter's own already-resolved type (init_fn.
+			# resolve() was already forced by the caller)
+			if init_fn.parameters is not None:
+				for param in init_fn.parameters:
+					if param.stem == node.id:
+						return param.type
+			return None
+		if isinstance( node, ast.Attribute ) and isinstance( node.value, ast.Name ) and node.value.id == 'self':
+			# a chained reference to an earlier self.attr in this SAME
+			# __init__ (already registered into class_obj.names by the time
+			# this runs - _infer_init_attributes processes assigns in
+			# textual order) or an explicitly pre-declared attribute
+			found = class_obj.names.get( node.attr )
+			return found.type if isinstance( found, Variable ) else None
+		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ):
+			# a plain constructor call (SomeClass(...), i32(...), ...) -
+			# arguments aren't type-checked here, that still happens
+			# normally when __init__ itself really lowers
+			found = self.find_name_or_none( node.func.id )
+			return found if isinstance( found, ( RCClass, CStruct, Scalar )) else None
+		if isinstance( node, ast.UnaryOp ):
+			if isinstance( node.op, ast.Not ):
+				return self.get_intrinsics()['bool']
+			return self._infer_simple_expr_type( node.operand, class_obj, init_fn )
+		if isinstance( node, ast.BinOp ):
+			left = self._infer_simple_expr_type( node.left, class_obj, init_fn )
+			right = self._infer_simple_expr_type( node.right, class_obj, init_fn )
+			# same type both sides only - no promotion rules attempted,
+			# bail (-> error) on anything less trivial than that
+			return left if left is not None and left == right else None
+		return None
 
 	def _validate_no_attribute_shadowing( self, class_obj: RCClass ) -> None:
 		''' a subclass cannot redeclare a name (field or method) already
