@@ -1835,6 +1835,39 @@ class Lowering:
 				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
 			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
 			return
+		if isinstance( declared, TaggedUnion ) and declared.file is None and not isinstance( actual, TaggedUnion ):
+			# anonymous union parameter (X|None) whose non-None leaf can
+			# itself mention a type param (e.g. `key: Ptr[Callable[[T],K]]
+			# |None`) - type_resolver.py's own speculative pre-pass
+			# deliberately declines to drill into a union leaf like this
+			# (see its _unify_type_param's own TaggedUnion branch) and
+			# leaves it to real argument-lowering time, here, once
+			# `actual`'s own concrete (non-union - a caller passing a whole
+			# union-typed variable through unchanged isn't this shape at
+			# all) type is known. Match against whichever leaf shares
+			# actual's own outer shape - a union's leaves are otherwise
+			# disjoint types, so at most one can structurally apply.
+			# Without this, K here was never bound by ordinary argument
+			# unification at all (confirmed by a real repro: it fell
+			# through to return-only inference, which then requires a
+			# single-return body - a needless restriction this shape
+			# should never have hit, since K IS argument-inferable through
+			# `key`), and if the body genuinely has multiple returns
+			# (as apply_or_default's `if key is not None: return key(x)`/
+			# `return default` does), K reached emitter_c.py as a still-
+			# bare, unsubstituted TypeVar - "c_type: unsupported type".
+			actual_spec = self._type_resolver._as_specialization( actual )
+			for leaf in declared.leaves():
+				if any( leaf is tv for tv in type_params ):
+					self._unify_type_param( type_params, leaf, actual, bindings, node, context_qualname )
+					return
+				if isinstance( leaf, Specialization ) and actual_spec is not None and leaf.base is actual_spec.base:
+					self._unify_type_param( type_params, leaf, actual, bindings, node, context_qualname )
+					return
+				if isinstance( leaf, CallableType ) and isinstance( actual, CallableType ):
+					self._unify_type_param( type_params, leaf, actual, bindings, node, context_qualname )
+					return
+			return
 		if isinstance( declared, GeneratorType ):
 			# a declared Generator[T,E]/Iterator[Result[T,E]] return type
 			# (e.g. iter[T,S:Iterable[T]](seq:S) -> Generator[T,StopIteration])
@@ -17528,6 +17561,53 @@ class FunctionLowering:
 		# yet (no general type-checking pass exists), same as every other
 		# call site in this file today
 
+	def _coerce_generic_call_args( self, monomorphized: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], node: ast.Call ) -> tuple[list[ir.Operand],dict[str,ir.Operand]]:
+		# a bare inferred call's own interleaved lower+unify (lower_and_
+		# unify, above) lowers each argument with strict=False against a
+		# partial-substitution HINT, deliberately skipping real coercion
+		# (see its own comment) since the hint can still contain an unbound
+		# type param mid-inference. Once every type param is bound and
+		# `monomorphized`'s own parameter types are fully concrete, an
+		# argument whose own natural type is just ONE non-union leaf of a
+		# union-typed parameter (e.g. `key: Ptr[Callable[[T],K]]|None`,
+		# monomorphized to `Ptr[Callable[[i32],i32]]|None`, called with a
+		# bare `Ptr[Callable[[i32],i32]]`-typed argument, never itself
+		# wrapped into the union) still needs the SAME real coercion an
+		# ordinary (non-generic) call's own _lower_and_infer_call_args
+		# already applies - without this, the union-wrapping never
+		# happened at all, reaching emitter_c.py's _emit_call_args with a
+		# bare function pointer passed where the whole union struct is
+		# declared, a real (if less silent) clang type-mismatch error -
+		# confirmed by a real repro.
+		#
+		# Deliberately narrow: only when `param.type` is ITSELF a union
+		# (the one shape strict=False's own skip actually leaves unfinished -
+		# ordinary same-type/no-op cases are already handled by the operand's
+		# own natural type matching exactly) - a blanket _coerce_or_check_
+		# operand over every parameter, unconditionally, re-surfaced a
+		# separate, pre-existing, genuinely out-of-scope gap early (a
+		# Closure[[T],K]-shaped parameter whose K is only resolvable via
+		# eager lambda-lowering, not fed back into monomorphized.parameters'
+		# own substitution - see lowering_test.py's test_lambda_eager_
+		# return_type_inference_with_capture, whose own docstring already
+		# documents this as "not fixed here, out of scope") as a hard
+		# lowering-time discovery.fail() instead of the deferred, silent-
+		# until-emission behavior every OTHER unrelated generic-call shape
+		# already had before this fix.
+		def _maybe_coerce( operand: ir.Operand, declared: Type|None ) -> ir.Operand:
+			if not isinstance( declared, TaggedUnion ):
+				return operand
+			return self._coerce_or_check_operand( operand, declared, node )
+		coerced_args = [
+			_maybe_coerce( operand, param.type )
+			for param, operand in zip( monomorphized.parameters or [], args )
+		]
+		coerced_kwargs = dict( kwargs )
+		for param in monomorphized.parameters or []:
+			if param.stem in coerced_kwargs:
+				coerced_kwargs[param.stem] = _maybe_coerce( coerced_kwargs[param.stem], param.type )
+		return coerced_args, coerced_kwargs
+
 	def _fill_generic_call_defaults( self, monomorphized: Function, args: list[ir.Operand], kwargs: dict[str,ir.Operand], node: ast.Call ) -> None:
 		# _lower_inferred_generic_call/_lower_overload_generic_call's own
 		# argument lowering (lower_and_unify, and the Overload group's own
@@ -17601,12 +17681,14 @@ class FunctionLowering:
 			inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 			self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 			spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
+			args, kwargs = self._coerce_generic_call_args( monomorphized, args, kwargs, node )
 			self._fill_generic_call_defaults( monomorphized, args, kwargs, node )
 			return self._emit_generic_call( node, spec, monomorphized, receiver, args, kwargs, expected_type, want_result, already_compiled = True )
 		inferred_args = [ bindings[id(tv)] for tv in target.type_params or [] ]
 		self.lowering._check_type_param_bounds( node, target.type_params or [], inferred_args, target.qualname )
 		spec = self.lowering.discovery._get_or_create_specialization( target, inferred_args )
 		monomorphized = self.lowering._monomorphized_function( spec )
+		args, kwargs = self._coerce_generic_call_args( monomorphized, args, kwargs, node )
 		self._fill_generic_call_defaults( monomorphized, args, kwargs, node )
 		if monomorphized.is_inline:
 			return self._lower_inline_call( node, monomorphized, receiver, args, kwargs, expected_type, want_result )

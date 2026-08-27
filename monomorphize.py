@@ -111,6 +111,16 @@ class Monomorphizer:
 			return False
 		if isinstance( t, Specialization ):
 			return self._is_concrete( t.base ) and all( self._is_concrete( a ) for a in t.args )
+		if isinstance( t, CallableType ):
+			return self._is_concrete( t.return_type ) and all( self._is_concrete( a ) for a in t.arg_types )
+		if isinstance( t, TaggedUnion ) and t.file is None:
+			# an anonymous union (T|None) can mention a TypeVar in one of its
+			# own leaves the same way a Specialization's args can (e.g.
+			# `key: Ptr[Callable[[T],K]]|None` - see substitute_type_params's
+			# own identical TaggedUnion branch); a real, user-declared
+			# `@union class Foo:` (t.file is not None) is never abstract this
+			# way, so left as concrete like any other ordinary ClassLike
+			return all( self._is_concrete( attr.type ) for attr in t.attributes )
 		return True
 
 	def substitute_type_params( self, t: Type|None, type_params: list[TypeVar], args: list[Type] ) -> Type|None:
