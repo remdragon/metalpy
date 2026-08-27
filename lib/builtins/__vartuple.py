@@ -49,6 +49,17 @@ class VariadicTuple[T]( Sequence[T], Iterable[T], Sized ):
 	def __getitem__( self, idx: usize ) -> Result[T, IndexError]:
 		return self.__inner.__getitem__( idx )
 
+	# real Python's own negative-index convention (t[-1] is the last
+	# element) - see _resolve_index's own comment for why this is a
+	# sibling overload, not a widened usize->isize parameter above.
+	@overload
+	def __getitem__( self, idx: isize ) -> Result[T, IndexError]:
+		match _resolve_index( idx, self.__inner.__len__() ):
+			case Result.Ok( resolved ):
+				return self.__inner.__getitem__( resolved )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	# t[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a NEW
 	# VariadicTuple[T], every element copied (incref'd if RC), matching
 	# every other slice target's own copy semantics (_resolve_slice_bounds).

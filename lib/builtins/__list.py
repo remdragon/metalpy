@@ -301,6 +301,17 @@ class UnsafeList[T]( Sized ):
 		compiler.incref( val )
 		return Result.Ok( val )
 
+	# real Python's own negative-index convention (x[-1] is the last
+	# element) - see _resolve_index's own comment for why this is a
+	# sibling overload, not a widened usize->isize parameter above.
+	@overload
+	def __getitem__( self, idx: isize ) -> Result[T, IndexError]:
+		match _resolve_index( idx, self.__raw.len() ):
+			case Result.Ok( resolved ):
+				return self.__getitem__( resolved )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	# x[a:b] slice syntax (lowering.py's _lower_slice_subscript) - real
 	# Python semantics: a NEW UnsafeList[T], every element copied (incref'd
 	# if RC), not a view - mirrors list[T]'s own __getitem__(slice) below.
@@ -318,12 +329,21 @@ class UnsafeList[T]( Sized ):
 		return result
 
 	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
+	@overload
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
 		slot: Ptr[None] = self.__raw._ptr_at( idx ).or_return()
 		self._release_element( slot )
 		compiler.incref( val )
 		self._write_element( slot, val )
 		return Result.Ok( None )
+
+	# real Python's own negative-index convention (x[-1] = val overwrites
+	# the last element) - see _resolve_index's own comment for why this is
+	# a sibling overload, not a widened usize->isize parameter above.
+	@overload
+	def __setitem__( self, idx: isize, val: T ) -> Result[None, IndexError]:
+		resolved: usize = _resolve_index( idx, self.__raw.len() ).or_return()
+		return self.__setitem__( resolved, val )
 
 	# Remove the element at idx, shifting everything after it one slot to
 	# the left. Decrefs the removed element if T is RC.
@@ -470,6 +490,18 @@ class list[T]( Sequence[T], Iterable[T], Sized ):
 		with self.__lock:
 			return self.__inner.__getitem__( idx )
 
+	# real Python's own negative-index convention (x[-1] is the last
+	# element) - see _resolve_index's own comment for why this is a
+	# sibling overload, not a widened usize->isize parameter above.
+	@overload
+	def __getitem__( self, idx: isize ) -> Result[T, IndexError]:
+		with self.__lock:
+			match _resolve_index( idx, self.__inner.__len__() ):
+				case Result.Ok( resolved ):
+					return self.__inner.__getitem__( resolved )
+				case Result.Err( e ):
+					return Result.Err( e )
+
 	# x[a:b] slice syntax (lowering.py's _lower_slice_subscript) - real
 	# Python semantics: a NEW list[T], every element copied (incref'd if
 	# RC), not a view - matches list[str][a:b] returning list[str] in real
@@ -491,9 +523,19 @@ class list[T]( Sequence[T], Iterable[T], Sized ):
 		return _list_iter( self ) # not _sequence_iter - see its own comment above
 
 	# Overwrite the element at idx. Increfs val and decrefs the value it replaces.
+	@overload
 	def __setitem__( self, idx: usize, val: T ) -> Result[None, IndexError]:
 		with self.__lock:
 			return self.__inner.__setitem__( idx, val )
+
+	# real Python's own negative-index convention (x[-1] = val overwrites
+	# the last element) - see _resolve_index's own comment for why this is
+	# a sibling overload, not a widened usize->isize parameter above.
+	@overload
+	def __setitem__( self, idx: isize, val: T ) -> Result[None, IndexError]:
+		with self.__lock:
+			resolved: usize = _resolve_index( idx, self.__inner.__len__() ).or_return()
+			return self.__inner.__setitem__( resolved, val )
 
 	# Remove and return the LAST element (O(1), no shift needed) - list[T]
 	# has no equivalent of this today; natural for a producer/consumer
