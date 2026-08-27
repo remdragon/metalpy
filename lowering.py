@@ -16626,6 +16626,11 @@ class FunctionLowering:
 		if receiver_pending_start is not None:
 			self._flush_new_pending_temps( receiver_pending_start, receiver )
 		unwrapped = self._new_temp( result_type )
+		# see _consume_checked_result's identical fresh_temp() call/comment -
+		# without this, a discarded/bare-operand unwrapped payload (e.g. used
+		# only as a `!=` operand, never bound) is never decref'd: a real leak,
+		# confirmed via `s[0] != 'h'` on an RC str
+		self._cfg.fresh_temp( unwrapped, result_type )
 		all_covered = len( covered_leaves ) == len( all_leaves )
 		if all_covered:
 			# every leaf dispatches straight into a handler - no

@@ -610,6 +610,34 @@ def main() -> i32:
 	return 0
 '''
 
+# regression: `s[0] != 'h'` auto-or_throw's the fallible __getitem__ result to
+# get the bare str, then uses it only as a `!=` operand (never bound to a
+# name) - _emit_or_throw's own unwrapped payload was never cfg.fresh_temp()-
+# registered (unlike _consume_checked_result's identical or_return() path),
+# so nothing ever decref'd it: a real leak of the extracted RC element.
+_SUBSCRIPT_RESULT_AS_BARE_COMPARE_OPERAND_DOES_NOT_LEAK = '''
+def check_str( s: str ) -> Result[bool, IndexError]:
+	if s[0] != 'h':
+		return Result.Ok( False )
+	return Result.Ok( True )
+
+def check_list( xs: list[str] ) -> Result[bool, IndexError]:
+	if xs[0] != 'x':
+		return Result.Ok( False )
+	return Result.Ok( True )
+
+def main() -> i32:
+	if not check_str( 'hello' ).unwrap( 'str' ):
+		return 1
+	if check_str( 'world' ).unwrap( 'str' ):
+		return 2
+	xs: list[str] = list[str]()
+	xs.append( 'x' )
+	if not check_list( xs ).unwrap( 'list' ):
+		return 3
+	return 0
+'''
+
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile auto-or_throw tests' )
 class AutoOrThrowBehaviorTests( RealCompileMixin, unittest.TestCase ):
@@ -627,6 +655,9 @@ class AutoOrThrowBehaviorTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_subscript_as_direct_t_typed_target_compiles( self ) -> None:
 		self.assert_programs_run([ ( 'subscript_direct_target', _SUBSCRIPT_AS_DIRECT_T_TYPED_TARGET_COMPILES ) ])
+
+	def test_subscript_result_as_bare_compare_operand_does_not_leak( self ) -> None:
+		self.assert_programs_run([ ( 'subscript_bare_compare', _SUBSCRIPT_RESULT_AS_BARE_COMPARE_OPERAND_DOES_NOT_LEAK ) ])
 
 	def test_subscript_assign_and_augassign_still_propagate_with_no_try( self ) -> None:
 		self.assert_programs_run([ ( 'subscript_assign_augassign', _SUBSCRIPT_ASSIGN_AND_AUGASSIGN_STILL_PROPAGATE_WITH_NO_TRY ) ])
