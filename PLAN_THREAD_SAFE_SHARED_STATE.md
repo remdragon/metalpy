@@ -1411,20 +1411,39 @@ a lazy-init site and a crash.
    and it's gated on a much bigger prerequisite than this open question's
    own framing ("just wire in a flag") suggests.**
 
-   What it would actually buy: today's RW spinlock (Stage 3/4) still makes
-   a reader do a bounded but real CAS-retry-loop against a SHARED word,
-   contending with a writer's own CAS on that same word - genuinely
-   lock-free only in the sense that no thread can be blocked forever, not
-   in the sense that a reader never spins. The double-width scheme this
-   question is about goes further: pack `[pointer, in-flight-reader-count]`
-   into one 128-bit word so a reader's "reserve" is a single atomic RMW
-   that never contends with a writer's own CAS the way today's shared
-   word does, and a writer never blocks waiting for a lock, only for the
-   count to drain - strictly less contention, and removes the spin
-   entirely from the read path. Given B.3's own "extremely short critical
-   sections" sizing (one `GetAttr`/`SetAttr`-width access) already makes
-   today's spin cost small, this is a real but narrow win, not a
-   qualitative one - no evidence exists that today's Stage 3/4 spinlock is
+   What it would actually buy - narrower than this document's own earlier
+   framing claimed, corrected here after checking against real sources
+   rather than left standing: x86-64 has no native 128-bit fetch-add: `XADD`
+   tops out at 64 bits (`REX.W` promotes it that far, no further -
+   [Felix Cloutier's `XADD` reference](https://www.felixcloutier.com/x86/xadd)),
+   so a reader's "reserve" on the packed `[pointer, count]` word can't be a
+   single unconditional RMW the way an ordinary refcount bump is today -
+   it has to be emulated as its own load/increment/`CMPXCHG16B`-retry loop,
+   the exact pattern real lock-free `atomic_shared_ptr` implementations use
+   for this (Anthony Williams' own split-reference-count design retries its
+   increment CAS "if the reference count reaches zero... on the new stored
+   value" -
+   [Just Software Solutions](https://www.justsoftwaresolutions.co.uk/threading/why-do-we-need-atomic_shared_ptr.html)).
+   So the read side does NOT become spin-free - it trades today's 4-byte
+   CAS-retry-loop (Stage 3/4's RW spinlock) for a 16-byte `CMPXCHG16B`-retry
+   loop, not for zero retries. The real property gained is narrower but
+   still genuine: **lock-freedom**, not spin-freedom - a retry only ever
+   happens because ANOTHER thread's own operation just succeeded (real,
+   system-wide forward progress), never because a reader is waiting on a
+   writer that got preempted mid-critical-section while holding something.
+   Today's spinlock already has that same lock-free property at the
+   thread-progress level (Stage 3/4's own design already guarantees no
+   thread blocks another indefinitely) - what it does NOT have is a
+   writer/reader split: today, a writer's exclusive CAS and a reader's
+   shared CAS both contend on the exact same word, so a burst of readers
+   can make a waiting writer retry its own CAS repeatedly (and vice versa).
+   The packed-word scheme's real, honest benefit is narrowing that
+   contention - readers no longer share a CAS target with the writer's own
+   exclusive-acquire attempt, giving each role a cleaner independent retry
+   loop - not eliminating retries outright. Given B.3's own "extremely
+   short critical sections" sizing (one `GetAttr`/`SetAttr`-width access)
+   already makes today's spin cost small, this is a real but narrow win,
+   not a qualitative one - no evidence exists that today's Stage 3/4 spinlock is
    an actual measured bottleneck on any real program.
 
    What it would cost, beyond the flag itself: `lib/atomic.py`'s
