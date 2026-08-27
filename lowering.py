@@ -5699,6 +5699,17 @@ class FunctionLowering:
 				# just `as NAME` clauses) - a hidden hand-off variable exists
 				# for every handler, see TryHandler's own docstring.
 				self._cfg.declare_exception_bind( handler.raise_value_var )
+				if handler.bind is None:
+					# anonymous `except Foo:` (no `as name`) - raise_value_var
+					# only gets a real read if the body contains a bare
+					# `raise` re-raising it (_stmt_Raise); with none, the
+					# emitter's own unconditional payload-write above (see
+					# this loop's own leading comment) is its only reference -
+					# real -Wunused-but-set-variable/C4189, and there's no
+					# syntax the user could write to opt out (this variable
+					# is entirely hidden from them). Silence unconditionally,
+					# same reasoning as this file's other MarkUsed call sites.
+					self._emit( ir.MarkUsed( operand = handler.raise_value_var ))
 				self._active_raise_values.append( handler.raise_value_var )
 				try:
 					for stmt in h.body:
@@ -7631,6 +7642,18 @@ class FunctionLowering:
 				# wherever it's otherwise flushed/released
 				payload = self._maybe_unwrap_union_arg( operand, member.type )
 				leaf_truth = self._truthiness_of_operand( payload, node )
+				if isinstance( leaf_truth, ir.Const ):
+					# _truthiness_of_operand's own default-truthy fallback
+					# (a plain RCClass/CStruct/... leaf with no __bool__,
+					# not itself Scalar/union) returns Const(True) WITHOUT
+					# ever reading payload - real -Wunused-but-set-variable
+					# (confirmed via a real repro: `if some_optional_match:`
+					# where the non-None leaf is a bare class with no
+					# __bool__). Harmless when leaf_truth DOES depend on
+					# payload (this branch is only reached for the const
+					# case), same reasoning as this file's other MarkUsed
+					# call sites.
+					self._emit( ir.MarkUsed( operand = payload ))
 			self._emit( ir.Assign( dest = dest, src = leaf_truth ))
 			self._emit( ir.Jump( target = end_label ))
 			self._emit( ir.Label( name = next_label ))
@@ -8488,7 +8511,16 @@ class FunctionLowering:
 			self._emit( ir.GetAttr( dest = err_dest, obj = data_dest, attr = f'v_{err_member.stem}' ))
 			for instr in self._cfg.decref( err_member.type, err_dest ):
 				self._emit( instr )
-		self._emit( ir.Label( name = end_label ))
+		# end_label is jumped to unconditionally from
+		# _lower_for_over_iterator_fallible_bind's own StopIteration exit
+		# (stop_label is None here - that helper ran instead, see its own
+		# comment) but, when stop_label WAS used, only break ever targets
+		# end_label (the natural exhaustion exit already fell straight
+		# through, right above) - a body with no break then leaves it a
+		# goto-less label, -Wunused-label/C4102 (confirmed via a real
+		# repro: any `for x in <list/str/...>:` with no break inside)
+		if stop_label is None or break_narrowed:
+			self._emit( ir.Label( name = end_label ))
 		if obj_needs_release:
 			# every non-early-return exit converges here (normal exhaustion
 			# via stop_label above, and break via break_label=end_label) -
