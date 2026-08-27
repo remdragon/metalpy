@@ -15570,6 +15570,25 @@ class FunctionLowering:
 				candidates = [ *init.stubs, *init.implementations ]
 				if any( kw.arg is None for kw in node.keywords ):
 					self.lowering.discovery.fail( f'**kwargs not supported yet: {ast.unparse(node)}', node )
+				# the probe below is a REAL lowering (_lower_overload_arg falls
+				# through to plain _lower_expr for anything but a bare
+				# literal), not a side-effect-free type peek - snapshot first
+				# and roll everything it did back once resolve_call has its
+				# answer, since _lower_generic_construction_args below is
+				# about to lower these SAME arg expressions again for real.
+				# Without this, a probe argument with any real side effect
+				# (e.g. a generator-returning call, whose own construction
+				# increfs its captured receiver) permanently duplicates that
+				# side effect - confirmed via a real repro: `list(pattern.
+				# finditer(mv))` left `pattern` with one extra, never-released
+				# reference, a real RC leak. Mirrors _lower_loop_body_with_
+				# ownership_retry's own identical rollback discipline.
+				instructions_mark = len( self._instructions )
+				defer_flags_mark = len( self._defer_flags )
+				cancel_flags_mark = self._cfg.cancel_flag_count
+				pending_temps_mark = len( self._pending_temps )
+				names_snapshot = dict( self._current_fn.names )
+				probe_snapshot = self._cfg.snapshot()
 				probe_args = [ self._lower_overload_arg( e, i, None, candidates, node ) for i, e in enumerate( node.args ) ]
 				probe_kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
 				try:
@@ -15587,6 +15606,13 @@ class FunctionLowering:
 						node,
 					)
 				init = resolved_init
+				del self._instructions[instructions_mark:]
+				del self._defer_flags[defer_flags_mark:]
+				self._cfg.truncate_cancel_flags( cancel_flags_mark )
+				del self._pending_temps[pending_temps_mark:]
+				self._current_fn.names.clear()
+				self._current_fn.names.update( names_snapshot )
+				self._cfg.hard_restore( probe_snapshot )
 			if not isinstance( init, Function ):
 				self.lowering.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
 			# init may be target_cls's OWN __init__ or an INHERITED one
