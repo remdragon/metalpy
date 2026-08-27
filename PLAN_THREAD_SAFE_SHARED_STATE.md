@@ -1306,9 +1306,11 @@ a lazy-init site and a crash.
    **Status update: implemented and merged (Cost mitigation #3), a plain
    CAS spinlock, not a real futex.** `_Atomic uint32_t` (0 = unlocked, 1 =
    locked), covering BOTH Part A's per-global lock and Part B's per-object
-   `$header.lock` uniformly (a single shared `__metalpy_spinlock_acquire`/
-   `_release` pair, `_PROLOGUE_POSIX_SPINLOCK` in `emitter_c.py`) - deliberately
-   narrower than this question's own "futex-based" wording: the doc's own
+   `$header.lock` uniformly (a single shared acquire/release pair,
+   `_PROLOGUE_POSIX_SPINLOCK` in `emitter_c.py` - later extended into a real
+   exclusive/shared pair each by Cost mitigation #4/Stage 4, see that
+   status update below) - deliberately narrower than this question's own
+   "futex-based" wording: the doc's own
    sizing target ("like a plain `_Atomic int`") is satisfied by a spinlock
    alone, `ir.AtomicCompareExchange` codegen was already wired end-to-end
    and tested (`lib/atomic.py`'s `Atomic[T]`) so this reuses existing
@@ -1338,6 +1340,13 @@ a lazy-init site and a crash.
    or only in a hypothetical inlined/optimized shape? Needs to be
    confirmed with real generated C, not assumed either way, before this
    is considered safe to ship.
+
+   **Status update: confirmed against real generated C under real
+   concurrent load - it does not occur, by construction.** See Cost
+   mitigation #4's own status update above (`test_field_reentrancy_stress`)
+   for the full writeup: a critical section never spans more than one field
+   access (B.3's own design), so no nested acquire on the same object's
+   `$header.lock` was ever reachable to begin with.
 3. **Lock-ordering deadlock across two different globals/objects** — a
    function that touches global A then global B, racing against another
    thread's function that touches B then A, is a classic ordering
@@ -1345,6 +1354,21 @@ a lazy-init site and a crash.
    fine-grained locking scheme). Worth an explicit statement of what
    guarantee (if any) this proposal makes here — likely "none, same as
    any other language with fine-grained locks," but say so.
+
+   **Status update: stated explicitly, as requested - this proposal makes
+   NO ordering guarantee.** Confirmed by construction, not just asserted:
+   every critical section this mechanism ever opens is scoped to exactly
+   ONE global/field access (Part A's own `Acquire.../decref/Assign/
+   Release...` sequence, Part B's own "lock the access, not the statement"
+   - B.3), so this document never itself holds two locks at once and
+   cannot introduce a NEW ordering deadlock on its own. But it also does
+   nothing to prevent one a program's own code constructs (two functions
+   independently touching global A then B, vs. B then A, each under their
+   own single-lock-at-a-time critical sections that can still interleave
+   across statements) - same accepted risk as any other language exposing
+   fine-grained locks (mutexes, `synchronized` blocks, etc.). Not pursued
+   further; a real fix (lock ordering/deadlock detection) is a much larger,
+   separate feature this document was never scoped to provide.
 4. **Read-write lock semantics** (cost mitigation #4) — prototype and
    measure before committing either way.
 
@@ -1364,6 +1388,14 @@ a lazy-init site and a crash.
    linked C library) would silently bypass detection. Needs an explicit
    escape hatch/flag, not a silent assumption that `Thread` is the only
    door.
+
+   **Status update: implemented and merged (Stage 1), shipped alongside
+   the detection mechanism itself, not as a follow-up.** `mpy.py`'s
+   `--assume-threaded` CLI flag sets `compiler.spawns_threads = True`
+   directly before `emit_c()` runs, forcing real lock/retain codegen on
+   even when no `@extern(spawns_thread=True)`-tagged function is ever
+   reached - covered by `thread_detection_test.py`'s
+   `test_assume_threaded_override_forces_lock_codegen`.
 6. **`-mcx16` (or equivalent) must actually be wired into the GCC/Clang
    build recipe** before A.3's future double-width-CAS upgrade path (see
    A.3 above) can be trusted as genuinely lock-free on those two
