@@ -4687,6 +4687,59 @@ class Tests( unittest.TestCase ):
 			f'element temp only gets decref\'d once (after the loop), not per iteration',
 		)
 
+	def test_for_over_iterator_end_label_omitted_when_no_break( self ) -> None:
+		# _lower_for_over_iterator's own end_label is purely a break target
+		# (the natural exhaustion exit falls through stop_label instead,
+		# right above it) - unlike _lower_for_range/_stmt_While, whose
+		# end_label doubles as the loop test's own JumpIfFalse target and
+		# so is always referenced regardless of break. A for-in-list/str/
+		# etc. loop with no break in its body used to still emit
+		# ir.Label(end_label) unconditionally, an orphan label nothing
+		# ever jumps to - real -Wunused-label/C4102 (confirmed via a real
+		# repro: grap.mpy's own several `for x in ...:` loops with no
+		# break inside).
+		code = '\n'.join([
+			'def main( xs: list[str] ) -> i32:',
+			'	for y in xs:',
+			'		pass',
+			'	return 0',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		label_names = { i.name for i in fn.instructions if type( i ).__name__ == 'Label' }
+		jump_targets = {
+			instr.target for instr in fn.instructions
+			if type( instr ).__name__ in ( 'Jump', 'JumpIfTrue', 'JumpIfFalse' )
+		}
+		orphans = { name for name in label_names if 'for_end' in name } - jump_targets
+		self.assertEqual( orphans, set(), f'orphan for_end label(s) with no referencing jump: {orphans}' )
+
+	def test_for_over_iterator_end_label_kept_when_break_present( self ) -> None:
+		# the same loop shape as the test above, but WITH a break - end_label
+		# must still be emitted and referenced here (this is its only
+		# purpose in this lowerer), guarding against an over-eager fix that
+		# drops the label unconditionally instead of only when unreferenced
+		code = '\n'.join([
+			'def main( xs: list[str] ) -> i32:',
+			'	for y in xs:',
+			'		break',
+			'	return 0',
+		])
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		label_names = { i.name for i in fn.instructions if type( i ).__name__ == 'Label' }
+		jump_targets = {
+			instr.target for instr in fn.instructions
+			if type( instr ).__name__ in ( 'Jump', 'JumpIfTrue', 'JumpIfFalse' )
+		}
+		for_end_labels = { name for name in label_names if 'for_end' in name }
+		self.assertTrue( for_end_labels, 'expected a for_end label to be emitted' )
+		self.assertTrue( for_end_labels <= jump_targets, f'for_end label(s) not referenced by any jump: {for_end_labels - jump_targets}' )
+
 	def test_subscript_with_getitem_returning_result_is_now_auto_consumed( self ) -> None:
 		# obj[i] is plain sugar for obj.__getitem__(i), nothing more - when
 		# __getitem__ is fallible the caller gets the raw Result[T,E] back.
@@ -9513,6 +9566,55 @@ class Tests( unittest.TestCase ):
 		# (canonicalized asciibetically by qualname - 'bool' < 'i32')
 		self.assertEqual( call.dest.type.stem, 'intrinsics.bool|intrinsics.i32' )
 
+	def test_union_truth_test_marks_unused_payload_extraction( self ) -> None:
+		# _truthiness_of_union_operand's own non-None-leaf branch extracts
+		# the leaf's payload purely to feed _truthiness_of_operand - but
+		# for a bare @cstruct leaf with no __bool__ of its own,
+		# _truthiness_of_operand's default-truthy fallback returns
+		# Const(True) WITHOUT ever reading that payload. Real repro:
+		# `if make():` where make() -> Foo|None and Foo has no __bool__ -
+		# the extracted payload temp was set but never used
+		# (-Wunused-but-set-variable/C4189), confirmed via grap.mpy's own
+		# `r_filespec.match(file).unwrap_or()` (an re.Match|None truthiness
+		# test reached through a call, not a bare Name the AST-level
+		# _rewrite_tagged_union_truthiness rewrite could narrow away)
+		# called through a Ptr[Callable[...]] value, not a bare `if
+		# make():` - the top-level if/while test gets a separate, EARLIER
+		# AST-level rewrite (type_resolver.py's _rewrite_tagged_union_
+		# truthiness) whose own _type_of_expr can resolve a direct call to
+		# a known Function, bypassing the exact code path this test
+		# targets (see _truthiness_of_union_operand's own docstring: this
+		# is the GENERAL fallback for an operand that rewrite never visits
+		# - an indirect call through a function pointer is exactly such a
+		# case, matching grap.mpy's own real repro: a call chain the
+		# eager, restricted _type_of_expr can't follow either)
+		code = '\n'.join([
+			'@cstruct',
+			'class Foo:',
+			'	x: i32',
+			'',
+			'def make() -> Foo|None:',
+			'	return None',
+			'',
+			'def main() -> i32:',
+			'	f: Ptr[Callable[[],Foo|None]] = make',
+			'	if f():',
+			'		return 1',
+			'	return 0',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		# the payload extraction is a GetAttr (union storage's own
+		# v_Foo-style member read) whose dest is never read by anything
+		# else afterward except a MarkUsed
+		payload_dests = [ i.dest for i in fn.instructions if type( i ).__name__ == 'GetAttr' and 'Foo' in i.attr ]
+		self.assertTrue( payload_dests, 'expected a GetAttr extracting the Foo payload' )
+		self.assertTrue(
+			any( isinstance( i, ir.MarkUsed ) and i.operand in payload_dests for i in fn.instructions ),
+			'expected a MarkUsed of the unread union-truth-test payload extraction',
+		)
+
 # --- in / not in against real builtin types --------------------------------
 
 class InOperatorRealBuiltinsTests( unittest.TestCase ):
@@ -9603,6 +9705,43 @@ class TryExceptOrThrowLoweringTests( unittest.TestCase ):
 		# function - or_throw()'s own Err branch is fully handled by the
 		# dispatch above, not by a separate OrReturn/OrJump
 		self.assertFalse( any( isinstance( i, ( ir.OrReturn, ir.OrJump )) for i in fn.instructions ))
+
+	def test_anonymous_except_handler_marks_hidden_bind_used( self ) -> None:
+		# `except IndexError:` (no `as name`) still gets a hidden
+		# raise_value_var (TryHandler.raise_value_var - every handler has
+		# one, see its own docstring), unconditionally assigned by the
+		# dispatch's own payload-write before jumping into the handler -
+		# but nothing in an anonymous handler's body can ever reference it
+		# (no bare `raise` here, no `as name` to bind it to), so without an
+		# explicit MarkUsed the assignment is real -Wunused-but-set-
+		# variable/C4189 (confirmed via a real repro: grap.mpy's own
+		# `except ValueError: continue`-shaped handlers)
+		code = '\n'.join([
+			'def foo() -> None:',
+			'	ar: list[str] = list[str]()',
+			'	try:',
+			"		print( ar[0].or_throw() )",
+			'	except IndexError:',
+			'		pass',
+		])
+		mod = self._import( code )
+		foo_fn = mod.get_local( 'foo' )
+		if foo_fn.resolve is not None:
+			foo_fn.resolve()
+		fn = self.compiler._lower( foo_fn )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		throw = next( i for i in fn.instructions if isinstance( i, ir.OrThrow ) )
+		leaf = throw.dispatch[0]
+		# ThrowLeaf.bind is ALWAYS handler.raise_value_var (the hidden
+		# hand-off variable exists for every handler, named or not - see
+		# TryHandler's own docstring), unlike TryHandler.bind itself,
+		# which stays None here since this handler has no `as name`
+		self.assertIsNotNone( leaf.bind )
+		self.assertTrue( leaf.bind.stem.startswith( '__except_value_' ), leaf.bind.stem )
+		self.assertTrue(
+			any( isinstance( i, ir.MarkUsed ) and i.operand is leaf.bind for i in fn.instructions ),
+			'expected a MarkUsed of the hidden except-value local',
+		)
 
 # --- @inline (PLAN_INLINE.md) -------------------------------------------
 
