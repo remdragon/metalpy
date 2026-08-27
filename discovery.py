@@ -15,6 +15,7 @@ from mpy_types import (
 	CEnum, RCClass, CStruct, CUnion, TaggedUnion, ClassLike, CType, Protocol,
 	Module, _is_covered_by, _overlaps, int_stem_range,
 )
+import overload_resolution
 import targets
 from targets import ActiveTarget
 if TYPE_CHECKING:
@@ -2293,24 +2294,22 @@ class Discovery( ast.NodeVisitor ):
 			return found.type if isinstance( found, Variable ) else None
 		if isinstance( node, ast.Call ):
 			# a plain constructor call (SomeClass(...), i32(...)), a bare
-			# free-function call, or a call to one of THIS class's own
-			# methods (self.compute_default()) - the callee's own DECLARED
-			# return type is used directly, never evaluated; arguments
-			# aren't type-checked here either, that still happens normally
-			# when __init__ itself really lowers. An overload group is
-			# still declined (which overload a real call resolves to
-			# depends on argument types, not attempted here) - everything
-			# else outside this Call handling entirely (a call through a
-			# receiver OTHER than self, a subscript callee, ...) is too,
-			# same "ask for an explicit annotation" fallback as any other
-			# unhandled shape
-			callee: Function|None = None
+			# free-function call, a call to one of THIS class's own methods
+			# (self.compute_default()), or a call to any of those that
+			# happens to be @overload'd - the callee's own DECLARED return
+			# type is used directly, never evaluated; arguments aren't
+			# type-checked against it either, that still happens normally
+			# when __init__ itself really lowers. See _infer_overload_
+			# call_return_type for the overload case's own narrower rules.
+			# Everything else outside this Call handling entirely (a call
+			# through a receiver OTHER than self, a subscript callee, ...)
+			# still declines, same "ask for an explicit annotation"
+			# fallback as any other unhandled shape
+			found: Name|None = None
 			if isinstance( node.func, ast.Name ):
 				found = self.find_name_or_none( node.func.id )
 				if isinstance( found, ( RCClass, CStruct, Scalar )):
 					return found
-				if isinstance( found, Function ):
-					callee = found
 			elif (
 				isinstance( node.func, ast.Attribute )
 				and isinstance( node.func.value, ast.Name ) and node.func.value.id == 'self'
@@ -2329,13 +2328,13 @@ class Discovery( ast.NodeVisitor ):
 					if isinstance( base, Specialization ):
 						base = base.base
 					found = base.chain_lookup( node.func.attr )
-				if isinstance( found, Function ):
-					callee = found
-			if callee is None:
-				return None
-			if callee.resolve is not None:
-				callee.resolve()
-			return callee.return_type
+			if isinstance( found, Function ):
+				if found.resolve is not None:
+					found.resolve()
+				return found.return_type
+			if isinstance( found, Overload ):
+				return self._infer_overload_call_return_type( found, node, class_obj, init_fn )
+			return None
 		if isinstance( node, ast.UnaryOp ):
 			if isinstance( node.op, ast.Not ):
 				return self.get_intrinsics()['bool']
@@ -2347,6 +2346,77 @@ class Discovery( ast.NodeVisitor ):
 			# bail (-> error) on anything less trivial than that
 			return left if left is not None and left == right else None
 		return None
+
+	def _infer_overload_call_return_type( self, group: Overload, node: ast.Call, class_obj: RCClass, init_fn: Function ) -> Type|None:
+		''' _infer_simple_expr_type's Call branch, for a callee that
+		resolved to an @overload group - which candidate a real call
+		dispatches to depends on the ARGUMENT types, so this reuses the
+		same pure overload_resolution.resolve_call machinery lowering.py/
+		type_resolver.py use for real dispatch (see that module's own
+		"pure function of types, no Discovery reference" docstring) rather
+		than reimplementing dispatch a second time. Mirrors type_resolver.
+		py's own best-effort _overload_call_return_type closely (same
+		stub_covers_call narrowing, so a call whose arguments are entirely
+		within a stub's own narrower domain gets the stub's return type,
+		not just the winning implementation's wider one) - deliberately
+		NOT calling that method directly, no TypeResolver instance exists
+		yet at this pass.
+
+		Declines (returns None, same as any other allowlist miss) for a
+		**kwargs spread, an argument this pass can't itself infer, or any
+		candidate involving a generic (Specialization) parameter/return
+		type: real dispatch eager-monomorphizes those first (type_
+		resolver.py's resolve_declared_types), Stage-2 Monomorphizer
+		machinery this discovery-time pass has no safe access to - same
+		"any doubt, decline" discipline as everywhere else in this
+		allowlist, just for a narrower reason here (this codebase's usual
+		non-generic overload group is small - 1-2 params, 2-4 candidates -
+		so this still covers the common case). same_type is left at
+		resolve_call's own identity default: this allowlist never produces
+		a freshly-monomorphized Specialization for resolve_call to need to
+		recognize as "the same type" as a differently-derived one - the
+		one real-world case that distinction exists for. '''
+		if any( kw.arg is None for kw in node.keywords ):
+			return None
+		candidates = ( *group.stubs, *group.implementations )
+		for fn in candidates:
+			if fn.resolve is not None:
+				fn.resolve()
+			if fn.parameters is None:
+				return None
+			if isinstance( fn.return_type, Specialization ) or any( isinstance( p.type, Specialization ) for p in fn.parameters ):
+				return None
+		arg_types: list[Type] = []
+		for arg in node.args:
+			t = self._infer_simple_expr_type( arg, class_obj, init_fn )
+			if t is None:
+				return None
+			arg_types.append( t )
+		kwarg_types: dict[str,Type] = {}
+		for kw in node.keywords:
+			assert kw.arg is not None # checked above
+			t = self._infer_simple_expr_type( kw.value, class_obj, init_fn )
+			if t is None:
+				return None
+			kwarg_types[kw.arg] = t
+		try:
+			_, resolved = overload_resolution.resolve_call(
+				list( group.stubs ), list( group.implementations ), arg_types, kwarg_types,
+				qualname = group.qualname,
+			)
+		except CompileError:
+			return None
+		winning_stub = next( ( s for s in group.stubs if s.bound_to is resolved ), None )
+		if winning_stub is None:
+			return resolved.return_type
+		call_slots: list[int|str] = [ *range( len( arg_types )), *kwarg_types.keys() ]
+		arg_leaves: dict[int|str,tuple[Type,...]] = {
+			**{ i: tuple( t.leaves() ) for i, t in enumerate( arg_types ) },
+			**{ name: tuple( t.leaves() ) for name, t in kwarg_types.items() },
+		}
+		if overload_resolution.stub_covers_call( winning_stub, call_slots, arg_leaves ):
+			return winning_stub.return_type
+		return resolved.return_type
 
 	def _validate_no_attribute_shadowing( self, class_obj: RCClass ) -> None:
 		''' a subclass cannot redeclare a name (field or method) already
