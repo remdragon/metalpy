@@ -9831,14 +9831,14 @@ class InlineTests( unittest.TestCase ):
 		return [ op.test_repr() for op in fn.instructions ]
 
 	# compiler.run() force-enqueues windows/_console.py's own console-codepage
-	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# global on every Windows target, and sys._raw_exit() whenever no_crt (see
 	# Compiler.force_reachable's own comment) - real but incidental to what
 	# these tests check, and absent entirely on non-Windows targets (or on
-	# CRT-linked Windows targets, for sys.exit specifically), so exact-set
+	# CRT-linked Windows targets, for sys._raw_exit specifically), so exact-set
 	# assertions filter them back out first
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
-		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys._raw_exit', 'windows.kernel32.ExitProcess',
 		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 
@@ -10144,14 +10144,14 @@ class InlineMultiStatementTests( unittest.TestCase ):
 		return fn
 
 	# compiler.run() force-enqueues windows/_console.py's own console-codepage
-	# global on every Windows target, and sys.exit() whenever no_crt (see
+	# global on every Windows target, and sys._raw_exit() whenever no_crt (see
 	# Compiler.force_reachable's own comment) - real but incidental to what
 	# these tests check, and absent entirely on non-Windows targets (or on
-	# CRT-linked Windows targets, for sys.exit specifically), so exact-set
+	# CRT-linked Windows targets, for sys._raw_exit specifically), so exact-set
 	# assertions filter them back out first
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
-		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys._raw_exit', 'windows.kernel32.ExitProcess',
 		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 

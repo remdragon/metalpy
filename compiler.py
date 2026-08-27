@@ -209,6 +209,23 @@ class Compiler:
 			return
 		self._enqueue( self.disco.main )
 		self._drain()
+		# stdout/stderr are buffered now (lib/sys.py) - force _flush_stdio
+		# reachable so emitter_c.py's __metalpy_main can call it right after
+		# the user's own main() returns, guaranteeing a flush on normal exit
+		# even when the user's program never calls sys.exit()/panic() itself
+		# (both of those already reach _flush_stdio via their own ordinary
+		# call graph - no forcing needed for that path). Gated on the
+		# program already using sys.stdout/sys.stderr in the first place
+		# (print() routes through sys.stdout.write - see builtins.print) -
+		# unconditional forcing here pulled the ENTIRE buffering/alloc/free
+		# machinery into every compiled program, even ones with no I/O at
+		# all, a real regression caught by compiler_test.py's own exact-
+		# reachable-set assertions (MutualRecursionTests). A program that
+		# never touches stdout/stderr never allocates their buffers, so
+		# there's genuinely nothing to flush.
+		uses_stdio = any( g.variable.qualname in ( 'sys.stdout', 'sys.stderr' ) for g in self.globals )
+		if uses_stdio:
+			self.force_reachable( 'sys', '_flush_stdio' )
 		if self.disco.active_target['os'] == 'windows':
 			# mirrors mpy.py's own no_crt computation ('c' not in
 			# compiler.extern_libs and not compiler.requires_crt) - captured
@@ -236,14 +253,17 @@ class Compiler:
 			self.force_reachable( 'windows._console', '_console_init' )
 			if no_crt:
 				# emitter_c.py's synthesized mainCRTStartup (no-CRT Windows
-				# entry point only) calls sys.exit() directly by its own
+				# entry point only) calls sys._raw_exit() directly by its own
 				# mangled C symbol name to terminate the process - force it
 				# reachable so that call always resolves. Unlike
 				# _console_init above, this is only needed when no_crt (a
 				# CRT-linked Windows build never emits mainCRTStartup at
 				# all), so it's gated separately rather than being forced
-				# unconditionally on every Windows target.
-				self.force_reachable( 'sys', 'exit' )
+				# unconditionally on every Windows target. sys._raw_exit, not
+				# the public sys.exit - see its own comment in lib/sys.py for
+				# why (a use-after-free on stdout/stderr's already-deinit'd
+				# RC globals if the flushing exit() were called here).
+				self.force_reachable( 'sys', '_raw_exit' )
 				# clang/gcc's own -O0 codegen implicitly calls the raw libc
 				# memset()/memcpy() symbols for local struct zero-init and
 				# by-value struct copies, regardless of whether the user's
