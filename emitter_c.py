@@ -5984,6 +5984,12 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# would then reference an undeclared identifier for those - gate on
 	# whether the global is actually present in THIS program.
 	has_argv_globals = any( g.variable.qualname == 'sys._raw_argc' for g in compiler.globals )
+	# same fixture-only-Discovery caveat as has_argv_globals above:
+	# compiler.py's Compiler.run() force_reaches sys._flush_stdio
+	# unconditionally, but that no-ops when paths= doesn't include a real
+	# lib/sys.py - gate the call emitted below on whether it actually
+	# resolved for THIS program.
+	has_flush_stdio = any( lf.function.qualname == 'sys._flush_stdio' for lf in compiler.functions if lf.function.extern_lib is None )
 	for lf in compiler.functions:
 		# @extern functions have no body (only a ; declaration in pass 1)
 		if lf.function.extern_lib is None:
@@ -6018,12 +6024,19 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		) if has_argv_globals else ''
 		unused_marker = '\t(void)argc; (void)argv;\n' if not has_argv_globals else ''
 		deinit_call = '\t__metalpy_deinit();\n' if deinit_enabled else ''
+		# flush buffered stdout/stderr (lib/sys.py) on the OTHER real exit
+		# path - a plain `return` from main(), which never goes through
+		# sys.exit()'s own flush call. Before deinit_call: dump_live_objects
+		# (part of __metalpy_deinit) writes its own report directly, no
+		# reason to make it wait behind a user-output flush.
+		flush_call = f'\t{mangle_qualname( "sys._flush_stdio" )}();\n' if has_flush_stdio else ''
 		parts.append(
 			'static int __metalpy_main( int argc, char** argv ) {\n'
 			+ unused_marker
 			+ argv_capture # BEFORE __metalpy_init() - that's what builds sys.argv itself from these
 			+ '\t__metalpy_init();\n'
 			+ f'\tint __result = {_USER_MAIN_C_NAME}();\n'
+			+ flush_call
 			+ deinit_call
 			+ '\treturn __result;\n'
 			+ '}'
@@ -6053,12 +6066,19 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# __metalpy_main directly (no real main() symbol exists at all under
 	# no_crt - see main_has_wrapper's own comment) and exits cleanly via the
 	# process itself.
-	# Terminates via sys.exit()'s own mangled C symbol (mangle_qualname
-	# doesn't need a Function object - 'sys.exit' is a known, fixed qualname,
-	# same as _global_init_fn_name's approach) rather than a hardcoded raw
-	# ExitProcess call - compiler.py's Compiler.run() force-enqueues sys.exit
-	# whenever no_crt, so this always resolves to a real, lowered function
-	# with its own pass-1 prototype already emitted above.
+	# Terminates via sys._raw_exit's own mangled C symbol (mangle_qualname
+	# doesn't need a Function object - 'sys._raw_exit' is a known, fixed
+	# qualname, same as _global_init_fn_name's approach) rather than a
+	# hardcoded raw ExitProcess call - compiler.py's Compiler.run()
+	# force-enqueues sys._raw_exit whenever no_crt, so this always resolves
+	# to a real, lowered function with its own pass-1 prototype already
+	# emitted above. Deliberately sys._raw_exit, NOT the public sys.exit: by
+	# this point __metalpy_main has already run flush_call + __metalpy_deinit
+	# (see main_has_wrapper's own synthesis above) - deinit has already
+	# released the RC-global stdout/stderr objects, so calling the flushing
+	# sys.exit() here would read their _buf field off already-freed memory
+	# (confirmed via a real STATUS_HEAP_CORRUPTION repro before this split
+	# existed - see lib/sys.py's own comment on _raw_exit).
 	if no_crt:
 		# rare parameterized-main lowering-fixture shape (main_has_wrapper
 		# False - see its own comment): __metalpy_main was never
@@ -6074,7 +6094,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 			# stays empty here, a known, accepted limitation of no_crt
 			# builds specifically, not a bug.
 			f'\tint __result = {entry_call};\n'
-			f'\t{mangle_qualname( "sys.exit" )}( (uint32_t)__result );\n'
+			f'\t{mangle_qualname( "sys._raw_exit" )}( (uint32_t)__result );\n'
 			'}\n'
 			'#endif'
 		)
@@ -6121,9 +6141,9 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		# no_crt build, since there's no loop in the call chain at all
 		# (RtlFillMemory/RtlCopyMemory are opaque extern calls). compiler.py's
 		# Compiler.run() force-enqueues sys.memset/sys.memcpy whenever
-		# no_crt, mirroring its existing sys.exit force_reachable - so
+		# no_crt, mirroring its existing sys._raw_exit force_reachable - so
 		# sys$memset/sys$memcpy always resolve here, same guarantee
-		# mainCRTStartup's own sys$exit call already relies on.
+		# mainCRTStartup's own sys$_raw_exit call already relies on.
 		parts.append(
 			'#ifdef _WIN32\n'
 			# MSVC recognizes memset/memcpy as compiler intrinsics under

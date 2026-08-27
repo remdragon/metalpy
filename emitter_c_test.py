@@ -4816,14 +4816,19 @@ class MetalpyInitSynthesisTests( unittest.TestCase ):
 
 	def test_windows_no_crt_exit_is_an_ordinary_sys_exit_call( self ) -> None:
 		# ExitProcess is no longer hand-declared/hardcoded raw C text inside
-		# mainCRTStartup itself - it's sys.py's own public exit() (forced
-		# reachable whenever no_crt by Compiler.force_reachable), called here
-		# by its own mangled C symbol name, same shape as any other call
+		# mainCRTStartup itself - it's sys.py's own package-private
+		# _raw_exit() (forced reachable whenever no_crt by
+		# Compiler.force_reachable), called here by its own mangled C symbol
+		# name, same shape as any other call. Deliberately _raw_exit, NOT the
+		# public sys.exit - by this point __metalpy_main has already flushed
+		# + deinit'd, so the public exit()'s own flush would be a
+		# use-after-free on the already-released stdout/stderr globals (see
+		# lib/sys.py's own comment on _raw_exit).
 		src = self._compiled_source_no_crt( self._WINDOWS_TARGET )
 		start = src.index( 'void mainCRTStartup( void ) {' )
 		end = src.index( '\n}', start )
 		body = src[ start : end ]
-		self.assertIn( 'sys$exit( (uint32_t)__result );', body )
+		self.assertIn( 'sys$_raw_exit( (uint32_t)__result );', body )
 		self.assertIn( 'ExitProcess(', src ) # real @extern prototype/call, somewhere
 		self.assertNotIn( 'void __stdcall ExitProcess( unsigned int );', src )
 

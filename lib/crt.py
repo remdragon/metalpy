@@ -177,6 +177,16 @@ def write(
 ) -> isize:
 	...
 
+# POSIX-only: lib/sys.py's stdout/stderr buffering uses this to pick
+# line-buffered (a real terminal) vs block-buffered (redirected file/pipe) -
+# same real() header/split posture as write's own POSIX branch above.
+@compiler.target( os = not 'windows' )
+@extern( 'c', 'isatty', header = 'unistd.h' )
+def isatty(
+	fd: i32,
+) -> i32:
+	...
+
 @extern( 'c', 'open' )
 def open(
 	path: ConstPtr[u8],

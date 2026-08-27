@@ -184,6 +184,16 @@ def WriteFile(
 ) -> bool:
 	...
 
+# lib/sys.py's stdout/stderr buffering uses this to detect a console handle
+# (line-buffer) vs a redirected file/pipe (block-buffer) - fails harmlessly
+# (returns false) on a non-console handle, no separate probe needed.
+@extern('kernel32', 'GetConsoleMode')
+def GetConsoleMode(
+	hConsoleHandle: HANDLE,
+	lpMode: Ptr[u32],
+) -> bool:
+	...
+
 @extern('kernel32', 'CreateFileA')
 def CreateFileA(
 	lpFileName: ConstPtr[u8],

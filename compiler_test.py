@@ -10,16 +10,17 @@ from mpy_types import Module, Variable, RCClass, Specialization
 
 class CompilerTestCase( unittest.TestCase ):
 	# compiler.run() force-enqueues windows/_console.py's own console-codepage
-	# global on every Windows target, and sys.exit() whenever no_crt (see
-	# Compiler.force_reachable's own comment) - real but incidental to what
-	# these tests are actually checking, and absent entirely on non-Windows
-	# targets (or on CRT-linked Windows targets, for sys.exit specifically),
-	# so every helper below that turns compiler.functions/.extern_libs into a
-	# comparable value filters them back out first, keeping assertions
-	# host-OS-independent
+	# global on every Windows target, and sys._raw_exit() whenever no_crt (see
+	# Compiler.force_reachable's own comment - sys._raw_exit, not the public
+	# sys.exit, is what mainCRTStartup calls directly under no_crt) - real
+	# but incidental to what these tests are actually checking, and absent
+	# entirely on non-Windows targets (or on CRT-linked Windows targets, for
+	# sys._raw_exit specifically), so every helper below that turns
+	# compiler.functions/.extern_libs into a comparable value filters them
+	# back out first, keeping assertions host-OS-independent
 	_CONSOLE_INIT_QUALNAMES = frozenset({
 		'windows._console._init_console', 'windows.kernel32.SetConsoleOutputCP',
-		'sys.exit', 'windows.kernel32.ExitProcess',
+		'sys._raw_exit', 'windows.kernel32.ExitProcess',
 		'sys.memset', 'sys.memcpy', 'windows.ntdll.RtlFillMemory', 'windows.ntdll.RtlCopyMemory',
 	})
 

@@ -55,38 +55,177 @@ def dump_live_objects() -> None:
 		compiler.dump_live_objects()
 
 # ---------------------------------------------------------------------------
-# stdout/stderr: minimal stream objects (see TODO.txt - full IO interfaces,
-# including buffering and reading, are still future work; this is just
-# enough for print() and lib/logging.py's StreamHandler).
+# stdout/stderr: minimal buffered stream objects (see TODO.txt - full IO
+# interfaces, including reading, are still future work; this is just enough
+# for print() and lib/logging.py's StreamHandler). Line-buffered when the
+# destination is a real terminal (flush on '\n', so interactive output stays
+# live), block-buffered otherwise (flush once _STDIO_BUF_CAP fills) - same
+# convention as Python/C stdio, far fewer syscalls than a raw write-per-call
+# for redirected/piped output. Flushed on every real exit path via
+# _flush_stdio() below - see exit()'s own call to it, compiler.py's
+# Compiler.run() force_reachable('sys', '_flush_stdio'), and emitter_c.py's
+# call from __metalpy_main right after the user's main() returns. NOT flushed
+# on a crash (SIGSEGV/unhandled exception): _PROLOGUE_CRASH_HANDLER
+# deliberately avoids calling into any metalpy-level code once the process
+# might be in a corrupted state (see its own comment in emitter_c.py) - any
+# buffered-but-unflushed output from immediately before a crash is a known,
+# accepted loss.
 # ---------------------------------------------------------------------------
 
+_STDIO_BUF_CAP: usize = 8192
+
 class _Stdout:
+	_buf: Ptr[u8] = None
+	_len: usize = 0
+	_is_tty: bool = False
+	_tty_checked: bool = False
+
 	@compiler.target( os = 'windows' )
-	def write( self, s: str ) -> Result[None,OSError]:
-		from fs import write_all
-		from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE
-		return write_all( GetStdHandle( STD_OUTPUT_HANDLE ), s.get_cstr(), s.byte_len() )
+	def _check_tty( self ) -> None:
+		from windows.kernel32 import GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE
+		mode: u32 = 0
+		self._is_tty = GetConsoleMode( GetStdHandle( STD_OUTPUT_HANDLE ), compiler.addrof( mode ))
+		self._tty_checked = True
 
 	@compiler.target( os = not 'windows' )
-	def write( self, s: str ) -> Result[None,OSError]:
+	def _check_tty( self ) -> None:
+		from crt import isatty
+		self._is_tty = isatty( 1 ) != 0 # STDOUT_FILENO is 1
+		self._tty_checked = True
+
+	@compiler.target( os = 'windows' )
+	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
 		from fs import write_all
-		return write_all( 1, s.get_cstr(), s.byte_len() ) # STDOUT_FILENO is 1
+		from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE
+		return write_all( GetStdHandle( STD_OUTPUT_HANDLE ), buf, count )
+
+	@compiler.target( os = not 'windows' )
+	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
+		from fs import write_all
+		return write_all( 1, buf, count ) # STDOUT_FILENO is 1
+
+	def flush( self ) -> Result[None,OSError]:
+		if self._len == 0:
+			return Result.Ok( None )
+		self._raw_write( self._buf, self._len ).or_return()
+		self._len = 0
+		return Result.Ok( None )
+
+	def write( self, s: str ) -> Result[None,OSError]:
+		if not self._tty_checked:
+			self._check_tty()
+		if self._buf is None:
+			self._buf = alloc[u8]( _STDIO_BUF_CAP )
+		n: usize = s.byte_len()
+		src: ConstPtr[u8] = s.get_cstr()
+		offset: usize = 0
+		# all bounded by _STDIO_BUF_CAP/n above - never actually overflows,
+		# same wrap_arithmetic-for-a-provably-safe-loop posture as fs.py's
+		# own write_all
+		with compiler.wrap_arithmetic:
+			while offset < n:
+				space: usize = _STDIO_BUF_CAP - self._len
+				if space == 0:
+					self.flush().or_return()
+					space = _STDIO_BUF_CAP
+				chunk: usize = n - offset
+				if chunk > space:
+					chunk = space
+				memcpy( self._buf + self._len, src + offset, chunk )
+				self._len += chunk
+				offset += chunk
+			if self._is_tty and n > 0 and src[ n - 1 ] == u8( 10 ): # '\n' - keep interactive output live
+				self.flush().or_return()
+		return Result.Ok( None )
+
+	def _release( self ) -> None:
+		''' exit-only: flush then free the backing buffer, so dump_live_objects
+		(debug builds) doesn't report this permanent, singleton allocation as a
+		leak. Package-private - see _flush_stdio's own call below. '''
+		self.flush().is_ok()
+		if self._buf is not None:
+			free( self._buf )
+			self._buf = None
 
 stdout: _Stdout = _Stdout()
 
 class _Stderr:
+	_buf: Ptr[u8] = None
+	_len: usize = 0
+	_is_tty: bool = False
+	_tty_checked: bool = False
+
 	@compiler.target( os = 'windows' )
-	def write( self, s: str ) -> Result[None,OSError]:
-		from fs import write_all
-		from windows.kernel32 import GetStdHandle, STD_ERROR_HANDLE
-		return write_all( GetStdHandle( STD_ERROR_HANDLE ), s.get_cstr(), s.byte_len() )
+	def _check_tty( self ) -> None:
+		from windows.kernel32 import GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE
+		mode: u32 = 0
+		self._is_tty = GetConsoleMode( GetStdHandle( STD_ERROR_HANDLE ), compiler.addrof( mode ))
+		self._tty_checked = True
 
 	@compiler.target( os = not 'windows' )
-	def write( self, s: str ) -> Result[None,OSError]:
+	def _check_tty( self ) -> None:
+		from crt import isatty
+		self._is_tty = isatty( 2 ) != 0 # STDERR_FILENO is 2
+		self._tty_checked = True
+
+	@compiler.target( os = 'windows' )
+	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
 		from fs import write_all
-		return write_all( 2, s.get_cstr(), s.byte_len() ) # STDERR_FILENO is 2
+		from windows.kernel32 import GetStdHandle, STD_ERROR_HANDLE
+		return write_all( GetStdHandle( STD_ERROR_HANDLE ), buf, count )
+
+	@compiler.target( os = not 'windows' )
+	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
+		from fs import write_all
+		return write_all( 2, buf, count ) # STDERR_FILENO is 2
+
+	def flush( self ) -> Result[None,OSError]:
+		if self._len == 0:
+			return Result.Ok( None )
+		self._raw_write( self._buf, self._len ).or_return()
+		self._len = 0
+		return Result.Ok( None )
+
+	def write( self, s: str ) -> Result[None,OSError]:
+		if not self._tty_checked:
+			self._check_tty()
+		if self._buf is None:
+			self._buf = alloc[u8]( _STDIO_BUF_CAP )
+		n: usize = s.byte_len()
+		src: ConstPtr[u8] = s.get_cstr()
+		offset: usize = 0
+		# see _Stdout.write's identical comment above
+		with compiler.wrap_arithmetic:
+			while offset < n:
+				space: usize = _STDIO_BUF_CAP - self._len
+				if space == 0:
+					self.flush().or_return()
+					space = _STDIO_BUF_CAP
+				chunk: usize = n - offset
+				if chunk > space:
+					chunk = space
+				memcpy( self._buf + self._len, src + offset, chunk )
+				self._len += chunk
+				offset += chunk
+			if self._is_tty and n > 0 and src[ n - 1 ] == u8( 10 ):
+				self.flush().or_return()
+		return Result.Ok( None )
+
+	def _release( self ) -> None:
+		''' see _Stdout._release's identical comment above. '''
+		self.flush().is_ok()
+		if self._buf is not None:
+			free( self._buf )
+			self._buf = None
 
 stderr: _Stderr = _Stderr()
+
+def _flush_stdio() -> None:
+	''' force-called from every real exit path - see this module's own
+	header comment above for why and where. Releases the buffers too (not
+	just flush()) - this is always the last real use of them. '''
+	stdout._release()
+	stderr._release()
 
 @compiler.target( os = 'windows' )
 def cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
@@ -233,15 +372,29 @@ def memcmp( a: ConstPtr[u8], b: ConstPtr[u8], count: usize ) -> i32:
 	from crt import memcmp as _crt_memcmp
 	return _crt_memcmp( a, b, count )
 
+# _raw_exit: bare process termination, no flush. Package-private - the only
+# other caller is emitter_c.py's own no_crt Windows mainCRTStartup synthesis,
+# which calls __metalpy_main() (already runs flush_call + __metalpy_deinit -
+# see emitter_c.py's own comment) and then needs ONLY to terminate the
+# process, not flush again: by that point __metalpy_deinit has already
+# released the RC-global stdout/stderr objects themselves, so a second
+# _flush_stdio() call here would read self._buf off already-freed memory - a
+# real use-after-free, confirmed via a genuine STATUS_HEAP_CORRUPTION
+# repro (free() handed the 0xCD mempoison pattern as a pointer) before this
+# split existed.
 @compiler.target( os = 'windows' )
-def exit( code: i32 ) -> NoReturn:
+def _raw_exit( code: i32 ) -> NoReturn:
 	from windows.kernel32 import ExitProcess
 	ExitProcess( u32( code ))
 
 @compiler.target( os = not 'windows' )
-def exit( code: i32 ) -> NoReturn:
+def _raw_exit( code: i32 ) -> NoReturn:
 	from crt import _exit
 	_exit( code )
+
+def exit( code: i32 ) -> NoReturn:
+	_flush_stdio() # buffered stdout/stderr - see their own header comment
+	_raw_exit( code )
 
 def panic( message: str ) -> NoReturn:
 	# TODO: route through a real `stderr` stream once IO interfaces exist (see
@@ -255,6 +408,12 @@ def panic( message: str ) -> NoReturn:
 	# MSVC's laxer pointer-type checking but is a hard error under GCC
 	# (-Wincompatible-pointer-types, promoted to an error by default on
 	# recent GCC).
+	# flush any already-buffered stdout FIRST - allocation-free (flush()
+	# never allocates, only the first write() to an empty stream does), so
+	# this doesn't compromise the OOM-safety this function needs; keeps
+	# ordinary program output from appearing AFTER this crash message on a
+	# shared terminal.
+	stdout.flush().is_ok()
 	_write_stderr_cstr( message.get_cstr(), message.byte_len() )
 	exit( 1 )
 
