@@ -2291,12 +2291,51 @@ class Discovery( ast.NodeVisitor ):
 			# textual order) or an explicitly pre-declared attribute
 			found = class_obj.names.get( node.attr )
 			return found.type if isinstance( found, Variable ) else None
-		if isinstance( node, ast.Call ) and isinstance( node.func, ast.Name ):
-			# a plain constructor call (SomeClass(...), i32(...), ...) -
-			# arguments aren't type-checked here, that still happens
-			# normally when __init__ itself really lowers
-			found = self.find_name_or_none( node.func.id )
-			return found if isinstance( found, ( RCClass, CStruct, Scalar )) else None
+		if isinstance( node, ast.Call ):
+			# a plain constructor call (SomeClass(...), i32(...)), a bare
+			# free-function call, or a call to one of THIS class's own
+			# methods (self.compute_default()) - the callee's own DECLARED
+			# return type is used directly, never evaluated; arguments
+			# aren't type-checked here either, that still happens normally
+			# when __init__ itself really lowers. An overload group is
+			# still declined (which overload a real call resolves to
+			# depends on argument types, not attempted here) - everything
+			# else outside this Call handling entirely (a call through a
+			# receiver OTHER than self, a subscript callee, ...) is too,
+			# same "ask for an explicit annotation" fallback as any other
+			# unhandled shape
+			callee: Function|None = None
+			if isinstance( node.func, ast.Name ):
+				found = self.find_name_or_none( node.func.id )
+				if isinstance( found, ( RCClass, CStruct, Scalar )):
+					return found
+				if isinstance( found, Function ):
+					callee = found
+			elif (
+				isinstance( node.func, ast.Attribute )
+				and isinstance( node.func.value, ast.Name ) and node.func.value.id == 'self'
+			):
+				# own class's own .names is already fully populated at this
+				# point (the ordinary body-parsing loop already finished -
+				# see _infer_init_attributes) - read it directly, same "not
+				# class_obj.chain_lookup, class_obj's own .resolve is still
+				# live on the call stack" reasoning as the inherited-field
+				# check just above; an INHERITED method needs the real
+				# chain walk though, same as that check's own base.chain_
+				# lookup fallback
+				found = class_obj.names.get( node.func.attr )
+				if found is None and class_obj.base is not None:
+					base = class_obj.base
+					if isinstance( base, Specialization ):
+						base = base.base
+					found = base.chain_lookup( node.func.attr )
+				if isinstance( found, Function ):
+					callee = found
+			if callee is None:
+				return None
+			if callee.resolve is not None:
+				callee.resolve()
+			return callee.return_type
 		if isinstance( node, ast.UnaryOp ):
 			if isinstance( node.op, ast.Not ):
 				return self.get_intrinsics()['bool']

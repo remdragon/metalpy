@@ -124,21 +124,102 @@ class Foo:
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'collides', self.discovery.errors.errors[0] )
 
-	def test_expression_outside_allowlist_errors( self ) -> None:
-		# self.compute() is a method call - outside the narrow, permanent
-		# allowlist by design (see _infer_simple_expr_type's own docstring)
+	def test_infers_attribute_type_from_own_method_call( self ) -> None:
+		# self.compute_default() - the callee's own DECLARED return type is
+		# used directly, never evaluated
 		mod = self._import( '''
 class Foo:
-	def compute( self ) -> i32:
+	def compute_default( self ) -> i32:
 		return 5
 	def __init__( self ) -> None:
-		self.x = self.compute()
+		self.x = self.compute_default()
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		x = foo.chain_lookup( 'x' )
+		self.assertIsInstance( x, Variable )
+		self.assertEqual( x.type.stem, 'i32' )
+
+	def test_infers_attribute_type_from_inherited_method_call( self ) -> None:
+		mod = self._import( '''
+class Base:
+	def compute_default( self ) -> i32:
+		return 5
+
+class Derived( Base ):
+	def __init__( self ) -> None:
+		self.x = self.compute_default()
+''' )
+		derived = mod.get_local( 'Derived' )
+		derived.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( derived.chain_lookup( 'x' ).type.stem, 'i32' )
+
+	def test_infers_attribute_type_from_free_function_call( self ) -> None:
+		mod = self._import( '''
+def compute_default() -> i32:
+	return 5
+
+class Foo:
+	def __init__( self ) -> None:
+		self.x = compute_default()
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self.assertEqual( foo.chain_lookup( 'x' ).type.stem, 'i32' )
+
+	def test_overloaded_method_call_is_outside_allowlist( self ) -> None:
+		# which overload a real call resolves to depends on argument types -
+		# not attempted here, same "ask for an explicit annotation" bail as
+		# any other unhandled shape
+		mod = self._import( '''
+class Foo:
+	@overload
+	def compute( self, n: i32 ) -> i32:
+		return n
+	@overload
+	def compute( self, n: f32 ) -> f32:
+		return n
+	def __init__( self ) -> None:
+		self.x = self.compute( n = 1 )
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot infer', self.discovery.errors.errors[0] )
+
+	def test_expression_outside_allowlist_errors( self ) -> None:
+		# a comparison - outside the narrow, permanent allowlist by design
+		# (see _infer_simple_expr_type's own docstring)
+		mod = self._import( '''
+class Foo:
+	def __init__( self, a: i32, b: i32 ) -> None:
+		self.x = a == b
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'cannot infer', self.discovery.errors.errors[0] )
 		self.assertIn( "declare 'x:", self.discovery.errors.errors[0] )
+
+	def test_call_through_non_self_receiver_is_outside_allowlist( self ) -> None:
+		# other.compute() - only self.method()/bare-name calls are in the
+		# allowlist, not a call through an arbitrary OTHER receiver
+		mod = self._import( '''
+class Helper:
+	def compute( self ) -> i32:
+		return 5
+
+class Foo:
+	def __init__( self, other: Helper ) -> None:
+		self.x = other.compute()
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot infer', self.discovery.errors.errors[0] )
 
 	def test_assigning_an_inherited_field_is_not_treated_as_new( self ) -> None:
 		# self.foo = foo in Derived's own __init__, where foo is declared on
@@ -245,6 +326,32 @@ class InitAttributeInferenceLoweringTests( unittest.TestCase ):
 		self.compiler.run()
 		self.assertTrue( self.discovery.errors.errors )
 
+	def test_instance_method_call_inference_still_hits_construction_safety( self ) -> None:
+		# type inference from self.compute_default() succeeds at discovery
+		# time (see test_infers_attribute_type_from_own_method_call), but a
+		# genuine INSTANCE method call on self can never legally supply an
+		# attribute's OWN initializing value - cfg.py's check_self_escape
+		# forbids calling a method on self until every required attribute
+		# is already bound, and the attribute THIS statement defines can
+		# never already be bound at the point of its own initializing call.
+		# Pre-existing, unrelated construction-safety rule - applies
+		# identically whether the attribute is inferred or explicitly
+		# declared; this feature must not paper over or bypass it
+		code = '\n'.join([
+			'class Foo:',
+			'	def compute_default( self ) -> i32:',
+			'		return 5',
+			'	def __init__( self ) -> None:',
+			'		self.x = self.compute_default()',
+			'def main() -> None:',
+			'	f: Foo = Foo()',
+			'	return',
+		])
+		self._import( code )
+		self.compiler.run()
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be used', self.discovery.errors.errors[0] )
+
 
 # --- real compile+link+run: proves the RC/coercion machinery treats an
 # inferred attribute exactly like a declared one - lowering.py needed zero
@@ -332,6 +439,41 @@ def main() -> i32:
 	return 0
 '''
 
+# the callee's declared return type is used directly - here an RC-typed one,
+# so this also exercises the RC path for a method-call-inferred attribute
+# (does the constructor built inside compute_default() survive being handed
+# back through __init__ and stored, with correct refcounting, no leak).
+# @staticmethod deliberately, not a plain instance method: cfg.py's own
+# check_self_escape forbids calling an INSTANCE method on self until every
+# required attribute is already initialized - and the very attribute this
+# statement defines can never already be initialized at the point of its
+# own initializing call, so `self.instance_method()` can never legally
+# supply an attribute's FIRST value, inferred or explicitly declared alike
+# (a pre-existing, unrelated construction-safety rule - see the dedicated
+# regression test in InitAttributeInferenceLoweringTests). A staticmethod
+# (or a bare free function) never touches self at all, so it's unaffected
+_METHOD_CALL_INFERENCE_RC = '''
+class Inner:
+	v: i32
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+class Outer:
+	@staticmethod
+	def compute_default() -> Inner:
+		return Inner( v = 11 )
+	def __init__( self ) -> None:
+		self.inner = self.compute_default()
+	def get( self ) -> i32:
+		return self.inner.v
+
+def main() -> i32:
+	o: Outer = Outer()
+	if o.get() != 11:
+		return 1
+	return 0
+'''
+
 # read from a method OTHER than __init__ - the core motivating case: proves
 # the attribute is fully registered before ANY unit of the class can be
 # lowered, not just whenever __init__ itself happens to be reached
@@ -359,6 +501,7 @@ class InitAttributeInferenceRealCompileTests( RealCompileMixin, unittest.TestCas
 			( 'constructor_call_inference_rc', _CONSTRUCTOR_CALL_INFERENCE_RC ),
 			( 'chained_self_attribute_inference', _CHAINED_SELF_ATTRIBUTE_INFERENCE ),
 			( 'branch_reassignment_inference', _BRANCH_REASSIGNMENT_INFERENCE ),
+			( 'method_call_inference_rc', _METHOD_CALL_INFERENCE_RC ),
 			( 'read_from_other_method_before_init_in_source', _READ_FROM_OTHER_METHOD_BEFORE_INIT_IN_SOURCE ),
 		])
 
