@@ -106,16 +106,23 @@ typedef struct {
 # Thread" gate, unlike the Cost-mitigations section's own aspirational #1 -
 # Part A itself was ALSO shipped without that switch, scoped down instead
 # by only ever protecting a global that's genuinely reassigned; Part B has
-# no equivalent narrower target - every RC object gets one). Same platform
-# asymmetry as A.3's per-global lock: a bare `void*` on Windows (SRWLOCK's
-# own all-zero state is a valid unlocked lock, so sys.alloc's own
-# poison-in-debug/uninitialized-in-release memory just needs an explicit
-# zero write at construction, not a real init call - see ir.Allocate's own
-# codegen); a real `pthread_mutex_t` on POSIX, needing a genuine
-# pthread_mutex_init() call at EVERY construction site (a real per-object
-# cost the "revisit the lighter primitive later" decision accepts for now).
+# no equivalent narrower target - every RC object gets one).
+# Cost mitigation #3: POSIX no longer pays A.3's own original asymmetry
+# (a real `pthread_mutex_t`, needing a genuine pthread_mutex_init() call at
+# EVERY construction site) - a plain `_Atomic uint32_t` CAS spinlock (0 =
+# unlocked, 1 = locked - see _global_lock_acquire/_field_lock_prologue's own
+# comments for the acquire/release codegen) is zero-init-safe exactly the
+# same way Windows's own bare `void*` already was, so both platforms now
+# share the identical "just zero-write it, no init call" construction-time
+# cost. Chosen over a real futex(2)-backed mutex: the critical sections this
+# protects are extremely short (one GetAttr/SetAttr-width access), so a
+# spinlock's worst case (busy-wait instead of descheduling) is cheap here,
+# and it reuses the SAME ir.AtomicCompareExchange-shaped codegen already
+# wired end-to-end for lib/atomic.py's Atomic[T] - no new syscall-wrapper
+# machinery needed. A real futex remains a legitimate future upgrade if
+# profiling under real contention ever shows spinning is a problem.
 _PROLOGUE_HEADER_FIELD_WINDOWS = '\tvoid* lock;\n'
-_PROLOGUE_HEADER_FIELD_PTHREAD = '\tpthread_mutex_t lock;\n'
+_PROLOGUE_HEADER_FIELD_SPINLOCK = '\t_Atomic uint32_t lock;\n'
 
 # debug-only alloc-site tracking (dump_live_objects, lib/sys.py): a single
 # global intrusive doubly-linked list threaded through every live RC object
@@ -143,7 +150,7 @@ _PROLOGUE_HEADER_FIELD_PTHREAD = '\tpthread_mutex_t lock;\n'
 # ones: this is diagnostic bookkeeping, not a hot path worth finer-grained
 # locking for.
 def _prologue_debug_list() -> str:
-	if _target_uses_pthread_lock():
+	if _target_uses_posix_lock():
 		# pthread_mutex_t is already in scope (pthread.h is force-included
 		# by _object_header_prologue() unconditionally on every POSIX
 		# target, regardless of debug mode - see its own comment).
@@ -389,22 +396,25 @@ def _object_header_prologue() -> str:
 	since the field's own C type depends on _target_os, which is only known
 	once emit_c() itself has set it (module-level constants can't see that -
 	see _target_os's own docstring on why it's set inside emit_c(), not at
-	import time). On POSIX, a genuine `#include <pthread.h>` right here,
-	NOT left to emit_c()'s own general required_headers collection loop -
-	that loop runs LATER, after this whole prologue (this is the very
-	FIRST thing emit_c() assembles) - confirmed as a real bug, not just
-	theoretical ordering pedantry: without a real prior declaration in
-	scope, `pthread_mutex_t lock;` here silently fell back to C's
-	legacy "implicit int" behavior on gcc (no error, just a wrong field
-	type - every subsequent `pthread_mutex_init(&obj->$header.lock, ...)`
-	call site then failed as "incompatible pointer type", since the field
-	was actually a plain int). A repeated `#include <pthread.h>` is always
-	safe (real header, standard include guards) even if something else in
-	the program ALSO required it independently - never a redundant include
-	system's problem to avoid, that's what include guards are for. '''
-	field = _PROLOGUE_HEADER_FIELD_PTHREAD if _target_uses_pthread_lock() else _PROLOGUE_HEADER_FIELD_WINDOWS
-	header_include = '#include <pthread.h>\n' if _target_uses_pthread_lock() else ''
+	import time). Part A/B's own POSIX lock is a plain `_Atomic uint32_t`
+	(Cost mitigation #3 - see _PROLOGUE_HEADER_FIELD_SPINLOCK's own comment),
+	needing only <stdatomic.h> (already unconditionally included, see
+	_PROLOGUE_HEADER_FIXED) - no <pthread.h> dependency at all anymore.
+	_prologue_debug_list() is the one remaining POSIX user of a real
+	`pthread_mutex_t` (unrelated alloc-site-tracking feature, debug builds
+	only), so `#include <pthread.h>` is only force-included here when THAT'S
+	active, right here (NOT left to emit_c()'s own general required_headers
+	collection loop, which runs LATER, after this whole prologue - this is
+	the very FIRST thing emit_c() assembles - confirmed as a real bug, not
+	just theoretical ordering pedantry, back when this field was itself a
+	`pthread_mutex_t`: without a real prior declaration in scope, that field
+	silently fell back to C's legacy "implicit int" behavior on gcc, no
+	error, just a wrong field type). A repeated `#include <pthread.h>` is
+	always safe (real header, standard include guards) even if something
+	else in the program ALSO required it independently. '''
+	field = _PROLOGUE_HEADER_FIELD_SPINLOCK if _target_uses_posix_lock() else _PROLOGUE_HEADER_FIELD_WINDOWS
 	debug_list = _prologue_debug_list() if _target_debug else ''
+	header_include = '#include <pthread.h>\n' if ( _target_debug and _target_uses_posix_lock() ) else ''
 	# alloc_loc/alloc_size/debug_link: debug-only alloc-site tracking
 	# (dump_live_objects) - alloc_loc points at a static string literal set
 	# once at construction (ir.Allocate codegen, emit_c), which also stamps
@@ -1406,19 +1416,20 @@ def mangle_qualname( qualname: str ) -> str:
 # which lower_global() (lowering.py) never reaches for a global's own
 # initializer (see that flag's own comment).
 #
-# The lock itself is a bare, paired `void*` global per protected variable -
-# not lib/threading.py's FastLock (an RCClass, itself heap-allocated, with
-# its OWN inner lock ALSO heap-allocated in __init__ - using one per
-# protected global would mean two nested heap allocations happening as
-# part of module-global initialization, before the very system this exists
-# to protect is itself safe to construct). SRWLOCK is documented by Win32
-# as a single opaque, pointer-sized value whose all-zero state IS already a
+# The lock itself is a bare, paired global per protected variable - not
+# lib/threading.py's FastLock (an RCClass, itself heap-allocated, with its
+# OWN inner lock ALSO heap-allocated in __init__ - using one per protected
+# global would mean two nested heap allocations happening as part of
+# module-global initialization, before the very system this exists to
+# protect is itself safe to construct). SRWLOCK is documented by Win32 as a
+# single opaque, pointer-sized value whose all-zero state IS already a
 # valid, unlocked lock (no InitializeSRWLock call exists anywhere in this
-# codebase) - a `void*` initialized to 0 is exactly that, no separate init
-# # function needed on Windows - Linux's own pthread_mutex_t storage is NOT
-# zero-init-safe the same way and needs a real pthread_mutex_init() call;
-# see _global_lock_name's own declaration site (in the globals-emission
-# loop, emit_c()) for that platform's storage shape and init wiring.
+# codebase) - a `void*` initialized to 0 is exactly that. POSIX's own
+# storage (Cost mitigation #3: a plain `_Atomic uint32_t` CAS spinlock, 0
+# meaning unlocked) is zero-init-safe the identical way, unlike the real
+# pthread_mutex_t this used to be - see _global_lock_name's own declaration
+# site (in the globals-emission loop, emit_c()) for both platforms' current
+# storage shape.
 # AcquireSRWLockExclusive/ReleaseSRWLockExclusive take a
 # `void**` here (not the real PSRWLOCK type) since SRWLOCK's own real
 # layout is just one pointer-sized slot (see windows/kernel32.py's own
@@ -1456,27 +1467,25 @@ def _global_lock_name( var: Variable ) -> str:
 _SRWLOCK_STRUCT_NAME = mangle_qualname( 'windows.kernel32.SRWLOCK' )
 
 def _global_lock_acquire( lock_name: str ) -> str:
-	if _target_uses_pthread_lock():
-		# pthread_mutex_lock, not lib/threading.py's own FastLock (see
-		# _global_lock_name's storage declaration site for why this needs a
-		# REAL pthread_mutex_t, not a bare void* the way SRWLOCK's storage
-		# gets away with) - <pthread.h> is force-included whenever any
-		# locked global exists on this target (see emit_c()'s own
-		# required_headers.add('pthread.h')), so the real prototype is
-		# always in scope here, unlike Windows's own hand-declared forward
-		# prototypes (SRWLOCK has no portable equivalent to "just include
-		# the real header", since that would drag in the whole of
-		# windows.h - pthread.h carries no such cost). Reached for macOS
-		# only past _global_lock_supported()'s own poison-pill assert - by
-		# the time this runs, that's already been survived (or this is a
-		# unit test exercising the string-building logic directly without
-		# going through the real gate - see this file's own tests).
-		return f'\tpthread_mutex_lock( &{lock_name} );'
+	if _target_uses_posix_lock():
+		# Cost mitigation #3's CAS spinlock, not lib/threading.py's own
+		# FastLock and not a real pthread_mutex_t either (see
+		# _global_lock_name's storage declaration site) - __metalpy_
+		# spinlock_acquire/_release (_PROLOGUE_POSIX_SPINLOCK) are
+		# force-emitted whenever any locked global/object exists on this
+		# target (see emit_c()'s own assembly, mirroring the Windows
+		# forward-declaration block just below), so they're always already
+		# in scope here. Reached for macOS only past _global_lock_
+		# supported()'s own poison-pill assert - by the time this runs,
+		# that's already been survived (or this is a unit test exercising
+		# the string-building logic directly without going through the
+		# real gate - see this file's own tests).
+		return f'\t__metalpy_spinlock_acquire( &{lock_name} );'
 	return f'\tAcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
 def _global_lock_release( lock_name: str ) -> str:
-	if _target_uses_pthread_lock():
-		return f'\tpthread_mutex_unlock( &{lock_name} );'
+	if _target_uses_posix_lock():
+		return f'\t__metalpy_spinlock_release( &{lock_name} );'
 	return f'\tReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&{lock_name} );'
 
 def _field_lock_prologue() -> str:
@@ -1491,21 +1500,22 @@ def _field_lock_prologue() -> str:
 	METALPY_IMMORTAL_REFCOUNT directly in a designated-initializer list
 	that never mentions .lock at all - C zero-fills that (a real guarantee
 	for a static aggregate initializer, unlike sys.alloc's own unions-
-	initialized heap memory), which is a valid unlocked SRWLOCK but NOT a
-	valid pthread_mutex_t (POSIX gives zero-init-safety to neither by
-	contract - A.3's own point, reused here) - locking it directly would be
-	real undefined behavior the first time ANY of its fields is ever read
-	through an ordinary GetAttr. Skipping locking entirely for an immortal
-	object is also simply correct on its own terms, the same reason
-	retain_object/release_object already skip refcount work for one: an
-	object nothing ever frees needs no exclusion for field access to be
-	safe UNLESS something actually reassigns that field concurrently -
-	immortal objects in this codebase are exactly the ones nothing does
-	that to (compile-time constants), so this stays sound, not just
-	convenient. '''
-	if _target_uses_pthread_lock():
-		lock_expr = 'pthread_mutex_lock( &obj->lock )'
-		unlock_expr = 'pthread_mutex_unlock( &obj->lock )'
+	initialized heap memory). Cost mitigation #3's spinlock made this
+	zero-fill a valid unlocked lock on POSIX too (0 = unlocked, same as
+	SRWLOCK's own all-zero state) - unlike the pthread_mutex_t this field
+	used to be (POSIX gave zero-init-safety to neither platform's ORIGINAL
+	primitive - A.3's own point), so an immortal object's lock field is now
+	always well-formed even though nothing ever explicitly locks it.
+	Skipping locking entirely for an immortal object is also simply correct
+	on its own terms, the same reason retain_object/release_object already
+	skip refcount work for one: an object nothing ever frees needs no
+	exclusion for field access to be safe UNLESS something actually
+	reassigns that field concurrently - immortal objects in this codebase
+	are exactly the ones nothing does that to (compile-time constants), so
+	this stays sound, not just convenient. '''
+	if _target_uses_posix_lock():
+		lock_expr = '__metalpy_spinlock_acquire( &obj->lock )'
+		unlock_expr = '__metalpy_spinlock_release( &obj->lock )'
 	else:
 		lock_expr = f'AcquireSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
 		unlock_expr = f'ReleaseSRWLockExclusive( (struct {_SRWLOCK_STRUCT_NAME}*)&obj->lock )'
@@ -1556,18 +1566,22 @@ _target_debug: bool = False
 # convention _target_os uses.
 _program_uses_threads: bool = False
 
-def _target_uses_pthread_lock() -> bool:
-	# Linux AND macOS share the identical pthread_mutex_t codegen (same
-	# storage type, same pthread_mutex_init/lock/unlock calls, same
-	# <pthread.h>/-lpthread requirement) - both are 'family: unix' per
-	# targets.py's own ActiveTarget, and macOS's pthread implementation is
-	# every bit as real a POSIX one as Linux's, just never run against a
+def _target_uses_posix_lock() -> bool:
+	# true for the two POSIX-family targets ('family: unix' per targets.py's
+	# own ActiveTarget) that use this module's own POSIX lock codegen for
+	# Part A/B (Cost mitigation #3: a CAS spinlock on _Atomic uint32_t, NOT
+	# pthread_mutex_t - see _global_lock_acquire/_field_lock_prologue's own
+	# comments) - macOS shares the identical spinlock codegen Linux does
+	# (plain C11 atomics, no OS-specific primitive), just never run against a
 	# real compiler in this repo's own dev environment (no macOS machine
 	# here - see _global_lock_supported's own poison-pill comment). One
 	# shared predicate, not two copy-pasted per-OS branches at each of this
 	# module's several call sites, so the day someone actually verifies
 	# macOS and deletes the poison pill below, there's exactly one already-
 	# correct code path waiting, not four to individually double-check.
+	# NOTE: _prologue_debug_list()'s own separate debug-only lock (alloc-site
+	# tracking, unrelated to Part A/B) still genuinely uses pthread_mutex_t
+	# on these same two targets - this predicate covers that choice too.
 	return _target_os in ( 'linux', 'macos' )
 
 # the full, unconditional concatenation - kept for callers that want every
@@ -1575,7 +1589,7 @@ def _target_uses_pthread_lock() -> bool:
 # emitter_c_test.py's own release_object test). emit_c() itself assembles
 # the pieces above selectively instead of using this directly. Placed here
 # (not right after _PROLOGUE_FLOAT_PARSE, where it lived before Part B),
-# not earlier: _object_header_prologue() needs _target_uses_pthread_lock()
+# not earlier: _object_header_prologue() needs _target_uses_posix_lock()
 # defined first, since this executes at IMPORT time, in top-to-bottom
 # module-body order - _target_os is still None at this point (only ever set
 # inside emit_c() itself, per that global's own docstring), so this always
@@ -1585,13 +1599,12 @@ PROLOGUE = _object_header_prologue() + _prologue_retain() + _prologue_release() 
 
 def _global_lock_supported() -> bool:
 	''' PLAN_THREAD_SAFE_SHARED_STATE.md Part A: Windows (SRWLOCK) and Linux
-	(pthread_mutex_t, needing a real pthread_mutex_init() call, not
-	zero-init-safe the way SRWLOCK is - see that plan's own A.3
-	POSIX-asymmetry note, and _global_lock_name's storage-declaration site
-	below for how the init call is actually wired in) are both real,
-	VERIFIED targets (this repo's own compiler matrix: clang/MSVC on
-	Windows, gcc via WSL on Linux). macOS structurally reuses the exact
-	same pthread_mutex_t codegen as Linux (_target_uses_pthread_lock) -
+	(Cost mitigation #3's own CAS spinlock, zero-init-safe the identical way
+	SRWLOCK is - see _global_lock_name's storage-declaration site below for
+	the current storage shape) are both real, VERIFIED targets (this repo's
+	own compiler matrix: clang/MSVC on Windows, gcc via WSL on Linux). macOS
+	structurally reuses the exact same spinlock codegen as Linux
+	(_target_uses_posix_lock) -
 	the code path exists and is believed correct by construction, but has
 	never actually been compiled, linked, or run on real macOS hardware or
 	a real Apple/GNU toolchain (no macOS machine is available in this
@@ -1614,7 +1627,7 @@ def _global_lock_supported() -> bool:
 	if _target_os == 'macos':
 		assert False, (
 			'this code is completely untested - macOS Part A global-locking has '
-			'structurally identical codegen to the verified Linux (pthread_mutex_t) '
+			'structurally identical codegen to the verified Linux (CAS spinlock) '
 			'path, but has never actually been compiled/linked/run on real macOS '
 			'hardware (no macOS machine in this dev environment). Do not remove this '
 			'assert without first doing that real verification - see this function\'s '
@@ -1658,6 +1671,35 @@ _PROLOGUE_GLOBAL_LOCK_WINDOWS = f'''\
 struct {_SRWLOCK_STRUCT_NAME};
 void AcquireSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
 void ReleaseSRWLockExclusive( struct {_SRWLOCK_STRUCT_NAME}* SRWLock );
+'''
+
+# the POSIX counterpart of _PROLOGUE_GLOBAL_LOCK_WINDOWS above - Cost
+# mitigation #3's CAS spinlock, shared verbatim by BOTH Part A's per-global
+# lock and Part B's per-object $header.lock (_global_lock_acquire/_release,
+# _field_lock_prologue all call these same two functions), the same "one
+# shared primitive, not two copy-pasted ones" reasoning
+# _target_uses_posix_lock's own docstring already applies to the OS check.
+# atomic_compare_exchange_weak (not _strong): this is a retry LOOP anyway
+# (a spurious failure just costs one extra iteration), and _weak compiles to
+# a tighter loop on the architectures that distinguish the two (a real,
+# documented tradeoff, not a shortcut - see C11's own 7.17.7.4). sched_yield
+# (<sched.h>, not a busy-only spin) after a failed attempt, matching this
+# repo's own "very short critical sections, spin instead of descheduling to
+# a futex is fine here" sizing decision (PLAN_THREAD_SAFE_SHARED_STATE.md's
+# own Cost mitigation #3 writeup) while still yielding the CPU to whoever's
+# actually holding the lock, rather than pegging a core the whole time.
+_PROLOGUE_POSIX_SPINLOCK = '''\
+#include <sched.h>
+static inline void __metalpy_spinlock_acquire( _Atomic uint32_t* lock ) {
+	uint32_t expected = 0;
+	while ( !atomic_compare_exchange_weak( lock, &expected, 1 ) ) {
+		expected = 0;
+		sched_yield();
+	}
+}
+static inline void __metalpy_spinlock_release( _Atomic uint32_t* lock ) {
+	atomic_store( lock, 0 );
+}
 '''
 
 def mangle_type( t: Type ) -> str:
@@ -4099,21 +4141,20 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# above are explicit writes, not relied-on zero-init) - the new
 			# per-object lock field needs the identical explicit
 			# construction-time init every other ObjectHeader field gets.
-			# Windows: an all-zero SRWLOCK IS a valid unlocked lock (A.3's
-			# own established fact, reused verbatim here) - a plain zero
-			# write suffices, no real init call. POSIX: pthread_mutex_t has
-			# no such zero-init guarantee - a genuine pthread_mutex_init()
-			# call is required at every single construction site. Skipped
+			# Both platforms are zero-init-safe now (Cost mitigation #3: an
+			# all-zero SRWLOCK on Windows, an all-zero `_Atomic uint32_t`
+			# spinlock - 0 meaning unlocked - on POSIX), so one plain zero
+			# write covers both; no real init call needed on either target
+			# anymore (POSIX used to need a genuine pthread_mutex_init() call
+			# here, back when this field was a real pthread_mutex_t - see
+			# _PROLOGUE_HEADER_FIELD_SPINLOCK's own comment). Skipped
 			# entirely (Cost mitigation #1) when this program never reaches
 			# pthread_create/CreateThread anywhere - acquire_field_lock/
 			# release_field_lock are themselves no-ops in that case (see
 			# their own AcquireFieldLock/ReleaseFieldLock emission-time
 			# gating above), so an uninitialized .lock field is never read.
 			if _global_lock_supported() and _program_uses_threads:
-				if _target_uses_pthread_lock():
-					lines.append( f'\tpthread_mutex_init( &(({dest})->$header.lock), ((void*)0) );' )
-				else:
-					lines.append( f'\t({dest})->$header.lock = ((void*)0);' )
+				lines.append( f'\t({dest})->$header.lock = 0;' )
 			if _target_debug:
 				# debug-mode alloc-site tracking (dump_live_objects) -
 				# instr.loc is stamped centrally by Lowering._emit
@@ -5453,34 +5494,17 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		compiler.extern_libs.setdefault( 'kernel32', set() ).update((
 			'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive',
 		))
-	if locks_needed and _global_lock_supported() and _target_uses_pthread_lock() and _program_uses_threads:
-		# pthread_mutex_t's real definition (needed below, where this
-		# module's own storage declaration is a genuine `pthread_mutex_t`,
-		# not an opaque void* the way SRWLOCK gets away with - see
-		# _global_lock_name's own storage-declaration comment) only exists
-		# if <pthread.h> is actually included in this translation unit.
-		# Ordinarily that only happens when a compiled program itself
-		# imports lib/posix/pthread.py (its own @extern(header='pthread.h')
-		# bindings populate compiler.disco.required_headers - see
-		# discovery.py's own extern_header handling) - force it here
-		# instead, the same way this whole block force-registers kernel32
-		# on Windows even for a program that never itself touches
-		# windows.kernel32. Registering 'pthread' the same way (mirroring
-		# lib/threading.py's own @extern('pthread', ...) bindings, which
-		# already link -lpthread whenever threading.py is used) - harmless
-		# even on a modern glibc where pthread symbols live in libc itself
-		# (glibc >= 2.34) and -lpthread resolves to an effectively-empty
-		# compatibility stub. Same treatment for macOS (_target_uses_pthread_
-		# lock covers both) - unverified whether -lpthread is even a
-		# meaningful flag there (vs. a no-op the way it's become on modern
-		# glibc) since none of this has actually been exercised on real
-		# macOS hardware - see _global_lock_supported's own poison-pill
-		# comment. Registering it regardless costs nothing if it does turn
-		# out to be a no-op there too.
-		compiler.disco.required_headers.add( 'pthread.h' )
-		compiler.extern_libs.setdefault( 'pthread', set() ).update((
-			'pthread_mutex_init', 'pthread_mutex_lock', 'pthread_mutex_unlock',
-		))
+	# Cost mitigation #3: POSIX no longer needs an equivalent force-
+	# registration block here - the CAS spinlock (_PROLOGUE_POSIX_SPINLOCK)
+	# needs only <stdatomic.h> (already unconditionally included) and
+	# <sched.h> (emitted directly alongside the spinlock functions
+	# themselves), no external library and no @extern-populated header at
+	# all. This is the whole point of the lighter primitive: a program that
+	# only needs Part A/B's own lock no longer force-links -lpthread the way
+	# it used to (a real pthread_mutex_t did require that) - only a program
+	# that ITSELF imports lib/posix/pthread.py or lib/threading.py still
+	# links it, through their own ordinary @extern bindings, unaffected by
+	# this change.
 	# __metalpy_format_f64 (PROLOGUE, always present) resolves ntdll's own
 	# exported _snprintf via GetProcAddress on Windows, to avoid linking
 	# msvcrt (see its own comment for why not a static ntdll.lib import).
@@ -5557,13 +5581,15 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		# clang's own implicit-declaration inference from the CALL SITE
 		# disagreed with the real prototype declared afterward).
 		parts.append( _PROLOGUE_GLOBAL_LOCK_WINDOWS )
-		# Neither Linux nor macOS needs an analogous hand-declared prologue
-		# (_target_uses_pthread_lock covers both): pthread_mutex_t's real
-		# definition and pthread_mutex_lock/unlock/init's real prototypes
-		# come from <pthread.h> itself (force-included just above, in this
-		# function's own required_headers.add('pthread.h')), which carries
-		# none of SRWLOCK's "don't want to drag in all of windows.h just
-		# for one struct" cost - see _global_lock_acquire's own comment.
+	elif ( locked_globals or uses_field_lock ) and _global_lock_supported() and _target_uses_posix_lock() and _program_uses_threads:
+		# the POSIX counterpart of the Windows branch just above - Cost
+		# mitigation #3's spinlock helpers, needed before _field_lock_
+		# prologue()'s own acquire_field_lock/release_field_lock bodies
+		# (which call __metalpy_spinlock_acquire/_release directly) and
+		# before any Part A call site elsewhere in this translation unit
+		# (_global_lock_acquire/_release, called from ordinary function
+		# bodies emitted LATER than this whole prologue assembly).
+		parts.append( _PROLOGUE_POSIX_SPINLOCK )
 	if uses_field_lock and _global_lock_supported() and _program_uses_threads:
 		parts.append( _field_lock_prologue() )
 	parts.append( _PROLOGUE_ARITH )
@@ -5765,25 +5791,16 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		# Variable/LoweredGlobal of their own to hang that machinery off.
 		for g in locked_globals:
 			parts.append( f'static void* {_global_lock_name( g.variable )} = 0;' )
-	elif locked_globals and _global_lock_supported() and _target_uses_pthread_lock() and _program_uses_threads:
-		# a REAL pthread_mutex_t here, not a bare void* - unlike SRWLOCK,
-		# zero-initializing a pthread_mutex_t isn't a portable guarantee
-		# (PLAN_THREAD_SAFE_SHARED_STATE.md's own A.3 POSIX-asymmetry note;
-		# glibc happens to tolerate it, lib/threading.py's own POSIX
-		# FastLock.__init__ deliberately does NOT rely on that and calls
-		# pthread_mutex_init() explicitly instead, and this mirrors that
-		# choice). No initializer here at all (plain tentative-definition
-		# zero BSS, same as any other uninitialized static) - the REAL
-		# initialization is a genuine pthread_mutex_init() call, emitted
-		# unconditionally at the very top of __metalpy_init() below, before
-		# any ordinary function body can possibly run (ir.AcquireGlobalLock/
-		# ir.ReleaseGlobalLock markers only ever appear inside ordinary
-		# function bodies, never inside a global's OWN init instructions -
-		# see Variable.reassigned_outside_init's own comment - so it's safe
-		# for this to run before, or in any order relative to, the
-		# topologically-sorted global-init calls just below it).
+	elif locked_globals and _global_lock_supported() and _target_uses_posix_lock() and _program_uses_threads:
+		# Cost mitigation #3: a plain `_Atomic uint32_t`, zero-initialized
+		# the same way Windows's own bare `void*` is just above (0 = unlocked
+		# - see _PROLOGUE_HEADER_FIELD_SPINLOCK's own comment) - no separate
+		# init call needed anymore, unlike the real pthread_mutex_t this
+		# storage used to be (POSIX gave zero-init-safety to neither
+		# platform's ORIGINAL primitive - A.3's own point, no longer true
+		# for either one now).
 		for g in locked_globals:
-			parts.append( f'static pthread_mutex_t {_global_lock_name( g.variable )};' )
+			parts.append( f'static _Atomic uint32_t {_global_lock_name( g.variable )} = 0;' )
 	for g in compiler.globals:
 		init_fn = _emit_global_init_fn( g )
 		if init_fn is not None:
@@ -5816,25 +5833,17 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		f'\t{_global_init_fn_name( g )}();'
 		for g in _topologically_sort_globals( compiler )
 	]
-	# pthread_mutex_init() calls for every protected global's real lock
-	# storage (see that storage declaration's own comment, just above, for
-	# why this can't just be a static zero-initializer the way SRWLOCK's
-	# storage is). Emitted first, ahead of init_calls - not because
-	# anything actually depends on that relative order (nothing in a
-	# global's own init instructions ever acquires one of these locks; see
-	# the storage declaration's own comment), just the simplest place to
-	# put an unconditional, order-independent one-time setup step.
-	lock_init_calls = (
-		[ f'\tpthread_mutex_init( &{_global_lock_name( g.variable )}, ((void*)0) );' for g in locked_globals ]
-		if locked_globals and _global_lock_supported() and _target_uses_pthread_lock() and _program_uses_threads else []
-	)
+	# Cost mitigation #3: no lock-init-calls list needed anymore - both
+	# platforms' protected-global lock storage is zero-init-safe (see the
+	# storage declaration's own comment just above), unlike the real
+	# pthread_mutex_t POSIX used to need a genuine pthread_mutex_init() call
+	# for here.
 	parts.append(
 		'static void __metalpy_init( void ) {\n'
 		# first thing any compiled program does, on every target/entry-point
 		# shape (see _PROLOGUE_CRASH_HANDLER's own comment) - before global
 		# initializers, let alone main(), get a chance to fault.
 		+ '\t__metalpy_install_crash_handler();\n'
-		+ ( '\n'.join( lock_init_calls ) + '\n' if lock_init_calls else '' )
 		+ ( '\n'.join( init_calls ) + '\n' if init_calls else '' )
 		+ '}'
 	)

@@ -1,4 +1,4 @@
-# Thread-safe module globals and instance fields — closing the "naive racy code corrupts memory" gap
+﻿# Thread-safe module globals and instance fields — closing the "naive racy code corrupts memory" gap
 
 ## Status
 
@@ -13,8 +13,8 @@ all previously-blocking bugs fixed, verified under real concurrent stress
 to master.**
 
 **Performance follow-ons (the "Cost mitigations" section below) - status
-update: staged into 4 sessions, Stages 1-2 landed and merged (see Cost
-mitigations #1/#2's own status updates for the full writeups), Stages 3-4
+update: staged into 4 sessions, Stages 1-3 landed and merged (see Cost
+mitigations #1/#2/#3's own status updates for the full writeups), Stage 4
 not yet started.**
 
 What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
@@ -1245,6 +1245,37 @@ a lazy-init site and a crash.
    futex-based spinlock/mutex, sized like a plain `_Atomic int`) purpose-
    built for this, rather than reusing `pthread_mutex_t` as-is. This is
    the single biggest cost unknown in the whole proposal.
+
+   **Status update: implemented and merged (Cost mitigation #3), a plain
+   CAS spinlock, not a real futex.** `_Atomic uint32_t` (0 = unlocked, 1 =
+   locked), covering BOTH Part A's per-global lock and Part B's per-object
+   `$header.lock` uniformly (a single shared `__metalpy_spinlock_acquire`/
+   `_release` pair, `_PROLOGUE_POSIX_SPINLOCK` in `emitter_c.py`) - deliberately
+   narrower than this question's own "futex-based" wording: the doc's own
+   sizing target ("like a plain `_Atomic int`") is satisfied by a spinlock
+   alone, `ir.AtomicCompareExchange` codegen was already wired end-to-end
+   and tested (`lib/atomic.py`'s `Atomic[T]`) so this reuses existing
+   machinery rather than adding new syscall-wrapper codegen a real
+   `futex(2)` mutex would need, and the critical sections this protects are
+   extremely short (one `GetAttr`/`SetAttr`-width access), where a
+   spinlock's worst case (busy-wait instead of descheduling, mitigated with
+   `sched_yield()` between attempts) matters far less than in the general
+   case futexes are built for. A real futex remains a legitimate future
+   upgrade if profiling under real contention ever shows spinning is a
+   problem. Zero-init-safe exactly the way Windows' `SRWLOCK` already was
+   (0 is a valid unlocked spinlock) - this REMOVES `pthread_mutex_init()`
+   entirely on POSIX (both Part A's and Part B's call sites), collapsing
+   A.3's own documented Windows/POSIX asymmetry rather than merely
+   shrinking it, and drops the `-lpthread`/`<pthread.h>` force-link this
+   mechanism used to need (a program that doesn't itself import
+   `lib/posix/pthread.py`/`lib/threading.py` no longer links pthread at
+   all just for Part A/B's own lock). Confirmed via a real compiled-and-run
+   `compiler.sizeof()` check (`thread_safe_fields_test.py`'s
+   `test_posix_spinlock_is_small`) and a sabotage test (a no-op spinlock
+   acquire reproduced real double-free/corruption crashes in the existing
+   Part A/B stress tests, restored after confirming that). Full 3-compiler
+   suite clean, including `METALPY_RUN_LOAD_TESTS=1` on WSL/gcc (the
+   primary leg for this POSIX-only change).
 2. **Does the reentrancy hazard in B.4 actually occur** in real generated
    code once GetAttr/SetAttr access is genuinely single-instruction-wide,
    or only in a hypothetical inlined/optimized shape? Needs to be
