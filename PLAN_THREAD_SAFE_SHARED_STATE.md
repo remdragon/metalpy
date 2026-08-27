@@ -1047,6 +1047,40 @@ issue.)
    choose, per-program, whether to emit the retain-on-read Incref/
    fresh_temp pair AT ALL - not something to reattempt with the current
    emission-time-only architecture.
+
+   **Status update: investigated (design-only, no code), recommendation is
+   to NOT build this.** The lowering-time pre-pass would have to run and
+   produce a final answer before `Compiler.run()` enqueues `main`
+   (`compiler.py`, before `_drain()` starts) - the existing `@extern(
+   spawns_thread=True)` mechanism can't supply that answer this early,
+   since `Compiler.spawns_threads` is only flipped incrementally as
+   thread-spawning functions are actually reached and lowered
+   (`compiler.py`'s `_lower()`, mirroring `requires_crt`) and is only FINAL
+   once the whole reachable call graph has drained - useless as an input
+   to a per-instruction lowering-time gate. A separate syntactic pre-pass
+   would need its own eager, whole-file AST walk descending into nested
+   function/lambda bodies (`Discovery.visit_FunctionDef` only registers
+   signatures eagerly, not bodies - a real thread-spawning import can sit
+   inside a method, e.g. `lib/threading.py`'s own `Thread.__init__`) plus
+   its own conservative reimplementation of `discovery.py`'s import-graph
+   resolution to know which files are even reachable - a second, permanent,
+   must-stay-conservative-forever detection mechanism, entirely separate
+   from and unable to reuse the one already shipped. Worse, to stay sound
+   against aliased imports (`from threading import Thread as T`),
+   cross-module reexports, and closure/function-pointer indirection (the
+   language has first-class closures), it cannot do call-site matching -
+   it would have to degrade to "any reachable file imports `threading`/
+   `posix.pthread`/`windows.kernel32` at all," a real regression from the
+   already-shipped `@extern(spawns_thread=True)` mechanism's own "catches
+   every wrapper for free via one syscall choke point" property. Given
+   Stage 1 already eliminates the expensive part (lock acquisition,
+   syscalls) for non-threaded programs, and what's left is only a couple of
+   atomic incref/decref instructions, building a second detection
+   mechanism - with a demonstrated history of causing a real double-free
+   the one time this exact idea was tried - to shave that residual cost is
+   not a good trade. **Not pursued further; revisit only if real profiling
+   of an actual non-threaded program shows the residual retain-on-read
+   traffic is a measurable hot-path cost, not speculatively.**
 2. **Write-once-after-`__init__` exemption — only sound for `__private`
    fields, and only once the "Prerequisite" section above actually ships.**
    A field assigned only in `__init__` and never reassigned by any other
@@ -1082,6 +1116,28 @@ issue.)
    reassigned from within its own defining class?) wasn't confirmed during
    this investigation and needs checking before assuming A.1's global
    exemption is as unconditionally cheap as stated there.
+
+   **Status update: checked, directly against the codebase. A.1's global
+   exemption is already sound, for two independent reasons - not a gap.**
+   First, the identical privacy split genuinely does apply to module
+   globals: `Discovery.check_module_visibility` (`discovery.py:707-835`) is
+   real, enforced infrastructure - it hard-errors the moment an accessing
+   module differs from a `__`-prefixed global's defining module, wired into
+   `visit_ImportFrom` and both attribute- and value-position resolution
+   across `discovery.py`/`lowering.py`. Second, and more fundamentally,
+   A.1's `reassigned_outside_init` flag is sound *independent* of whether
+   that enforcement exists at all: this is a whole-program AOT compiler
+   where each global is exactly one shared `Variable` object for the entire
+   compilation (`mpy_types.py`), referenced (never cloned) by every
+   importing module's scope. `cfg.py`'s `assign()` flips the flag on that
+   one object's identity from every real write path (`_stmt_Assign`,
+   `_stmt_AugAssign`, tuple/pattern/for-loop targets all funnel through
+   it) - and the only way a different module's code can even reference `X`
+   is `from module_a import X`, which binds that identical `Variable`
+   object, not a copy. There is no disconnected second representation of
+   "the same global" the flip could fail to reach. No counterexample
+   program exists; this closes the open question with no follow-up fix
+   needed.
 
    **Status update: implemented and merged, `__private` fields only, exactly
    the scope described above.** `ir.AcquireFieldLock`/`ReleaseFieldLock`
