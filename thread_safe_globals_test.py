@@ -289,6 +289,7 @@ def main() -> i32:
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile tests' )
 class ThreadSafeGlobalsTests( RealCompileMixin, unittest.TestCase ):
 	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
 	def test_concurrent_read_write_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
@@ -298,12 +299,14 @@ class ThreadSafeGlobalsTests( RealCompileMixin, unittest.TestCase ):
 		self.assert_programs_run([ ( 'scalar_global_unaffected', _SCALAR_GLOBAL_UNAFFECTED ) ])
 
 	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
 	def test_narrowed_read_concurrent_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
 		self.assert_programs_run([ ( 'narrowed_read_concurrent_stress', _NARROWED_READ_CONCURRENT_STRESS ) ], timeout = 30.0 )
 
 	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part A only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
 	def test_global_init_write_race_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run

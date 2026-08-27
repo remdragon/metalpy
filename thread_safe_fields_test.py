@@ -339,6 +339,7 @@ class ThreadSafeFieldsTests( RealCompileMixin, unittest.TestCase ):
 		])
 
 	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part B only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
 	def test_concurrent_field_read_write_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
@@ -348,6 +349,7 @@ class ThreadSafeFieldsTests( RealCompileMixin, unittest.TestCase ):
 		self.assert_programs_run([ ( 'scalar_field_unaffected', _SCALAR_FIELD_UNAFFECTED ) ])
 
 	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part B only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
 	def test_narrowed_field_read_concurrent_stress( self ) -> None:
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run

@@ -6142,6 +6142,7 @@ class ListThreadSafetyTests( test_support.RealCompileMixin, CompilerTestCase ):
 		self.compiler = Compiler( self.discovery )
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@test_support.skip_unless_load_tests
 	def test_programs_compile_and_run( self ) -> None:
 		''' every real compile-and-run program in this class, merged into a
 		single executable (one build for the whole class); a nonzero exit is
@@ -7844,6 +7845,7 @@ class ThreadRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 		self.compiler = Compiler( self.discovery )
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@test_support.skip_unless_load_tests
 	def test_programs_compile_and_run( self ) -> None:
 		''' every real compile-and-run program in this class, merged into a
 		single executable (one build for the whole class); a nonzero exit is
@@ -9856,6 +9858,7 @@ class DictThreadSafetyTests( test_support.RealCompileMixin, CompilerTestCase ):
 		self.compiler = Compiler( self.discovery )
 
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	@test_support.skip_unless_load_tests
 	def test_programs_compile_and_run( self ) -> None:
 		''' every real compile-and-run program in this class, merged into a
 		single executable (one build for the whole class); a nonzero exit is

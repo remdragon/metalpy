@@ -1279,6 +1279,7 @@ class str( Sequence[str], Iterable[str], Sized ):
 
 		return str._from_owned_cstr( buf, new_size ).unwrap( 'invalid UTF-8 in replace' )
 
+	@overload
 	def join( self, parts: list[str] ) -> str:
 		''' self inserted between each element of parts - str.concat's own
 		two-pass shape, plus self's own bytes between consecutive parts.
@@ -1288,7 +1289,14 @@ class str( Sequence[str], Iterable[str], Sized ):
 		and list[T]'s own methods are all lock-guarded per call (see
 		__list.py's own header comment), so bridging to str.concat would
 		still need an explicit copy into an UnsafeList[str] either way -
-		not worth it just to share concat's own loop body. '''
+		not worth it just to share concat's own loop body.
+
+		This is the FAST PATH (no copy) - the sibling join[S: Iterable[str]]
+		overload just below handles anything else (a generator, any other
+		Iterable[str] conformer) by materializing into a real list[str]
+		first, then calling straight back into this one; overload
+		resolution always prefers this exact-match candidate over that
+		generic one for an argument that's already a real list[str]. '''
 		count: usize = parts.__len__()
 		if count == 0:
 			return ''
@@ -1317,6 +1325,31 @@ class str( Sequence[str], Iterable[str], Sized ):
 
 		new_buf[offset] = 0
 		return str._from_owned_cstr( new_buf, new_size ).unwrap( 'invalid UTF-8 in join' )
+
+	@overload
+	def join[S: IteratorProtocol[str]]( self, parts: S ) -> str:
+		''' an already-in-progress iterator (a real generator - e.g.
+		map(...)'s own return value - or any hand-written __next__
+		conformer) - drains it into a real list[str] first, same "collect
+		into a concrete Sequence, then measure/copy" fallback CPython's own
+		PyUnicode_Join uses for a non-fast-sequence iterable, then hands
+		that straight to the list[str] overload above. join's own
+		algorithm there is a genuine two-pass shape (sum byte lengths to
+		size one allocation, THEN copy) - a lazy, single-consumption
+		iterator can support neither pass as written (no len() up front, no
+		re-reading after the first walk), so there's no cheaper option than
+		materializing it first. Mirrors list[T].__init__'s own identical
+		IteratorProtocol[T]/Iterable[T] overload pair (__list.py) exactly,
+		for the same reason. '''
+		return self.join( list( parts ))
+
+	@overload
+	def join[S: Iterable[str]]( self, parts: S ) -> str:
+		''' anything else with its own __iter__ (a Sequence, a dict's own
+		key-iteration, ...) that isn't already a list[str] or an in-
+		progress iterator - goes through __iter__() first, then drains
+		exactly like the IteratorProtocol[str] overload just above. '''
+		return self.join( parts.__iter__() )
 
 	def partition( self, sep: str ) -> tuple[str,str,str]:
 		''' splits self at the FIRST occurrence of sep into (before, sep,
