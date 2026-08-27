@@ -3590,12 +3590,23 @@ class TypeResolver:
 			# multiple $$__new__ wrappers coexist for this cls (see the
 			# cache-key comment above) - each needs its own distinct C
 			# symbol, or the second one synthesized would silently collide
-			# with/shadow the first's mangled name. init.line is stable and
-			# already unique per __init__ candidate within one file (two
-			# distinct defs can never share a line) - untouched for every
-			# non-overloaded class (the overwhelming common case), so this
-			# never changes an existing, already-stable $$__new__ symbol
-			qualname = f'{qualname}${init.line}'
+			# with/shadow the first's mangled name. init.line alone is NOT
+			# enough: an __init__ overload leaf with its OWN type param on
+			# top of cls's (list[T].__init__[S: IteratorProtocol[T]]) is
+			# monomorphized separately per concrete S at each construction
+			# call site (_lower_generic_construction_args' own
+			# own_type_params branch) - `init` here is already one such
+			# substituted copy, so two DISTINCT S instantiations (e.g.
+			# map()'s own generator vs a set's own _sequence_iter generator)
+			# still share the same originating .line, and init.line alone
+			# collides between them (confirmed via a real repro: both ended
+			# up emitted under the same C symbol with conflicting parameter
+			# types). Fold in each (already-substituted, fully concrete)
+			# parameter's own qualname too - unique per distinct signature,
+			# stable for the overwhelming common case (one $$__new__ per
+			# init.line) where every param there is untouched.
+			sig = ','.join( p.type.qualname for p in ( init.parameters or [] ) if p.type is not None )
+			qualname = f'{qualname}${init.line}${sig}'
 		new_params: list[Parameter] = []
 		for p in ( init.parameters or [] ):
 			new_params.append( Parameter(
