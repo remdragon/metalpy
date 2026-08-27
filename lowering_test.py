@@ -11124,6 +11124,47 @@ class JoinedStrLoweringTests( unittest.TestCase ):
 			any( 'Foo' in e and '__str__' in e for e in self.discovery.errors.errors ), self.discovery.errors.errors,
 		)
 
+	def test_class_attribute_access_in_fstring_is_a_clean_compile_error( self ) -> None:
+		# `Foo.flag` (accessed through the CLASS, not an instance) used to
+		# silently reach emitter_c.py as a bare undeclared identifier -
+		# find_name_recursive's scope-terminal branch resolved the chain
+		# fine, but nothing ever rejected it. Real-world repro: grap.mpy's
+		# `f'... = {Grap.one!r}'`.
+		self._import( '\n'.join([
+			'class Foo:',
+			'	flag: bool = False',
+			'',
+			'def main() -> str:',
+			'	return f"{Foo.flag!r}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( 'class attribute access is not supported' in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
+	def test_class_attribute_access_in_fstring_errors_even_with_a_same_class_instance_in_scope( self ) -> None:
+		# the same check above used to be bypassed entirely when an
+		# instance of the SAME class also existed as a local: `flag`'s own
+		# Variable lives in Foo.names (populated once Foo is resolved via
+		# construction), and the scope-terminal branch returned it directly
+		# as if it were a real class-level global before ever reaching the
+		# class-attribute check - is_global (False for anything class-
+		# scoped) is what now excludes it. grap.mpy's real shape.
+		self._import( '\n'.join([
+			'class Foo:',
+			'	flag: bool = False',
+			'',
+			'def main() -> str:',
+			'	foo = Foo()',
+			'	return f"{Foo.flag!r}"',
+		]))
+		self.compiler._lower( self.discovery.main )
+		self.assertTrue(
+			any( 'class attribute access is not supported' in e for e in self.discovery.errors.errors ),
+			self.discovery.errors.errors,
+		)
+
 	def test_self_documenting_equals_syntax_needs_no_special_handling( self ) -> None:
 		# f"{x=}" - CPython's own parser already expands this into an
 		# extra literal Constant('x=') ahead of the FormattedValue before
