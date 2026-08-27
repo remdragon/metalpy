@@ -550,6 +550,18 @@ class Variable( Name ):
 	# True - PLAN_THREAD_SAFE_SHARED_STATE.md's A.1: provably single-write,
 	# no lock needed. Only meaningful for is_global=True RC-typed globals.
 	reassigned_outside_init: bool = False
+	# per-field analog of the above (PLAN_THREAD_SAFE_SHARED_STATE.md Cost
+	# mitigation #2) - flipped by lowering.py's non-construction SetAttr
+	# branches (mirroring cfg.py's assign() flipping reassigned_outside_init
+	# for a global) the moment a class attribute Variable is written from
+	# anywhere OTHER than its own class's __init__. Separate field, not a
+	# reused reassigned_outside_init: that one's is_global=True precondition
+	# and this one's __private-scoped, __init__-relative precondition are
+	# different questions that happen to share a "provably single-writer"
+	# shape - conflating them would let one's flip silently satisfy the
+	# other's very different soundness requirement. Only meaningful for a
+	# class-attribute Variable (never set for is_global=True/local Variables).
+	field_reassigned_outside_init: bool = False
 	# set only for a local declared `Volatile[T]` (_stmt_AnnAssign) - means
 	# its C storage must be qualified `volatile` (see emitter_c._declarator)
 	is_volatile: bool = False

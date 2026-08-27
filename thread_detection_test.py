@@ -129,8 +129,12 @@ class ThreadDetectionTests( unittest.TestCase ):
 		])
 		compiler, c_source = self._compile( source )
 		self.assertTrue( compiler.spawns_threads )
-		self.assertIn( 'acquire_field_lock', c_source )
-		self.assertIn( 'release_field_lock', c_source )
+		# real CALL sites, not just the helper function definitions (which
+		# Cost mitigation #2 can cause to be emitted even when every actual
+		# per-field access at this specific site is a no-op - see
+		# thread_detection_test.py's own exemption test for why)
+		self.assertIn( 'acquire_field_lock( (ObjectHeader*)(', c_source )
+		self.assertIn( 'release_field_lock( (ObjectHeader*)(', c_source )
 
 	def test_assume_threaded_override_forces_lock_codegen( self ) -> None:
 		# mpy.py's own --assume-threaded escape hatch (PLAN_THREAD_SAFE_
@@ -162,8 +166,8 @@ class ThreadDetectionTests( unittest.TestCase ):
 		self.assertFalse( compiler.spawns_threads ) # nothing spawns a thread here
 		compiler.spawns_threads = True # the override, applied exactly like mpy.py's --assume-threaded
 		c_source = emitter_c.emit_c( compiler )
-		self.assertIn( 'acquire_field_lock', c_source )
-		self.assertIn( 'release_field_lock', c_source )
+		self.assertIn( 'acquire_field_lock( (ObjectHeader*)(', c_source )
+		self.assertIn( 'release_field_lock( (ObjectHeader*)(', c_source )
 
 	def test_threadpool_construction_sets_spawns_threads( self ) -> None:
 		# ThreadPool is a lib/threading.py wrapper, not a direct Thread() -
@@ -179,6 +183,91 @@ class ThreadDetectionTests( unittest.TestCase ):
 		])
 		compiler, _c_source = self._compile( source )
 		self.assertTrue( compiler.spawns_threads )
+
+
+	def test_private_write_once_field_exempt_even_when_threaded( self ) -> None:
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #2 - a `__private`
+		# field written only from its own class's __init__ (Holder.__b) needs
+		# no lock at all, even in a program that DOES spawn a real thread
+		# elsewhere (compiler.spawns_threads True) - construction happens
+		# single-threaded, before the object can be published anywhere.
+		source = '\n'.join([
+			'import compiler',
+			'import threading',
+			'class Box:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'class Holder:',
+			'	__b: Box',
+			'	def __init__( self, b: Box ) -> None:',
+			'		self.__b = b',
+			'	def get( self ) -> i32:',
+			'		return self.__b.x',
+			'class Worker:',
+			'	def run( self ) -> None:',
+			'		pass',
+			'',
+			'def main() -> i32:',
+			'	h: Holder = Holder( Box( 1 ) )',
+			'	w: Worker = Worker()',
+			'	t: threading.Thread = threading.Thread( w.run )',
+			'	t.join()',
+			'	return h.get()',
+		])
+		compiler, c_source = self._compile( source )
+		self.assertTrue( compiler.spawns_threads ) # program DOES spawn a thread elsewhere
+		# the helper FUNCTIONS themselves (acquire_field_lock/release_field_
+		# lock's own `static inline void ...` definitions) are emitted
+		# whenever ANY field lock marker exists anywhere in the program - see
+		# emitter_c.py's uses_field_lock, presence-based on purpose (Cost
+		# mitigation #2's exemption is a per-ACCESS emission-time decision,
+		# not a whole-program one). Checking for actual CALL sites instead -
+		# their unique `(ObjectHeader*)(` cast, which no definition line has.
+		for needle in ( 'acquire_field_lock( (ObjectHeader*)(', 'release_field_lock( (ObjectHeader*)(' ):
+			self.assertNotIn( needle, c_source, f'{needle!r} found for a __private write-once field, even though it should be exempt' )
+
+	def test_private_field_reassigned_outside_init_still_gets_lock_codegen( self ) -> None:
+		# the positive-space counterpart of the exemption test above - a
+		# `__private` field reassigned from a method OTHER than __init__
+		# (even one still inside the same class, a legitimate private access)
+		# must NOT be treated as exempt - confirms the detector actually
+		# checks field_reassigned_outside_init, not just the '__' name shape.
+		source = '\n'.join([
+			'import compiler',
+			'import threading',
+			'class Box:',
+			'	x: i32',
+			'	def __init__( self, x: i32 ) -> None:',
+			'		self.x = x',
+			'class Holder:',
+			'	__b: Box',
+			'	def __init__( self, b: Box ) -> None:',
+			'		self.__b = b',
+			'	def __swap( self, b: Box ) -> None:',
+			'		self.__b = b',
+			'	def trigger_swap( self, b: Box ) -> None:',
+			'		self.__swap( b )',
+			'	def get( self ) -> i32:',
+			'		return self.__b.x',
+			'class Worker:',
+			'	def run( self ) -> None:',
+			'		pass',
+			'',
+			'def main() -> i32:',
+			'	h: Holder = Holder( Box( 1 ) )',
+			'	h.trigger_swap( Box( 2 ) )',
+			'	w: Worker = Worker()',
+			'	t: threading.Thread = threading.Thread( w.run )',
+			'	t.join()',
+			'	return h.get()',
+		])
+		compiler, c_source = self._compile( source )
+		self.assertTrue( compiler.spawns_threads )
+		# real CALL sites, not just the always-present helper function
+		# definitions - see the exemption test's own identical comment above
+		self.assertIn( 'acquire_field_lock( (ObjectHeader*)(', c_source )
+		self.assertIn( 'release_field_lock( (ObjectHeader*)(', c_source )
 
 
 if __name__ == '__main__':

@@ -1629,6 +1629,25 @@ def _global_lock_supported() -> bool:
 	# any target this returns False for.
 	return _target_os in ( 'windows', 'linux', 'macos' )
 
+def _field_lock_exempt( field: 'Variable|None' ) -> bool:
+	''' PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #2 - true when `field`
+	is a `__private` field (discovery.check_field_visibility's own name-
+	mangling test: leading '__', not also trailing '__') that lowering.py
+	proved is NEVER written from outside its own class's __init__
+	(Variable.field_reassigned_outside_init - see that field's own comment).
+	Such a field can only ever be written while its owning object is still
+	under construction, single-threaded and unpublished by construction (no
+	other reference to it exists yet for a second thread to have obtained) -
+	so no reader can ever race a writer over it, real thread-spawning program
+	or not. `field is None` (a synthesized/internal access with no declaring
+	Variable) is never exempt - see AcquireFieldLock.field's own docstring. '''
+	if field is None:
+		return False
+	stem = field.stem
+	if not stem.startswith( '__' ) or stem.endswith( '__' ):
+		return False
+	return not field.field_reassigned_outside_init
+
 # the bare forward tag (no body) is always legal to repeat, even if the
 # real struct ALSO gets a full body defined elsewhere in this same
 # translation unit (C explicitly allows redeclaring an incomplete tag any
@@ -3955,11 +3974,11 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			return []
 		return [ _global_lock_release( _global_lock_name( instr.var ))]
 	if isinstance( instr, ir.AcquireFieldLock ):
-		if not ( _global_lock_supported() and _program_uses_threads ):
-			return [] # unsupported target, or no thread ever spawned - see _global_lock_supported's/_program_uses_threads's own docstrings
+		if not ( _global_lock_supported() and _program_uses_threads ) or _field_lock_exempt( instr.field ):
+			return [] # unsupported target, no thread ever spawned, or a provably write-once-in-__init__ __private field (Cost mitigation #2) - see the relevant helpers' own docstrings
 		return [ f'\tacquire_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
 	if isinstance( instr, ir.ReleaseFieldLock ):
-		if not ( _global_lock_supported() and _program_uses_threads ):
+		if not ( _global_lock_supported() and _program_uses_threads ) or _field_lock_exempt( instr.field ):
 			return []
 		return [ f'\trelease_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
 	if isinstance( instr, ir.DecrefDynamic ):
