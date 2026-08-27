@@ -1,0 +1,7 @@
+MetalPy
+Copyright 2026 Royce Mitchell
+
+Programs compiled by MetalPy may bundle third-party runtime components
+(e.g. Tcl/Tk, zlib) under their own licenses. See licenses/ and the
+generated dist/THIRD-PARTY-LICENSES.txt for those notices — they are
+separate from, and do not modify, this project's own Apache 2.0 license.
