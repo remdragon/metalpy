@@ -256,7 +256,7 @@ class TypeResolver:
 		# once, lazily, the first time an RCClass actually needs one
 		self._sys_free_scheduled: bool = False
 		self._destructors_synthesized: set[int] = set()
-		self._constructors_synthesized: set[tuple[int,int]] = set() # (id(RCClass), id(init)) -> $$__new__ already synthesized - see _synthesize_rcclass_constructor
+		self._constructors_synthesized: dict[tuple[int,int],Function] = {} # (id(RCClass), id(init)) -> its own already-synthesized $$__new__ Function - see _synthesize_rcclass_constructor
 		self._dtor_label_id = 0
 		self._sys_functions: dict[str,Function] = {}
 		# re-entrancy guard for _schedule_uniontype_storage: union_storage.
@@ -3480,7 +3480,7 @@ class TypeResolver:
 		fn.add_name( 'self', self_param )
 		self.schedule( fn )
 
-	def _synthesize_rcclass_constructor( self, cls: RCClass, init: Function ) -> None:
+	def _synthesize_rcclass_constructor( self, cls: RCClass, init: Function ) -> 'Function|None':
 		''' build an AST Function for $$__new__ - a per-class constructor
 		mirroring _synthesize_rcclass_destructor: allocate a raw,
 		uninitialized instance (compiler.__raw_alloc__) and call the
@@ -3492,6 +3492,22 @@ class TypeResolver:
 		class statically, never dispatched through a vtable - so it needs
 		no emitter special-casing at all, ordinary Function emission
 		handles it.
+
+		Returns the synthesized (or already-cached) Function directly -
+		the caller uses THIS return value as its own call target, never a
+		follow-up cls.get_local('$$__new__') lookup. An overloaded __init__
+		can legitimately need several coexisting $$__new__ wrappers for one
+		cls (see the cache-key comment below); cls.add_name('$$__new__', ...)
+		still registers one of them under that fixed name too (kept for the
+		common, non-overloaded case and any lookup that genuinely only cares
+		about "some constructor of this class"), but the LAST one registered
+		there would silently shadow every earlier one for a same-named
+		lookup after the fact - returning the correct Function directly, so
+		the caller never has to go through that shared, overwritable slot
+		at all, is what actually keeps this safe. None only for the
+		defensive `cls.type_params` guard just below (never real for the
+		one production caller, which only ever passes an already-concrete
+		RCClass).
 
 		Called ONLY eagerly from _try_lower_construct_call itself, never
 		from compiler._lower's own class-registration trigger the way the
@@ -3522,7 +3538,7 @@ class TypeResolver:
 		bare, unsubstituted TypeVar T, crashing the emitter outright once
 		it tried to mangle a TypeVar into a C type). '''
 		if cls.type_params:
-			return  # only concrete RCClasses get a constructor
+			return None  # only concrete RCClasses get a constructor
 		# an overloaded __init__ means MULTIPLE, differently-shaped $$__new__
 		# wrappers can legitimately coexist for the SAME concrete cls (one
 		# per distinct __init__ candidate actually used at some real
@@ -3533,14 +3549,13 @@ class TypeResolver:
 		# see the qualname suffix just below for the matching C-symbol half
 		# of this same fix.
 		cache_key = ( id( cls ), id( init ))
-		if cache_key in self._constructors_synthesized:
-			return
-		self._constructors_synthesized.add( cache_key )
+		if cached := self._constructors_synthesized.get( cache_key ):
+			return cached
 
 		if cls.resolve is not None:
 			cls.resolve()
 		if not isinstance( init, Function ):
-			return  # an Overload - lowering.py's _try_lower_construct_call already rejects this case with its own error message
+			return None  # an Overload - lowering.py's _try_lower_construct_call already rejects this case with its own error message
 		if init.resolve is not None:
 			init.resolve()
 		if any( p.is_vararg or p.is_kwarg or p.is_move or p.is_copy for p in ( init.parameters or [] )):
@@ -3590,12 +3605,23 @@ class TypeResolver:
 			# multiple $$__new__ wrappers coexist for this cls (see the
 			# cache-key comment above) - each needs its own distinct C
 			# symbol, or the second one synthesized would silently collide
-			# with/shadow the first's mangled name. init.line is stable and
-			# already unique per __init__ candidate within one file (two
-			# distinct defs can never share a line) - untouched for every
-			# non-overloaded class (the overwhelming common case), so this
-			# never changes an existing, already-stable $$__new__ symbol
-			qualname = f'{qualname}${init.line}'
+			# with/shadow the first's mangled name. init.line alone is NOT
+			# enough: an __init__ overload leaf with its OWN type param on
+			# top of cls's (list[T].__init__[S: IteratorProtocol[T]]) is
+			# monomorphized separately per concrete S at each construction
+			# call site (_lower_generic_construction_args' own
+			# own_type_params branch) - `init` here is already one such
+			# substituted copy, so two DISTINCT S instantiations (e.g.
+			# map()'s own generator vs a set's own _sequence_iter generator)
+			# still share the same originating .line, and init.line alone
+			# collides between them (confirmed via a real repro: both ended
+			# up emitted under the same C symbol with conflicting parameter
+			# types). Fold in each (already-substituted, fully concrete)
+			# parameter's own qualname too - unique per distinct signature,
+			# stable for the overwhelming common case (one $$__new__ per
+			# init.line) where every param there is untouched.
+			sig = ','.join( p.type.qualname for p in ( init.parameters or [] ) if p.type is not None )
+			qualname = f'{qualname}${init.line}${sig}'
 		new_params: list[Parameter] = []
 		for p in ( init.parameters or [] ):
 			new_params.append( Parameter(
@@ -3730,6 +3756,8 @@ class TypeResolver:
 			fn.add_name( p.stem, p )
 		self.schedule( fn )
 		cls.add_name( '$$__new__', fn )
+		self._constructors_synthesized[cache_key] = fn
+		return fn
 
 	def _build_field_teardown_ast( self, field_expr: ast.Attribute, field_type: Type ) -> list[ast.stmt]:
 		''' recursively build AST statements to decref every RC leaf

@@ -15393,9 +15393,16 @@ class FunctionLowering:
 		# compiler.py class-registration trigger - schedule() is a
 		# deferred queue, so THIS call site needs $$__new__'s live Function
 		# object available right now, not whenever it eventually gets
-		# dequeued (see _synthesize_rcclass_constructor's own docstring)
-		self.lowering._type_resolver._synthesize_rcclass_constructor( concrete_cls, init )
-		new_fn = concrete_cls.get_local( '$$__new__' )
+		# dequeued (see _synthesize_rcclass_constructor's own docstring).
+		# Uses the RETURN value directly, never a follow-up
+		# concrete_cls.get_local('$$__new__') lookup - an overloaded
+		# __init__ can synthesize several coexisting $$__new__ wrappers for
+		# the SAME concrete_cls (one per distinct init actually constructed
+		# with), and cls.add_name('$$__new__', ...) only ever keeps the
+		# LAST one under that shared name; the return value is always the
+		# one that matches THIS call's own `init`, regardless of how many
+		# others have been synthesized for concrete_cls in the meantime.
+		new_fn = self.lowering._type_resolver._synthesize_rcclass_constructor( concrete_cls, init )
 		assert isinstance( new_fn, Function ), f'internal compiler error: {concrete_cls.qualname} has no synthesized $$__new__'
 		self.lowering.schedule( new_fn.return_type )
 		dest = self._new_temp( new_fn.return_type )
