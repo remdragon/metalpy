@@ -16967,7 +16967,15 @@ def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:
 	return key( x )
 
 def main() -> i32:
-	result: i32 = apply( 5, key = lambda v: v )
+	# i32(5), not a bare 5 - a bare int literal's own natural type is now
+	# builtins.int (arbitrary-precision), not i32 (see lowering.py's
+	# _expr_Constant), and nothing else in this call links T back to K
+	# (they're independent type params in apply's own signature - only the
+	# lambda's own trivial identity body happens to make T==K here, which
+	# the type-param inference has no way to see ahead of lowering the
+	# lambda) - so T needs to be pinned to i32 explicitly for this to
+	# still exercise the eager-lambda-lowering path it's actually testing
+	result: i32 = apply( i32( 5 ), key = lambda v: v )
 	with compiler.wrap_arithmetic:
 		diff: i32 = result - 5
 	return diff

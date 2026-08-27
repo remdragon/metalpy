@@ -6072,7 +6072,20 @@ class Tests( unittest.TestCase ):
 			'	return key( x )',
 			'',
 			'def outer( y: i32 ) -> i32:',
-			'	return apply( 5, key = lambda v: y )',
+			# assigned to an unannotated local, NOT returned directly - this
+			# file's own _emit_generic_call now types a generic call's dest
+			# as the REAL (monomorphized) return type rather than silently
+			# trusting the outer context's own expected type (see that
+			# method's own comment) - `return apply(...)` directly would
+			# check the call's result against outer's own -> i32, tripping
+			# this Closure[...]-shaped-return-type-substitution gap (still
+			# genuinely unresolved to a concrete i32 - see this test's own
+			# docstring, "not fixed here, out of scope") earlier than
+			# before. i32(5), not a bare 5, still needed - see this file's
+			# own bare-literal-default comment elsewhere - i32 is the ONLY
+			# other thing that could pin T here.
+			'	result = apply( i32( 5 ), key = lambda v: y )',
+			'	return y',
 		])
 		self._import( code )
 		outer_fn = self.discovery.modules['__test__'].get_local( 'outer' )
@@ -11930,10 +11943,14 @@ class GenericCallDefaultParameterTests( unittest.TestCase ):
 			'	return pad',
 			'',
 			'def main() -> i32:',
-			'	t = ( 1, 2, 3 )', # unannotated - infers straight from the tuple
-			# literal, unlike list/slice, which need an explicit annotation to
-			# even compile - see this class's own docstring for why this is
-			# the shape that actually reaches the buggy path in practice
+			# i32(...) elements, not bare literals - a bare int literal's own
+			# natural type is now builtins.int (arbitrary-precision), not
+			# i32 (see lowering.py's _expr_Constant); `t` itself STAYS
+			# unannotated (still infers straight from the tuple literal,
+			# unlike list/slice, which need an explicit annotation to even
+			# compile - see this class's own docstring for why that's the
+			# shape that actually reaches the buggy path in practice)
+			'	t = ( i32( 1 ), i32( 2 ), i32( 3 ))',
 			'	return take( t )',
 		])
 		self._import( code )
@@ -11995,6 +12012,89 @@ class GenericCallDefaultParameterTests( unittest.TestCase ):
 		assigns = [ i for i in fn.instructions if isinstance( i, ir.Assign ) and i.dest.stem.endswith( '$pad' ) ]
 		self.assertEqual( len( assigns ), 1 )
 		self.assertEqual( assigns[0].src, ir.Const( type = self.discovery.get_intrinsics()['i32'], value = 5 ))
+
+
+class GenericCallDestTypeTests( unittest.TestCase ):
+	''' _emit_generic_call used to type a generic call's own dest as
+	`expected_type or monomorphized.return_type` - trusting the CALLER's
+	own expected type outright instead of the REAL, just-monomorphized
+	return type. For a free generic function (unlike
+	_lower_class_generic_method_call, e.g. Result.Ok, which already
+	unifies expected_type against the class's own type params up front),
+	nothing before that point ever required the two to agree - type params
+	are inferred purely from the ARGUMENTS. Typing dest as expected_type
+	regardless made operand.type == expected_type true BY CONSTRUCTION,
+	which skips _lower_expr's own real safety net (_coerce_or_check_operand
+	only ever catches a genuine mismatch when the two differ) - so a real
+	divergence went completely undetected, reaching emitter_c.py with dest
+	LYING about its own type (confirmed via a real repro: a `struct
+	builtins$int*` assigned through an `int32_t` dest, "incompatible
+	pointer to integer conversion"). Only ever surfaced once a bare int
+	literal argument stopped always defaulting to i32 (which happened to
+	coincidentally match whatever the caller expected, in practice, every
+	time). Fixed by typing dest as the real resolved return type instead,
+	letting _lower_expr's own outer _coerce_or_check_operand call catch a
+	genuine mismatch exactly like it already does for every other kind of
+	operand - a real "expected X, got Y" compile error now, not a silent
+	miscompile. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _lower_main( self ):
+		return self.compiler._lower( self.discovery.main )
+
+	def test_generic_return_type_mismatch_is_a_real_compile_error_not_a_miscompile( self ) -> None:
+		code = '\n'.join([
+			'def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def main() -> i32:',
+			# int(5), not a bare 5 - forces T=builtins.int unambiguously,
+			# independent of any literal-default behavior. K is only ever
+			# inferable from the LAMBDA's own body (`v` - an identity), which
+			# has no declared signature of its own to conflict-check against
+			# T/K up front the way apply(int(5), key=identity_i32) (a real
+			# function reference with its own concrete i32 signature) would -
+			# so K quietly resolves to builtins.int too, genuinely
+			# incompatible with the i32 the assignment target below
+			# declares. Before the fix, this compiled with NO errors,
+			# silently emitting a dest typed i32 for a call that actually
+			# returns builtins.int (confirmed via a real repro: raw C
+			# "incompatible pointer to integer conversion" reaching the
+			# emitted output undetected by MetalPy's own type checker).
+			'	result: i32 = apply( int( 5 ), key = lambda v: v )',
+			'	return result',
+		])
+		self._import( code )
+		self._lower_main()
+		errors = [ str( e ) for e in self.discovery.errors.errors ]
+		self.assertEqual( len( errors ), 1, errors )
+		self.assertIn( 'expected intrinsics.i32, got builtins.int', errors[0] )
+
+	def test_generic_return_type_match_still_compiles_and_dest_is_correctly_typed( self ) -> None:
+		code = '\n'.join([
+			'def apply[T,K]( x: T, key: Ptr[Callable[[T],K]] ) -> K:',
+			'	return key( x )',
+			'',
+			'def identity_i32( v: i32 ) -> i32:',
+			'	return v',
+			'',
+			'def main() -> i32:',
+			'	result: i32 = apply( i32( 5 ), key = identity_i32 )',
+			'	return result',
+		])
+		self._import( code )
+		fn = self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		i32 = self.discovery.get_intrinsics()['i32']
+		calls = [ i for i in fn.instructions if isinstance( i, ir.Call ) and getattr( i.target, 'stem', None ) == 'apply' ]
+		self.assertEqual( len( calls ), 1 )
+		self.assertIs( calls[0].dest.type, i32 )
 
 
 class OverloadMoveResolutionTests( unittest.TestCase ):

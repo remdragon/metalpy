@@ -4373,10 +4373,20 @@ class FunctionLowering:
 			if setitem_fn is None:
 				# no real __setitem__ declared (raw pointers, or any other
 				# type that doesn't define subscript assignment as a method)
-				# - falls back to the flat SetItem opcode, unconditionally
-				# (mirrors _expr_Subscript's own raw-pointer GetItem fallback)
-				index = self._lower_expr( target.slice, None )
-				operand = self._lower_expr( node.value, None )
+				# - falls back to the flat SetItem opcode, unconditionally.
+				# Both the index and the value need a real expected_type here,
+				# same as _expr_Subscript's own raw-pointer GetItem fallback
+				# already gives its index (this comment used to just claim to
+				# mirror that, without actually doing so) - without it, a bare
+				# literal on either side (`buf[0] = x`/`buf[i] = 0`) falls
+				# through to whatever the bare-literal default happens to be,
+				# instead of the pointer's own real index/element type.
+				index_type = self.lowering.discovery.get_intrinsics()['usize']
+				elem_type = None
+				if isinstance( obj.type, Specialization ) and isinstance( obj.type.base, Scalar ) and obj.type.base.stem in ( 'Ptr', 'ConstPtr' ):
+					elem_type = obj.type.args[0]
+				index = self._lower_expr( target.slice, index_type )
+				operand = self._lower_expr( node.value, elem_type )
 				self._emit( ir.SetItem( obj = obj, index = index, value = operand ))
 			else:
 				# a real __setitem__ - call it like any other method, then if
@@ -4488,19 +4498,21 @@ class FunctionLowering:
 			# always already resolved
 			self.lowering._ensure_resolved( existing )
 			if existing is not None and existing.type is not None and self.lowering._ensure_resolved( existing.type ).is_rc_pointer():
-				# no hint at all (not existing.type, not even usize) - an
-				# RCClass target is never itself a Ptr specialization, and
-				# __iadd__'s own parameter type is independent of the
-				# receiver's type (e.g. Counter.__iadd__(self, v: i32)), so
-				# hinting a bare literal toward existing.type (an RCClass)
-				# would wrongly REJECT it outright (_expr_Constant's own
-				# literal-vs-expected_type check fires regardless of strict)
-				# instead of just widening or skipping a coercion - infer
-				# right's own natural type instead, exactly like an ordinary
-				# `existing + right` BinOp already would (_lower_binary_
-				# operands never hints a non-constant/differently-typed
-				# operand toward the OTHER side's type either)
-				right = self._lower_expr( node.value, None )
+				# not existing.type itself - an RCClass target is never a Ptr
+				# specialization, and __iadd__'s own parameter type is
+				# independent of the receiver's type (e.g. Counter.__iadd__(
+				# self, v: i32)), so hinting a bare literal toward
+				# existing.type (an RCClass) would wrongly REJECT it outright
+				# (_expr_Constant's own literal-vs-expected_type check fires
+				# regardless of strict). Instead, peek at __iadd__'s own
+				# declared parameter type (when unambiguous) and hint the
+				# literal with THAT - without it, a bare literal locks in as
+				# builtins.int before _find_iplace_dunder ever runs, missing
+				# an i32-typed __iadd__ outright (see
+				# _peek_single_dunder_param_type's own docstring)
+				iplace_name = _IPLACE_BINOP_DUNDER.get( type( node.op ))
+				right_hint = self._peek_single_dunder_param_type( existing.type, iplace_name ) if iplace_name is not None else None
+				right = self._lower_expr( node.value, right_hint )
 				iplace_method = self._find_iplace_dunder( existing.type, type( node.op ), right.type )
 				if iplace_method is not None:
 					self._emit_iplace_dunder_call( node, iplace_method, existing, right )
@@ -4570,12 +4582,14 @@ class FunctionLowering:
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
 			field_is_rc = self.lowering._ensure_resolved( attr_var.type ).is_rc_pointer()
 			if field_is_rc:
-				# no hint - see the Name branch's identical comment: a field's
-				# own RCClass type is never a sensible hint for __iadd__'s
-				# independently-typed argument, and hinting a bare literal
-				# toward it would wrongly REJECT it outright (_expr_Constant's
-				# literal-vs-expected_type check isn't strict-gated)
-				right = self._lower_expr( node.value, None )
+				# not attr_var.type itself - see the Name branch's identical
+				# comment: a field's own RCClass type is never a sensible hint
+				# for __iadd__'s independently-typed argument, and hinting a
+				# bare literal toward it would wrongly REJECT it outright.
+				# Peek at __iadd__'s own declared parameter type instead
+				iplace_name = _IPLACE_BINOP_DUNDER.get( type( node.op ))
+				right_hint = self._peek_single_dunder_param_type( attr_var.type, iplace_name ) if iplace_name is not None else None
+				right = self._lower_expr( node.value, right_hint )
 			else:
 				usize_cls = self.lowering.discovery.get_intrinsics()['usize']
 				right_hint = usize_cls if self.lowering._type_resolver._is_ptr_specialization( old.type ) else old.type
@@ -4678,11 +4692,15 @@ class FunctionLowering:
 				get_shape = self.lowering._type_resolver._result_shape( getitem_fn.return_type )
 				elem_type = get_shape[0] if get_shape is not None else getitem_fn.return_type
 				elem_is_rc = self.lowering._ensure_resolved( elem_type ).is_rc_pointer()
-				# no hint when the element is RC - see the Attribute/Name
-				# branches' identical comment on why elem_type is never a
-				# sensible hint for __iadd__'s own independently-typed
-				# argument (and would wrongly reject a bare literal outright)
-				right = self._lower_expr( node.value, None if elem_is_rc else elem_type, strict = False )
+				# elem_type itself is never the hint when the element is RC -
+				# see the Attribute/Name branches' identical comment. Peek at
+				# __iadd__'s own declared parameter type instead
+				if elem_is_rc:
+					iplace_name = _IPLACE_BINOP_DUNDER.get( type( node.op ))
+					right_hint = self._peek_single_dunder_param_type( elem_type, iplace_name ) if iplace_name is not None else None
+				else:
+					right_hint = elem_type
+				right = self._lower_expr( node.value, right_hint, strict = False )
 				iplace_method = self._find_iplace_dunder( elem_type, type( node.op ), right.type ) if elem_is_rc else None
 				get_dest = self._new_temp( getitem_fn.return_type )
 				self._emit( ir.Call( dest = get_dest, target = getitem_fn, receiver = obj, args = [ index ], kwargs = {} ))
@@ -10087,7 +10105,15 @@ class FunctionLowering:
 		# unambiguous - unlike the general "b: Box = 0" RCClass case this
 		# method deliberately keeps rejecting below (see the generator_
 		# zero_rc_field comment), so this is scoped to int specifically,
-		# not a blanket literal-into-any-RCClass relaxation. Rewrites to
+		# not a blanket literal-into-any-RCClass relaxation. Also fires
+		# when expected_type is None outright (a genuinely bare literal,
+		# e.g. `x = 0`/`pos = j` where j turns out to be some other type
+		# entirely) - int is the safe, no-silent-narrowing default for a
+		# literal with no context at all, not i32 (see the sibling
+		# expected_type-is-None branch further down, which still defaults
+		# to i32 when the literal is only ambiguous within a TaggedUnion/
+		# TypeVar, a narrower case where forcing RCClass int would break
+		# ordinary scalar-union code like `x: str|i32 = 5`). Rewrites to
 		# an ordinary `int(literal)` construction call and re-dispatches
 		# through the general Call path - the SAME thing a user would
 		# have to write by hand today, just implicit here. The nested
@@ -10098,7 +10124,7 @@ class FunctionLowering:
 		# risk of this branch firing twice for the same value.
 		if type( node.value ) is int:
 			int_type = self.lowering.discovery.find_name_or_none( 'int' )
-			if int_type is not None and expected_type is int_type:
+			if int_type is not None and ( expected_type is int_type or expected_type is None ):
 				# int.__init__ only takes an i32 - fine for the common case
 				# (int(literal)), but there's no reason a genuinely bigger
 				# literal shouldn't just work too, this being arbitrary-
@@ -10125,7 +10151,7 @@ class FunctionLowering:
 					)
 				ast.copy_location( call_node, node )
 				ast.fix_missing_locations( call_node )
-				return self._lower_expr( call_node, expected_type )
+				return self._lower_expr( call_node, int_type )
 		# a literal being lowered against a CONCRETE, non-union expected type -
 		# verify the literal's own Python value kind could plausibly represent
 		# it at all (the same coarse stem-compatibility _LITERAL_COMPATIBLE_
@@ -10246,7 +10272,7 @@ class FunctionLowering:
 					)
 		# expected_type being a TaggedUnion (e.g. str|None) is treated the
 		# same as no expected_type at all: a literal's OWN Python type
-		# always determines its natural type (bool/i32/str/NoneType) -
+		# always determines its natural type (bool/i32(*)/str/NoneType) -
 		# blindly typing the Const as the whole union here would be wrong
 		# (a literal is never itself union-shaped at the C level), and
 		# _lower_expr's own post-hoc coercion (see its comment) is what
@@ -10255,6 +10281,9 @@ class FunctionLowering:
 		# the validation exemption above - the literal's own natural type
 		# is what UNIFIES to solve T, so tagging the Const with the bare
 		# TypeVar itself (leaving it unsubstituted downstream) is wrong.
+		# (*) an int literal specifically only reaches here for these two
+		# union/TypeVar cases - a truly bare expected_type is None already
+		# returned above via the int(literal) construction rewrite.
 		if expected_type is None or isinstance( expected_type, TaggedUnion ) or isinstance( expected_type, TypeVar ):
 			if isinstance( node.value, bool ):
 				expected_type = self.lowering.discovery.get_intrinsics()['bool']
@@ -10267,9 +10296,14 @@ class FunctionLowering:
 				# expected_type None, so this is purely the no-context default
 				expected_type = self.lowering.discovery.get_intrinsics()['f64']
 			elif isinstance( node.value, int ):
-				# integer literals default to i32 when no contextual type is
-				# available (bare `x = 1`, generic-call arg inference, etc.)
-				# TODO FIXME: for most user code, this should probably be builtins.int and get scheduled as an immortal constant
+				# a genuinely bare literal (expected_type is None outright) is
+				# already redirected to int(literal) above, before this block -
+				# this only still runs for TaggedUnion/TypeVar, where the
+				# literal's natural type has to fit a partially-known shape
+				# (e.g. `x: str|i32 = 5`, a generic call unifying a bare `T`)
+				# and forcing RCClass int would break that. Also the fallback
+				# when builtins.int itself hasn't been discovered yet (early
+				# bootstrap / a test stubbing its own minimal `class int:`).
 				expected_type = self.lowering.discovery.get_intrinsics()['i32']
 			elif isinstance( node.value, str ):
 				expected_type = self.lowering.discovery.find_name_or_none( 'str' )
@@ -11371,6 +11405,13 @@ class FunctionLowering:
 		isize/usize aren't members of _SIGNED_INT_WIDENING_ORDER at all) is
 		this method's own private coercion rule, scoped to slice bounds
 		only. '''
+		if isinstance( expr, ast.Constant ) and type( expr.value ) is int:
+			# a bare literal bound (s[0:5]) has no @inline-splice hazard to
+			# dodge (that only applies to a Call expression like len(t)) -
+			# lower it directly against isize_cls so it doesn't fall through
+			# to the bare-literal default (builtins.int, which is unrelated
+			# to isize and isn't in _SLICE_BOUND_WIDENABLE_STEMS)
+			return self._lower_expr( expr, isize_cls )
 		operand = self._lower_expr( expr, None )
 		if operand.type is isize_cls:
 			return operand
@@ -11629,7 +11670,7 @@ class FunctionLowering:
 	def _expr_Call( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		return self._lower_call( node, expected_type, want_result = True )
 
-	def _lower_binary_operands( self, left_node: ast.expr, right_node: ast.expr, expected_type: Type|None, *, infer_right_from_left: bool = True ) -> tuple[ir.Operand,ir.Operand]:
+	def _lower_binary_operands( self, left_node: ast.expr, right_node: ast.expr, expected_type: Type|None, *, infer_right_from_left: bool = True, op: type|None = None ) -> tuple[ir.Operand,ir.Operand]:
 		# shared by _expr_BinOp and _expr_Compare: a bare literal constant on
 		# either side has no type of its own to offer, so the non-constant
 		# side is lowered first and its own inferred type used as the
@@ -11694,16 +11735,23 @@ class FunctionLowering:
 			# _expr_Constant's own literal-compatibility check ("an int literal
 			# cannot be used where Vector is expected") before this expression
 			# ever reaches _lower_binop_values' own dunder/reflected-dunder
-			# dispatch - confirmed via a real repro. None here lets the
-			# literal infer its own natural type instead, same as it would
-			# with no hint at all, so the reflected-dunder lookup below can
-			# still find e.g. Vector.__radd__(other: i32) matching it.
+			# dispatch - confirmed via a real repro. Falls back to peeking at
+			# right.type's own REFLECTED dunder (e.g. Vector.__radd__(other:
+			# i32) for `5 + some_vector`) when op is known and unambiguous -
+			# without it, the literal locks in as builtins.int before
+			# _find_dunder_for_arg ever runs, missing an i32-typed __radd__
+			# outright (see _peek_single_dunder_param_type's own docstring).
+			# None (both here and as this whole peek's own miss/ambiguous
+			# result) lets the literal infer its own natural type instead,
+			# same as it would with no hint at all.
 			if self.lowering._type_resolver._is_ptr_specialization( right.type ):
 				left_hint = usize_cls
 			elif isinstance( right.type, Scalar ):
 				left_hint = right.type
 			else:
-				left_hint = None
+				method_name = _BINOP_DUNDER.get( op ) if op is not None else None
+				reflected_name = _REFLECTED_BINOP_DUNDER.get( method_name ) if method_name is not None else None
+				left_hint = self._peek_single_dunder_param_type( right.type, reflected_name ) if reflected_name is not None else None
 			left = self._lower_expr( left_node, left_hint, strict = False )
 		elif right_is_const and not left_is_const:
 			left = self._lower_expr( left_node, operand_hint, strict = False )
@@ -11712,7 +11760,11 @@ class FunctionLowering:
 			elif isinstance( left.type, Scalar ):
 				right_hint = left.type
 			else:
-				right_hint = None
+				# forward dunder this time (e.g. Vector.__add__(other: i32)
+				# for `some_vector + 5`) - see the left_is_const branch's
+				# identical comment just above
+				method_name = _BINOP_DUNDER.get( op ) if op is not None else None
+				right_hint = self._peek_single_dunder_param_type( left.type, method_name ) if method_name is not None else None
 			right = self._lower_expr( right_node, right_hint, strict = False )
 		else:
 			left = self._lower_expr( left_node, operand_hint, strict = False )
@@ -11743,7 +11795,7 @@ class FunctionLowering:
 		return left, right
 
 	def _expr_BinOp( self, node: ast.BinOp, expected_type: Type|None ) -> ir.Operand:
-		left, right = self._lower_binary_operands( node.left, node.right, expected_type )
+		left, right = self._lower_binary_operands( node.left, node.right, expected_type, op = type( node.op ))
 		return self._lower_binop_values( node, left, right, expected_type )
 
 	def _lower_binop_values( self, node: 'ast.BinOp|ast.AugAssign', left: ir.Operand, right: ir.Operand, expected_type: Type|None ) -> ir.Operand:
@@ -12901,7 +12953,22 @@ class FunctionLowering:
 		if isinstance( node.ops[0], ( ast.In, ast.NotIn )):
 			return self._lower_in_comparison( node, negate = isinstance( node.ops[0], ast.NotIn ))
 
-		left = self._lower_expr( node.left, None )
+		if ( isinstance( node.left, ast.Constant ) and not isinstance( node.comparators[0], ast.Constant )
+				and isinstance( node.comparators[0], ast.Name )):
+			# a bare literal on the left needs a hint from the right side's
+			# own type, or it locks in as builtins.int (this file's own
+			# bare-literal default) before dispatch even looks for a
+			# matching dunder - e.g. `1 < a` (a: i32) needs the literal to
+			# become i32, not int, to find i32.__lt__. Only probed here for
+			# a bare Name - provably side-effect-free to look up twice
+			# (re-lowered again below/inside _lower_eq_or_ne exactly as it
+			# always was) - a Call or other expression is left alone rather
+			# than risk double-evaluating it.
+			right_probe = self._lower_expr( node.comparators[0], None, strict = False )
+			left_hint = right_probe.type if isinstance( right_probe.type, Scalar ) else None
+			left = self._lower_expr( node.left, left_hint )
+		else:
+			left = self._lower_expr( node.left, None )
 		if isinstance( node.ops[0], ( ast.Eq, ast.NotEq )):
 			# Eq/NotEq get their OWN unified path (_lower_eq_or_ne), tried
 			# BEFORE the scalar-vs-non-scalar fork below (unlike every other
@@ -13115,6 +13182,62 @@ class FunctionLowering:
 			if is_wildcard or self.lowering._type_resolver._same_type( param_type, arg_type ):
 				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
 		return None
+
+	def _peek_single_dunder_param_type( self, owner_type: Type|None, name: str ) -> Type|None:
+		''' best-effort hint for a bare literal about to be lowered as a
+		binary/in-place dunder's own operand - needed now that a bare
+		literal's natural type is builtins.int (an RCClass), not a Scalar:
+		an RCClass receiver's __add__/__iadd__/__radd__/etc almost always
+		declares a concrete Scalar 'other' param (e.g. Counter.__iadd__(self,
+		v: i32)), and without this hint the literal locks in as int before
+		_find_dunder_for_arg/_find_iplace_dunder ever run, missing every
+		such method outright (confirmed via a real repro: `v + 10` on a
+		class only declaring __add__(other: i32) started failing the moment
+		bare literals stopped defaulting to i32).
+
+		Unlike _find_dunder_for_arg, this runs BEFORE the literal is
+		lowered, so there's no real arg_type yet to filter an Overload
+		group down with the usual "exact match" rule - instead this only
+		considers each candidate's own PARAM KIND: a literal can only ever
+		plausibly become a Scalar (or None/bool/str/bytes/...) anyway, never
+		an arbitrary class (_expr_Constant's own literal-compatibility
+		check already rejects that outright) - so candidates whose param
+		isn't a Scalar are simply not real hint targets and get filtered
+		out, exactly like `v + 10` needing Vector.__add__(other: i32), not
+		Vector's OTHER __add__(other: Vector) overload for `v + w`. Returns
+		a hint only when EXACTLY ONE Scalar-typed candidate remains -
+		still-ambiguous (two Scalar-typed overloads) or no match at all
+		returns None, same as a missing method, and the caller falls back
+		to the literal's own natural-type inference exactly as it did
+		before this hint existed. '''
+		if owner_type is None:
+			return None
+		owner_type = self.lowering._ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass )):
+			found = owner_type.chain_lookup( name )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( name ) if isinstance( names, dict ) else None
+		found = self.lowering._resolve_scalar_name( found )
+		candidates = found.implementations if isinstance( found, Overload ) else ( [ found ] if isinstance( found, Function ) else [] )
+		scalar_param_types: list[Type] = []
+		for impl in candidates:
+			if impl.resolve is not None:
+				impl.resolve()
+			params = impl.parameters or []
+			# same receiver-stripping asymmetry _find_dunder_for_arg's own
+			# candidate loop documents: a Scalar-registered dunder keeps its
+			# receiver as an ordinary leading parameter, a real class
+			# method has already had it stripped
+			arg_index = 1 if impl.cls is None else 0
+			if len( params ) != arg_index + 1:
+				continue
+			param_type = params[arg_index].type
+			if isinstance( param_type, Scalar ):
+				scalar_param_types.append( param_type )
+		if len( scalar_param_types ) != 1:
+			return None
+		return scalar_param_types[0]
 
 	def _find_indexlike_getitem( self, owner_type: Type|None ) -> Function|None:
 		''' like self.lowering._find_method(owner_type, '__getitem__'), but
@@ -17158,8 +17281,49 @@ class FunctionLowering:
 			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, target.qualname )
 			return operand
 
-		args = [ lower_and_unify( param, expr ) for param, expr in positional ]
-		kwargs = { param.stem: lower_and_unify( param, expr ) for param, expr in keyword }
+		# argument "signal strength" for type-param inference varies -
+		# processing every argument in plain left-to-right order lets a
+		# weaker-signal argument bind a type param FIRST, wrongly
+		# conflicting with (or starving) a stronger one that comes later:
+		#   - a bare literal's own natural type (builtins.int/f64/... with
+		#     no context - _expr_Constant's own expected_type-is-None rule)
+		#     is WEAK evidence: `apply(5, key=identity_i32)` had `5` bind
+		#     T=builtins.int before `key`'s own Ptr[Callable[[i32],i32]]
+		#     signature could reveal T should be i32, conflicting with it -
+		#     confirmed via a real repro.
+		#   - a lambda with no explicit parameter annotations has NO signal
+		#     of its own at all (PLAN_LAMBDA.md's "eager lambda lowering" -
+		#     it needs a type param ALREADY bound to even infer its own
+		#     parameter types) - `apply(5, key=lambda v: v)` needs `5`
+		#     processed BEFORE the lambda, the opposite ordering from the
+		#     literal-vs-concrete-reference case just above.
+		# Three tiers fixes both: ordinary/concrete arguments (a Name,
+		# a real Call, a typed function reference, ...) always run FIRST,
+		# in their own original relative order; bare literals run next;
+		# lambdas run last, once every other argument has contributed
+		# whatever binding it can. Safe to reorder purely because neither a
+		# literal nor a lambda EXPRESSION ITSELF (as opposed to calling it)
+		# has an observable side effect - the emitted Call's own argument
+		# order below is entirely separate (list/dict position, not
+		# evaluation order) and is unaffected either way.
+		args: list[ir.Operand|None] = [ None ] * len( positional )
+		kwargs: dict[str,ir.Operand] = {}
+		def _arg_tier( expr: ast.expr ) -> int:
+			if isinstance( expr, ast.Lambda ):
+				return 2
+			if isinstance( expr, ast.Constant ):
+				return 1
+			return 0
+		all_args: list[tuple[int|str,Parameter,ast.expr]] = (
+			[ ( i, param, expr ) for i, ( param, expr ) in enumerate( positional ) ]
+			+ [ ( param.stem, param, expr ) for param, expr in keyword ]
+		)
+		for key, param, expr in sorted( all_args, key = lambda t: _arg_tier( t[2] ) ):
+			result = lower_and_unify( param, expr )
+			if isinstance( key, int ):
+				args[key] = result
+			else:
+				kwargs[key] = result
 		for ( param, _expr ), operand in zip( positional, args ):
 			self._apply_move_hook( param, operand, target.qualname )
 		for param, _expr in keyword:
@@ -17639,7 +17803,7 @@ class FunctionLowering:
 		# forced True there specifically to skip its own identical check)
 		return self._finish_call_result( node, result, want_result )
 
-	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, *, already_compiled: bool = False ) -> ir.Operand|None:
+	def _emit_generic_call( self, node: ast.Call, spec: Specialization, monomorphized: Function, receiver: ir.Operand|None, args: list[ir.Operand], kwargs: dict[str,ir.Operand], expected_type: Type|None, want_result: bool, *, already_compiled: bool = False, return_type: Type|None = None ) -> ir.Operand|None:
 		# schedules the Specialization itself as the compile unit (see
 		# _monomorphized_function/compiler.py's own handling of it), shared
 		# tail for both the explicit Name[T](...) and inferred call paths -
@@ -17670,16 +17834,45 @@ class FunctionLowering:
 		self.lowering.schedule( monomorphized.return_type )
 		for param in monomorphized.parameters or []:
 			self.lowering.schedule( param.type )
+		# the REAL return type - monomorphized.return_type by default, but a
+		# caller can override via `return_type` when monomorphized.return_type
+		# itself isn't fully concrete (see _lower_class_generic_method_call's
+		# own call site: a classmethod constructor's declared return type is
+		# the ENCLOSING class's bare TaggedUnion, referencing the class's OWN
+		# type params - not substituted by _monomorphized_function, which
+		# only substitutes the METHOD's own type params. That caller passes
+		# the real concrete Specialization it already computed instead).
+		real_return_type = return_type if return_type is not None else monomorphized.return_type
 		# a discarded Result return is no longer hard-rejected here - case 1
 		# of the general auto-or_throw() rule (_finish_call_result, below)
 		# picks it up instead, so this call still needs a real dest to
 		# consume even though the CALLER's own want_result is False
-		force_result = not want_result and cfg.is_result_type( monomorphized.return_type )
+		force_result = not want_result and cfg.is_result_type( real_return_type )
 		# discarded plain (non-Result) RC return - see _lower_call's own
 		# identical discard_rc for why this still needs a real dest
-		discard_rc = not want_result and not force_result and monomorphized.return_type is not None and monomorphized.return_type.is_rc()
+		discard_rc = not want_result and not force_result and real_return_type is not None and real_return_type.is_rc()
 		if want_result or force_result or discard_rc:
-			dest = self._new_temp( expected_type or monomorphized.return_type )
+			# real_return_type, NOT `expected_type or ...` (the convention
+			# every OTHER call-emission tail in this file uses) - for a
+			# GENERIC call specifically, the type params (and so the real
+			# return type) are only resolved from the ARGUMENTS, fully
+			# independent of expected_type; nothing before this point ever
+			# required them to agree. Typing `dest` as expected_type
+			# directly used to make that agreement TRUE BY CONSTRUCTION
+			# (skipping this file's own real safety net - _lower_expr's tail
+			# calls _coerce_or_check_operand against expected_type right
+			# after this returns, but only ever a genuine MISMATCH if
+			# operand.type differs from expected_type in the first place) -
+			# so a real divergence went undetected, reaching emitter_c.py
+			# with `dest` LYING about its own type (a bare literal argument
+			# happening to always default to i32, matching whatever the
+			# caller expected, is what masked this: confirmed via a real
+			# repro once literals started defaulting to builtins.int
+			# instead). dest now always carries the REAL type; a genuine
+			# mismatch is caught (coerced, or a proper "expected X, got Y"
+			# error) by that same outer _coerce_or_check_operand call,
+			# exactly as it already does for every other kind of operand.
+			dest = self._new_temp( real_return_type )
 			self._emit( ir.Call( dest = dest, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
 			return self._finish_call_result( node, dest, want_result )
 		self._emit( ir.Call( dest = None, target = monomorphized, receiver = receiver, args = args, kwargs = kwargs ))
@@ -17735,7 +17928,28 @@ class FunctionLowering:
 		method_spec = self.lowering.discovery._get_or_create_specialization( target, cls_args )
 		monomorphized = self.lowering._monomorphized_function( method_spec )
 		self._fill_generic_call_defaults( monomorphized, args, kwargs, node )
-		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result )
+		# monomorphized.return_type is NOT reliable here (see
+		# _emit_generic_call's own `return_type` param comment) -
+		# _monomorphized_function only substitutes the METHOD's own type
+		# params (empty for a classmethod like Result.Ok), never the
+		# ENCLOSING class's (class_type_params/cls_args, resolved just
+		# above) that target.return_type is actually expressed in terms of
+		# (e.g. `Result.Ok(val: T) -> Result[T,E]`, T/E being the class's
+		# own, not the method's). expected_type itself is the right value
+		# here (falls back to monomorphized.return_type when it's None,
+		# same as _emit_generic_call's own default for every other caller)
+		# - UNLIKE _lower_inferred_generic_call's own generic-function path,
+		# this method already unified expected_type against target.
+		# return_type/class_type_params right at its own top (see `bindings`
+		# above), so trusting it here is well-founded, not the same
+		# "silently diverges from the real return type" hazard that path
+		# had (confirmed: substituting target.return_type through cls_args
+		# directly instead, the seemingly more "principled" alternative,
+		# produces a DIFFERENT type REPRESENTATION than expected_type/
+		# _get_or_create_specialization do for a CStruct-based generic - a
+		# real regression caught by this file's own IR-shape tests, not
+		# just theory).
+		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result, return_type = expected_type )
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
 		match self.lowering._is_compiler_call( node ):

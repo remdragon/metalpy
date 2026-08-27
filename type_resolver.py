@@ -4934,9 +4934,10 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# unannotated tuple local - same posture as this pass's own
 			# Constant handling just above) - each element's REAL lowered
 			# type via _natural_literal_type, NOT this pass's own Constant
-			# branch's annotation-style mapping (bare `1` -> builtins.int
-			# there vs intrinsics.i32 here) - using the wrong one would tag
-			# this tuple with a DIFFERENT TupleType than the one _expr_Tuple
+			# branch's annotation-style mapping (still a real divergence for
+			# a bare float - `1.5` -> builtins.float there [an f32 alias] vs
+			# intrinsics.f64 here) - using the wrong one would tag this
+			# tuple with a DIFFERENT TupleType than the one _expr_Tuple
 			# actually builds at real lowering time, two distinct backing
 			# RCClasses for what's supposed to be one tuple type. Without
 			# this branch at all, an unannotated tuple local's type was
@@ -5740,7 +5741,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		means what an ANNOTATION spelling would: `int` the arbitrary-precision
 		class, `float` an alias for f32). Only for _infer_generic_args' own
 		trust_literals path below, where the question is what type the
-		argument literal will actually be lowered as. '''
+		argument literal will actually be lowered as.
+
+		NOTE: as of the bare-literal-defaults-to-builtins.int change,
+		Lowering._expr_Constant's own expected_type-is-None branch for a
+		bare int now ALSO sugars into builtins.int, not intrinsics.i32 -
+		this method's own int branch deliberately has NOT been updated to
+		match yet (still returns i32). Updating it surfaces a REAL, but
+		GENERAL and PRE-EXISTING (confirmed reproducible on a clean master
+		checkout, with no generics, no int, and no literal at all involved -
+		just `try_insert(MyError(), bad)` as a bare discarded statement
+		whose Result gets auto-or_throw'd via an early return) RC leak: a
+		discarded call's own fresh RC-typed ARGUMENT operand is a pending
+		temp that the statement's own NORMAL end-of-statement cleanup
+		would release, but _emit_or_throw's early-return/propagate branch
+		(lowering.py) jumps straight to the function's epilogue instead,
+		skipping that release entirely - every early-return-capable
+		construct (or_throw, or_return, checked arithmetic, ...) is
+		presumably affected identically, this is NOT a generics- or int-
+		specific bug at all. Reverted here rather than fixed alongside the
+		literal-default change - real leak, but its own separate,
+		substantially deeper investigation (CFG pending-temp release on the
+		early-return path), unrelated to what this method's own docstring
+		is about. Left stale/inconsistent on purpose in the meantime;
+		several hardcoded-i32 unit tests (type_resolver_test.py's
+		TypeResolutionTests, emitter_c_test.py's CallableTests) and this
+		method's own real callers still assume the OLD i32 mapping too. '''
 		intrinsics = self.discovery.get_intrinsics()
 		if node.value is None:
 			return self.discovery.get_none_type()
@@ -6203,7 +6229,32 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		unique = self._label_id
 		self._label_id += 1
 		tmp_name = f'__multi_assign_{unique}'
-		tmp_assign = ast.Assign( targets = [ ast.Name( id = tmp_name, ctx = ast.Store() ) ], value = node.value )
+		value = node.value
+		# a bare literal RHS has no type of its own to offer the synthetic
+		# tmp below - it defaults to builtins.int with no other context
+		# (Lowering._expr_Constant's own expected_type-is-None rule) - but
+		# if ANY target is an already-declared Name with a concrete Scalar
+		# type, hint the literal toward THAT via an explicit constructor
+		# call, mirroring what a plain `x = 99` already does when x
+		# pre-exists (reuses x's own type, no int-default involved at all).
+		# Without this, `x: i32 = 1; y: i32 = 2; x = y = 99` broke the
+		# moment the tmp's own bare `99` started defaulting to builtins.int
+		# instead of matching x/y's pre-existing i32 - confirmed via a real
+		# repro. Only the FIRST such target found is used as the hint (this
+		# is a best-effort hint, not a real type-consistency check across
+		# every target - a genuine mismatch between targets still surfaces
+		# normally, per-target, at each of the real assigns spliced below).
+		if isinstance( value, ast.Constant ) and type( value.value ) is int and not isinstance( value.value, bool ):
+			for target in node.targets:
+				if isinstance( target, ast.Name ):
+					existing = self.locals.get( target.id )
+					if isinstance( existing, Scalar ):
+						hinted = ast.Call( func = ast.Name( id = existing.stem, ctx = ast.Load() ), args = [ value ], keywords = [] )
+						ast.copy_location( hinted, value )
+						ast.fix_missing_locations( hinted )
+						value = hinted
+						break
+		tmp_assign = ast.Assign( targets = [ ast.Name( id = tmp_name, ctx = ast.Store() ) ], value = value )
 		ast.copy_location( tmp_assign, node )
 		stmts: list[ast.stmt] = [ tmp_assign ]
 		for target in node.targets:
