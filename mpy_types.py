@@ -1386,6 +1386,16 @@ class Function( Type, ScopeMixin ):
 	# combines every referenced notice into one dist/THIRD-PARTY-LICENSES
 	# file.
 	extern_notices: tuple[str,...] = ()
+	# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #1: True only for the
+	# real OS-thread-creation syscall boundary (posix.pthread.pthread_create,
+	# windows.kernel32.CreateThread) - marks the ONE place Compiler needs to
+	# notice to know "this program can ever have a second OS thread", rather
+	# than scanning for construction of lib/threading.py's own Thread class
+	# (which would miss anything reaching a thread through a different path,
+	# and duplicate detection logic every future thread-spawning wrapper
+	# would need its own case for). See compiler.py's own requires_crt-
+	# adjacent flip site for how this gets consumed - identical pattern.
+	extern_spawns_thread: bool = False
 
 	is_overload: bool = False # was this def @overload-decorated (whether it ended up a stub or, with a real body, an Overload.implementations entry)
 	bound_to: 'Function|None' = None # stubs only: the plain implementation this stub's signature resolves to (see discovery.py's _bind_overload_stub)

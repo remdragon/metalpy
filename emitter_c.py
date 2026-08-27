@@ -1543,6 +1543,19 @@ _target_os: str|None = None
 # reflects a release-shaped ObjectHeader/vtable with no tracking overhead.
 _target_debug: bool = False
 
+# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #1 - mirrors _target_os's
+# own precedent exactly: set once at the top of emit_c() from compiler.
+# spawns_threads (itself set incrementally the moment pthread_create/
+# CreateThread is ever reached - see compiler.py's own requires_crt-adjacent
+# flip site), read from _emit_instruction, which doesn't take it as a
+# parameter. False here (not None) so PROLOGUE (built at import time) stays
+# a safe, conservative "no threading" default for direct callers that never
+# go through emit_c() at all (see emitter_c_test.py's own release_object
+# test) - unlike _target_os, nothing downstream needs to distinguish "not
+# yet set" from "set False", so there's no need for the three-state None
+# convention _target_os uses.
+_program_uses_threads: bool = False
+
 def _target_uses_pthread_lock() -> bool:
 	# Linux AND macOS share the identical pthread_mutex_t codegen (same
 	# storage type, same pthread_mutex_init/lock/unlock calls, same
@@ -3925,25 +3938,28 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		# SRWLOCK (PLAN_THREAD_SAFE_SHARED_STATE.md's B.4).
 		return [ f'\trelease_object( (ObjectHeader*)({_emit_operand(instr.value)}) );' ]
 	if isinstance( instr, ir.AcquireGlobalLock ):
-		if not ( instr.var.reassigned_outside_init and _global_lock_supported() ):
+		if not ( instr.var.reassigned_outside_init and _global_lock_supported() and _program_uses_threads ):
 			# either this global turns out to never actually be reassigned
 			# anywhere (a read-side marker emitted before that fact was
-			# known - see cfg.py's own is_alias branch) or this platform
+			# known - see cfg.py's own is_alias branch), this platform
 			# doesn't support the lock yet (POSIX - see
-			# _global_lock_supported's own docstring) - a pure no-op either
-			# way, not a partial/best-effort lock
+			# _global_lock_supported's own docstring), or (PLAN_THREAD_
+			# SAFE_SHARED_STATE.md Cost mitigation #1) this program never
+			# reaches pthread_create/CreateThread anywhere, so nothing can
+			# race regardless of what this global does - a pure no-op
+			# either way, not a partial/best-effort lock
 			return []
 		return [ _global_lock_acquire( _global_lock_name( instr.var ))]
 	if isinstance( instr, ir.ReleaseGlobalLock ):
-		if not ( instr.var.reassigned_outside_init and _global_lock_supported() ):
+		if not ( instr.var.reassigned_outside_init and _global_lock_supported() and _program_uses_threads ):
 			return []
 		return [ _global_lock_release( _global_lock_name( instr.var ))]
 	if isinstance( instr, ir.AcquireFieldLock ):
-		if not _global_lock_supported():
-			return [] # unsupported target - see _global_lock_supported's own docstring
+		if not ( _global_lock_supported() and _program_uses_threads ):
+			return [] # unsupported target, or no thread ever spawned - see _global_lock_supported's/_program_uses_threads's own docstrings
 		return [ f'\tacquire_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
 	if isinstance( instr, ir.ReleaseFieldLock ):
-		if not _global_lock_supported():
+		if not ( _global_lock_supported() and _program_uses_threads ):
 			return []
 		return [ f'\trelease_field_lock( (ObjectHeader*)({_emit_operand(instr.obj)}) );' ]
 	if isinstance( instr, ir.DecrefDynamic ):
@@ -4068,8 +4084,13 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 			# own established fact, reused verbatim here) - a plain zero
 			# write suffices, no real init call. POSIX: pthread_mutex_t has
 			# no such zero-init guarantee - a genuine pthread_mutex_init()
-			# call is required at every single construction site.
-			if _global_lock_supported():
+			# call is required at every single construction site. Skipped
+			# entirely (Cost mitigation #1) when this program never reaches
+			# pthread_create/CreateThread anywhere - acquire_field_lock/
+			# release_field_lock are themselves no-ops in that case (see
+			# their own AcquireFieldLock/ReleaseFieldLock emission-time
+			# gating above), so an uninitialized .lock field is never read.
+			if _global_lock_supported() and _program_uses_threads:
 				if _target_uses_pthread_lock():
 					lines.append( f'\tpthread_mutex_init( &(({dest})->$header.lock), ((void*)0) );' )
 				else:
@@ -5378,9 +5399,16 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	--no-leak-check) only matters in a debug build - it disables the
 	automatic __metalpy_deinit() leak-check epilogue (decref every global,
 	then dump_live_objects()) that otherwise runs after main() returns. '''
-	global _target_os, _target_debug
+	global _target_os, _target_debug, _program_uses_threads
 	_target_os = compiler.disco.active_target['os']
 	_target_debug = bool( compiler.disco.active_target['debug'] )
+	# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #1 - compiler.
+	# spawns_threads is already final by the time emit_c() runs (set
+	# incrementally during lowering, compiler.py's own requires_crt-adjacent
+	# flip site; mpy.py's --assume-threaded escape hatch, if requested, is
+	# applied directly to compiler.spawns_threads before emit_c() is ever
+	# called).
+	_program_uses_threads = compiler.spawns_threads
 	locked_globals = [ g for g in compiler.globals if _needs_global_lock( g.variable ) ]
 	# PLAN_THREAD_SAFE_SHARED_STATE.md Part B: every constructed RC object
 	# now carries its own lock (ObjectHeader's own new field,
@@ -5394,7 +5422,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		or any( isinstance( instr, ir.Allocate ) and instr.cls is not None and instr.cls.has_object_header() for g in compiler.globals for instr in g.instructions )
 	)
 	locks_needed = locked_globals or has_object_header_alloc
-	if locks_needed and _global_lock_supported() and _target_os == 'windows':
+	if locks_needed and _global_lock_supported() and _target_os == 'windows' and _program_uses_threads:
 		# real kernel32.dll exports (SRWLOCK is a genuine Win32 primitive,
 		# not something this codebase invents) - registered the same way
 		# __metalpy_format_f64's own GetProcAddress dependency is, just
@@ -5406,7 +5434,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		compiler.extern_libs.setdefault( 'kernel32', set() ).update((
 			'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive',
 		))
-	if locks_needed and _global_lock_supported() and _target_uses_pthread_lock():
+	if locks_needed and _global_lock_supported() and _target_uses_pthread_lock() and _program_uses_threads:
 		# pthread_mutex_t's real definition (needed below, where this
 		# module's own storage declaration is a genuine `pthread_mutex_t`,
 		# not an opaque void* the way SRWLOCK gets away with - see
@@ -5496,7 +5524,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		parts.append( _prologue_retain() )
 	if uses_decref:
 		parts.append( _prologue_release() )
-	if ( locked_globals or uses_field_lock ) and _global_lock_supported() and _target_os == 'windows':
+	if ( locked_globals or uses_field_lock ) and _global_lock_supported() and _target_os == 'windows' and _program_uses_threads:
 		# needed for Part A's own per-global lock storage (locked_globals)
 		# AND Part B's per-object $header.lock (uses_field_lock) - both use
 		# the identical SRWLOCK forward declarations/AcquireSRWLockExclusive/
@@ -5517,7 +5545,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		# function's own required_headers.add('pthread.h')), which carries
 		# none of SRWLOCK's "don't want to drag in all of windows.h just
 		# for one struct" cost - see _global_lock_acquire's own comment.
-	if uses_field_lock and _global_lock_supported():
+	if uses_field_lock and _global_lock_supported() and _program_uses_threads:
 		parts.append( _field_lock_prologue() )
 	parts.append( _PROLOGUE_ARITH )
 	if uses_format_conv:
@@ -5708,7 +5736,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# not dependency order - see _emit_global_init_fn's own docstring)
 	for g in compiler.globals:
 		parts.append( _emit_global_declaration( g ))
-	if locked_globals and _global_lock_supported() and _target_os == 'windows':
+	if locked_globals and _global_lock_supported() and _target_os == 'windows' and _program_uses_threads:
 		# one bare, all-zero-initialized `void*` per protected global -
 		# SRWLOCK's own all-zero state is already a valid, unlocked lock
 		# (see _PROLOGUE_GLOBAL_LOCK_WINDOWS's own comment), so this needs
@@ -5718,7 +5746,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 		# Variable/LoweredGlobal of their own to hang that machinery off.
 		for g in locked_globals:
 			parts.append( f'static void* {_global_lock_name( g.variable )} = 0;' )
-	elif locked_globals and _global_lock_supported() and _target_uses_pthread_lock():
+	elif locked_globals and _global_lock_supported() and _target_uses_pthread_lock() and _program_uses_threads:
 		# a REAL pthread_mutex_t here, not a bare void* - unlike SRWLOCK,
 		# zero-initializing a pthread_mutex_t isn't a portable guarantee
 		# (PLAN_THREAD_SAFE_SHARED_STATE.md's own A.3 POSIX-asymmetry note;
@@ -5779,7 +5807,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# put an unconditional, order-independent one-time setup step.
 	lock_init_calls = (
 		[ f'\tpthread_mutex_init( &{_global_lock_name( g.variable )}, ((void*)0) );' for g in locked_globals ]
-		if locked_globals and _global_lock_supported() and _target_uses_pthread_lock() else []
+		if locked_globals and _global_lock_supported() and _target_uses_pthread_lock() and _program_uses_threads else []
 	)
 	parts.append(
 		'static void __metalpy_init( void ) {\n'

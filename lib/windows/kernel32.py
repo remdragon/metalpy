@@ -215,7 +215,7 @@ def CloseHandle(
 # DWORD WINAPI ThreadProc(LPVOID lpParameter) - the one shape every thread
 # entry point takes; lib/threading.py's own Thread class always hands this
 # the same fixed trampoline (never a per-closure one - see its own comment)
-@extern('kernel32', 'CreateThread')
+@extern('kernel32', 'CreateThread', spawns_thread=True)
 def CreateThread(
 	lpThreadAttributes: Ptr[None],
 	dwStackSize: usize,

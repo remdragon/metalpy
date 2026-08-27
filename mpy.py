@@ -64,6 +64,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'suppress compiler warnings on an otherwise-successful build (shown by default)' )
 	p.add_argument( '--no-leak-check', action = 'store_true',
 		help = 'disable the automatic debug-build leak-check epilogue (decref globals + dump_live_objects at exit) - no effect in release builds' )
+	p.add_argument( '--assume-threaded', action = 'store_true',
+		help = 'force Part A/B\'s locking machinery on even if the program never reaches pthread_create/CreateThread - escape hatch for a program that reaches a second OS thread some other way (a raw signal handler, an externally-invoked C callback) this compiler cannot see (normally: locking is skipped whenever no reachable code ever spawns a thread)' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
@@ -194,6 +196,8 @@ def main() -> None:
 		return
 
 	# --- stage 5: emit C ---
+	if args.assume_threaded:
+		compiler.spawns_threads = True
 	no_crt = 'c' not in compiler.extern_libs and not compiler.requires_crt
 	if args.crt:
 		no_crt = False

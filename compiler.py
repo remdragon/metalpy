@@ -120,6 +120,15 @@ class Compiler:
 		# the CRT at all" is all any caller (mpy.py, Compiler.run's own
 		# no_crt computation below) ever asks of it.
 		self.requires_crt: bool = False
+		# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #1 - same
+		# reachability-gated shape as requires_crt above: set True the
+		# moment ANY reachable/lowered function's own extern_spawns_thread
+		# flag is set (mpy_types.Function.extern_spawns_thread's own
+		# comment) - i.e. the program reaches pthread_create/CreateThread,
+		# directly or via any wrapper (Thread, ThreadPool, reactor.py, ...).
+		# Read by emitter_c.py's emit_c() to decide whether Part A/B's real
+		# locking machinery is ever needed at all.
+		self.spawns_threads: bool = False
 
 	def import_code( self, code: str, filename: Path, scope: str|None = None ) -> Module:
 		# pass the entry module's own eventual qualname through as `package` so
@@ -406,6 +415,8 @@ class Compiler:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 				self.extern_dlls.update( unit.extern_dlls )
 				self.extern_notices.update( unit.extern_notices )
+				if unit.extern_spawns_thread:
+					self.spawns_threads = True
 			if unit.requires_crt:
 				self.requires_crt = True
 			lf = LoweredFunction( function = unit, instructions = instructions )

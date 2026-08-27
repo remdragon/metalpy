@@ -53,7 +53,7 @@ def pthread_mutex_unlock(
 # header='pthread.h' means the REAL declaration from the header is what
 # the C compiler actually sees, this one is only for this compiler's own
 # type-checking
-@extern('pthread', 'pthread_create', header='pthread.h')
+@extern('pthread', 'pthread_create', header='pthread.h', spawns_thread=True)
 def pthread_create(
 	thread: Ptr[pthread_t],
 	attr: Ptr[None],
