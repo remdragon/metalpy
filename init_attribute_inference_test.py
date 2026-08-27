@@ -170,10 +170,38 @@ class Foo:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self.assertEqual( foo.chain_lookup( 'x' ).type.stem, 'i32' )
 
-	def test_overloaded_method_call_is_outside_allowlist( self ) -> None:
-		# which overload a real call resolves to depends on argument types -
-		# not attempted here, same "ask for an explicit annotation" bail as
-		# any other unhandled shape
+	def test_infers_attribute_type_from_overloaded_method_call( self ) -> None:
+		# which overload a real call resolves to depends on the ARGUMENT
+		# types - resolved via the same pure overload_resolution.
+		# resolve_call machinery real dispatch uses, not a separate
+		# reimplementation. n's own i32 param type identity-matches the
+		# first candidate's own i32 parameter, so that's the one that
+		# wins, and its declared i32 return type is what gets inferred
+		mod = self._import( '''
+class Foo:
+	@overload
+	def compute( self, n: i32 ) -> i32:
+		return n
+	@overload
+	def compute( self, n: f32 ) -> f32:
+		return n
+	def __init__( self, n: i32 ) -> None:
+		self.x = self.compute( n = n )
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		x = foo.chain_lookup( 'x' )
+		self.assertIsInstance( x, Variable )
+		self.assertEqual( x.type.stem, 'i32' )
+
+	def test_overload_call_with_no_matching_candidate_is_outside_allowlist( self ) -> None:
+		# n = 1 (a bare literal) infers to builtins.int - neither
+		# candidate's own i32/f32 parameter identity-matches that, so
+		# resolve_call itself finds no matching overload (same as a real
+		# call site would - this isn't a special case, it's the ordinary
+		# "no candidate accepts this argument" outcome), and the whole
+		# expression declines the same as any other unresolvable shape
 		mod = self._import( '''
 class Foo:
 	@overload
@@ -184,6 +212,28 @@ class Foo:
 		return n
 	def __init__( self ) -> None:
 		self.x = self.compute( n = 1 )
+''' )
+		foo = mod.get_local( 'Foo' )
+		foo.resolve()
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot infer', self.discovery.errors.errors[0] )
+
+	def test_overload_with_generic_candidate_is_outside_allowlist( self ) -> None:
+		# a generic (Specialization-typed) parameter on ANY candidate in
+		# the group declines the whole group - real dispatch would need
+		# to eagerly monomorphize that candidate first (type_resolver.py's
+		# resolve_declared_types), Stage-2 Monomorphizer machinery not
+		# safely reachable from this discovery-time pass
+		mod = self._import( '''
+class Foo:
+	@overload
+	def compute( self, n: i32 ) -> i32:
+		return n
+	@overload
+	def compute( self, items: Ptr[i32] ) -> i32:
+		return 0
+	def __init__( self, n: i32 ) -> None:
+		self.x = self.compute( n = n )
 ''' )
 		foo = mod.get_local( 'Foo' )
 		foo.resolve()
@@ -474,6 +524,36 @@ def main() -> i32:
 	return 0
 '''
 
+# the winning overload candidate's own declared return type is inferred -
+# real dispatch (via overload_resolution.resolve_call, same machinery this
+# uses) picks the i32 candidate since n's own param type identity-matches
+# it. A bare free function, not a self.method() call: an INSTANCE method
+# call can never legally supply an attribute's OWN initializing value (see
+# InitAttributeInferenceLoweringTests.test_instance_method_call_inference_
+# still_hits_construction_safety) - unrelated to overload resolution
+# itself, so it's sidestepped here the same way _METHOD_CALL_INFERENCE_RC
+# sidesteps it with @staticmethod
+_OVERLOAD_CALL_INFERENCE = '''
+@overload
+def compute( n: i32 ) -> i32:
+	return n
+@overload
+def compute( n: f32 ) -> f32:
+	return n
+
+class Foo:
+	def __init__( self, n: i32 ) -> None:
+		self.x = compute( n = n )
+	def get( self ) -> i32:
+		return self.x
+
+def main() -> i32:
+	f: Foo = Foo( n = 42 )
+	if f.get() != 42:
+		return 1
+	return 0
+'''
+
 # read from a method OTHER than __init__ - the core motivating case: proves
 # the attribute is fully registered before ANY unit of the class can be
 # lowered, not just whenever __init__ itself happens to be reached
@@ -502,6 +582,7 @@ class InitAttributeInferenceRealCompileTests( RealCompileMixin, unittest.TestCas
 			( 'chained_self_attribute_inference', _CHAINED_SELF_ATTRIBUTE_INFERENCE ),
 			( 'branch_reassignment_inference', _BRANCH_REASSIGNMENT_INFERENCE ),
 			( 'method_call_inference_rc', _METHOD_CALL_INFERENCE_RC ),
+			( 'overload_call_inference', _OVERLOAD_CALL_INFERENCE ),
 			( 'read_from_other_method_before_init_in_source', _READ_FROM_OTHER_METHOD_BEFORE_INIT_IN_SOURCE ),
 		])
 
