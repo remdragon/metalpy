@@ -79,8 +79,22 @@ class set[T]( Sequence[T], Iterable[T], Sized ):
 	# key, so this forwards straight to key_at (current live-entry order,
 	# see UnsafeDict.key_at's own comment - order is unspecified/can shift
 	# across a discard/remove, same as Python's own unordered set).
+	@overload
 	def __getitem__( self, index: usize ) -> Result[T, IndexError]:
 		return self.__inner.key_at( index )
+
+	# real Python's own negative-index convention - see _resolve_index's
+	# own comment for why this is a sibling overload, not a widened
+	# usize->isize parameter above. Positional order here is the same
+	# unspecified/can-shift live-entry order __getitem__(usize) above
+	# already documents, same caveat applies.
+	@overload
+	def __getitem__( self, index: isize ) -> Result[T, IndexError]:
+		match _resolve_index( index, self.__len__() ):
+			case Result.Ok( resolved ):
+				return self.__getitem__( resolved )
+			case Result.Err( e ):
+				return Result.Err( e )
 
 	def __iter__( self ) -> Generator[T, StopIteration]:
 		return _sequence_iter( self )

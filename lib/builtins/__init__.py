@@ -307,6 +307,35 @@ def _clamp_slice_bound( bound: isize, len_i: isize ) -> isize:
 	return resolved
 
 
+# resolves a SINGLE-ELEMENT index against a container's own real length,
+# matching real Python's own container[i] semantics: a negative i counts
+# back from real_len (s[-1] is the last element), but - unlike
+# _resolve_slice_bounds' own deliberately-forgiving clamping - an i that's
+# still out of range after that adjustment is a genuine Err(IndexError()),
+# never silently clamped. Every existing __getitem__(idx: usize) overload
+# across this codebase keeps working completely unchanged (usize can never
+# spell a negative index in the first place, so this helper is never even
+# reachable from that path) - each type instead gains a SIBLING __getitem__(
+# idx: isize) overload (see e.g. bytes.__getitem__ below) that calls this
+# first, then delegates to its own existing usize overload. Purely additive:
+# usize and isize have no implicit conversion between them (SYNTAX.md), so
+# widening the EXISTING parameter type in place would have broken every
+# already-compiling `container[i]` call site with a usize-typed i (the
+# overwhelmingly common case, e.g. any `for i in range(len(x))` loop) -
+# confirmed unacceptable, not just theoretical.
+def _resolve_index( i: isize, real_len: usize ) -> Result[usize, IndexError]:
+	with compiler.panic_arithmetic( 'a real container length always fits isize' ):
+		len_i: isize = isize( real_len )
+	resolved: isize = i
+	if resolved < 0:
+		with compiler.wrap_arithmetic: # len_i is a real container length, never large enough to overflow isize
+			resolved = resolved + len_i
+	if resolved < 0 or resolved >= len_i:
+		return Result.Err( IndexError() )
+	with compiler.panic_arithmetic( 'resolved is now known to be in [0, len_i), which always fits usize' ):
+		return Result.Ok( usize( resolved ) )
+
+
 
 # shared byte-level helpers for bytes.find()/bytearray.find() (etc.) - pure
 # sys.memcmp over an explicit length, unlike str.find()'s UTF-8-aware
@@ -432,6 +461,17 @@ class bytes( Sequence[u8], Iterable[u8], Sized ):
 			return Result.Err( IndexError() )
 		return Result.Ok( self.__data[index] )
 
+	# real Python's own negative-index convention (b[-1] is the last byte) -
+	# see _resolve_index's own comment for why this is a sibling overload,
+	# not a widened usize->isize parameter on the overload just above.
+	@overload
+	def __getitem__( self, index: isize ) -> Result[u8,IndexError]:
+		match _resolve_index( index, self.__len ):
+			case Result.Ok( resolved ):
+				return self.__getitem__( resolved )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	# s[a:b] slice syntax (lowering.py's _lower_slice_subscript) - a new,
 	# independently-owned bytes, matching real Python's own slice semantics
 	# exactly (out-of-range bounds silently clamp - see
@@ -532,6 +572,17 @@ class bytearray( Sequence[u8], Iterable[u8], Sized ):
 			return Result.Err( IndexError() )
 		return Result.Ok( self.__data[index] )
 
+	# real Python's own negative-index convention (b[-1] is the last byte) -
+	# see _resolve_index's own comment for why this is a sibling overload,
+	# not a widened usize->isize parameter on the overload just above.
+	@overload
+	def __getitem__( self, index: isize ) -> Result[u8,IndexError]:
+		match _resolve_index( index, self.__len ):
+			case Result.Ok( resolved ):
+				return self.__getitem__( resolved )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	@overload
 	def __getitem__( self, s: slice ) -> bytearray:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -
@@ -544,11 +595,30 @@ class bytearray( Sequence[u8], Iterable[u8], Sized ):
 		( start, stop ) = _resolve_slice_bounds( s, self.__len )
 		return self._byte_slice( start, stop )
 
+	@overload
 	def __setitem__( self, index: usize, value: u8 ) -> None:
 		if compiler.target.debug:
 			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__setitem__() called after release()'
 			assert index < self.__len, 'bytearray.__setitem__() index out of range'
 		self.__data[index] = value
+
+	# real Python's own negative-index convention (b[-1] = val overwrites
+	# the last byte) - see _resolve_index's own comment for why this is a
+	# sibling overload, not a widened usize->isize parameter above. This
+	# overload's OWN contract stays infallible/debug-assert-only, matching
+	# the usize overload just above exactly (not _resolve_index's own
+	# Result[usize,IndexError] - there's no Result to propagate through an
+	# infallible -> None signature).
+	@overload
+	def __setitem__( self, index: isize, value: u8 ) -> None:
+		resolved: isize = index
+		if resolved < 0:
+			with compiler.wrap_arithmetic: # self.__len is a real buffer length, never large enough to overflow isize
+				resolved = resolved + isize( self.__len )
+		if compiler.target.debug:
+			assert self.__data != BYTEARRAY_INVALID, 'bytearray.__setitem__() called after release()'
+			assert 0 <= resolved and usize( resolved ) < self.__len, 'bytearray.__setitem__() index out of range'
+		self.__setitem__( usize( resolved ), value )
 
 	def __iter__( self ) -> Generator[u8, StopIteration]:
 		return _sequence_iter( self )
@@ -912,14 +982,15 @@ class str( Sequence[str], Iterable[str], Sized ):
 
 	@overload
 	def __getitem__( self, idx: usize ) -> Result[str, IndexError]:
-		''' codepoint-indexed access (Python's s[i]) - no negative-index
-		support, matching list/bytearray/dict/set.__getitem__ here, none of
-		which support negative indices either. Jumps to the nearest <=256-
-		codepoint group via __index (O(1)), then decodes forward through at
-		most 255 codepoints to reach idx's own start byte offset - same
-		decode_utf8_at-forward-through-consumed-bytes shape lstrip/rstrip
-		below already use, just bounded to one group instead of the whole
-		string. '''
+		''' codepoint-indexed access (Python's s[i]) - jumps to the nearest
+		<=256-codepoint group via __index (O(1)), then decodes forward
+		through at most 255 codepoints to reach idx's own start byte offset
+		- same decode_utf8_at-forward-through-consumed-bytes shape
+		lstrip/rstrip below already use, just bounded to one group instead
+		of the whole string. Negative indices go through the sibling
+		__getitem__(idx: isize) overload just below instead, which resolves
+		down to a real usize first (see _resolve_index) - this overload's
+		own forward-decode logic is unaffected either way. '''
 		if idx >= self.__char_count:
 			return Result.Err( IndexError() )
 		group: usize = idx >> 8
@@ -935,6 +1006,14 @@ class str( Sequence[str], Iterable[str], Sized ):
 			decode_utf8_at( self.__data, i, compiler.addrof( consumed ))
 			end: usize = i + consumed
 		return Result.Ok( self._byte_slice( i, end ))
+
+	# real Python's own negative-index convention (s[-1] is the last
+	# codepoint) - see _resolve_index's own comment for why this is a
+	# sibling overload, not a widened usize->isize parameter above.
+	@overload
+	def __getitem__( self, idx: isize ) -> Result[str, IndexError]:
+		resolved: usize = _resolve_index( idx, self.__char_count ).or_return()
+		return self.__getitem__( resolved )
 
 	@overload
 	def __getitem__( self, s: slice ) -> str:

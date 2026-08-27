@@ -52,6 +52,17 @@ class memoryview( Sequence[u8], Iterable[u8], Sized ):
 			return Result.Err( IndexError() )
 		return Result.Ok( self.__ptr[idx] )
 
+	# real Python's own negative-index convention (mv[-1] is the last byte)
+	# - see _resolve_index's own comment for why this is a sibling
+	# overload, not a widened usize->isize parameter above.
+	@overload
+	def __getitem__( self, idx: isize ) -> Result[u8, IndexError]:
+		match _resolve_index( idx, self.__len ):
+			case Result.Ok( resolved ):
+				return self.__getitem__( resolved )
+			case Result.Err( e ):
+				return Result.Err( e )
+
 	@overload
 	def __getitem__( self, s: slice ) -> memoryview:
 		''' s[a:b] slice syntax (lowering.py's _lower_slice_subscript) -

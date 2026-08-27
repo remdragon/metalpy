@@ -4379,7 +4379,7 @@ class FunctionLowering:
 					self._emit( ir.SetAttrIndex( obj = root, attr = attr, index = index, value = operand ))
 					return
 			obj = self._lower_expr( target.value, None )
-			setitem_fn = self.lowering._find_method( obj.type, '__setitem__' )
+			setitem_fn = self._find_indexlike_setitem( obj.type, target.slice )
 			if setitem_fn is None:
 				# no real __setitem__ declared (raw pointers, or any other
 				# type that doesn't define subscript assignment as a method)
@@ -4667,7 +4667,7 @@ class FunctionLowering:
 			# that would otherwise be unsafe).
 			subscript_pending_start = len( self._pending_temps )
 			obj = self._lower_expr( node.target.value, None )
-			getitem_fn = self._find_indexlike_getitem( obj.type )
+			getitem_fn = self._find_indexlike_getitem( obj.type, node.target.slice )
 			if getitem_fn is None:
 				# no real __getitem__ declared (raw pointers, or any other
 				# type that doesn't define subscript access as a method) -
@@ -4698,7 +4698,7 @@ class FunctionLowering:
 				# instead of two independent checks that could each fail at
 				# a different time. index is lowered exactly once, shared by
 				# both the get and (fallback) set calls.
-				setitem_fn = self.lowering._find_method( obj.type, '__setitem__' )
+				setitem_fn = self._find_indexlike_setitem( obj.type, node.target.slice )
 				if setitem_fn is None:
 					self.lowering.discovery.fail( f'{ast.unparse(node.target.value)} defines __getitem__ but not __setitem__ - cannot assign to {ast.unparse(node.target)}', node.target )
 				self.lowering._ensure_resolved( getitem_fn )
@@ -11628,7 +11628,7 @@ class FunctionLowering:
 		# lib/ call sites that only ever used constant indices.
 		resolved_obj_type = self.lowering._ensure_resolved( obj.type )
 		tuple_type = self.lowering._tuple_storage.tuple_type_for( resolved_obj_type )
-		getitem_fn = None if tuple_type is not None else self._find_indexlike_getitem( obj.type )
+		getitem_fn = None if tuple_type is not None else self._find_indexlike_getitem( obj.type, node.slice )
 		if getitem_fn is None:
 			if tuple_type is not None:
 				valid_index = (
@@ -11642,9 +11642,19 @@ class FunctionLowering:
 						node,
 					)
 				index = node.slice.value
-				if not ( 0 <= index < len( tuple_type.elem_types )):
+				arity = len( tuple_type.elem_types )
+				# real Python's own negative-index convention (t[-1] is the
+				# last element) - resolved here, at compile time, same as
+				# every other bound already is for this direct-field-access
+				# rewrite (there's no runtime __getitem__ call here to
+				# delegate the wraparound to - see _resolve_index's own
+				# comment for the general runtime-container version of this
+				# same rule)
+				if index < 0:
+					index += arity
+				if not ( 0 <= index < arity ):
 					self.lowering.discovery.fail(
-						f'tuple index {index} out of range for {resolved_obj_type.qualname} (0..{len(tuple_type.elem_types)-1}): {ast.unparse(node)}',
+						f'tuple index {node.slice.value} out of range for {resolved_obj_type.qualname} ({-arity}..{arity-1}): {ast.unparse(node)}',
 						node,
 					)
 				attr_var = self.lowering._attr_lookup( resolved_obj_type, f'_{index}', node )
@@ -13278,7 +13288,7 @@ class FunctionLowering:
 			return None
 		return scalar_param_types[0]
 
-	def _find_indexlike_getitem( self, owner_type: Type|None ) -> Function|None:
+	def _find_indexlike_getitem( self, owner_type: Type|None, index_node: ast.expr|None = None ) -> Function|None:
 		''' like self.lowering._find_method(owner_type, '__getitem__'), but
 		Overload-aware for the ordinary x[i] (non-slice) subscript path -
 		once a type gains a second __getitem__ overload for slice syntax
@@ -13299,7 +13309,23 @@ class FunctionLowering:
 		numeric regardless of which concrete Scalar a type picks, and no
 		slice-descriptor argument is ever itself a bare Scalar, so "prefer
 		the Scalar-typed leaf" is a structurally sound, arg-type-agnostic
-		way to pick the index leaf over the slice leaf. '''
+		way to pick the index leaf over the slice leaf.
+
+		A type can now ALSO declare a SECOND Scalar-typed leaf (e.g. an
+		isize sibling alongside the usize leaf, for real Python-style
+		negative indexing - see _resolve_index's own comment) - `index_node`,
+		when given, disambiguates: a literal negative index (`x[-1]`, folded
+		to a bare ast.Constant by compile_time_transformer by the time this
+		runs) prefers an isize-typed leaf if one exists; every other index
+		shape (a Name, a Call, a non-negative literal, ...) keeps the
+		historical behavior and prefers usize - deliberately NOT probing the
+		index expression's own inferred type here (that would risk double-
+		lowering/double-evaluating a side-effecting index expression - the
+		exact hazard this file's own comments elsewhere already flag
+		repeatedly), so a variable already holding a genuinely negative
+		isize still needs an explicit `.__getitem__(...)` call rather than
+		bare subscript syntax - a real, narrower gap than a bare negative
+		literal, left unaddressed here. '''
 		owner_type = self.lowering._ensure_resolved( owner_type )
 		if isinstance( owner_type, ( CStruct, RCClass )):
 			found = owner_type.chain_lookup( '__getitem__' )
@@ -13311,6 +13337,11 @@ class FunctionLowering:
 			return found
 		if not isinstance( found, Overload ):
 			return None
+		wants_isize = (
+			isinstance( index_node, ast.Constant ) and type( index_node.value ) is int
+			and not isinstance( index_node.value, bool ) and index_node.value < 0
+		)
+		scalar_candidates: list[Function] = []
 		for impl in found.implementations:
 			if impl.resolve is not None:
 				impl.resolve()
@@ -13320,8 +13351,70 @@ class FunctionLowering:
 				continue
 			param_type = self.lowering._ensure_resolved( params[arg_index].type )
 			if isinstance( param_type, Scalar ):
+				scalar_candidates.append( impl )
+		if not scalar_candidates:
+			return None
+		def _param_stem( impl: Function ) -> str:
+			p = ( impl.parameters or [] )[ 1 if impl.cls is None else 0 ]
+			return self.lowering._ensure_resolved( p.type ).stem
+		if wants_isize:
+			for impl in scalar_candidates:
+				if _param_stem( impl ) == 'isize':
+					return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
+		for impl in scalar_candidates:
+			if _param_stem( impl ) != 'isize':
 				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
-		return None
+		# every candidate was isize (no plain usize leaf at all) - fall back
+		# to whichever scalar leaf exists, same as the original single-
+		# candidate behavior
+		return self.lowering._resolve_receiver_generic_dunder( scalar_candidates[0], owner_type )
+
+	def _find_indexlike_setitem( self, owner_type: Type|None, index_node: ast.expr|None = None ) -> Function|None:
+		''' the __setitem__ counterpart of _find_indexlike_getitem - see its
+		own docstring for the full reasoning (Overload-aware lookup, usize-
+		vs-isize disambiguation from a literal negative index). The one
+		real difference: __setitem__ takes TWO parameters (index, value),
+		not one, so "the index candidate" here means the FIRST parameter is
+		a plain Scalar, not "the whole parameter list is one Scalar". '''
+		owner_type = self.lowering._ensure_resolved( owner_type )
+		if isinstance( owner_type, ( CStruct, RCClass ) ):
+			found = owner_type.chain_lookup( '__setitem__' )
+		else:
+			names = getattr( owner_type, 'names', None )
+			found = names.get( '__setitem__' ) if isinstance( names, dict ) else None
+		found = self.lowering._resolve_scalar_name( found )
+		if isinstance( found, Function ):
+			return found
+		if not isinstance( found, Overload ):
+			return None
+		wants_isize = (
+			isinstance( index_node, ast.Constant ) and type( index_node.value ) is int
+			and not isinstance( index_node.value, bool ) and index_node.value < 0
+		)
+		scalar_candidates: list[Function] = []
+		for impl in found.implementations:
+			if impl.resolve is not None:
+				impl.resolve()
+			params = impl.parameters or []
+			index_arg = 1 if impl.cls is None else 0
+			if len( params ) <= index_arg:
+				continue
+			index_param_type = self.lowering._ensure_resolved( params[index_arg].type )
+			if isinstance( index_param_type, Scalar ):
+				scalar_candidates.append( impl )
+		if not scalar_candidates:
+			return None
+		def _index_param_stem( impl: Function ) -> str:
+			index_arg = 1 if impl.cls is None else 0
+			return self.lowering._ensure_resolved( ( impl.parameters or [] )[index_arg].type ).stem
+		if wants_isize:
+			for impl in scalar_candidates:
+				if _index_param_stem( impl ) == 'isize':
+					return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
+		for impl in scalar_candidates:
+			if _index_param_stem( impl ) != 'isize':
+				return self.lowering._resolve_receiver_generic_dunder( impl, owner_type )
+		return self.lowering._resolve_receiver_generic_dunder( scalar_candidates[0], owner_type )
 
 	def _lower_eq_or_ne( self, node: ast.Compare, left: ir.Operand, expected_type: Type|None, negate: bool ) -> ir.Operand:
 		''' `==`/`!=`, for ANY left operand (scalar or not) - unlike every
@@ -14515,6 +14608,20 @@ class FunctionLowering:
 			in_range = [ t for t in candidate_types if isinstance( t, Scalar ) and int_stem_range( t )[0] <= expr.value <= int_stem_range( t )[1] ]
 			if len( in_range ) == 1:
 				candidate_types = in_range
+			elif expr.value >= 0 and { t.stem for t in in_range } == { 'usize', 'isize' }:
+				# a non-negative literal fits BOTH usize and isize's own
+				# real range (magnitude alone can never disambiguate this
+				# one specific pair, unlike e.g. i8 vs i32) - real Python-
+				# style negative-index overloads (see _resolve_index's own
+				# comment) exist specifically so a NEGATIVE literal can
+				# reach the isize leaf; a non-negative literal has no
+				# reason to prefer it over the historical usize default,
+				# so break the tie toward usize rather than surface a
+				# confusing "ambiguous" error for the overwhelmingly
+				# common case (every existing `x.__getitem__(0)`-shaped
+				# call site with a literal 0..N index, e.g. lib/re.py's
+				# own out.__getitem__(0)).
+				candidate_types = [ t for t in in_range if t.stem == 'usize' ]
 		if len( candidate_types ) == 1:
 			return self._lower_expr( expr, candidate_types[0] )
 		if len( candidate_types ) > 1:
