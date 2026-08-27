@@ -487,6 +487,62 @@ class WalrusInWhileConditionLeakTests( RealCompileMixin, unittest.TestCase ):
 		self.assertEqual( foo_lines, [], f'both walrus-rebound Foo instances must be released each iteration, got:\n{out}' )
 
 
+# KNOWN GAP (see _stmt_While's own comment on fresh_rc_walrus_names): the
+# release above only covers the loop's NORMAL (body-completed) back edge - an
+# explicit `continue` inside the body jumps straight to start_label
+# (continue_label == start_label for a while loop) and bypasses it entirely.
+# Same shape as _WALRUS_IN_WHILE_CONDITION_LEAK but with the body replaced by
+# a bare `continue` - expected to leak both walrus-rebound Foo instances until
+# that gap is closed. Marked expectedFailure so this documents the gap
+# without failing the suite; flip to a real assertion (and drop the
+# decorator) once fixed.
+_WALRUS_IN_WHILE_CONDITION_CONTINUE_LEAK = '''
+import sys
+
+class Foo:
+	x: i32
+	def __init__(self, x: i32) -> None:
+		self.x = x
+
+def make_two() -> list[Foo]:
+	result: list[Foo] = list[Foo]()
+	result.append( Foo( 1 ))
+	result.append( Foo( 2 ))
+	return result
+
+def helper() -> i32:
+	items = make_two()
+	while item := items.pop( None ):
+		continue
+	return 0
+
+def main() -> i32:
+	helper()
+	sys.dump_live_objects() # every Foo popped off items across BOTH iterations must be released, not just the final one
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class WalrusInWhileConditionContinueLeakTests( RealCompileMixin, unittest.TestCase ):
+	@unittest.expectedFailure
+	def test_continue_inside_a_while_walrus_loop_bypasses_the_per_iteration_release( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( _WALRUS_IN_WHILE_CONDITION_CONTINUE_LEAK, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ))
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 10 )
+		self.assertEqual( result.returncode, 0,
+			f'program crashed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}'
+			f'{test_support.c_source_on_failure( c_source )}' )
+		out = result.stdout.decode( 'utf-8', errors = 'replace' )
+		foo_lines = [ line for line in out.splitlines() if '__main__.Foo @' in line ]
+		self.assertEqual( foo_lines, [], f'both walrus-rebound Foo instances must be released each iteration, got:\n{out}' )
+
+
 # cfg.py's promote_borrowed_for_loop() - a for-loop that reassigns a borrowed
 # parameter mints a ONE-TIME incref before the loop starts (promoting the
 # parameter from BORROWED to OWNED for the rest of the function), but the
