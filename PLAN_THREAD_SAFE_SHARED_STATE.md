@@ -9,9 +9,13 @@ below) is implemented and merged.
 
 **Part B itself (the actual per-object lock) - status update: implemented,
 all previously-blocking bugs fixed, verified under real concurrent stress
-(see below), full 3-compiler suite (clang/MSVC/WSL-gcc) clean.** Not yet
-merged to master as of this writing - implementation soundness and the
-merge decision are separate questions.
+(see below), full 3-compiler suite (clang/MSVC/WSL-gcc) clean, and merged
+to master.**
+
+**Performance follow-ons (the "Cost mitigations" section below) - status
+update: staged into 4 sessions, Stage 1 landed and merged (see Cost
+mitigation #1's own status update for the full writeup), Stages 2-4 not
+yet started.**
 
 What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
 mirroring Part A's global-lock markers, keyed on the receiver operand
@@ -972,6 +976,77 @@ issue.)
    would need the compiler to specifically recognize a construction of
    `lib/threading.py`'s own `Thread` class (a new, narrow, one-off
    special case, not a general escape-analysis feature).
+
+   **Status update: implemented and merged, with a revised detection
+   design.** Rather than recognizing `Thread` construction, a new optional
+   `@extern(..., spawns_thread=True)` decorator parameter
+   (`discovery.py`'s `_parse_extern_decorator`) tags the actual OS-thread-
+   creation syscall boundary itself — `posix.pthread.pthread_create()` and
+   `windows.kernel32.CreateThread()`. This is strictly more robust than
+   class-construction detection: it catches thread creation through *any*
+   path (not just `lib/threading.py`'s own `Thread` wrapper — `ThreadPool`,
+   `lib/reactor.py`, `lib/tcpserver.py`'s dispatcher all bottom out at
+   these same two syscalls, so no extra per-wrapper detection code is ever
+   needed), which also closes Open Question #5 below for the *detection*
+   half (a raw `@extern` binding to either syscall is caught the same
+   way a user's own hand-written binding to them would be, if one
+   existed) — though the escape hatch for a thread reached some *other*
+   way (a signal handler, an externally-invoked C callback) is still a
+   real, separate need, and is shipped alongside (see below).
+   `Compiler.spawns_threads` (a new field, `compiler.py`) flips
+   incrementally the moment such a function is actually reached and
+   lowered — the exact same pattern already used for `requires_crt`
+   (`compiler.py`'s function-lowering branch, right beside
+   `if unit.requires_crt: self.requires_crt = True`) — so no whole-program
+   scan is needed at all, unlike `has_object_header_alloc`'s own scan
+   pattern (which was considered and rejected as unnecessary overhead
+   here, since the incremental flip is strictly cheaper and simpler).
+   `emitter_c.py`'s `emit_c()` reads `compiler.spawns_threads` into a new
+   `_program_uses_threads` module global (mirroring `_target_os`'s own
+   established precedent exactly), which then gates the real-vs-no-op
+   decision for every `AcquireGlobalLock`/`ReleaseGlobalLock`/
+   `AcquireFieldLock`/`ReleaseFieldLock` marker, the per-object and
+   per-global `pthread_mutex_init()` call sites, and the SRWLOCK/
+   `pthread.h` forward-declaration registration - the identical
+   emission-time-decided pattern `_global_lock_supported()` already uses,
+   just with one more condition ANDed in. `mpy.py` ships a
+   `--assume-threaded` escape hatch (Open Question #5's own remaining
+   half) that sets `compiler.spawns_threads = True` directly before
+   `emit_c()` runs, for a program that reaches a second OS thread some
+   way this compiler can't see. Confirmed load-bearing via a real
+   sabotage test (forcing `_program_uses_threads` off unconditionally
+   reproduced a real `STATUS_ILLEGAL_INSTRUCTION` crash in 15/15 runs of
+   the existing concurrent stress tests, restored immediately after
+   confirming that) and new `thread_detection_test.py` coverage (no lock
+   codegen at all for a program that never spawns a thread, real codegen
+   for one that does, transitive detection through `ThreadPool`, the
+   override flag). Full 3-compiler suite clean.
+
+   **A related item (Cost mitigation #5 in the original numbering below,
+   "Part B's retain-on-read overhead") was attempted in the SAME pass and
+   REVERTED after a real double-free bug was found.** The idea: tag the
+   specific `Incref`/`Decref` instructions Part B's own retain-on-read
+   protection introduced (e.g. `_expr_Attribute`'s field-read retain) and
+   elide them too when `_program_uses_threads` is false, the same way the
+   lock markers are elided. This is UNSOUND as designed: `cfg.py`'s
+   `fresh_temp()`/`is_fresh_temp()` bookkeeping (which lets a later
+   binding-time incref be SKIPPED because the value is "already fresh")
+   is decided at LOWERING time, permanently baked into the instruction
+   stream by the time emission-time elision would try to also skip the
+   retain-on-read Incref itself — eliding the Incref while the downstream
+   skip-because-already-fresh decision still stands desyncs the two,
+   producing an unbalanced decref at scope exit (a real, reproduced
+   premature free, not a theoretical concern). Fully reverted (`ir.py`'s
+   `Incref`/`Decref` have no `retain_on_read` field, `cfg.py`'s
+   `fresh_temp`/`delete_temp`/`untrack_temp` are unchanged from their Part
+   B shape). A future attempt would need to decide "does this program
+   spawn threads" at LOWERING time (a cheap syntactic pre-pass over the
+   AST for `Thread`/`ThreadPool`/etc. constructions, accepting some
+   false-positive imprecision, rather than the current exact-but-only-
+   known-at-emission-time incremental flip) so lowering.py itself can
+   choose, per-program, whether to emit the retain-on-read Incref/
+   fresh_temp pair AT ALL - not something to reattempt with the current
+   emission-time-only architecture.
 2. **Write-once-after-`__init__` exemption — only sound for `__private`
    fields, and only once the "Prerequisite" section above actually ships.**
    A field assigned only in `__init__` and never reassigned by any other
