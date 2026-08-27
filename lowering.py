@@ -7743,7 +7743,29 @@ class FunctionLowering:
 		# repeated block, same as _stmt_If's test) so it's genuinely
 		# re-evaluated every time the bottom Jump loops back
 		self._emit( ir.Label( name = start_label ))
+		# a walrus (`while x := f():`) FRESHLY declared right here in the
+		# test is a genuinely different shape than every other loop-carried
+		# binding: _expr_NamedExpr's own "no prior declaration" branch
+		# (_declare_local, matching an ordinary `x = f()` statement) is
+		# correct for the FIRST run through this code, but this exact same
+		# compiled Assign then re-executes every later iteration too (via
+		# the back-edge Jump below looping back to start_label, BEFORE the
+		# test) - a plain declare-shaped Assign never decrefs whatever x
+		# already held from the PRIOR iteration before overwriting it,
+		# unlike an ordinary reassignment of an already-EXISTING name
+		# (_cfg_assign's own decref-old-then-assign, which the test's OTHER
+		# branch in _expr_NamedExpr already gets correctly). Detected here
+		# by diffing fn.names before/after lowering the test - any NAME
+		# that's newly present afterward was freshly declared BY the test
+		# itself. Confirmed via a real repro: `while root := paths.pop(
+		# ''):` leaked root's own first-iteration value every time the loop
+		# body ran a genuine second iteration.
+		names_before_test = dict( self._current_fn.names )
 		test = self._lower_branch_condition( node.test )
+		fresh_rc_walrus_names = [
+			v for k, v in self._current_fn.names.items()
+			if k not in names_before_test and isinstance( v, Variable ) and cfg.rc_leaves( v.type )
+		]
 		self._emit( ir.JumpIfFalse( cond = test, target = end_label ))
 		loop_snapshot = self._cfg.snapshot()
 		# continue_captured unused here - start_label (this loop's own
@@ -7787,6 +7809,21 @@ class FunctionLowering:
 				natural_exit_narrowed[exit_name] = [ member ]
 			natural_exit_live = set( loop_snapshot.live )
 		self._cfg.merge_loop_exits( natural_exit_narrowed, break_narrowed, natural_exit_live, break_live )
+		# release this iteration's own value of any RC-typed walrus target
+		# freshly declared by the test (see fresh_rc_walrus_names' own
+		# comment above) BEFORE looping back to re-run that same declare-
+		# shaped Assign again - it has no way to know it's about to
+		# overwrite a real value rather than uninitialized memory. NOTE:
+		# this only covers the loop's own NORMAL (body-completed) back
+		# edge - an explicit `continue` inside the body jumps to
+		# start_label directly (continue_label == start_label for a while
+		# loop) and bypasses this, same gap, not yet handled; not
+		# reachable by any real code in this codebase today (confirmed:
+		# no while-loop-with-walrus-test in lib/ uses continue), flagged
+		# here rather than silently left in a comment nobody sees.
+		for var in fresh_rc_walrus_names:
+			for instr in self._cfg.decref( var.type, var ):
+				self._emit( instr )
 		self._emit( ir.Jump( target = start_label ))
 		self._emit( ir.Label( name = end_label ))
 

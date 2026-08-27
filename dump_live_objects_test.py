@@ -436,5 +436,113 @@ class BorrowedParamReassignedInIfLeakTests( RealCompileMixin, unittest.TestCase 
 		self.assertIn( 'count=1', foo_lines[0], f'helper()\'s own reassigned y (make()\'s Foo) must not leak:\n{out}' )
 
 
+# lowering.py's _stmt_While - `while x := f():` re-executes the walrus's own
+# fresh-declare lowering (no release of the PRIOR iteration's value) on every
+# pass through the back edge, even though it's only a true first-time
+# declaration on iteration 1. Confirmed via a real repro: grap.mpy's own
+# `while root := paths.pop(''):`.
+_WALRUS_IN_WHILE_CONDITION_LEAK = '''
+import sys
+
+class Foo:
+	x: i32
+	def __init__(self, x: i32) -> None:
+		self.x = x
+
+def make_two() -> list[Foo]:
+	result: list[Foo] = list[Foo]()
+	result.append( Foo( 1 ))
+	result.append( Foo( 2 ))
+	return result
+
+def helper() -> i32:
+	items = make_two()
+	while item := items.pop( None ):
+		pass
+	return 0
+
+def main() -> i32:
+	helper()
+	sys.dump_live_objects() # every Foo popped off items across BOTH iterations must be released, not just the final one
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class WalrusInWhileConditionLeakTests( RealCompileMixin, unittest.TestCase ):
+	def test_walrus_reassigned_every_iteration_of_a_while_condition_does_not_leak( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( _WALRUS_IN_WHILE_CONDITION_LEAK, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ))
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 10 )
+		self.assertEqual( result.returncode, 0,
+			f'program crashed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}'
+			f'{test_support.c_source_on_failure( c_source )}' )
+		out = result.stdout.decode( 'utf-8', errors = 'replace' )
+		foo_lines = [ line for line in out.splitlines() if '__main__.Foo @' in line ]
+		self.assertEqual( foo_lines, [], f'both walrus-rebound Foo instances must be released each iteration, got:\n{out}' )
+
+
+# cfg.py's promote_borrowed_for_loop() - a for-loop that reassigns a borrowed
+# parameter mints a ONE-TIME incref before the loop starts (promoting the
+# parameter from BORROWED to OWNED for the rest of the function), but the
+# pushed Epilogue entry was indistinguishable from an ordinary loop-body-local
+# push: restore() (called once the loop body's retried lowering succeeds)
+# truncated it away as if it were block-scoped, so the promoted incref was
+# never balanced by a release at the function's own epilogue - a permanent
+# +1 leak, present even when the loop's own iterable is empty (0 runtime
+# iterations). Confirmed via a real repro: grap.mpy's own
+# `for file in self._list_dir(root):` reassigning `path`.
+_FOR_LOOP_PROMOTED_PARAM_LEAK = '''
+import sys
+
+class Foo:
+	x: i32
+	def __init__(self, x: i32) -> None:
+		self.x = x
+
+def make_empty() -> list[Foo]:
+	return list[Foo]()
+
+def helper( item: Foo ) -> i32:
+	for other in make_empty(): # never runs - the promoted incref still fires unconditionally
+		if other.x == 0:
+			item = other
+		else:
+			item = other
+	return item.x
+
+def main() -> i32:
+	f = Foo( 1 )
+	helper( f )
+	sys.dump_live_objects() # only main's own f may still be live - the promoted-but-never-released copy must not also show up
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class ForLoopPromotedParamLeakTests( RealCompileMixin, unittest.TestCase ):
+	def test_promoting_a_borrowed_param_for_an_empty_for_loop_does_not_leak( self ) -> None:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( _FOR_LOOP_PROMOTED_PARAM_LEAK, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ))
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 10 )
+		self.assertEqual( result.returncode, 0,
+			f'program crashed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}'
+			f'{test_support.c_source_on_failure( c_source )}' )
+		out = result.stdout.decode( 'utf-8', errors = 'replace' )
+		foo_lines = [ line for line in out.splitlines() if '__main__.Foo @' in line ]
+		self.assertEqual( len( foo_lines ), 1, f'expected exactly 1 __main__.Foo group (main\'s own f), got:\n{out}' )
+		self.assertIn( 'count=1', foo_lines[0], f'the promoted-but-unreleased copy of item must not leak:\n{out}' )
+
+
 if __name__ == '__main__':
 	unittest.main()

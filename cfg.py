@@ -114,6 +114,7 @@ class Epilogue:
 	is_err_only: bool = False # errdefer vs plain defer - only meaningful when flag is set
 	cancelled: bool = False
 	is_construction_attr: bool = False # a self.<attr> entry pushed by attr_assign()/complete_base_construction() during a fallible __init__ - see current_epilogue_label_for_construction_err()'s own docstring for why these can never share a label the way a defer/errdefer or plain local entry can
+	survives_loop_restore: bool = False # set only by promote_borrowed_for_loop() - that entry is pushed WHILE lowering a loop body (so restore() would normally treat it as block-scoped and truncate it away, same as an ordinary loop-local), but it represents a real, permanent ownership promotion of a pre-loop binding that now needs releasing once, at the function's own epilogue - not every loop iteration and not never. See restore()'s own survivors check.
 
 	@property
 	def is_flag_guarded( self ) -> bool:
@@ -327,8 +328,8 @@ class CFGState:
 		# the bug complete_base_construction's own comment describes).
 		self._construction_required = list( required )
 
-	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None, is_construction_attr: bool = False ) -> Epilogue:
-		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref, is_construction_attr = is_construction_attr )
+	def _push( self, operand: Variable, type_for_decref: Type, state: OwnState, *, key: str | None = None, is_construction_attr: bool = False, survives_loop_restore: bool = False ) -> Epilogue:
+		entry = Epilogue( instructions = [], name = self._new_label( 'epilogue' ), operand = operand, type = type_for_decref, is_construction_attr = is_construction_attr, survives_loop_restore = survives_loop_restore )
 		self._epilogue_stack.append( entry )
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
@@ -522,7 +523,7 @@ class CFGState:
 		for i, orig_entry in enumerate( snap.entry_objects ):
 			if not self._epilogue_stack[i].is_flag_guarded:
 				self._epilogue_stack[i] = orig_entry
-		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.name in self._captured_labels ]
+		survivors = [ e for e in self._epilogue_stack[snap.stack_depth:] if e.is_flag_guarded or e.name in self._captured_labels or e.survives_loop_restore ]
 		del self._epilogue_stack[snap.stack_depth:]
 		self._epilogue_stack += survivors
 
@@ -1418,11 +1419,23 @@ class CFGState:
 		prologue takes (_enter_parameter). Called once per name found by
 		find_promotable_loop_mismatches(), right before lowering.py re-lowers
 		the loop from its own start label - the returned instructions must
-		be emitted there, before that label. '''
+		be emitted there, before that label.
+
+		survives_loop_restore=True on the pushed entry: this call happens
+		WHILE lowering.py's own retry loop is still inside the loop body's
+		lowering (before the loop's own restore() call further up the call
+		stack), so without this the entry would be indistinguishable from an
+		ordinary loop-body-local push and get silently truncated away by
+		that same restore() once the (now-successful) retry attempt
+		finishes - releasing the promoted incref never happens, a permanent
+		+1 leak of the parameter's final value, confirmed via a real repro
+		(grap.mpy's own dump_live_objects(), a for-loop reassigning a
+		borrowed str parameter - the leak persisted even when the loop body
+		never executed at all, i.e. an empty iterable). '''
 		binding = self.bindings[name]
 		assert binding.state == OwnState.BORROWED, f'promote_borrowed_for_loop({name!r}): binding is {binding.state}, not BORROWED'
 		instructions = self._incref_instructions( binding.type, binding.operand )
-		self._push( binding.operand, binding.type, OwnState.OWNED, key = name )
+		self._push( binding.operand, binding.type, OwnState.OWNED, key = name, survives_loop_restore = True )
 		return instructions
 
 	@property
