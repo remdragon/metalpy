@@ -115,6 +115,41 @@ def main() -> i32:
 	return 0
 '''
 
+# regression: risky( bad ) above passes only scalar args, so it never builds a
+# fresh pending temp as part of the discarded call's own argument list. This
+# variant's `try_insert( MyError(), bad )` does - a fresh RC arg constructed
+# INLINE for a discarded call whose Err leaf is uncovered (propagates via
+# auto-or_throw's early-return path, not a normal fall-through statement end).
+# That argument temp leaked (never released on the early-return branch) until
+# fixed - see _finish_call_result/_auto_or_throw/_emit_or_throw's own
+# receiver_pending_start threading.
+_BARE_DISCARDED_FALLIBLE_CALL_WITH_FRESH_RC_ARG_DOES_NOT_LEAK = '''
+class MyError:
+	pass
+
+def try_insert( key: MyError, bad: bool ) -> Result[None,MyError]:
+	if bad:
+		return Result.Err( MyError() )
+	return Result.Ok( None )
+
+def propagate_generic( bad: bool ) -> Result[None,MyError]:
+	try_insert( MyError(), bad ) # discarded call, fresh RC arg - must not leak
+	return Result.Ok( None )
+
+def main() -> i32:
+	match propagate_generic( True ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
+	match propagate_generic( False ):
+		case Result.Ok( v ):
+			pass
+		case Result.Err( e ):
+			return 2
+	return 0
+'''
+
 # --- item 5: arr[0] as `x: i32 = arr[0]` now compiles/propagates/dispatches
 
 _SUBSCRIPT_AS_DIRECT_T_TYPED_TARGET_COMPILES = '''
@@ -176,6 +211,58 @@ def main() -> i32:
 			return 3
 	if lst[0].unwrap( 'x' ) != 109:
 		return 4
+	return 0
+'''
+
+# regression: a __setitem__/__getitem__ pair returning Result[_,E] whose Err
+# leaf is uncovered (no try) - the AugAssign's own combined `result` (a FRESH
+# RC value, here a new Box built via __add__) is passed as the discarded
+# __setitem__ call's own argument. That argument temp leaked (never released
+# on the early-return propagate path) until fixed - same bug family/fix as
+# _BARE_DISCARDED_FALLIBLE_CALL_WITH_FRESH_RC_ARG_DOES_NOT_LEAK above, found
+# by auditing every other _auto_or_throw( ..., want_result = False ) site for
+# the same shape (see lowering.py's `subscript_pending_start`).
+_SUBSCRIPT_AUGASSIGN_WITH_FRESH_RC_RESULT_DOES_NOT_LEAK = '''
+import compiler
+
+class MyError:
+	pass
+
+class Box:
+	v: i32 = 0
+
+	def __init__( self, v: i32 ) -> None:
+		self.v = v
+
+	def __add__( self, other: Box ) -> Box:
+		with compiler.wrap_arithmetic:
+			return Box( self.v + other.v )
+
+class Container:
+	slot: Box = Box( 0 )
+	fail: bool = False
+
+	def __getitem__( self, i: i32 ) -> Box:
+		return self.slot
+
+	def __setitem__( self, i: i32, v: Box ) -> Result[None,MyError]:
+		if self.fail:
+			return Result.Err( MyError() )
+		self.slot = v
+		return Result.Ok( None )
+
+def bump( c: Container ) -> Result[None,MyError]:
+	c[0] += Box( 5 ) # discarded __setitem__ call, fresh RC `result` arg - must not leak
+	return Result.Ok( None )
+
+def main() -> i32:
+	c: Container = Container()
+	c.fail = True
+	match bump( c ):
+		case Result.Ok( v ):
+			return 1
+		case Result.Err( e ):
+			pass
 	return 0
 '''
 
@@ -535,11 +622,17 @@ class AutoOrThrowBehaviorTests( RealCompileMixin, unittest.TestCase ):
 	def test_bare_discarded_fallible_call_propagates_and_dispatches( self ) -> None:
 		self.assert_programs_run([ ( 'bare_discard_call', _BARE_DISCARDED_FALLIBLE_CALL_PROPAGATES_AND_DISPATCHES ) ])
 
+	def test_bare_discarded_fallible_call_with_fresh_rc_arg_does_not_leak( self ) -> None:
+		self.assert_programs_run([ ( 'bare_discard_fresh_rc_arg', _BARE_DISCARDED_FALLIBLE_CALL_WITH_FRESH_RC_ARG_DOES_NOT_LEAK ) ])
+
 	def test_subscript_as_direct_t_typed_target_compiles( self ) -> None:
 		self.assert_programs_run([ ( 'subscript_direct_target', _SUBSCRIPT_AS_DIRECT_T_TYPED_TARGET_COMPILES ) ])
 
 	def test_subscript_assign_and_augassign_still_propagate_with_no_try( self ) -> None:
 		self.assert_programs_run([ ( 'subscript_assign_augassign', _SUBSCRIPT_ASSIGN_AND_AUGASSIGN_STILL_PROPAGATE_WITH_NO_TRY ) ])
+
+	def test_subscript_augassign_with_fresh_rc_result_does_not_leak( self ) -> None:
+		self.assert_programs_run([ ( 'subscript_augassign_fresh_rc', _SUBSCRIPT_AUGASSIGN_WITH_FRESH_RC_RESULT_DOES_NOT_LEAK ) ])
 
 	def test_checked_arithmetic_inside_generator_body_still_works( self ) -> None:
 		self.assert_programs_run([ ( 'checked_arith_generator', _CHECKED_ARITHMETIC_INSIDE_GENERATOR_BODY_STILL_WORKS ) ])

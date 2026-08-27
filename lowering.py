@@ -2149,6 +2149,16 @@ class FunctionLowering:
 		# False, unaffected - nothing of the splice remains after it to
 		# skip past, so jumping to the caller's own epilogue is correct
 		# there, exactly as it always has been.
+		# set by _stmt_Expr right before lowering a bare discarded-call
+		# statement (`foo(...)` with no assignment) - snapshots len(self.
+		# _pending_temps) from BEFORE the call's own args are built, exactly
+		# like or_throw()/or_return()'s own receiver_pending_start (see their
+		# own comment for why: the CALL's argument temps must be released
+		# on _emit_or_throw's early-return propagate path too, not just the
+		# receiver). Consumed (and reset) by _finish_call_result the one time
+		# it actually reaches the discarded-Result auto-or_throw() branch -
+		# see its own comment.
+		self._discarded_call_pending_start: int|None = None
 		self._in_inline_splice_prelude = False
 		# parallel to self._cfg's own _inline_scope_stack (cfg.py), pushed/
 		# popped in lockstep by _splice_multi_statement_inline_body - cfg.py's
@@ -4627,6 +4637,21 @@ class FunctionLowering:
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( node.target, ast.Subscript ):
+			# snapshotted before ANY of obj/index/old/right/result below are
+			# built - same rationale as _stmt_Expr's own receiver_pending_
+			# start (see self._discarded_call_pending_start's own comment):
+			# both the get_dest and set_dest _auto_or_throw calls further
+			# down can each early-return via an uncovered Err leaf, and their
+			# own operand/argument temps (most commonly `result`, the fresh
+			# combined value passed into the discarded __setitem__ call)
+			# must be released on that path too, not just left pending for a
+			# normal end-of-statement flush the early return skips right
+			# past. Safe to snapshot this early because this whole branch IS
+			# the full statement - no outer in-progress expression's own
+			# pending temp could exist before this point to accidentally
+			# flush (see _flush_new_pending_temps's own docstring on why
+			# that would otherwise be unsafe).
+			subscript_pending_start = len( self._pending_temps )
 			obj = self._lower_expr( node.target.value, None )
 			getitem_fn = self._find_indexlike_getitem( obj.type )
 			if getitem_fn is None:
@@ -4723,7 +4748,10 @@ class FunctionLowering:
 				# _require_chained_result_return - _auto_or_throw must not
 				# re-validate (and re-report) either one on its own
 				old = (
-					self._auto_or_throw( node.target, get_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = True, pre_checked = True )
+					self._auto_or_throw(
+						node.target, get_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = True, pre_checked = True,
+						receiver_pending_start = subscript_pending_start,
+					)
 					if get_shape is not None else get_dest
 				)
 				assert old is not None # want_result=True above guarantees this
@@ -4737,7 +4765,10 @@ class FunctionLowering:
 					set_dest = self._new_temp( setitem_fn.return_type )
 					self._emit( ir.Call( dest = set_dest, target = setitem_fn, receiver = obj, args = [ index, result ], kwargs = {} ))
 					if set_shape is not None:
-						self._auto_or_throw( node.target, set_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = False, pre_checked = True )
+						self._auto_or_throw(
+							node.target, set_dest, self.lowering._SUBSCRIPT_ALTERNATIVES, want_result = False, pre_checked = True,
+							receiver_pending_start = subscript_pending_start,
+						)
 		else:
 			self.lowering.discovery.fail( f'unsupported AugAssign target: {ast.unparse(node)}', node )
 
@@ -4821,7 +4852,15 @@ class FunctionLowering:
 			return
 		if not isinstance( node.value, ast.Call ):
 			self.lowering.discovery.fail( f'unsupported expression statement: {ast.unparse(node)}', node )
+		# snapshotted BEFORE lowering the call at all (its own callee/args are
+		# about to be built) - see self._discarded_call_pending_start's own
+		# comment on why: a discarded Result-typed call whose Err leaf auto-
+		# propagates needs its OWN argument temps released on that early-
+		# return path too, exactly like an explicit .or_throw()/or_return()
+		# call's receiver_pending_start already does for the receiver
+		self._discarded_call_pending_start = len( self._pending_temps )
 		self._lower_call( node.value, None, want_result = False )
+		self._discarded_call_pending_start = None
 
 	def _lower_generator_yield( self, node: ast.Yield ) -> None:
 		''' PLAN_GENERATORS.md Phase F - a real `yield` suspend point:
@@ -16380,7 +16419,10 @@ class FunctionLowering:
 			return None
 		return unwrapped
 
-	def _auto_or_throw( self, node: ast.AST, value: ir.Operand, alternatives: str, *, want_result: bool = True, pre_checked: bool = False ) -> ir.Operand|None:
+	def _auto_or_throw(
+		self, node: ast.AST, value: ir.Operand, alternatives: str, *,
+		want_result: bool = True, pre_checked: bool = False, receiver_pending_start: int|None = None,
+	) -> ir.Operand|None:
 		''' The ONE general rule this whole file's auto-consumption story
 		now boils down to: whenever a Result[T,E]-shaped value is (1) a
 		discarded statement (want_result=False) or (2) flowing into a
@@ -16407,7 +16449,10 @@ class FunctionLowering:
 		shape = self.lowering._type_resolver._result_shape( value.type )
 		if shape is None:
 			return value if want_result else None
-		return self._emit_or_throw( node, value, want_result, alternatives = alternatives, pre_checked = pre_checked )
+		return self._emit_or_throw(
+			node, value, want_result, alternatives = alternatives, pre_checked = pre_checked,
+			receiver_pending_start = receiver_pending_start,
+		)
 
 	def _maybe_auto_consume_result( self, node: ast.AST, operand: ir.Operand, expected_type: Type|None, alternatives: str, *, context: str|None = None ) -> ir.Operand|None:
 		''' case 2 of the general auto-or_throw() rule (see _auto_or_throw's
@@ -16467,7 +16512,19 @@ class FunctionLowering:
 				self._emit( instr )
 			self._cfg.untrack_temp( result )
 			return None
-		self._auto_or_throw( node, result, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = False )
+		# consumed (and reset) here, the ONE place case-1 auto-or_throw
+		# actually reaches _emit_or_throw's own early-return propagate path -
+		# see self._discarded_call_pending_start's own comment. Only non-None
+		# when this call IS the bare discarded-statement call itself (set by
+		# _stmt_Expr immediately before lowering it); a nested call reached
+		# while building this one's own args/receiver always has want_result
+		# = True and returns above before ever reaching here, so it can never
+		# steal/clear this out from under the outer call
+		pending_start, self._discarded_call_pending_start = self._discarded_call_pending_start, None
+		self._auto_or_throw(
+			node, result, self.lowering._AUTO_CONSUME_ALTERNATIVES, want_result = False,
+			receiver_pending_start = pending_start,
+		)
 		return None
 
 	def _lower_parameter_default( self, target: Function, param: Parameter, node: ast.Call ) -> ir.Operand:
