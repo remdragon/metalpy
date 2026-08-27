@@ -4292,7 +4292,18 @@ class FunctionLowering:
 				)
 			operand = self._lower_expr( node.value, attr_var.type )
 			needs_field_lock = False
-			if self._construction_self is not None and obj is self._construction_self:
+			is_construction_write = self._construction_self is not None and obj is self._construction_self
+			if not is_construction_write:
+				# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #2 - mirrors
+				# cfg.py's assign() flipping reassigned_outside_init for a
+				# global the moment it's written from outside its own
+				# initializer. `obj is self._construction_self` is the ONLY
+				# "this write is __init__ constructing itself" shape (a write
+				# to some OTHER already-published object, even from within a
+				# different object's own __init__, is exactly the race this
+				# flag exists to catch) - so anything else flips it, unconditionally.
+				attr_var.field_reassigned_outside_init = True
+			if is_construction_write:
 				# self.<attr> = value, inside __init__ construction itself -
 				# tracked for definite-assignment/self-escape purposes (see
 				# RCCLASS ATTRIBUTE LIFETIME.md and cfg.attr_assign())
@@ -4360,14 +4371,14 @@ class FunctionLowering:
 				# of the old value and the store of the new one.
 				needs_field_lock = self._is_real_field_receiver( obj.type )
 				if needs_field_lock:
-					self._emit( ir.AcquireFieldLock( obj = obj ))
+					self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var ))
 				old = self._new_temp( attr_var.type )
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = target.attr ))
 				for instr in self._cfg.attr_replace( attr_var.type, old, operand, is_alias = self.lowering._is_aliasing_expr( node.value, operand )):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = target.attr, value = operand ))
 			if needs_field_lock:
-				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
@@ -4582,11 +4593,11 @@ class FunctionLowering:
 				# owned reference that this statement's own pending_temps
 				# cleanup balances at the end (see _new_temp/fresh_temp) -
 				# two owners in, two decrefs out, whichever branch below runs.
-				self._emit( ir.AcquireFieldLock( obj = obj ))
+				self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var ))
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
 				for instr in self._cfg.incref( attr_var.type, old ):
 					self._emit( instr )
-				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
 				self._cfg.fresh_temp( old, attr_var.type )
 			else:
 				self._emit( ir.GetAttr( dest = old, obj = obj, attr = node.target.attr ))
@@ -4623,7 +4634,11 @@ class FunctionLowering:
 			# needs its own explicit case-2 coercion
 			result = self._coerce_or_check_operand( self._lower_binop_values( node, old, right, attr_var.type ), attr_var.type, node )
 			needs_field_lock = False
-			if self._construction_self is not None and obj is self._construction_self:
+			is_construction_write = self._construction_self is not None and obj is self._construction_self
+			if not is_construction_write:
+				# see _stmt_Assign's identical flip for why
+				attr_var.field_reassigned_outside_init = True
+			if is_construction_write:
 				# self.<attr> += value, inside __init__ construction itself -
 				# same definite-assignment/self-escape tracking an ordinary
 				# self.<attr> = value gets in _stmt_Assign
@@ -4642,12 +4657,12 @@ class FunctionLowering:
 				# the lock across anything but one field access).
 				needs_field_lock = self._is_real_field_receiver( obj.type )
 				if needs_field_lock:
-					self._emit( ir.AcquireFieldLock( obj = obj ))
+					self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var ))
 				for instr in self._cfg.attr_replace( attr_var.type, old, result, is_alias = False ):
 					self._emit( instr )
 			self._emit( ir.SetAttr( obj = obj, attr = node.target.attr, value = result ))
 			if needs_field_lock:
-				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( node.target, ast.Subscript ):
@@ -7180,12 +7195,12 @@ class FunctionLowering:
 			if is_real_field:
 				self._check_field_visibility( field_obj.type, field_var, arg_node.attr, arg_node )
 			if is_real_field and cfg.rc_leaves( field_var.type ):
-				self._emit( ir.AcquireFieldLock( obj = field_obj ))
+				self._emit( ir.AcquireFieldLock( obj = field_obj, field = field_var ))
 				raw = self._new_temp( field_var.type )
 				self._emit( ir.GetAttr( dest = raw, obj = field_obj, attr = arg_node.attr ))
 				for instr in self._cfg.decref( field_var.type, raw ):
 					self._emit( instr )
-				self._emit( ir.ReleaseFieldLock( obj = field_obj ))
+				self._emit( ir.ReleaseFieldLock( obj = field_obj, field = field_var ))
 				self._cfg.untrack_temp( raw )
 				return
 			# either a non-RC field (nothing to decref - falls into the
@@ -11090,7 +11105,7 @@ class FunctionLowering:
 		# nothing here owns) - only obj's FIELD needs protecting.
 		attr_is_rc = bool( cfg.rc_leaves( attr_var.type )) and self._is_real_field_receiver( obj.type )
 		if attr_is_rc:
-			self._emit( ir.AcquireFieldLock( obj = obj ))
+			self._emit( ir.AcquireFieldLock( obj = obj, field = attr_var ))
 		self._emit( ir.GetAttr( dest = dest, obj = obj, attr = node.attr ))
 		if is_narrowed:
 			base = self.lowering.monomorphize_class( attr_var.type ) if isinstance( attr_var.type, Specialization ) else attr_var.type
@@ -11101,13 +11116,13 @@ class FunctionLowering:
 			self._emit( ir.GetAttr( dest = leaf_dest, obj = payload_dest, attr = f'v_{member.stem}' ))
 			if attr_is_rc:
 				self._emit( ir.Incref( value = leaf_dest ))
-				self._emit( ir.ReleaseFieldLock( obj = obj ))
+				self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
 				self._cfg.fresh_temp( leaf_dest, member.type )
 			return leaf_dest
 		if attr_is_rc:
 			for instr in self._cfg.incref( attr_var.type, dest ):
 				self._emit( instr )
-			self._emit( ir.ReleaseFieldLock( obj = obj ))
+			self._emit( ir.ReleaseFieldLock( obj = obj, field = attr_var ))
 			self._cfg.fresh_temp( dest, attr_var.type )
 		# a pointer-typed field passed into a differently-typed pointer parameter
 		# (e.g. sys.memcpy( ..., self.__metadata, ... ) where src is ConstPtr[u8])

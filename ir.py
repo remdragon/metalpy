@@ -713,16 +713,29 @@ class AcquireFieldLock( Instruction ):
 	materializing for straight-line code). `obj` is the RECEIVER operand
 	(not a Variable, unlike AcquireGlobalLock's `var` - the lock lives in
 	the object's OWN ObjectHeader, keyed off whichever expression currently
-	holds the reference, not off any particular binding of it). '''
+	holds the reference, not off any particular binding of it). `field` is
+	the field's own declared Variable (PLAN_THREAD_SAFE_SHARED_STATE.md
+	Cost mitigation #2) - lets emission time decide, per access, whether
+	THIS specific field ever needs the lock at all (a `__private` field
+	provably never reassigned outside `__init__` needs none - see
+	Variable.field_reassigned_outside_init's own comment), the same way
+	AcquireGlobalLock's own `var` already lets emission time consult
+	Variable.reassigned_outside_init. Optional (None for a synthesized/
+	internal access with no real declaring Variable to point at, e.g. one
+	reached through a chain this compiler doesn't track per-field) -
+	treated as "not exempt, needs the ordinary check" wherever consumed. '''
 	obj: Operand
+	field: Variable|None = None
 
 	def test_repr( self ) -> str:
 		return f'AcquireFieldLock( obj={self.obj!r} )'
 
 @dataclass( kw_only = True )
 class ReleaseFieldLock( Instruction ):
-	''' the matching END marker for AcquireFieldLock. '''
+	''' the matching END marker for AcquireFieldLock - `field` mirrors its
+	own identical field, see there for why. '''
 	obj: Operand
+	field: Variable|None = None
 
 	def test_repr( self ) -> str:
 		return f'ReleaseFieldLock( obj={self.obj!r} )'

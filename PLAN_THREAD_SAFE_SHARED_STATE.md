@@ -13,9 +13,9 @@ all previously-blocking bugs fixed, verified under real concurrent stress
 to master.**
 
 **Performance follow-ons (the "Cost mitigations" section below) - status
-update: staged into 4 sessions, Stage 1 landed and merged (see Cost
-mitigation #1's own status update for the full writeup), Stages 2-4 not
-yet started.**
+update: staged into 4 sessions, Stages 1-2 landed and merged (see Cost
+mitigations #1/#2's own status updates for the full writeups), Stages 3-4
+not yet started.**
 
 What's built: `ir.AcquireFieldLock`/`ReleaseFieldLock` markers (ir.py,
 mirroring Part A's global-lock markers, keyed on the receiver operand
@@ -1082,6 +1082,45 @@ issue.)
    reassigned from within its own defining class?) wasn't confirmed during
    this investigation and needs checking before assuming A.1's global
    exemption is as unconditionally cheap as stated there.
+
+   **Status update: implemented and merged, `__private` fields only, exactly
+   the scope described above.** `ir.AcquireFieldLock`/`ReleaseFieldLock`
+   gained a new `field: Variable|None` operand (the field's own declared
+   `Variable`) so emission time can identify WHICH field a given critical
+   section is for — every one of `lowering.py`'s ~11 construction sites now
+   passes it through. `Variable` gained a new `field_reassigned_outside_init`
+   flag (deliberately separate from `reassigned_outside_init`, since that
+   one's `is_global`-scoped precondition and this one's `__private`/
+   `__init__`-scoped precondition are different questions that happen to
+   share a "provably single-writer" shape — conflating them would let one's
+   flip silently satisfy the other's very different soundness requirement),
+   flipped by `lowering.py`'s non-construction `SetAttr` branches in
+   `_stmt_Assign`/`_stmt_AugAssign` (mirroring `cfg.py`'s `assign()` flipping
+   `reassigned_outside_init` for a global) the moment a field is written from
+   anywhere OTHER than `obj is self._construction_self` — a write to some
+   OTHER already-published object, even from inside a *different* object's
+   own `__init__`, still flips it, which is exactly the race this flag
+   exists to catch. `emitter_c.py`'s new `_field_lock_exempt()` gates the
+   `AcquireFieldLock`/`ReleaseFieldLock` no-op decision on `field.stem`
+   being genuinely `__private` (leading `__`, not also trailing `__` — the
+   same name-mangling test `discovery.check_field_visibility` already uses)
+   AND `not field.field_reassigned_outside_init`. Confirmed load-bearing via
+   a real sabotage test: forcing the exemption to always report `True`
+   reproduced a real "double free/release detected" crash in a new stress
+   test (`thread_safe_fields_test.py`'s
+   `test_private_field_reassigned_outside_init_stress` — a `__private` field
+   reassigned from another private method, not `__init__`), restored
+   immediately after confirming that. New `thread_detection_test.py`
+   coverage: a `__private` write-once-in-`__init__` field gets no lock
+   codegen even in a program that DOES spawn a thread elsewhere (the
+   per-field exemption is independent of Cost mitigation #1's whole-program
+   flag), and a `__private` field reassigned outside `__init__` still gets
+   real lock codegen (confirms the detector checks
+   `field_reassigned_outside_init`, not just the `__` name shape). Full
+   3-compiler suite clean, including with `METALPY_RUN_LOAD_TESTS=1`.
+   `_protected`/public fields remain out of scope, as originally decided
+   above — a `__private`-only exemption needed no interprocedural
+   reasoning; that follow-on would.
 3. **"Pull into a local" is already the idiom, for free.** A field/global
    read into a local already produces an independently owned, freshly
    increfed reference under this compiler's existing convention (verified

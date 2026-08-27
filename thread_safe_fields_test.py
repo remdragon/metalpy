@@ -113,6 +113,101 @@ def main() -> i32:
 	return 0
 '''
 
+# the __private write-once-after-__init__ exemption's own sabotage target
+# (PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #2) - a `__current` field
+# reassigned NOT from __init__ but from another method of the SAME class
+# (Holder.__swap, itself only reachable through the public trigger_swap
+# wrapper - `self.__current = ...` inside a private method is still a
+# legitimate, allowed private access, but it's NOT construction, so
+# Variable.field_reassigned_outside_init must flip True here). Field-shaped
+# analogue of _CONCURRENT_FIELD_READ_WRITE_STRESS above; the only structural
+# difference is the leading '__' and the write going through a private
+# method instead of a free function - if the exemption's detector ever
+# wrongly reported this field as exempt (e.g. by trusting the '__' prefix
+# alone, without checking field_reassigned_outside_init), the SAME real
+# torn/freed-pointer race _CONCURRENT_FIELD_READ_WRITE_STRESS above catches
+# would reproduce here too, since no lock would ever be emitted for it.
+_PRIVATE_FIELD_REASSIGNED_OUTSIDE_INIT_STRESS = '''
+import compiler
+import threading
+
+class Box:
+	x: i32
+	def __init__( self, x: i32 ) -> None:
+		self.x = x
+
+class Holder:
+	__current: Box
+	def __init__( self, initial: Box ) -> None:
+		self.__current = initial
+	def __swap( self, n: i32 ) -> None:
+		self.__current = Box( n )
+	def trigger_swap( self, n: i32 ) -> None:
+		self.__swap( n )
+	def read( self ) -> Box:
+		return self.__current
+
+class Reader:
+	h: Holder
+	saw_bad: bool
+	def __init__( self, h: Holder ) -> None:
+		self.h = h
+		self.saw_bad = False
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 2000:
+			b: Box = self.h.read()
+			if b.x < -1:
+				self.saw_bad = True
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+class Writer:
+	h: Holder
+	def __init__( self, h: Holder ) -> None:
+		self.h = h
+	def run( self ) -> None:
+		i: i32 = 0
+		while i < 2000:
+			self.h.trigger_swap( i )
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+def main() -> i32:
+	h: Holder = Holder( Box( -1 ) )
+	readers: list[Reader] = list[Reader]()
+	threads: list[threading.Thread] = list[threading.Thread]()
+	i: i32 = 0
+	while i < 32:
+		r: Reader = Reader( h )
+		readers.append( r )
+		threads.append( threading.Thread( r.run ) )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	i = 0
+	while i < 8:
+		w: Writer = Writer( h )
+		threads.append( threading.Thread( w.run ) )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	k: usize = 0
+	nt: usize = threads.__len__()
+	while k < nt:
+		th: threading.Thread = threads.__getitem__( k ).unwrap( 'index in bounds' )
+		th.join()
+		with compiler.wrap_arithmetic:
+			k += 1
+	j: usize = 0
+	nr: usize = readers.__len__()
+	while j < nr:
+		r2: Reader = readers.__getitem__( j ).unwrap( 'index in bounds' )
+		if r2.saw_bad:
+			return 1
+		with compiler.wrap_arithmetic:
+			j += 1
+	return 0
+'''
+
 # a plain scalar field (no RC leaves at all) written via SetAttr from many
 # threads - regression guard for the field-shaped version of Part A's own
 # "no RC leaves -> no lock, ever" early return (cfg.rc_leaves(attr_var.type)
@@ -344,6 +439,15 @@ class ThreadSafeFieldsTests( RealCompileMixin, unittest.TestCase ):
 		# own executable: real OS threads, must not be merged with other
 		# cases via assert_programs_run
 		self.assert_programs_run([ ( 'concurrent_field_read_write_stress', _CONCURRENT_FIELD_READ_WRITE_STRESS ) ], timeout = 30.0 )
+
+	@unittest.skipUnless( sys.platform in ( 'win32', 'linux' ), 'Part B only guards Windows/Linux targets - see this file\'s own header comment' )
+	@test_support.skip_unless_load_tests
+	def test_private_field_reassigned_outside_init_stress( self ) -> None:
+		# own executable: real OS threads, must not be merged with other
+		# cases via assert_programs_run - PLAN_THREAD_SAFE_SHARED_STATE.md
+		# Cost mitigation #2's own sabotage target (see the source's own
+		# header comment above)
+		self.assert_programs_run([ ( 'private_field_reassigned_outside_init_stress', _PRIVATE_FIELD_REASSIGNED_OUTSIDE_INIT_STRESS ) ], timeout = 30.0 )
 
 	def test_scalar_field_unaffected( self ) -> None:
 		self.assert_programs_run([ ( 'scalar_field_unaffected', _SCALAR_FIELD_UNAFFECTED ) ])
