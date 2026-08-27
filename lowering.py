@@ -2171,6 +2171,19 @@ class FunctionLowering:
 		# return, CEnum construction) leaves this False and gets validated
 		self._allow_literal_bit_reinterpret = False
 		self._defer_flags: list[Variable] = []
+		# hidden for-loop iterator locals (__for_obj_N) whose real assignment
+		# sits at the for-statement's own lexical position, guarded only by
+		# whatever ENCLOSING loop/branch reaches it - a for-loop nested
+		# inside another loop leaves __for_obj_N genuinely uninitialized on
+		# the outer-loop-never-runs path. Safe at runtime regardless (the
+		# corresponding _defer_flags entry starts False - see
+		# _emit_epilogue's flag_inits - so the guarded release this guards
+		# never actually reads it), but MSVC's flow analysis can't see that
+		# correlation across two different variables and flags it anyway
+		# (C4703). _emit_epilogue splices a real `= 0` default init for each
+		# of these right after FuncStart, same trick flag_inits already
+		# uses, so the declaration is never skippable-over by a goto
+		self._for_obj_null_inits: list[Variable] = []
 		# PLAN_GENERATORS.md's defer/errdefer phase (Mechanism 2) - whatever
 		# type_resolver.py's _tag_armed_defer_sites tagged the statement
 		# CURRENTLY being lowered with (see _lower_stmt's own push/pop),
@@ -2691,6 +2704,12 @@ class FunctionLowering:
 		] + [
 			ir.Assign( dest = flag, src = ir.Const( type = flag.type, value = True ))
 			for flag in self._cfg.cancel_flags()
+		] + [
+			# see self._for_obj_null_inits's own comment - default-initialize
+			# so a goto that skips this loop's real assignment (an enclosing
+			# loop that never runs) leaves a well-defined null, not garbage
+			ir.Assign( dest = var, src = ir.Const( type = var.type, value = None ))
+			for var in self._for_obj_null_inits
 		]
 		self._instructions[body_start:body_start] = flag_inits
 
@@ -5467,8 +5486,7 @@ class FunctionLowering:
 		# we get here inside a loop, BODY always falls through to its own
 		# natural end, so this registered defer is always disarmed again a few
 		# lines down and never actually replayed at the function's own epilogue
-		self._register_defer_block( is_err_only = False, body = [ _make_exit_stmt() ], node = node, allow_inside_loop = True )
-		exit_flag = self._defer_flags[-1] # the one push_defer above just armed
+		exit_entry = self._register_defer_block( is_err_only = False, body = [ _make_exit_stmt() ], node = node, allow_inside_loop = True )
 
 		for stmt in node.body:
 			# same per-statement recovery boundary as the arithmetic-mode/
@@ -5479,8 +5497,8 @@ class FunctionLowering:
 				continue
 
 		if not node.body or not self._stmt_diverges( node.body[-1] ):
-			bool_cls = self.lowering.discovery.find_name( 'bool', node )
-			self._emit( ir.Assign( dest = exit_flag, src = ir.Const( type = bool_cls, value = False )))
+			for instr in self._cfg.disarm_defer( exit_entry ):
+				self._emit( instr )
 			self._lower_stmt( _make_exit_stmt() )
 
 	def _body_may_break_or_continue_to_enclosing_loop( self, body: list[ast.stmt] ) -> bool:
@@ -5662,14 +5680,13 @@ class FunctionLowering:
 				'discard whatever the try/except was actually about to return', node,
 			)
 
-		exit_flag: Variable|None = None
+		exit_entry: cfg.Epilogue|None = None
 		if node.finalbody:
 			# registered BEFORE the body is lowered, exactly like
 			# _lower_with_context_manager's own __exit__ - covers every
 			# early-exit path reached from inside body/else/any handler
 			# (return, or an uncovered or_throw() leaf propagating out)
-			self._register_defer_block( is_err_only = False, body = node.finalbody, node = node, allow_inside_loop = True )
-			exit_flag = self._defer_flags[-1]
+			exit_entry = self._register_defer_block( is_err_only = False, body = node.finalbody, node = node, allow_inside_loop = True )
 
 		# Handlers are mutually-exclusive alternatives - structurally like
 		# if/elif arms - and get the same enter_branch/snapshot/restore/
@@ -5859,9 +5876,9 @@ class FunctionLowering:
 				# _lower_with_context_manager uses for its own __exit__,
 				# just at this construct's own (possibly multi-path)
 				# fallthrough merge point instead of a single body's own end
-				bool_cls = self.lowering.discovery.find_name( 'bool', node )
-				assert exit_flag is not None
-				self._emit( ir.Assign( dest = exit_flag, src = ir.Const( type = bool_cls, value = False )))
+				assert exit_entry is not None
+				for instr in self._cfg.disarm_defer( exit_entry ):
+					self._emit( instr )
 				for stmt in node.finalbody:
 					try:
 						self._lower_stmt( stmt )
@@ -7485,13 +7502,17 @@ class FunctionLowering:
 			)
 		self._emit( ir.DecrefDynamic( value = operand ))
 
-	def _register_defer_block( self, is_err_only: bool, body: list[ast.stmt], node: ast.AST, *, allow_inside_loop: bool = False ) -> None:
+	def _register_defer_block( self, is_err_only: bool, body: list[ast.stmt], node: ast.AST, *, allow_inside_loop: bool = False ) -> cfg.Epilogue:
 		''' allow_inside_loop is set only by _lower_with_context_manager,
 		whose own loop-safety is verified by its caller via
 		_body_may_break_or_continue_to_enclosing_loop before this runs - see
 		that check's own comment for why a with-statement's internal defer registration
 		doesn't share defer/errdefer's own "single armed slot" hazard in
-		the case it actually uses this override. '''
+		the case it actually uses this override. Returns the pushed
+		Epilogue entry - a caller whose own body always falls through to a
+		single, always-executed exit point (with/for/try-finally) should
+		hand it to cfg.py's disarm_defer() there instead of unconditionally
+		emitting a runtime `flag = false` reset. '''
 		kind = 'errdefer' if is_err_only else 'defer'
 		if self._loop_depth > 0 and not allow_inside_loop:
 			self.lowering.discovery.fail( f'{kind} is not allowed inside a loop - call another function and {kind} inside that instead', node )
@@ -7537,10 +7558,11 @@ class FunctionLowering:
 			self._in_deferred_body = outer_in_deferred_body
 
 		self._defer_flags.append( flag )
-		self._cfg.push_defer( captured, flag, is_err_only )
+		entry = self._cfg.push_defer( captured, flag, is_err_only )
 		# this is what actually runs at the with-statement's/call's position -
 		# marks the block "armed" so the epilogue knows to replay it
 		self._emit( ir.Assign( dest = flag, src = ir.Const( type = bool_cls, value = True )))
+		return entry
 
 	# --- loops ---------------------------------------------------------------
 
@@ -7867,6 +7889,7 @@ class FunctionLowering:
 			body_snapshot = self._cfg.snapshot()
 			instructions_mark = len( self._instructions )
 			defer_flags_mark = len( self._defer_flags )
+			for_obj_null_inits_mark = len( self._for_obj_null_inits )
 			cancel_flags_mark = self._cfg.cancel_flag_count
 			pending_temps_mark = len( self._pending_temps )
 			# fn.names is lowering.py's own (not cfg.py's) name->Variable table -
@@ -7897,6 +7920,7 @@ class FunctionLowering:
 					self.lowering.discovery.fail( str( e ), node )
 				del self._instructions[instructions_mark:]
 				del self._defer_flags[defer_flags_mark:]
+				del self._for_obj_null_inits[for_obj_null_inits_mark:]
 				self._cfg.truncate_cancel_flags( cancel_flags_mark )
 				del self._pending_temps[pending_temps_mark:]
 				self._cfg.hard_restore( body_snapshot )
@@ -8449,11 +8473,11 @@ class FunctionLowering:
 			return stmt
 
 		obj_needs_release = self._cfg.is_fresh_temp( obj )
-		obj_release_flag: Variable|None = None
+		obj_release_entry: cfg.Epilogue|None = None
 		if obj_needs_release:
 			self._cfg.untrack_temp( obj )
-			self._register_defer_block( is_err_only = False, body = [ _make_obj_decref_stmt() ], node = node, allow_inside_loop = True )
-			obj_release_flag = self._defer_flags[-1] # the one push_defer above just armed
+			obj_release_entry = self._register_defer_block( is_err_only = False, body = [ _make_obj_decref_stmt() ], node = node, allow_inside_loop = True )
+			self._for_obj_null_inits.append( obj_var )
 		next_var = self._declare_hidden_local( f'__for_next_{unique}', result_type, node )
 
 		if remaining_error_type is not None:
@@ -8619,8 +8643,9 @@ class FunctionLowering:
 			# ends"). An early return reached from inside the loop body
 			# never reaches this point at all - that path is exactly what
 			# the still-armed defer itself covers, replayed by _stmt_Return.
-			assert obj_release_flag is not None
-			self._emit( ir.Assign( dest = obj_release_flag, src = ir.Const( type = bool_cls, value = False )))
+			assert obj_release_entry is not None
+			for instr in self._cfg.disarm_defer( obj_release_entry ):
+				self._emit( instr )
 			self._lower_stmt( _make_obj_decref_stmt() )
 
 	def _lower_for_over_iterator_fallible_bind(
@@ -15683,6 +15708,7 @@ class FunctionLowering:
 				# ownership_retry's own identical rollback discipline.
 				instructions_mark = len( self._instructions )
 				defer_flags_mark = len( self._defer_flags )
+				for_obj_null_inits_mark = len( self._for_obj_null_inits )
 				cancel_flags_mark = self._cfg.cancel_flag_count
 				pending_temps_mark = len( self._pending_temps )
 				names_snapshot = dict( self._current_fn.names )
@@ -15706,6 +15732,7 @@ class FunctionLowering:
 				init = resolved_init
 				del self._instructions[instructions_mark:]
 				del self._defer_flags[defer_flags_mark:]
+				del self._for_obj_null_inits[for_obj_null_inits_mark:]
 				self._cfg.truncate_cancel_flags( cancel_flags_mark )
 				del self._pending_temps[pending_temps_mark:]
 				self._current_fn.names.clear()
