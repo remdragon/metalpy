@@ -1453,10 +1453,95 @@ a lazy-init site and a crash.
    today: `linker_c.py`/`emitter_c.py` currently reference no `-mcx16`,
    `libatomic`, or `cmpxchg16b` anywhere, grep-confirmed).
 
+   **Real-world hardware/deployment trade-offs of `CMPXCHG16B` itself**
+   (as distinct from the in-compiler implementation cost above), checked
+   against real sources, not assumed:
+
+   - **Reliability - a hard crash risk this compiler doesn't have today.**
+     `CMPXCHG16B` (unlike the plain `CMPXCHG`/`CMPXCHG8B` this compiler
+     already emits) has a genuine HARDWARE alignment requirement, not just
+     a performance nicety: the destination operand must be 16-byte
+     aligned, or the instruction faults
+     ([Felix Cloutier's x86 reference](https://www.felixcloutier.com/x86/cmpxchg8b:cmpxchg16b)).
+     A misaligned `[pointer, count]` word - a real risk given this
+     compiler already has three independently-behaving struct-layout
+     paths (MSVC/clang/gcc) - would be a hard runtime crash (`#GP`), not a
+     slowdown, on every target that actually executes the instruction.
+     Separately: modern CPUs/kernels increasingly treat ANY locked
+     instruction whose operand crosses a cache line ("split lock") as
+     disruptive enough to actively police - Intel's own guidance
+     describes split-lock atomics as able to "serialize a massive system,
+     halting all transactions from all cores... for the duration of the
+     atomic instruction" (10s of microseconds), which is why some Linux
+     kernels now detect and kill/throttle offending processes
+     ([Intel Community](https://community.intel.com/t5/Intel-oneAPI-Threading-Building/lock-cmpxchg8b-causes-excessive-L3-Cache-Misses/td-p/1040971)).
+     `CMPXCHG16B`'s hardware alignment requirement is exactly what
+     prevents this failure mode for THIS instruction specifically - but
+     only if the compiler's own layout code actually guarantees it on
+     every target, which is new correctness surface, not a given.
+   - **Availability - a real, if currently narrow, deployment gap.**
+     `CMPXCHG16B` support is a CPUID-reported feature
+     (`CPUID.01H:ECX[13]`), not an architectural guarantee even on
+     64-bit x86 - early 64-bit AMD/Intel silicon shipped without it, and
+     it's still an OPTIONAL, maskable feature under virtualization today:
+     hypervisors (Hyper-V, VMware EVC, VirtualBox - VirtualBox defaults
+     this OFF for new VMs) can and do hide it from a guest even when the
+     physical host supports it, specifically to allow live migration
+     across a fleet of mixed-generation hardware
+     ([VMware EVC FAQ](https://knowledge.broadcom.com/external/article/313545/vmware-evc-and-cpu-compatibility-faq.html),
+     [VirtualBox ticket #10792](https://www.virtualbox.org/ticket/10792)).
+     Critically, that masking does NOT stop a program from issuing the
+     instruction anyway - a Linux kernel patch thread on exactly this
+     topic notes CPUID masking "does not disable the actual features," so
+     "an application can still use masked features, which can cause
+     failures if a virtual machine is migrated to a host that does not
+     physically support" them
+     ([LKML](https://lkml.iu.edu/hypermail/linux/kernel/1207.3/00155.html)).
+     For a compiler that ships native executables to run on whatever
+     machine the user has, this is a real, silent `SIGILL` risk on some
+     nonzero slice of virtualized/cloud deployments today - not a
+     theoretical worry, and this compiler has no runtime CPUID-dispatch
+     mechanism to fall back gracefully if the instruction is unavailable.
+     No ARM equivalent exists for this repo's current target matrix
+     (Windows-x64/Linux-x64 only) to worry about yet, but worth recording
+     for any future port: ARM's own 128-bit atomic story is newer and
+     less uniform than x86's - a dedicated `CASP` instruction only arrived
+     with the ARMv8.1 "Large Systems Extensions," with fully atomic 128-bit
+     load/store not guaranteed until ARMv8.4 (`LSE2`); older ARMv8.0
+     cores need a weaker `LDXP`/`STXP` load-linked/store-conditional
+     fallback with different performance and (per Microsoft's own AArch64
+     atomics writeup) subtler atomicity guarantees
+     ([Old New Thing](https://devblogs.microsoft.com/oldnewthing/20220811-00/?p=106963),
+     [ARM developer docs](https://developer.arm.com/documentation/110478/0100/AArch64-Atomic-Instructions/The-different-groups-of-A64-atomic-instructions)).
+   - **Performance - not free even when it works.** `CMPXCHG16B` still
+     needs the `LOCK` prefix for cross-core atomicity, the same
+     serializing/memory-fence cost class as any locked instruction
+     (confirmed by older but illustrative Pentium 4 measurements showing
+     locked `CMPXCHG8B` running ~67 cycles slower than its unlocked form -
+     [LKML](https://lkml.iu.edu/1012.1/00263.html)); a correctly-aligned
+     16-byte CAS is not dramatically cheaper per-operation than today's
+     4-byte spinlock CAS, and under real contention BOTH still cause the
+     same cache-line-bouncing between cores' private caches (MESI
+     protocol) - the win this upgrade path targets is removing the
+     retry-loop/spin from the READ side entirely, not making each
+     individual atomic op faster.
+   - **Build times - genuinely not a concern.** `-mcx16` is a pure codegen
+     flag (enables use of one instruction pattern when the compiler's own
+     IR calls for a 16-byte atomic); it doesn't change what gets compiled
+     or add extra passes, so no measurable build-time impact either way -
+     the risk this flag carries is entirely about correctness/availability
+     at RUN time, not compile time.
+
    Net: worth reconsidering only alongside A.2's own representation work,
    not as a standalone flag-wiring task, and only with real profiling
    evidence that Stage 3/4's existing spinlock is an actual bottleneck
-   under real contention - not pursued further for now.
+   under real contention - not pursued further for now. Even setting the
+   in-compiler implementation cost aside, the real-world trade-offs above
+   (a hard-crash alignment requirement, a genuine cloud/VM availability
+   gap this compiler has no runtime fallback for, and a locked instruction
+   that's still not free under contention) make this a meaningfully
+   riskier primitive than today's Stage 3/4 spinlock, not just a more
+   complex one to build.
 
 ## Verification plan for any future attempt
 
