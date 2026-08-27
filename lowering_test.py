@@ -6059,31 +6059,28 @@ class Tests( unittest.TestCase ):
 		# happens BEFORE _compile_now, so eager lowering sees an already-
 		# closed body and infers the real return type correctly regardless.
 		# NOTE: checked at the LOWERING level only (never calls emitter_c.
-		# emit_c()) - the outer generic apply[T,K]'s own return type
-		# substitution through a Closure[...]-shaped parameter has a
-		# separate, PRE-EXISTING gap unrelated to captures (confirmed
-		# reproducible with a plain bound-method closure argument too, no
-		# lambda/capture involved) that only surfaces at C emission time;
-		# not fixed here, out of scope - this test only verifies what this
-		# pass is actually responsible for: the closure's OWN return type is
-		# correctly, eagerly inferred despite capturing.
+		# emit_c()) - this test only verifies what THIS pass is responsible
+		# for (the closure's OWN return type, correctly eagerly inferred
+		# despite capturing). The outer generic apply[T,K]'s own return
+		# type substitution through a Closure[...]-shaped parameter used to
+		# have a separate gap (_unify_type_param/_type_mentions_param had
+		# no ClosureType branch, so K was wrongly return-only-inferred
+		# instead of bound from `key`'s own real type) - now fixed, see
+		# emitter_c_test.py's test_generic_closure_param_return_type_
+		# inferred_from_argument for the full compile+run coverage.
 		code = '\n'.join([
 			'def apply[T,K]( x: T, key: Closure[[T],K] ) -> K:',
 			'	return key( x )',
 			'',
 			'def outer( y: i32 ) -> i32:',
-			# assigned to an unannotated local, NOT returned directly - this
-			# file's own _emit_generic_call now types a generic call's dest
-			# as the REAL (monomorphized) return type rather than silently
-			# trusting the outer context's own expected type (see that
-			# method's own comment) - `return apply(...)` directly would
-			# check the call's result against outer's own -> i32, tripping
-			# this Closure[...]-shaped-return-type-substitution gap (still
-			# genuinely unresolved to a concrete i32 - see this test's own
-			# docstring, "not fixed here, out of scope") earlier than
-			# before. i32(5), not a bare 5, still needed - see this file's
-			# own bare-literal-default comment elsewhere - i32 is the ONLY
-			# other thing that could pin T here.
+			# assigned to an unannotated local, NOT returned directly -
+			# unrelated to the now-fixed Closure gap above, kept as-is since
+			# it still exercises this file's own _emit_generic_call typing a
+			# generic call's dest as the REAL (monomorphized) return type
+			# rather than the outer context's own expected type. i32(5), not
+			# a bare 5, still needed - see this file's own bare-literal-
+			# default comment elsewhere - i32 is the ONLY other thing that
+			# could pin T here.
 			'	result = apply( i32( 5 ), key = lambda v: y )',
 			'	return y',
 		])

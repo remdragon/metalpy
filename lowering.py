@@ -1835,6 +1835,30 @@ class Lowering:
 				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
 			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
 			return
+		if isinstance( declared, ClosureType ) and isinstance( actual, ClosureType ):
+			# key: Closure[[T],K] - a bound-method/capturing-lambda-typed
+			# parameter, unified the same way a Ptr[Callable[[T],K]]
+			# parameter's own CallableType branch (just above) does; a
+			# capturing lambda argument's own REAL return type is already
+			# known by this point (_expr_Lambda's own eager-lowering infers
+			# it from the body regardless of any hint - PLAN_LAMBDA.md), so
+			# K binds normally from `actual` here rather than needing
+			# return-only inference at all. Without this, K was classified
+			# as return-only-missing (_type_mentions_param has the same gap -
+			# see its own ClosureType branch) and _infer_return_only_type_
+			# params tried to re-derive it by eagerly compiling `apply`'s
+			# OWN body against `key`'s still-abstract declared type
+			# (Closure[[T],K]) - self-referential and unable to ever resolve
+			# to anything concrete, since it has no access to the ACTUAL
+			# argument's real inferred type at all. That silently bound K to
+			# itself (declared IS the bare type param K, unify's own tv-
+			# match branch accepts any `actual`, including K right back),
+			# reaching emitter_c.py with a still-bare TypeVar - "c_type:
+			# unsupported type" - confirmed by a real repro.
+			for d_arg, a_arg in zip( declared.arg_types, actual.arg_types ):
+				self._unify_type_param( type_params, d_arg, a_arg, bindings, node, context_qualname )
+			self._unify_type_param( type_params, declared.return_type, actual.return_type, bindings, node, context_qualname )
+			return
 		if isinstance( declared, TaggedUnion ) and declared.file is None and not isinstance( actual, TaggedUnion ):
 			# anonymous union parameter (X|None) whose non-None leaf can
 			# itself mention a type param (e.g. `key: Ptr[Callable[[T],K]]
@@ -1916,23 +1940,31 @@ class Lowering:
 	def _type_mentions_param( self, t: Type|None, tv: TypeVar ) -> bool:
 		''' PLAN_RETURN_INFERENCE.md - true if the bare TypeVar `tv` occurs
 		anywhere inside `t`, using the SAME structural recursion
-		_unify_type_param itself uses (Specialization.args, CallableType.
-		arg_types/return_type) - deliberately not the broader shape
-		Monomorphizer.substitute_type_params uses (which also recurses into
-		ClosureType/anonymous-TaggedUnion leaves): "does this parameter
-		type CONTAIN tv" needs to agree exactly with "would _unify_type_param
-		actually BIND tv from an argument at this position", or a type param
-		that's structurally present but never actually unified against
-		would be wrongly classified as argument-inferable and never get a
-		chance at return-only inference at all. '''
+		_unify_type_param itself uses (Specialization.args, CallableType/
+		ClosureType.arg_types/return_type, anonymous-TaggedUnion leaves):
+		"does this parameter type CONTAIN tv" needs to agree exactly with
+		"would _unify_type_param actually BIND tv from an argument at this
+		position", or a type param that's structurally present but never
+		actually unified against would be wrongly classified as argument-
+		inferable and never get a chance at return-only inference at all.
+		A `key: Closure[[T],K]` parameter is the confirmed real case for
+		ClosureType: without that branch, K was wrongly classified as
+		return-only-missing, and _infer_return_only_type_params tried to
+		re-derive it by eagerly compiling the GENERIC function's own body
+		against `key`'s still-abstract declared type - self-referential and
+		unable to ever resolve to anything concrete, since it has no access
+		to the actual argument's real (already-known, via eager lambda-
+		lowering) closure type at all. '''
 		if t is None:
 			return False
 		if t is tv:
 			return True
 		if isinstance( t, Specialization ):
 			return any( self._type_mentions_param( a, tv ) for a in t.args )
-		if isinstance( t, CallableType ):
+		if isinstance( t, ( CallableType, ClosureType )):
 			return any( self._type_mentions_param( a, tv ) for a in t.arg_types ) or self._type_mentions_param( t.return_type, tv )
+		if isinstance( t, TaggedUnion ) and t.file is None:
+			return any( self._type_mentions_param( attr.type, tv ) for attr in t.attributes )
 		if isinstance( t, GeneratorType ):
 			# Generator[T,E]/Iterator[Result[T,E]]/Generator[T,SendType,E] -
 			# a return-only type param can live inside any of these slots

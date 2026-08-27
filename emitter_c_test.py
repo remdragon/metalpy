@@ -17492,6 +17492,37 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
 
 	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_generic_closure_param_return_type_inferred_from_argument( self ) -> None:
+		# key: Closure[[T],K] (a capturing-lambda/bound-method-typed
+		# parameter, unlike Ptr[Callable[...]] above) had its own, separate
+		# gap: _unify_type_param/_type_mentions_param had no ClosureType
+		# branch, so K was wrongly classified as return-only-missing
+		# (referenced by no parameter at all) rather than argument-
+		# inferable from `key`'s own real, already-known (via eager lambda-
+		# lowering, PLAN_LAMBDA.md) closure type. _infer_return_only_type_
+		# params then tried to re-derive K by eagerly compiling apply's own
+		# body against `key`'s still-abstract declared type - self-
+		# referential (K only known through calling `key`, itself typed
+		# Closure[[T],K]) and never resolves to anything concrete, silently
+		# binding K to itself and reaching emitter_c.py as a still-bare
+		# TypeVar - "c_type: unsupported type" - confirmed via a real repro
+		# (lowering_test.py's test_lambda_eager_return_type_inference_with_
+		# capture already covered the LOWERING-level half of this shape;
+		# this covers the full compile+run, previously unreachable).
+		self._run( '''
+def apply[T,K]( x: T, key: Closure[[T],K] ) -> K:
+	return key( x )
+
+def main() -> i32:
+	y: i32 = 5
+	result: i32 = apply( i32( 5 ), key = lambda v: y )
+	with compiler.wrap_arithmetic:
+		return result - 5
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ))
+
+	@unittest.skipUnless( _CC is not None, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	def test_field_lazy_init_narrows_past_if( self ) -> None:
 		# regression: `if self.g is None: self.g = Owned(...)` never narrowed
 		# self.g on the path after the if, even though every reaching path
