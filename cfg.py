@@ -334,7 +334,7 @@ class CFGState:
 		self.bindings[key if key is not None else operand.stem] = _Binding( operand = operand, type = type_for_decref, state = state, entry = entry )
 		return entry
 
-	def push_defer( self, instructions: list[ir.Instruction], flag: Variable, is_err_only: bool ) -> None:
+	def push_defer( self, instructions: list[ir.Instruction], flag: Variable, is_err_only: bool ) -> Epilogue:
 		''' defer/errdefer's own replay, registered at the defer/errdefer
 		statement's own position (lowering.py emits the flag's own `= True`
 		Assign right after this call - that's what "armed" means at
@@ -343,10 +343,35 @@ class CFGState:
 		stack together, deepest first. Never touches self.bindings (there's
 		no name to look it up by - it's not a variable), so it's immune to
 		merge_if()'s dict-based reconciliation entirely; restore() below
-		gives it the different treatment it actually needs instead. '''
-		self._epilogue_stack.append( Epilogue(
+		gives it the different treatment it actually needs instead.
+		Returns the pushed entry so a caller whose own body always falls
+		through (with's __exit__, a for-loop's iterator release, try/
+		finally's finalbody) can hand it straight to disarm_defer() below,
+		instead of unconditionally emitting a runtime flag reset. '''
+		entry = Epilogue(
 			instructions = instructions, name = self._new_label( 'epilogue' ), flag = flag, is_err_only = is_err_only,
-		))
+		)
+		self._epilogue_stack.append( entry )
+		return entry
+
+	def disarm_defer( self, entry: Epilogue ) -> list[ir.Instruction]:
+		''' called right where a defer/errdefer's registering construct
+		(with/for/try-finally) reaches its own natural, always-executed exit
+		- the caller is about to replay entry's body directly, right here,
+		so the function-epilogue ladder must never replay it again. Thin
+		wrapper over _neutralize(): the overwhelmingly common case (nothing
+		earlier in the function has already committed a goto into entry's
+		own shared label) statically cancels it, returning no instructions
+		at all - emitting `flag = false` there anyway is always-false-at-
+		runtime dead code MSVC's flow analysis proves and warns on (C4702)
+		at every one of these call sites. Falls back to the real runtime
+		reset only in the rarer captured-label case, exactly like
+		_neutralize()'s other callers. Discards the replacement entry
+		_neutralize() returns - safe here since push_defer() never records
+		a defer entry in self.bindings, so nothing else holds a reference
+		to the original that would need updating. '''
+		_replacement, instructions = self._neutralize( entry )
+		return instructions
 
 	def mark_possibly_retained( self, operand: ir.Operand ) -> None:
 		''' called by lowering.py's own _emit() (_mark_errdefer_retained_args)

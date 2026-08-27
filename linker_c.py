@@ -183,7 +183,19 @@ class CcTool:
 			# behind this experimental switch there.
 			cmd = [ self.path, '/nologo', '/std:c11', '/experimental:c11atomics' ]
 			if warnings:
-				cmd += [ '/W4', '/wd4701' ]
+				# wd4702 - "unreachable code": fires on the shared, goto-
+				# based epilogue ladder cfg.py builds (a defer/RC release
+				# guarded by a runtime flag, reached from more than one goto
+				# site) whenever MSVC's own optimizer can prove, for a
+				# PARTICULAR reaching path, that the flag is constant at
+				# that point - real, provably-safe dead code its own
+				# dataflow found, not a codegen bug (confirmed against a
+				# real release build: hundreds of instances, all inside
+				# defer-flag guards or inlined release_object()'s `if
+				# (!obj) return;`, none reachable). Same shape/same fix as
+				# wd4701 just below - see emitter_c.py's __return_value
+				# comment for that one's own identical reasoning
+				cmd += [ '/W4', '/wd4701', '/wd4702' ]
 			cmd += [ '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
@@ -222,6 +234,24 @@ class CcTool:
 			if warnings:
 				cmd += [ '-Wno-uninitialized' ]
 				cmd += [ '-Wno-sometimes-uninitialized' ] if self.name == 'clang' else [ '-Wno-maybe-uninitialized' ]
+				# cfg.py's disarm_defer() (see its own docstring) statically
+				# cancels a defer/errdefer/for-loop-release flag whenever
+				# nothing else in the function ever jumped into its shared
+				# epilogue label - the common case. That flag's own `= true`
+				# arm-write (emitted eagerly, unconditionally, at the defer's
+				# own registration point, before disarm_defer's later verdict
+				# is known) then has no read left ANYWHERE to consume it: the
+				# now-cancelled entry gets no replay at the function's own
+				# closing ladder (build_epilogue_ladder's `not entry.
+				# cancelled` gate), and disarm_defer's own point already
+				# released the guarded object directly instead of via the
+				# flag. A real, confirmed (not speculative) set-but-never-
+				# read local, same false-positive-adjacent shape as the
+				# -Wno-uninitialized cases just above - not worth restructuring
+				# the eager-arm design (every defer site would need to know
+				# its own eventual fate before any later return in the
+				# function has even been lowered) just to silence this
+				cmd += [ '-Wno-unused-but-set-variable' ]
 			if want_debug_info:
 				cmd += [ '-g' ]
 			if debug:
