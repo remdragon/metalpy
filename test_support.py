@@ -32,6 +32,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import unittest
 
 # local imports:
 import emitter_c
@@ -303,3 +304,11 @@ class RealCompileMixin:
 
 
 HAS_CC = _CC is not None
+
+# real multi-OS-thread stress/load tests (many threads x thousands of
+# iterations) are slow and occasionally flaky under CI contention - off by
+# default, opt in with METALPY_RUN_LOAD_TESTS=1 when actually working on
+# concurrency-sensitive code.
+RUN_LOAD_TESTS = os.environ.get( 'METALPY_RUN_LOAD_TESTS' ) == '1'
+skip_unless_load_tests = unittest.skipUnless( RUN_LOAD_TESTS,
+	'load/stress test disabled by default - set METALPY_RUN_LOAD_TESTS=1 to enable' )

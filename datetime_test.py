@@ -511,6 +511,7 @@ class DatetimeTests( RealCompileMixin, unittest.TestCase ):
 	def test_rc_lifetime_stress( self ) -> None:
 		self.assert_programs_run([ ( 'datetime_rc_stress', _DATETIME_RC_STRESS ) ], timeout = 30.0 )
 
+	@test_support.skip_unless_load_tests
 	def test_localtz_concurrent_init_stress( self ) -> None:
 		# own executable: relies on __localtz being freshly-unset at process
 		# start (see this case's own docstring above) - must not be merged
