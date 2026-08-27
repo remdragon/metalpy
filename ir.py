@@ -683,8 +683,17 @@ class AcquireGlobalLock( Instruction ):
 	(confirmed unsound via a real test: the naive "look for an adjacent
 	Decref+Assign" version this replaced silently never matched a union-
 	typed global at all - exactly localtz()'s own shape, the bug that
-	motivated this whole mechanism). '''
+	motivated this whole mechanism). `exclusive` (PLAN_THREAD_SAFE_SHARED_
+	STATE.md Cost mitigation #4) - True for a REASSIGNMENT (this global's
+	own storage is being overwritten, needs exclusive access), False for a
+	plain READ (retaining the CURRENT value - safe to run concurrently with
+	other readers, only ever races a genuine writer). Defaults True: the
+	SAFE default for any call site that doesn't pass it explicitly is the
+	strictest one - a write mistakenly marked exclusive is merely slower,
+	never unsound, while a write mistakenly marked shared would be a silent
+	race. '''
 	var: Variable
+	exclusive: bool = True
 
 	def test_repr( self ) -> str:
 		return f'AcquireGlobalLock( var={self.var.qualname!r} )'
@@ -695,8 +704,11 @@ class ReleaseGlobalLock( Instruction ):
 	_cfg_assign, immediately after the ir.Assign that overwrites the
 	global's slot (the actual store cfg.assign() itself never emits - see
 	_cfg_assign's own docstring for why both the RC-bookkeeping instructions
-	and this trailing Assign have to come from one function body). '''
+	and this trailing Assign have to come from one function body).
+	`exclusive` mirrors AcquireGlobalLock's own identical field - see there
+	for why. '''
 	var: Variable
+	exclusive: bool = True
 
 	def test_repr( self ) -> str:
 		return f'ReleaseGlobalLock( var={self.var.qualname!r} )'
@@ -723,9 +735,15 @@ class AcquireFieldLock( Instruction ):
 	Variable.reassigned_outside_init. Optional (None for a synthesized/
 	internal access with no real declaring Variable to point at, e.g. one
 	reached through a chain this compiler doesn't track per-field) -
-	treated as "not exempt, needs the ordinary check" wherever consumed. '''
+	treated as "not exempt, needs the ordinary check" wherever consumed.
+	`exclusive` (Cost mitigation #4) mirrors AcquireGlobalLock's own
+	identical field - True for a field WRITE (SetAttr, or the read-modify-
+	write replace half of an AugAssign), False for a field READ (retaining
+	the CURRENT value). Defaults True for the same reason AcquireGlobalLock's
+	own default does. '''
 	obj: Operand
 	field: Variable|None = None
+	exclusive: bool = True
 
 	def test_repr( self ) -> str:
 		return f'AcquireFieldLock( obj={self.obj!r} )'
@@ -733,9 +751,10 @@ class AcquireFieldLock( Instruction ):
 @dataclass( kw_only = True )
 class ReleaseFieldLock( Instruction ):
 	''' the matching END marker for AcquireFieldLock - `field` mirrors its
-	own identical field, see there for why. '''
+	own identical field, see there for why. `exclusive` mirrors it too. '''
 	obj: Operand
 	field: Variable|None = None
+	exclusive: bool = True
 
 	def test_repr( self ) -> str:
 		return f'ReleaseFieldLock( obj={self.obj!r} )'
