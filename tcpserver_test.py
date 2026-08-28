@@ -37,6 +37,10 @@
 #   - default_pool_size_matches_the_python_heuristic: threading.
 #     default_pool_size() == min(32, cpu_count() + 4), computed dynamically
 #     so it doesn't flake across machines with different core counts.
+#   - thread_pool_drains_a_backlog_in_fifo_order: a 1-worker pool given 5
+#     jobs while the worker is parked on a blocked 6th runs them in
+#     submission order - regression test for a real LIFO-drain/starvation
+#     bug (_PoolWorker used to drain via list.pop(), i.e. LIFO).
 
 import unittest
 
@@ -389,6 +393,78 @@ def main() -> i32:
 		return 1
 	if got < usize( 1 ) or got > usize( 32 ):
 		return 2
+	return 0
+''' ),
+			( 'thread_pool_drains_a_backlog_in_fifo_order', '''
+import compiler
+import atomic
+import threading
+
+class Gate:
+	started: atomic.Atomic[i32]
+	release: atomic.Atomic[bool]
+	def __init__( self ) -> None:
+		self.started = atomic.Atomic[i32]( 0 )
+		self.release = atomic.Atomic[bool]( False )
+	def blocking( self ) -> None:
+		self.started.fetch_add( 1 )
+		while not self.release.load():
+			pass
+
+class Recorder:
+	order: list[usize]
+	def __init__( self ) -> None:
+		self.order = list[usize]()
+	def record( self, n: usize ) -> None:
+		self.order.append( n )
+
+class Job:
+	idx: usize
+	rec: Recorder
+	def __init__( self, idx: usize, rec: Recorder ) -> None:
+		self.idx = idx
+		self.rec = rec
+	def run( self ) -> None:
+		self.rec.record( self.idx )
+
+def busy_delay() -> None:
+	i: usize = 0
+	while i < usize( 200000000 ):
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+def main() -> i32:
+	gate: Gate = Gate()
+	rec: Recorder = Recorder()
+	pool: threading.ThreadPool = threading.ThreadPool( usize( 1 ))   # one worker - forces every job onto the same queue
+
+	pool.submit( gate.blocking ).unwrap( 'submit gate' )   # occupies the one worker, parking it
+	busy_delay()   # give the worker time to actually start and block on the gate
+	if gate.started.load() != 1:
+		return 1
+
+	# queue up a real backlog behind the blocked worker - previously drained
+	# LIFO (list.pop() took the LAST element), so job 4 would have run
+	# before job 1; Queue[T]'s FIFO drain must preserve submission order
+	i: usize = 0
+	while i < usize( 5 ):
+		job: Job = Job( i, rec )
+		pool.submit( job.run ).unwrap( 'submit job' )
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+	gate.release.store( True )
+	pool.shutdown( True )
+
+	if rec.order.__len__() != usize( 5 ):
+		return 2
+	i = 0
+	while i < usize( 5 ):
+		got: usize = rec.order.__getitem__( i ).unwrap( 'order index in bounds by construction' )
+		if got != i:
+			return 3   # out of submission order - LIFO regression
+		with compiler.wrap_arithmetic:
+			i = i + 1
 	return 0
 ''' ),
 		], timeout = 30 )   # busy-wait loops on gate release - an infinite-spin regression fails instead of hanging the whole suite, matching reactor_test.py's own convention
