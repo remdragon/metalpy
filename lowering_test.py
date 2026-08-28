@@ -12614,6 +12614,155 @@ class IfIsNotNoneNarrowingTests( unittest.TestCase ):
 		self.assertFalse( is_narrowed )
 
 
+class CompoundNoneNarrowingTests( unittest.TestCase ):
+	''' De Morgan generalization of IfIsNotNoneNarrowingTests above to a
+	compound `or`/`and` test over DISTINCT subjects - `if a is None or b is
+	None: <diverges>` proves both a and b non-None afterward (same as a
+	single `is None` guard proves it for one), and `if a is not None and b
+	is not None:` narrows both inside the body (same as a single `is not
+	None` guard). Previously type_resolver.py's visit_If only recognized a
+	single ast.Compare test, so a BoolOp test like this narrowed NEITHER
+	operand - confirmed as a real bug via lib/sys.py's _BufferedStream,
+	which needed 2-3 Optional fields null-checked together and had to fall
+	back to separate sequential `if x is None:` statements as a workaround. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = False )
+		self.compiler = Compiler( self.discovery )
+
+	def _import( self, code: str ):
+		return self.compiler.import_code( code, filename = Path( '__test__.py' ))
+
+	def _sizeof_is_narrowed_to_u8( self, code: str, varname: str ) -> bool:
+		# same proof-by-compiler.sizeof technique as
+		# IfIsNotNoneNarrowingTests._sizeof_x_is_narrowed_to_u8 above, just
+		# parameterized over which assigned local to check (a compound test
+		# narrows more than one subject at once, so a single fixed 'x' name
+		# isn't enough here)
+		self.discovery.import_name( 'builtins' )
+		self._import( code )
+		fn = self.compiler._lower( self.discovery.main )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		assigns = { getattr( i.dest, 'stem', None ): i.src for i in fn.instructions if isinstance( i, ir.Assign ) }
+		src = assigns[varname]
+		return isinstance( src, ir.Const ) and src.value == 1
+
+	def test_narrows_both_subjects_past_two_operand_or_is_none_guard( self ) -> None:
+		is_narrowed = self._sizeof_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	a: U = U.A( 1 )',
+			'	b: U = U.A( 2 )',
+			'	if a is None or b is None:',
+			'		return',
+			'	xa: usize = compiler.sizeof( a )',
+			'	xb: usize = compiler.sizeof( b )',
+			'	return',
+		]), 'xa' )
+		self.assertTrue( is_narrowed )
+		is_narrowed_b = self._sizeof_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	a: U = U.A( 1 )',
+			'	b: U = U.A( 2 )',
+			'	if a is None or b is None:',
+			'		return',
+			'	xa: usize = compiler.sizeof( a )',
+			'	xb: usize = compiler.sizeof( b )',
+			'	return',
+		]), 'xb' )
+		self.assertTrue( is_narrowed_b )
+
+	def test_narrows_all_subjects_past_three_operand_or_is_none_guard( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	a: U = U.A( 1 )',
+			'	b: U = U.A( 2 )',
+			'	c: U = U.A( 3 )',
+			'	if a is None or b is None or c is None:',
+			'		return',
+			'	xa: usize = compiler.sizeof( a )',
+			'	xb: usize = compiler.sizeof( b )',
+			'	xc: usize = compiler.sizeof( c )',
+			'	return',
+		])
+		self.assertTrue( self._sizeof_is_narrowed_to_u8( code, 'xa' ))
+		self.assertTrue( self._sizeof_is_narrowed_to_u8( code, 'xb' ))
+		self.assertTrue( self._sizeof_is_narrowed_to_u8( code, 'xc' ))
+
+	def test_narrows_both_subjects_inside_two_operand_and_is_not_none_body( self ) -> None:
+		code = '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	a: U = U.A( 1 )',
+			'	b: U = U.A( 2 )',
+			'	if a is not None and b is not None:',
+			'		xa: usize = compiler.sizeof( a )',
+			'		xb: usize = compiler.sizeof( b )',
+			'	return',
+		])
+		self.assertTrue( self._sizeof_is_narrowed_to_u8( code, 'xa' ))
+		self.assertTrue( self._sizeof_is_narrowed_to_u8( code, 'xb' ))
+
+	def test_mixed_polarity_or_does_not_narrow( self ) -> None:
+		# `a is None or b is not None` is NOT a De Morgan shape (the two
+		# operands don't agree on polarity) - must decline narrowing
+		# outright rather than guessing, same "caller declines silently"
+		# posture as every other narrowing shape helper
+		is_narrowed = self._sizeof_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	a: U = U.A( 1 )',
+			'	b: U = U.A( 2 )',
+			'	if a is None or b is not None:',
+			'		return',
+			'	xa: usize = compiler.sizeof( a )',
+			'	return',
+		]), 'xa' )
+		self.assertFalse( is_narrowed )
+
+	def test_and_body_does_not_leak_into_the_non_narrowed_join( self ) -> None:
+		# code AFTER the if (neither branch terminates) must NOT be
+		# narrowed - nothing proves a/b non-None once execution could have
+		# skipped the body entirely
+		is_narrowed = self._sizeof_is_narrowed_to_u8( '\n'.join([
+			'@union',
+			'class U:',
+			'	A: u8',
+			'	Nothing: None',
+			'',
+			'def main() -> None:',
+			'	a: U = U.A( 1 )',
+			'	b: U = U.A( 2 )',
+			'	if a is not None and b is not None:',
+			'		pass',
+			'	xa: usize = compiler.sizeof( a )',
+			'	return',
+		]), 'xa' )
+		self.assertFalse( is_narrowed )
+
+
 class RejectMoveThroughUnionOrOverloadTests( unittest.TestCase ):
 	''' calling an @move-decorated method through a union-typed receiver
 	or an overload group is now a compile error, not a silent gap. Both
