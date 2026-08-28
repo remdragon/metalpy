@@ -1126,6 +1126,27 @@ class TypeResolutionTests( unittest.TestCase ):
 		free_pos = src.index( 'sys.free' )
 		self.assertLess( del_pos, free_pos )
 
+	def test_destructor_synthesis_calls_inherited_del_when_subclass_has_none( self ) -> None:
+		# regression: a subclass that doesn't redeclare __del__ at all must
+		# still call its base's __del__ - _synthesize_rcclass_destructor used
+		# to look this up via cls.get_local('__del__') (own-scope only),
+		# silently skipping the call entirely for a subclass with no __del__
+		# of its own even though an ancestor declares one (real, confirmed
+		# bug: the base's __del__ never ran for any such subclass instance,
+		# no compile error, no crash - see chain_lookup vs get_local)
+		mod = self._import( '\n'.join([
+			'class Base:',
+			'	@virtual',
+			'	def __del__( self ) -> None:',
+			'		pass',
+			'class Derived( Base ):',
+			'	y: i32',
+		]))
+		cls = self._resolve_class( mod, 'Derived' )
+		dtor = self._synthesize_and_dequeue( cls )
+		src = ast.unparse( dtor.node )
+		self.assertIn( 'self.__del__()', src )
+
 	def test_destructor_synthesis_decrefs_rc_field( self ) -> None:
 		mod = self._import( '\n'.join([
 			'class Inner: pass',

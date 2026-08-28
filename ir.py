@@ -613,6 +613,17 @@ class Call( Instruction ):
 	# GetAttr.obj/SetAttr.obj are already structurally exempted rather
 	# than individually special-cased at every call site
 	is_super_init_call: bool = False
+	# super().<method>(...) for any method OTHER than __init__ (lowering.py's
+	# own _lower_super_call) - target here is the BASE's own Function
+	# (self_cls.base.chain_lookup(method_name)), which may itself be
+	# @virtual (redeclaring it as an override requires @virtual on both
+	# sides - discovery.py's _validate_no_attribute_shadowing). Ordinary
+	# vtable dispatch keys off target.is_virtual alone and would re-enter
+	# the CALLER's own override through the receiver's real runtime vtable
+	# (infinite recursion) - this flag tells emitter_c.py to call target's
+	# own C symbol directly instead, the one thing "call MY base's own
+	# implementation" actually means.
+	is_super_call: bool = False
 
 	def test_repr( self ) -> str:
 		return (
