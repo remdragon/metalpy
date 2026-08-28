@@ -56,6 +56,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'extra flags passed through to the linker' )
 	p.add_argument( '--strip', action = 'store_true',
 		help = 'strip symbols / fold identical code for a smaller binary' )
+	p.add_argument( '--map', action = 'store_true',
+		help = 'emit a linker map file (<output>.map) for inspecting per-symbol code size' )
 	p.add_argument( '--asan', action = 'store_true',
 		help = 'build with AddressSanitizer (requires the C runtime - forces CRT linking for a program that would otherwise build freestanding/no-CRT)' )
 	p.add_argument( '--crt', action = 'store_true',
@@ -266,7 +268,8 @@ def main() -> None:
 			if lib not in ldflags:
 				flag = linker_c.resolve_lib_ldflag( cc, lib, compiler.extern_libs[lib], verbose = args.v, no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
-		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip )
+		map_path = exe_path.with_suffix( exe_path.suffix + '.map' ) if args.map else None
+		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip, map_file = map_path )
 		if link_result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
 			print( link_result.stdout, file = sys.stderr )
@@ -280,6 +283,8 @@ def main() -> None:
 			print( link_result.stdout, file = sys.stderr )
 
 		print( f'mpy: built {exe_path}' )
+		if map_path is not None:
+			print( f'mpy: wrote {map_path}' )
 
 		# --- bundle runtime DLL dependencies declared via @extern(..., dll=...) -
 		# driven entirely by compiler.extern_dlls (populated only from functions

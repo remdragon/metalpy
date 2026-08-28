@@ -196,6 +196,24 @@ class CcTool:
 				# wd4701 just below - see emitter_c.py's __return_value
 				# comment for that one's own identical reasoning
 				cmd += [ '/W4', '/wd4701', '/wd4702' ]
+			# NOT adding /Gy (function-level linking, MSVC's analog of
+			# clang/gcc's -ffunction-sections below) - measured ZERO size
+			# benefit from it on this codebase's own generated C: a real
+			# release+strip build (link.exe already gets /OPT:REF /OPT:ICF
+			# under strip below) came out byte-identical, same exact symbol
+			# set, with or without /Gy. Unlike LLVM (see -ffunction-sections'
+			# own comment for the real 20% win it unlocks there), MSVC's own
+			# backend apparently doesn't emit byte-for-byte identical machine
+			# code for structurally-identical generic instantiations even
+			# once /Gy gives /OPT:ICF individual COMDATs to compare - so
+			# there's nothing here for ICF to actually fold. /Gy also
+			# introduced a reproducible CreateProcess "Access is denied"
+			# hitting the just-linked exe under this project's own build-
+			# then-immediately-run test harness (root-caused to Windows/EDR
+			# holding the file slightly longer for /Gy's more fragmented
+			# per-function-COMDAT layout, not real corruption - the same exe
+			# runs fine seconds later by hand) - moot now that there's no
+			# size upside to weigh against it either.
 			cmd += [ '-c', str( src ), f'/Fo:{obj}' ]
 			if no_crt:
 				cmd += [ '/GS-' ]
@@ -230,6 +248,15 @@ class CcTool:
 			cmd = [ self.path, '-std=c11' ]
 			if warnings:
 				cmd += [ '-Wall', '-Wextra' ]
+			# -ffunction-sections/-fdata-sections: give every function/global
+			# its own section, so the linker's identical-code/data folding
+			# (lld-link's /OPT:ICF, or a GNU ld with --icf, see CcTool.link()'s
+			# strip branch) has individual chunks to compare and merge at all -
+			# without this, a whole .o's functions share one section and
+			# nothing is foldable regardless of how many byte-identical
+			# monomorphized generic instantiations exist. Free money for
+			# release/strip builds.
+			cmd += [ '-ffunction-sections', '-fdata-sections' ]
 			cmd += [ '-c', str( src ), '-o', str( obj ) ]
 			if warnings:
 				cmd += [ '-Wno-uninitialized' ]
@@ -296,7 +323,7 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False ) -> subprocess.CompletedProcess[str]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False, map_file: Path|None = None ) -> subprocess.CompletedProcess[str]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
@@ -329,6 +356,8 @@ class CcTool:
 				# COMDAT folding) is the closest MSVC analog to what people
 				# actually mean by a "stripped" release build
 				cmd += [ '/OPT:REF', '/OPT:ICF' ]
+			if map_file is not None:
+				cmd += [ f'/MAP:{map_file}' ]
 			# no /fsanitize=address here: that's a cl.exe compiler-frontend
 			# flag, not understood by link.exe directly - cl.exe embeds the
 			# necessary /DEFAULTLIB directive for the ASan runtime straight
@@ -400,6 +429,16 @@ class CcTool:
 					# place, /OPT:REF /OPT:ICF (dead-code elim + identical-
 					# COMDAT folding) is the closest real analog
 					cmd += [ '-Wl,/OPT:REF', '-Wl,/OPT:ICF' ]
+			if map_file is not None:
+				if os.name == 'posix':
+					# real GNU ld (gcc, or clang under WSL) - -Map=<file> is a
+					# standard ld option, forwarded straight through via -Wl,
+					cmd += [ f'-Wl,-Map={map_file}' ]
+				else:
+					# clang on native Windows drives lld-link (MSVC-compatible,
+					# see the no_crt/strip branches above) - lld-link accepts
+					# MSVC link.exe's own /MAP:<file> spelling, not GNU ld's
+					cmd += [ f'-Wl,/MAP:{map_file}' ]
 		if verbose:
 			print( ' '.join( cmd ), file = sys.stderr )
 		return subprocess.run( cmd,

@@ -134,6 +134,56 @@ def ExitProcess(
 def GetLastError() -> u32:
 	...
 
+# console control events - GenerateConsoleCtrlEvent's own dwCtrlEvent
+# values and HandlerRoutine's own dwCtrlType (same numbering, one set of
+# constants for both). CTRL_C_EVENT/CTRL_BREAK_EVENT map to SIGINT for
+# lib/signal.py's own no-CRT Windows backend (see its own comment on why);
+# the other three exist for completeness (logoff/shutdown/close) but
+# aren't wired to anything yet.
+CTRL_C_EVENT: u32 = 0
+CTRL_BREAK_EVENT: u32 = 1
+CTRL_CLOSE_EVENT: u32 = 2
+CTRL_LOGOFF_EVENT: u32 = 5
+CTRL_SHUTDOWN_EVENT: u32 = 6
+
+# BOOL WINAPI HandlerRoutine(DWORD dwCtrlType) - the one shape every
+# console control handler takes, mirrors CreateThread's own
+# lpStartAddress comment just below for the identical "one fixed
+# trampoline shape" reasoning.
+#
+# BOOL WINAPI SetConsoleCtrlHandler(PHANDLER_ROUTINE HandlerRoutine, BOOL Add) -
+# HandlerRoutine=0 (NULL) with Add=true/false is itself a real, documented
+# call shape (toggles this process's own Ctrl+C handling for the ATTACHED-
+# TO-A-JOB case) but never used here - lib/signal.py's own caller always
+# passes a real trampoline. Runs the handler on a DEDICATED OS thread
+# Windows spins up for it, never the thread that called SetConsoleCtrlHandler
+# or any other application thread - see lib/signal.py's own comment on why
+# that rules out routing this through the same per-thread context()
+# mechanism the CRT-signal() backend uses.
+@extern( 'kernel32', 'SetConsoleCtrlHandler' )
+def SetConsoleCtrlHandler(
+	HandlerRoutine: Ptr[Callable[[u32], bool]],
+	Add: bool,
+) -> bool:
+	...
+
+# BOOL WINAPI GenerateConsoleCtrlEvent(DWORD dwCtrlEvent, DWORD dwProcessGroupId) -
+# ONLY accepts CTRL_C_EVENT/CTRL_BREAK_EVENT (any other value is a
+# documented invalid-parameter failure - there is no Windows console event
+# for an arbitrary POSIX signal number). dwProcessGroupId=0 means "every
+# process sharing the calling process's own console" - includes the
+# caller itself, which is what lib/signal.py's own raise_signal() below
+# relies on for self-delivery. ASYNCHRONOUS - unlike the CRT's raise(),
+# this only QUEUES the event; SetConsoleCtrlHandler's own registered
+# handler runs on Windows' own dedicated delivery thread at its own pace,
+# not before this call returns. See raise_signal's own comment.
+@extern( 'kernel32', 'GenerateConsoleCtrlEvent' )
+def GenerateConsoleCtrlEvent(
+	dwCtrlEvent: u32,
+	dwProcessGroupId: u32,
+) -> bool:
+	...
+
 # LPWSTR GetCommandLineW(void) - the process' own command line, as the OS
 # loader set it (Unicode, unlike the CRT's own possibly-mangled main(argc,
 # argv)). Available regardless of whether the CRT is linked - see sys.py's

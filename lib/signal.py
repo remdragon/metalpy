@@ -73,11 +73,21 @@ well-defined:
 import compiler
 import sys
 import threading
+if compiler.target.os == 'windows':
+	from windows.kernel32 import SetConsoleCtrlHandler, CTRL_C_EVENT, CTRL_BREAK_EVENT
 
 SIGINT: i32 = compiler.cexpr( 'SIGINT', 'signal.h', i32 )
 
 _HandlerFn: TypeAlias = Ptr[Callable[[i32], None]]
 
+# _signal/_raise stay CRT-based (@extern('c', ...)) unconditionally - only
+# context() below still calls them. signal.signal() itself uses a separate,
+# no-CRT-required path on Windows (see _win_ctrl_handler below) - reachability
+# means a program that only ever calls signal.signal(), never context(), no
+# longer needs 'c' in its extern_libs at all on Windows, and can build
+# freestanding. A program that DOES use context() still needs the CRT, same
+# as before this split - see context()'s own comment for why its per-thread
+# semantics can't be ported to the Windows-native mechanism below.
 @extern( 'c', 'signal', header = 'signal.h' )
 def _signal( signum: i32, handler: _HandlerFn ) -> _HandlerFn:
 	...
@@ -154,14 +164,104 @@ def _signal_handler( sig: i32 ) -> None:
 	_signal( sig, _signal_handler )   # only reached if sig's default action doesn't terminate the process - the top-of-function reinstall above was just undone by the sig_dfl call two lines up
 
 
+if compiler.target.os == 'windows':
+	# lazily-installed exactly once (SetConsoleCtrlHandler with Add=true
+	# APPENDS to a chain rather than replacing - calling it again would just
+	# invoke this same stateless trampoline redundantly per event, harmless
+	# but wasteful, so guarded here instead)
+	_win_handler_installed: bool = False
+
+	def _win_ctrl_handler( ctrl_type: u32 ) -> bool:
+		''' the ONE real Windows console control handler ever installed (by
+		signal() below, via SetConsoleCtrlHandler) - runs on a dedicated OS
+		thread Windows itself spins up for control-event delivery, NEVER the
+		thread that called signal() or any other application thread. That
+		rules out routing this through _TlsSignalHandler the way the CRT-
+		based _signal_handler above does for context(): there is no
+		meaningful "current application thread" to look up from here, so
+		context()'s per-thread scoping simply has no correct equivalent on
+		this path - deliberately not attempted (see context()'s own comment).
+		Only checks the process-wide _SignalHandler registry, same as
+		_signal_handler's own second-priority fallback.
+		Maps CTRL_C_EVENT/CTRL_BREAK_EVENT to SIGINT - the only two console
+		events with a real POSIX-signal analog; every other dwCtrlType
+		(CLOSE/LOGOFF/SHUTDOWN) has no SIGINT-shaped equivalent and isn't
+		mapped here.
+		Returns True (handled, stop the chain) only if something is actually
+		registered for SIGINT; False lets Windows fall through to any other
+		installed handler and finally its own default action (process
+		termination) - matching _signal_handler's own "unregistered signal
+		behaves as if this module were never imported" contract. '''
+		if ctrl_type != CTRL_C_EVENT and ctrl_type != CTRL_BREAK_EVENT:
+			return False
+		if SIGINT in _SignalHandler:
+			_SignalHandler.__getitem__( SIGINT ).unwrap( '_win_ctrl_handler: SIGINT just confirmed present' )( SIGINT )
+			return True
+		return False
+
+
 def signal( sig: i32, handler: _HandlerFn ) -> None:
 	''' permanent, process-wide registration - see module docstring, and
 	context() for a scoped alternative. Registry write happens BEFORE the
 	OS-level install (not after): a real signal delivered in between would
 	otherwise find nothing registered yet and fall through to the default-
-	and-reraise path, defeating the registration that was mid-flight. '''
+	and-reraise path, defeating the registration that was mid-flight.
+
+	Windows: installs via SetConsoleCtrlHandler (_win_ctrl_handler above),
+	NOT the CRT's signal()/_signal_handler - no libc dependency, so a
+	program using only signal.signal() (never context()) can build
+	freestanding on Windows. Only SIGINT actually fires this way (see
+	_win_ctrl_handler's own comment) - registering any other signal number
+	here still records it in _SignalHandler for consistency, but nothing
+	will ever deliver it on this platform, matching Windows' own long-
+	standing lack of real POSIX signal support beyond SIGINT. '''
 	_SignalHandler[sig] = handler
-	_signal( sig, _signal_handler )   # idempotent - harmless if sig's trampoline is already installed
+	if compiler.target.os == 'windows':
+		global _win_handler_installed
+		if not _win_handler_installed:
+			SetConsoleCtrlHandler( _win_ctrl_handler, True )
+			_win_handler_installed = True
+	else:
+		_signal( sig, _signal_handler )   # idempotent - harmless if sig's trampoline is already installed
+
+
+def raise_signal( sig: i32 ) -> None:
+	''' delivers `sig` to THIS thread, synchronously, exactly mirroring
+	_signal_handler's own priority logic (this thread's own context()
+	override first, then the process-wide signal.signal() registration) -
+	mirrors real Python's own signal.raise_signal() (3.11+), and is the
+	portable way to simulate/test a signal.signal()/context() registration.
+	Prefer this over declaring a private @extern('c','raise',...) the way
+	older test code in this codebase used to (see signal_test.py's own
+	history).
+
+	Implemented as a DIRECT, in-process call into this module's own
+	registries - no OS API, no CRT, on EITHER platform. This mirrors what
+	the CRT's own raise() actually does under the hood when a PROGRAM
+	calls it explicitly (as opposed to a real external event, e.g. an
+	actual Ctrl+C): the CRT keeps its own internal per-process signal-
+	handler table and raise() just calls straight into it, synchronously,
+	in the calling thread - it does NOT round-trip through
+	SetConsoleCtrlHandler/the console subsystem for this case at all (that
+	path exists only to catch REAL external console events and feed them
+	into the same internal table). _SignalHandler/_TlsSignalHandler ARE
+	that same table here, so raise_signal() can just call into them
+	directly - simpler, fully synchronous, and portable, unlike an earlier
+	version of this that round-tripped through GenerateConsoleCtrlEvent
+	(Windows-only, asynchronous, and unable to raise anything but
+	SIGINT/CTRL_BREAK - solving a problem that direct dispatch doesn't
+	have in the first place). Real external delivery (an actual Ctrl+C at
+	the console) still goes through _win_ctrl_handler/_signal_handler as
+	before - this only replaces the "a program deliberately raises its own
+	signal" case, which is all raise()'s explicit-call behavior, and this
+	function, ever needed to support. '''
+	tls: UnsafeDict[i32, Flag]|None = _TlsSignalHandler.get()
+	if tls is not None:
+		if sig in tls:
+			tls.__getitem__( sig ).unwrap( 'raise_signal: sig just confirmed present in tls' )._set()
+			return
+	if sig in _SignalHandler:
+		_SignalHandler.__getitem__( sig ).unwrap( 'raise_signal: sig just confirmed present in _SignalHandler' )( sig )
 
 
 class context:

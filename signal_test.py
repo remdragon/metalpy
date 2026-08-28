@@ -28,58 +28,43 @@ def main() -> i32:
 	return 0
 ''' ),
 			( 'raised_sigint_sets_the_flag_inside_the_context', '''
-import compiler
 import signal
-
-@extern( 'c', 'raise', header = 'signal.h' )
-def _raise( sig: i32 ) -> i32:
-	...
 
 def main() -> i32:
 	flag: signal.Flag = signal.Flag()
 	with signal.context( signal.SIGINT, flag ):
 		if flag.get():
 			return 1
-		_raise( signal.SIGINT )
+		signal.raise_signal( signal.SIGINT )
 		if not flag.get():
 			return 2
 	return 0
 ''' ),
 			( 'flag_from_a_finished_context_is_inert_afterward', '''
-import compiler
 import signal
-
-@extern( 'c', 'raise', header = 'signal.h' )
-def _raise( sig: i32 ) -> i32:
-	...
 
 def main() -> i32:
 	flag: signal.Flag = signal.Flag()
 	with signal.context( signal.SIGINT, flag ):
-		_raise( signal.SIGINT )
+		signal.raise_signal( signal.SIGINT )
 	if not flag.get():
 		return 1 # the flag itself keeps whatever value it had - only the registration pointing at it is gone
 	return 0
 ''' ),
 			( 'nested_context_same_signal_shadows_then_restores', '''
-import compiler
 import signal
-
-@extern( 'c', 'raise', header = 'signal.h' )
-def _raise( sig: i32 ) -> i32:
-	...
 
 def main() -> i32:
 	outer: signal.Flag = signal.Flag()
 	inner: signal.Flag = signal.Flag()
 	with signal.context( signal.SIGINT, outer ):
 		with signal.context( signal.SIGINT, inner ):
-			_raise( signal.SIGINT )
+			signal.raise_signal( signal.SIGINT )
 			if not inner.get():
 				return 1
 			if outer.get():
 				return 2
-		_raise( signal.SIGINT )
+		signal.raise_signal( signal.SIGINT )
 		if not outer.get():
 			return 3
 	return 0
@@ -93,14 +78,18 @@ def main() -> i32:
 		it - exactly the "process-global one-time init" shape
 		test_support.assert_programs_run's own docstring says must run
 		standalone, since a later merged case sharing the same process
-		would otherwise see this leftover registration too. '''
-		self._assert_compiles_and_runs( self._emit( '''
-import compiler
-import signal
+		would otherwise see this leftover registration too.
 
-@extern( 'c', 'raise', header = 'signal.h' )
-def _raise( sig: i32 ) -> i32:
-	...
+		Uses signal.raise_signal() (not a private @extern('c','raise',...))
+		- signal.signal()'s own OS-level install is no longer necessarily
+		the CRT's signal()/raise() pair (see signal.py's own comment on its
+		Windows-native SetConsoleCtrlHandler path), so a direct raise()
+		call here would silently test nothing on that platform.
+		raise_signal() dispatches directly and synchronously (see its own
+		comment), so this checks _fired immediately, same as the old
+		raise()-based version did. '''
+		self._assert_compiles_and_runs( self._emit( '''
+import signal
 
 _fired: bool = False
 
@@ -110,7 +99,7 @@ def _on_sigint( sig: i32 ) -> None:
 
 def main() -> i32:
 	signal.signal( signal.SIGINT, _on_sigint )
-	_raise( signal.SIGINT )
+	signal.raise_signal( signal.SIGINT )
 	if not _fired:
 		return 1
 	return 0
@@ -124,12 +113,7 @@ def main() -> i32:
 		over signal.signal()'s while the context is active, and
 		signal.signal()'s own registration resumes once the context exits. '''
 		self._assert_compiles_and_runs( self._emit( '''
-import compiler
 import signal
-
-@extern( 'c', 'raise', header = 'signal.h' )
-def _raise( sig: i32 ) -> i32:
-	...
 
 _global_fired: bool = False
 
@@ -139,18 +123,18 @@ def _on_sigint( sig: i32 ) -> None:
 
 def main() -> i32:
 	signal.signal( signal.SIGINT, _on_sigint )
-	_raise( signal.SIGINT )
+	signal.raise_signal( signal.SIGINT )
 	if not _global_fired:
 		return 1
 	flag: signal.Flag = signal.Flag()
 	with signal.context( signal.SIGINT, flag ):
 		_global_fired = False
-		_raise( signal.SIGINT )
+		signal.raise_signal( signal.SIGINT )
 		if not flag.get():
 			return 2
 		if _global_fired:
 			return 3
-	_raise( signal.SIGINT )
+	signal.raise_signal( signal.SIGINT )
 	if not _global_fired:
 		return 4
 	return 0
