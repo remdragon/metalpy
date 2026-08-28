@@ -196,7 +196,7 @@ def _prologue_debug_list() -> str:
 	void* h = GetStdHandle( (uint32_t)-12 ); // STD_ERROR_HANDLE
 	if ( h != (void*)(intptr_t)-1 && h != 0 ) {
 		uint32_t written = 0;
-		WriteFile( h, (const uint8_t*)s, len, &written, 0 );
+		WriteFile( h, (const uint8_t*)s, (uint32_t)len, &written, 0 );
 	}
 '''
 		poison_exit = '\tExitProcess( 3 );\n'
@@ -446,7 +446,7 @@ def _prologue_debug_ops() -> str:
 	void* h = GetStdHandle( (uint32_t)-11 ); // STD_OUTPUT_HANDLE
 	if ( h == (void*)(intptr_t)-1 || h == 0 ) return;
 	uint32_t written = 0;
-	WriteFile( h, (const uint8_t*)s, len, &written, 0 );
+	WriteFile( h, (const uint8_t*)s, (uint32_t)len, &written, 0 );
 '''
 		# side-table tracking node allocation - hand-declared HeapAlloc/
 		# HeapFree/GetProcessHeap prototypes (same "repeated, compatible
