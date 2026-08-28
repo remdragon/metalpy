@@ -37,7 +37,7 @@ module/import time (see pool's own comment).
 
 import compiler
 import threading
-import socket
+import atomic
 import fs
 import reactor
 
@@ -53,10 +53,14 @@ def _wait_error_to_os_error( werr: reactor.WaitError ) -> OSError:
 
 
 # ---------------------------------------------------------------------------
-# thread pool - a fixed set of daemon threads, each with its own job queue
-# and its own loopback wake pair (used directly, genuinely blocking - no
-# Poller involved, unlike reactor.Worker's own non-blocking/polled use of
-# the identical socket.make_loopback_pair() primitive).
+# thread pool - a fixed set of daemon threads, each with its own
+# threading.Queue[Job] (FIFO batch-drain - see Queue[T]'s own header comment
+# in lib/threading.py). Previously hand-rolled a list[Job].pop()-based drain
+# + loopback wake pair: pop() removes the LAST element, so a job could be
+# starved indefinitely behind a steady stream of newer submissions on the
+# same worker - a real fairness bug for a reactor-driven pool, since it
+# directly means unpredictable tail latency for whichever fiber's I/O
+# happened to land behind newer requests. Queue[T] fixes that for free.
 #
 # Job is public (not module-private) for the same reason `pool` (below) is -
 # this module's own white-box concurrency tests construct one directly.
@@ -78,53 +82,44 @@ class Job:
 
 
 class _PoolWorker:
-	__jobs:       list[Job]
-	__wake_read:  socket.Socket
-	__wake_write: socket.Socket
+	__queue: threading.Queue[Job]
 
 	def __init__( self ) -> None:
-		self.__jobs = list[Job]()
-		( read_side, write_side ) = socket.make_loopback_pair()
-		self.__wake_read = read_side
-		self.__wake_write = write_side
+		self.__queue = threading.Queue[Job]()
 
 	def submit( self, job: Job ) -> None:
-		self.__jobs.append( job )
-		poke: bytes = b'x'
-		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.submit: wake failed' )
+		self.__queue.put( job ).unwrap( '_PoolWorker.submit: unbounded queue put always succeeds' )
 
 	def run_forever( self ) -> None:
-		''' blocks (a genuine, thread-blocking recv - no Poller, this thread
-		has nothing else to do while idle) until a poke arrives, then drains
-		and runs every job currently queued - possibly more than one poke's
-		worth, which is fine, same "at least one byte means check the queue"
-		discipline reactor.Worker's own __drain_wake uses. '''
-		buf: bytearray = bytearray( usize( 64 ))
+		''' blocks (Queue[T].drain()'s own genuine thread-blocking wait - no
+		Poller, this thread has nothing else to do while idle) until a job
+		arrives, then runs every job currently queued, in FIFO submission
+		order - see this class's own header comment for why that matters. '''
 		while True:
-			self.__wake_read.recv( buf.get_ptr(), usize( 64 )).unwrap( '_PoolWorker.run_forever: wake recv failed' )
-			while True:
-				match self.__jobs.pop():
-					case Result.Ok( job ):
-						work: Closure[[], Result[usize, OSError]] = job.work
-						match work():
-							case Result.Ok( v ):
-								job.handle.complete( Result.Ok( v ))
-							case Result.Err( e ):
-								job.handle.complete( Result.Err( e ))
-						job.waiter.wake_external()
-					case Result.Err( _ ):
-						break
+			batch: UnsafeList[Job] = self.__queue.drain()
+			i: usize = 0
+			while i < batch.__len__():
+				job: Job = batch.__getitem__( i ).unwrap( '_PoolWorker.run_forever: batch index in bounds by construction' )
+				work: Closure[[], Result[usize, OSError]] = job.work
+				match work():
+					case Result.Ok( v ):
+						job.handle.complete( Result.Ok( v ))
+					case Result.Err( e ):
+						job.handle.complete( Result.Err( e ))
+				job.waiter.wake_external()
+				with compiler.wrap_arithmetic:
+					i = i + 1
 
 
 class _Pool:
 	__workers: list[_PoolWorker]
 	__threads: list[threading.Thread]
-	__next:    usize
+	__next:    atomic.Atomic[usize]
 
 	def __init__( self, size: usize ) -> None:
 		self.__workers = list[_PoolWorker]()
 		self.__threads = list[threading.Thread]()
-		self.__next = 0
+		self.__next = atomic.Atomic[usize]( 0 )
 		i: usize = 0
 		while i < size:
 			w: _PoolWorker = _PoolWorker()
@@ -135,20 +130,23 @@ class _Pool:
 				i = i + 1
 
 	def submit( self, job: Job ) -> None:
-		idx: usize = self.__next
+		''' round-robin via an atomic fetch_add, not a plain load-then-store
+		on a bare usize field - two threads calling submit() concurrently
+		could otherwise both read the SAME index before either wrote back,
+		silently skipping a worker (a lost round-robin step, which also
+		lets more jobs pile onto one worker than round-robin intends - see
+		threading.ThreadPool.submit()'s own docstring for the identical bug
+		found and fixed there first). '''
+		ticket: usize = self.__next.fetch_add( usize( 1 ))
 		with compiler.panic_arithmetic( '_Pool.submit: pool size is zero' ):
-			self.__next = ( idx + 1 ) % self.__workers.__len__()
+			idx: usize = ticket % self.__workers.__len__()
 		w: _PoolWorker = self.__workers.__getitem__( idx ).unwrap( '_Pool.submit: index in bounds by construction' )
 		w.submit( job )
 
 
-# A top-level binding, constructed at module/import time - previously
-# lazily constructed instead, to work around a real compiler bug (a Socket
-# built during static/global init crashed on first cross-thread use).
-# CONFIRMED FIXED (task_12a321c3 - the root cause was a global-init
-# ordering gap in _topologically_sort_globals, fixed by a concurrent
-# session's own unrelated work, commit 0e82361/81d91d1) - reverified via
-# the original repro before removing the workaround here.
+# A top-level binding, constructed at module/import time (global-init
+# ordering/cross-thread OS-object construction is sound here - see
+# _topologically_sort_globals).
 #
 # Public (not module-private) despite being an implementation detail
 # ordinary AsyncFile callers never touch directly - this module's own
