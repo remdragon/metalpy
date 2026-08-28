@@ -6675,6 +6675,56 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			return None
 		return subject_expr, base, members, none_member, is_not
 
+	def _compound_none_narrowing_shapes( self, test: ast.expr, want_boolop: type, want_is_not: bool ) -> list[tuple[str,str|None,list[str]|None,list[Variable]]] | None:
+		''' De Morgan generalization of _is_none_narrowing_shape/
+		_bare_truthiness_narrowing_shape to a same-connective chain of them
+		over DISTINCT subjects - `if a is None or b is None: <diverges>`
+		(want_boolop=Or, want_is_not=False) proves both a and b non-None past
+		the if, exactly like a single `if a is None: <diverges>` proves it
+		for a alone; `if a is not None and b is not None:` (want_boolop=And,
+		want_is_not=True) narrows both inside the body, exactly like a
+		single `if a is not None:` does for a alone. Flattens nested same-
+		connective BoolOps (`a is None or b is None or c is None`). Declines
+		(returns None) on ANY doubt - a mixed connective, an operand with the
+		opposite polarity (`a is None or b is not None`, not a De Morgan
+		shape at all), an unnarrowable subject, or the same subject checked
+		twice - same "caller declines silently" philosophy the single-
+		operand shape helpers already use; visit_If's existing single-
+		operand path still applies for whatever this declines. '''
+		if not ( isinstance( test, ast.BoolOp ) and isinstance( test.op, want_boolop )):
+			return None
+		operands: list[ast.expr] = []
+		def _flatten( expr: ast.expr ) -> None:
+			if isinstance( expr, ast.BoolOp ) and isinstance( expr.op, want_boolop ):
+				for v in expr.values:
+					_flatten( v )
+			else:
+				operands.append( expr )
+		_flatten( test )
+		results: list[tuple[str,str|None,list[str]|None,list[Variable]]] = []
+		seen: set[str] = set()
+		for operand in operands:
+			shape = self._is_none_narrowing_shape( operand )
+			if shape is None:
+				shape = self._bare_truthiness_narrowing_shape( operand )
+			if shape is None or not isinstance( shape[0], ( ast.Name, ast.Attribute )):
+				return None
+			subject_expr, _base, members, none_member, shape_is_not = shape
+			if shape_is_not != want_is_not:
+				return None
+			non_none = [ m for m in members if m is not none_member ]
+			if not non_none:
+				return None
+			key = self._narrow_subject_key( subject_expr )
+			if key is None:
+				return None
+			subject_name, attr_base, attr_hops = key
+			if subject_name in seen:
+				return None
+			seen.add( subject_name )
+			results.append( ( subject_name, attr_base, attr_hops, non_none ) )
+		return results if len( results ) >= 2 else None
+
 	def visit_Compare( self, node: ast.Compare ) -> ast.expr:
 		self.generic_visit( node )
 		if len( node.ops ) != 1 or not isinstance( node.ops[0], ( ast.Is, ast.IsNot )):
@@ -7184,6 +7234,12 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		is_not = False
 		narrow_attr_base: str|None = None
 		narrow_attr_hops: list[str]|None = None
+		# multiple (subject_name, attr_base, attr_hops, members) targets -
+		# only ever more than one entry for the compound `or`/`and` shape
+		# below; the single-subject case above still funnels through here
+		# as a length-1 list so the rest of this method needn't branch on
+		# "one subject vs several" at all
+		narrow_targets: list[tuple[str,str|None,list[str]|None,list[Variable]]] = []
 		if none_shape is not None and isinstance( none_shape[0], ( ast.Name, ast.Attribute )):
 			subject_expr, _base, members, none_member, shape_is_not = none_shape
 			non_none = [ m for m in members if m is not none_member ]
@@ -7199,7 +7255,21 @@ class _ReferenceResolver( ast.NodeTransformer ):
 				if key is not None:
 					subject_name, narrow_attr_base, narrow_attr_hops = key
 					narrow_members = non_none
+					narrow_targets = [ ( subject_name, narrow_attr_base, narrow_attr_hops, narrow_members ) ]
 				is_not = shape_is_not
+		elif isinstance( node.test, ast.BoolOp ):
+			# De Morgan's law: `a is None or b is None: <diverges>` proves
+			# both non-None past the if, same shape as a single `is None`
+			# guard (is_not=False, narrows the ELSE branch/post-if survival);
+			# `a is not None and b is not None:` narrows both inside the
+			# body, same shape as a single `is not None` guard (is_not=True)
+			compound = self._compound_none_narrowing_shapes( node.test, ast.Or, False )
+			if compound is not None:
+				narrow_targets, is_not = compound, False
+			else:
+				compound = self._compound_none_narrowing_shapes( node.test, ast.And, True )
+				if compound is not None:
+					narrow_targets, is_not = compound, True
 		# rewrite test BEFORE recursing into it, so the new BoolOp children
 		# (Name references, Compare, Call) are visited normally (unchanged
 		# from before this method's own narrowing support)
@@ -7225,7 +7295,7 @@ class _ReferenceResolver( ast.NodeTransformer ):
 					result.append( visited )
 			return result
 
-		if narrow_members is None or subject_name is None:
+		if not narrow_targets:
 			# self.locals is unscoped - a plain Assign inside either branch
 			# (visit_Assign) permanently overwrites it, so without saving/
 			# restoring around each branch a conditional reassignment (e.g.
@@ -7269,18 +7339,26 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# otherwise. Same "one real type" contract _build_narrow_marker's
 		# own narrowed_type computes identically - kept separate here since
 		# this pass's OWN self._narrowed/self.locals bookkeeping needs it
-		# independently of building the marker itself.
-		narrowed_type = narrow_members[0].type if len( narrow_members ) == 1 else self.discovery._get_or_create_union( [ m.type for m in narrow_members ] )
+		# independently of building the marker itself. Computed once per
+		# target up front - every target in narrow_targets shares the same
+		# is_not (compound shapes only ever mix uniform polarity, see
+		# _compound_none_narrowing_shapes), so a single loop below drives
+		# all of them the same way the old single-subject code drove one.
+		targets = [ ( subject_name, attr_base, attr_hops, members,
+				members[0].type if len( members ) == 1 else self.discovery._get_or_create_union( [ m.type for m in members ] ))
+			for subject_name, attr_base, attr_hops, members in narrow_targets ]
 		narrowed_body = node.body if is_not else node.orelse
 		other_body = node.orelse if is_not else node.body
 		case_entry_narrowed = dict( self._narrowed )
-		self._narrowed[subject_name] = [ narrowed_type ]
+		for subject_name, _attr_base, _attr_hops, _members, narrowed_type in targets:
+			self._narrowed[subject_name] = [ narrowed_type ]
 		try:
 			narrowed_visited = _visit_stmts( narrowed_body )
 		finally:
 			self._narrowed = case_entry_narrowed
 		narrowed_visited = [
-			self._build_narrow_marker( subject_name, narrow_members, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ),
+			*( self._build_narrow_marker( subject_name, members, node, attr_base = attr_base, attr_hops = attr_hops )
+				for subject_name, attr_base, attr_hops, members, _narrowed_type in targets ),
 			*narrowed_visited,
 		]
 		other_visited = _visit_stmts( other_body )
@@ -7296,10 +7374,15 @@ class _ReferenceResolver( ast.NodeTransformer ):
 		# raise as its own last statement) - nothing past it reaches the
 		# join, so there's nothing for this marker to narrow, and appending
 		# one after a terminator would corrupt cfg.py's own terminates
-		# detection (which keys off the branch's LAST statement).
+		# detection (which keys off the branch's LAST statement). Applied
+		# per-target - one subject of a compound condition being reassigned
+		# doesn't imply the others were too.
 		other_terminates = bool( other_body ) and isinstance( other_body[-1], ( ast.Return, ast.Break, ast.Continue, ast.Raise ))
-		if not other_terminates and self.locals.get( subject_name ) is narrowed_type:
-			other_visited = [ *other_visited, self._build_narrow_marker( subject_name, narrow_members, node, attr_base = narrow_attr_base, attr_hops = narrow_attr_hops ) ]
+		if not other_terminates:
+			extra_markers = [ self._build_narrow_marker( subject_name, members, node, attr_base = attr_base, attr_hops = attr_hops )
+				for subject_name, attr_base, attr_hops, members, narrowed_type in targets
+				if self.locals.get( subject_name ) is narrowed_type ]
+			other_visited = [ *other_visited, *extra_markers ]
 		if other_terminates:
 			# the un-narrowed branch never reaches the join - every path that
 			# DOES (whatever follows this if-statement in the same enclosing
@@ -7311,7 +7394,8 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# bare generic call's own eager inference (_infer_generic_args ->
 			# _type_of_expr) - sees the narrowed type instead of the stale,
 			# still-unioned declared type.
-			self._narrowed[subject_name] = [ narrowed_type ]
+			for subject_name, _attr_base, _attr_hops, _members, narrowed_type in targets:
+				self._narrowed[subject_name] = [ narrowed_type ]
 		if is_not:
 			node.body, node.orelse = narrowed_visited, other_visited
 		else:
