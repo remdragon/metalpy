@@ -2124,6 +2124,15 @@ def _declarator( t: Type|None, name: str, *, volatile: bool = False ) -> str:
 	(ParamTypes)), so plain string concatenation of c_type(t) and name can't
 	express it. `volatile` is for Volatile[T] locals (_stmt_AnnAssign) only -
 	never set for a function-pointer declarator or a field. '''
+	if isinstance( t, FixedArrayType ):
+		# same discontinuous "TYPE NAME[N]" shape _struct_or_union_body
+		# already uses for a FixedArrayType FIELD - a local variable of
+		# this type is otherwise unrestricted C: `compiler.addrof(buf)`
+		# decays it to Ptr[ElemType] the same way a field does (see
+		# ir.ArrayFieldPtr/AddrOfArrayIndex, obj can be a bare local now),
+		# and `buf[i]` reads/writes an element in place (ir.GetAttrIndex/
+		# SetAttrIndex, obj=the local itself, attr='').
+		return f'{"volatile " if volatile else ""}{c_type(t.elem_type)} {name}[{t.count}]'
 	callable_ptr = _callable_ptr_type( t )
 	prefix = 'volatile ' if volatile else ''
 	if callable_ptr is None:
@@ -3500,6 +3509,19 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 		return '->'
 	return '.'
 
+def _root_array_expr( obj: 'ir.Operand', attr: str ) -> str:
+	''' `(obj)OP attr` for a FixedArrayType field, or bare `obj` when
+	attr == '' - the convention ir.GetAttrIndex/SetAttrIndex/ArrayFieldPtr/
+	AddrOfArrayIndex use to let the SAME instruction shape cover both "obj
+	is the object holding the array FIELD" (attr=the field name) and "obj
+	IS the array itself" (a bare local/parameter of FixedArrayType, no
+	containing struct - attr=''), see lowering.py's
+	_fixed_array_index_target and _lower_compiler_addrof. '''
+	if attr == '':
+		return f'({_emit_operand(obj)})'
+	op = _member_access_operator( obj.type )
+	return f'({_emit_operand(obj)}){op}{_field_name(attr)}'
+
 def _emit_self_operand( receiver: ir.Operand, target: Function, *, force_direct: bool = False ) -> str:
 	''' an @interface CStruct's self is ALWAYS Ptr[T] (see lowering.py's
 	self_param construction) - receiver is therefore always already a
@@ -4039,29 +4061,26 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t{_emit_operand(instr.dest)} = &({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
 
 	if isinstance( instr, ir.ArrayFieldPtr ):
-		# compiler.addrof(x.field) where field is a FixedArrayType - one
-		# flat C expression, (obj)OP field, deliberately with NO leading &
-		# (see ArrayFieldPtr's own docstring: a real C array member decays
-		# to a pointer to its first element on use - &-ing it would give a
-		# pointer-TO-array instead, a different, mismatched C type)
-		op = _member_access_operator( instr.obj.type )
-		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)};' ]
+		# compiler.addrof(x.field) where field is a FixedArrayType (or
+		# compiler.addrof(buf) where buf ITSELF is one, attr='' - see
+		# _root_array_expr) - one flat C expression, deliberately with NO
+		# leading & (see ArrayFieldPtr's own docstring: a real C array
+		# decays to a pointer to its first element on use - &-ing it would
+		# give a pointer-TO-array instead, a different, mismatched C type)
+		return [ f'\t{_emit_operand(instr.dest)} = {_root_array_expr(instr.obj, instr.attr)};' ]
 
 	if isinstance( instr, ir.AddrOfArrayIndex ):
-		# compiler.addrof(x.field[i]) - one flat C expression,
-		# &(obj)OP field[index] - see AddrOfArrayIndex's own docstring
-		op = _member_access_operator( instr.obj.type )
-		return [ f'\t{_emit_operand(instr.dest)} = &(({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}]);' ]
+		# compiler.addrof(x.field[i]) / compiler.addrof(buf[i]) - one flat
+		# C expression, &(root)[index] - see AddrOfArrayIndex's own docstring
+		return [ f'\t{_emit_operand(instr.dest)} = &({_root_array_expr(instr.obj, instr.attr)}[{_emit_operand(instr.index)}]);' ]
 
 	if isinstance( instr, ir.GetAttrIndex ):
-		# f.arr[i] - one flat C expression, (obj)OP field[index] - see
-		# GetAttrIndex's own docstring for why this targets the field
+		# f.arr[i] / buf[i] - one flat C expression, (root)[index] - see
+		# GetAttrIndex's own docstring for why this targets the array
 		# directly rather than composing GetAttr+GetItem
-		op = _member_access_operator( instr.obj.type )
-		return [ f'\t{_emit_operand(instr.dest)} = ({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}];' ]
+		return [ f'\t{_emit_operand(instr.dest)} = {_root_array_expr(instr.obj, instr.attr)}[{_emit_operand(instr.index)}];' ]
 	if isinstance( instr, ir.SetAttrIndex ):
-		op = _member_access_operator( instr.obj.type )
-		return [ f'\t({_emit_operand(instr.obj)}){op}{_field_name(instr.attr)}[{_emit_operand(instr.index)}] = {_emit_operand(instr.value)};' ]
+		return [ f'\t{_root_array_expr(instr.obj, instr.attr)}[{_emit_operand(instr.index)}] = {_emit_operand(instr.value)};' ]
 
 
 	if isinstance( instr, ir.SizeOf ):

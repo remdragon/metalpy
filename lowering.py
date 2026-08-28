@@ -4080,12 +4080,18 @@ class FunctionLowering:
 			return found.type
 		return None
 
-	def _fixed_array_index_target( self, attr_node: ast.Attribute, index_node: ast.expr ) -> tuple[ir.Operand,str,FixedArrayType,ir.Operand]|None:
+	def _fixed_array_index_target( self, attr_node: 'ast.Attribute|ast.Name', index_node: ast.expr ) -> tuple[ir.Operand,str,FixedArrayType,ir.Operand]|None:
 		''' `f.arr[i]` where `f.arr` (attr_node) statically resolves to a
-		FixedArrayType field - returns (root_obj, attr_name, array_type,
-		index_operand) ready for ir.GetAttrIndex/SetAttrIndex, or None if it
-		doesn't (every other subscript shape is handled unchanged by the
-		ordinary paths in _expr_Subscript/_stmt_Assign). Checked via
+		FixedArrayType field, OR `buf[i]` where `buf` (attr_node, a bare
+		ast.Name) is ITSELF a local/parameter of FixedArrayType - returns
+		(root_obj, attr_name, array_type, index_operand) ready for
+		ir.GetAttrIndex/SetAttrIndex, or None if it doesn't (every other
+		subscript shape is handled unchanged by the ordinary paths in
+		_expr_Subscript/_stmt_Assign). For the bare-Name case, attr_name is
+		always '' - emission (see emitter_c.py's GetAttrIndex/SetAttrIndex/
+		ArrayFieldPtr/AddrOfArrayIndex handling) treats an empty attr as
+		"root_obj IS the array itself", spelling a flat `root[index]`
+		instead of `(root).attr[index]`. Checked via
 		_static_field_type_or_none FIRST, before lowering attr_node.value
 		for real - that helper emits no IR, never fails, and never evaluates
 		attr_node, so a non-match here doesn't double-evaluate the root
@@ -4116,10 +4122,34 @@ class FunctionLowering:
 				f'index {index_node.value} out of range for {array_type.qualname} (0..{array_type.count-1}): {ast.unparse(index_node)}',
 				index_node,
 			)
-		root = self._lower_expr( attr_node.value, None )
+		if isinstance( attr_node, ast.Name ):
+			root = self._fixed_array_root_operand( attr_node )
+			attr = ''
+		else:
+			root = self._lower_expr( attr_node.value, None )
+			attr = attr_node.attr
 		index_type = self.lowering.discovery.get_intrinsics()['usize']
 		index = self._lower_expr( index_node, index_type )
-		return root, attr_node.attr, array_type, index
+		return root, attr, array_type, index
+
+	def _fixed_array_root_operand( self, name_node: ast.Name ) -> ir.Operand:
+		''' the raw Operand for a bare local/parameter Name already known
+		(by the caller) to be of FixedArrayType - used only by
+		_fixed_array_index_target's Name branch and
+		_lower_compiler_addrof's bare-Name branch, to get the array's own
+		storage as an addressable root. Deliberately bypasses _expr_Name's
+		ordinary "read this as a whole VALUE" path (which rejects
+		FixedArrayType outright, the same as the Attribute/field-read case
+		- see FixedArrayType's own docstring: it has no whole-value read),
+		since indexing/addrof-ing the array itself isn't a whole-value
+		read at all. '''
+		name = self.lowering.discovery.find_name( name_node.id, name_node )
+		if not isinstance( name, Variable ):
+			self.lowering.discovery.fail( f'{name_node.id!r} is not a value, cannot use it as an expression', name_node )
+		if not name.is_global and not self._cfg.is_live( name_node.id ):
+			self.lowering.discovery.fail( f'{name_node.id!r} is not initialized on all code branches', name_node )
+		self.lowering._ensure_resolved( name )
+		return name
 
 	def _existing_local_or_none( self, target_id: str, node: ast.AST, context: str ) -> Variable|None:
 		''' is target_id ALREADY a genuine binding this assignment should
@@ -4583,7 +4613,7 @@ class FunctionLowering:
 			if writeback is not None:
 				writeback( obj )
 		elif isinstance( target, ast.Subscript ):
-			if isinstance( target.value, ast.Attribute ):
+			if isinstance( target.value, ( ast.Attribute, ast.Name )):
 				fixed = self._fixed_array_index_target( target.value, target.slice )
 				if fixed is not None:
 					root, attr, array_type, index = fixed
@@ -6653,6 +6683,19 @@ class FunctionLowering:
 			dest = self._new_temp( elem_ptr_type )
 			self._emit( ir.AddrOfArrayIndex( dest = dest, obj = root, attr = attr, index = index ))
 			return dest
+		if isinstance( arg_node, ast.Subscript ) and isinstance( arg_node.value, ast.Name ):
+			# compiler.addrof(buf[i]) where buf ITSELF (a bare local/
+			# parameter, not a field) is a FixedArrayType - same shape as
+			# the field-rooted case just above, attr='' (see
+			# _fixed_array_index_target's own docstring).
+			fixed = self._fixed_array_index_target( arg_node.value, arg_node.slice )
+			if fixed is not None:
+				root, attr, array_type, index = fixed
+				ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+				elem_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ array_type.elem_type ] )
+				dest = self._new_temp( elem_ptr_type )
+				self._emit( ir.AddrOfArrayIndex( dest = dest, obj = root, attr = attr, index = index ))
+				return dest
 		if isinstance( arg_node, ast.Attribute ):
 			if not isinstance( arg_node.value, ast.Name ):
 				self.lowering.discovery.fail(
@@ -6692,8 +6735,24 @@ class FunctionLowering:
 			return dest
 		if not isinstance( arg_node, ast.Name ):
 			self.lowering.discovery.fail( f'compiler.addrof(...) argument must be a bare local variable, not {ast.unparse(node)}', node )
-		value = self._lower_expr( arg_node, None )
 		ptr_cls = self.lowering.discovery.get_intrinsics()['Ptr']
+		static_type = self._static_field_type_or_none( arg_node )
+		if isinstance( static_type, FixedArrayType ):
+			# compiler.addrof(buf) where buf ITSELF is a FixedArrayType local
+			# -> Ptr[ElemType] via C's own array-to-pointer decay, same as
+			# ArrayFieldPtr's field-rooted case (NOT plain AddrOf/&buf, which
+			# would give ElemType(*)[N] - pointer-TO-array, a real type
+			# mismatch against the declared Ptr[ElemType] destination). obj
+			# is the local itself, attr='' (see _fixed_array_index_target's
+			# own docstring for the convention). Uses _fixed_array_root_
+			# operand, not _lower_expr, since a FixedArrayType has no
+			# ordinary whole-value read to fall into (see its own docstring).
+			root = self._fixed_array_root_operand( arg_node )
+			elem_ptr_type = self.lowering.discovery._get_or_create_specialization( ptr_cls, [ static_type.elem_type ] )
+			dest = self._new_temp( elem_ptr_type )
+			self._emit( ir.ArrayFieldPtr( dest = dest, obj = root, attr = '' ))
+			return dest
+		value = self._lower_expr( arg_node, None )
 		# &value's C type is one pointer level deeper than value's OWN storage.
 		# For a scalar/CStruct a variable stores the value directly, so that is
 		# Ptr[T]. But an RCClass value is itself stored as a pointer (a `Foo`
@@ -7230,6 +7289,15 @@ class FunctionLowering:
 		if isinstance( value_node, ast.Constant ):
 			return self._lower_scalar_cast( target_type, value_node, node )
 		value = self._lower_expr( value_node, None )
+		if isinstance( value.type, CEnum ) and value.type.value_type is target_type:
+			# compiler.cast(u8, some_foo) where Foo is a u8-backed @enum -
+			# same bare reinterpret as the T(x) scalar-constructor route
+			# (_try_lower_scalar_construct_call) allows for the identical
+			# shape - see its own comment for why (a CEnum's runtime
+			# representation IS its value_type exactly).
+			dest = self._new_temp( expected_type or target_type )
+			self._emit( ir.CastWrap( dest = dest, operand = value ))
+			return dest
 		if not isinstance( value.type, Scalar ):
 			self.lowering.discovery.fail(
 				f'compiler.cast(...) second argument must be a scalar value, not {value.type.qualname if value.type else "?"}: {ast.unparse(node)}',
@@ -9882,6 +9950,20 @@ class FunctionLowering:
 		if not name.is_global and not self._cfg.is_live( node.id ):
 			self.lowering.discovery.fail( f'{node.id!r} is not initialized on all code branches', node )
 		self.lowering._ensure_resolved( name )
+		if isinstance( name.type, FixedArrayType ):
+			# same restriction as a FixedArrayType FIELD's whole-value read
+			# (see _expr_Attribute's identical check, and FixedArrayType's
+			# own docstring: a bare C array is never a loadable/assignable
+			# VALUE, only element-indexed access or compiler.addrof() work).
+			# Callers that legitimately need the array's own storage as an
+			# addressable ROOT (indexing, addrof) use
+			# _fixed_array_root_operand instead of the ordinary _lower_expr/
+			# _expr_Name dispatch, so they never reach this rejection.
+			self.lowering.discovery.fail(
+				f'{node.id!r}: {name.type.qualname} locals cannot be read as a whole value '
+				f'(no element-level array access is implemented)',
+				node,
+			)
 		member = self._cfg.narrowed_member( node.id )
 		# _same_type, not raw `is` - same PLAN_COMPILER_BUG_SWEEP.md audit
 		# that found the other Shape 1 candidates flagged this escape-hatch
@@ -11935,7 +12017,7 @@ class FunctionLowering:
 		return dest
 
 	def _expr_Subscript( self, node: ast.Subscript, expected_type: Type|None ) -> ir.Operand:
-		if isinstance( node.value, ast.Attribute ) and not isinstance( node.slice, ast.Slice ):
+		if isinstance( node.value, ( ast.Attribute, ast.Name )) and not isinstance( node.slice, ast.Slice ):
 			fixed = self._fixed_array_index_target( node.value, node.slice )
 			if fixed is not None:
 				root, attr, array_type, index = fixed
@@ -16094,6 +16176,16 @@ class FunctionLowering:
 			# dunder dispatch needed: one compiler primitive already
 			# covers every Scalar-to-Scalar pair uniformly
 			return self._lower_scalar_cast( target_cls, operand, node )
+		if isinstance( operand.type, CEnum ) and operand.type.value_type is target_cls:
+			# the reverse of CEnum construction (Foo(u8(0)), above): a
+			# CEnum's runtime representation IS its own value_type exactly
+			# (same comment there), so u8(some_foo) is just as much a bare
+			# reinterpret - no range check needed (target_cls IS already
+			# the enum's own declared underlying type, so it can never be
+			# narrowing), no dunder dispatch needed either.
+			dest = self._new_temp( target_cls )
+			self._emit( ir.CastWrap( dest = dest, operand = operand ))
+			return dest
 		# a non-Scalar source (e.g. an RCClass) - this is where library-
 		# authored extensibility (Scalar.names, see discovery.py's
 		# visit_Assign) actually earns its keep: a `SomeClass.__u32__(self)
