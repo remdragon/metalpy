@@ -1,0 +1,144 @@
+'''
+Minimal Direct2D demo: a Win32 window with a Direct2D HWND render target,
+repainting three filled rectangles on WM_PAINT. First real GUI/graphics
+program in this codebase - see lib/windows/user32.py and
+lib/windows/com/id2d1.py for the underlying bindings (both hand-written
+from scratch for this demo, no prior Win32 windowing/Direct2D support
+existed here).
+
+The render target and brushes are module-level globals, not locals of
+main(): WndProc must be a bare top-level function (real closures aren't
+supported by this compiler yet - see lib/tkinter.py's own identical note
+on Tcl_CreateCommand callbacks), so it has no other way to reach them.
+'''
+
+import compiler
+from windows.user32 import (
+	HWND, WPARAM, LPARAM, LRESULT, RECT, MSG, PAINTSTRUCT, WNDCLASSEXW,
+	WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, SW_SHOW, WM_DESTROY, WM_PAINT,
+	RegisterClassExW, CreateWindowExW, DefWindowProcW, GetMessageW,
+	TranslateMessage, DispatchMessageW, PostQuitMessage, ShowWindow,
+	UpdateWindow, GetClientRect, BeginPaint, EndPaint,
+)
+from windows.com import HRESULT, SUCCEEDED
+from windows.com.id2d1 import (
+	D2D1_COLOR_F, D2D1_RECT_F, D2D1_SIZE_U,
+	D2D1_RENDER_TARGET_PROPERTIES, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+	D2D1_FACTORY_TYPE_SINGLE_THREADED, IID_ID2D1FACTORY,
+	D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget,
+)
+
+g_render_target: Ptr[ID2D1RenderTarget] = None
+g_brush_red: Ptr[None] = None
+g_brush_green: Ptr[None] = None
+g_brush_blue: Ptr[None] = None
+
+def render() -> None:
+	if g_render_target is None:
+		return
+	g_render_target.BeginDraw()
+	white: D2D1_COLOR_F = D2D1_COLOR_F( r = 1.0, g = 1.0, b = 1.0, a = 1.0 )
+	g_render_target.Clear( compiler.addrof( white ))
+	rect1: D2D1_RECT_F = D2D1_RECT_F( left = 40.0, top = 40.0, right = 220.0, bottom = 180.0 )
+	g_render_target.FillRectangle( compiler.addrof( rect1 ), g_brush_red )
+	rect2: D2D1_RECT_F = D2D1_RECT_F( left = 260.0, top = 70.0, right = 440.0, bottom = 230.0 )
+	g_render_target.FillRectangle( compiler.addrof( rect2 ), g_brush_green )
+	rect3: D2D1_RECT_F = D2D1_RECT_F( left = 150.0, top = 210.0, right = 360.0, bottom = 330.0 )
+	g_render_target.FillRectangle( compiler.addrof( rect3 ), g_brush_blue )
+	tag1: u64 = 0
+	tag2: u64 = 0
+	g_render_target.EndDraw( compiler.addrof( tag1 ), compiler.addrof( tag2 ))
+
+def wnd_proc( hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM ) -> LRESULT:
+	if msg == WM_DESTROY:
+		PostQuitMessage( 0 )
+		return 0
+	if msg == WM_PAINT:
+		ps: PAINTSTRUCT = PAINTSTRUCT()
+		BeginPaint( hwnd, compiler.addrof( ps ))
+		render()
+		EndPaint( hwnd, compiler.addrof( ps ))
+		return 0
+	return DefWindowProcW( hwnd, msg, wparam, lparam )
+
+def main() -> i32:
+	global g_render_target, g_brush_red, g_brush_green, g_brush_blue
+
+	class_name: str = 'MetalpyD2DDemo'
+
+	with compiler.wrap_arithmetic:
+		cb_size: u32 = u32( compiler.sizeof( WNDCLASSEXW ))
+	wc: WNDCLASSEXW = WNDCLASSEXW(
+		cbSize = cb_size,
+		lpfnWndProc = wnd_proc,
+		lpszClassName = class_name.to_utf16(),
+	)
+	if RegisterClassExW( compiler.addrof( wc )) == 0:
+		print( 'RegisterClassExW failed' )
+		return 1
+
+	hwnd: HWND = CreateWindowExW(
+		0, class_name.to_utf16(), 'metalpy Direct2D demo'.to_utf16(),
+		WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, 500, 400,
+		None, None, None, None,
+	)
+	if hwnd is None:
+		print( 'CreateWindowExW failed' )
+		return 2
+
+	factory_out: Ptr[None] = None
+	hr: HRESULT = D2D1CreateFactory(
+		D2D1_FACTORY_TYPE_SINGLE_THREADED,
+		compiler.addrof( IID_ID2D1FACTORY ),
+		None,
+		compiler.addrof( factory_out ),
+	)
+	if not SUCCEEDED( hr ):
+		print( 'D2D1CreateFactory failed' )
+		return 3
+	factory: Ptr[ID2D1Factory] = compiler.cast( Ptr[ID2D1Factory], factory_out )
+
+	client_rect: RECT = RECT()
+	GetClientRect( hwnd, compiler.addrof( client_rect ))
+	with compiler.wrap_arithmetic:
+		size: D2D1_SIZE_U = D2D1_SIZE_U(
+			width = u32( client_rect.right - client_rect.left ),
+			height = u32( client_rect.bottom - client_rect.top ),
+		)
+
+	rt_props: D2D1_RENDER_TARGET_PROPERTIES = D2D1_RENDER_TARGET_PROPERTIES()
+	hwnd_rt_props: D2D1_HWND_RENDER_TARGET_PROPERTIES = D2D1_HWND_RENDER_TARGET_PROPERTIES(
+		hwnd = hwnd, pixelSize = size,
+	)
+	rt_out: Ptr[None] = None
+	hr = factory.CreateHwndRenderTarget(
+		compiler.addrof( rt_props ), compiler.addrof( hwnd_rt_props ), compiler.addrof( rt_out ),
+	)
+	if not SUCCEEDED( hr ):
+		print( 'CreateHwndRenderTarget failed' )
+		return 4
+	g_render_target = compiler.cast( Ptr[ID2D1RenderTarget], rt_out )
+
+	red: D2D1_COLOR_F = D2D1_COLOR_F( r = 0.8, g = 0.1, b = 0.1, a = 1.0 )
+	green: D2D1_COLOR_F = D2D1_COLOR_F( r = 0.1, g = 0.7, b = 0.2, a = 1.0 )
+	blue: D2D1_COLOR_F = D2D1_COLOR_F( r = 0.1, g = 0.3, b = 0.9, a = 1.0 )
+	red_out: Ptr[None] = None
+	green_out: Ptr[None] = None
+	blue_out: Ptr[None] = None
+	g_render_target.CreateSolidColorBrush( compiler.addrof( red ), None, compiler.addrof( red_out ))
+	g_render_target.CreateSolidColorBrush( compiler.addrof( green ), None, compiler.addrof( green_out ))
+	g_render_target.CreateSolidColorBrush( compiler.addrof( blue ), None, compiler.addrof( blue_out ))
+	g_brush_red = red_out
+	g_brush_green = green_out
+	g_brush_blue = blue_out
+
+	ShowWindow( hwnd, SW_SHOW )
+	UpdateWindow( hwnd )
+
+	msg: MSG = MSG()
+	while GetMessageW( compiler.addrof( msg ), None, 0, 0 ) > 0:
+		TranslateMessage( compiler.addrof( msg ))
+		DispatchMessageW( compiler.addrof( msg ))
+
+	return 0
