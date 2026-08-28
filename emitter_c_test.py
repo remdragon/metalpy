@@ -8828,6 +8828,64 @@ def main() -> i32:
 		self._assert_compiles_and_runs( emitter_c.emit_c( self.compiler ), expected_exit = 2 )
 
 
+class BareFieldReturnFromWithInsideLoopLeakTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' cfg.py's current_epilogue_label() picks the TOPMOST active epilogue
+	entry as a `return`'s shared-ladder jump target and stops looking as soon
+	as it finds one that isn't itself confined - but a with-statement's own
+	__exit__ defer entry is flag-guarded, so it was accepted as "safe"
+	without ever checking the with-statement's own ctx local sitting BELOW
+	it on the stack. When that ctx local is loop-confined (the with-block is
+	nested inside a while/for), restore() silently drops it once the loop
+	body finishes lowering - so a `return self.<field>` (or any bare aliasing
+	return) reached from inside such a with-block jumped to a shared label
+	whose eventual ladder never released the ctx value at all. Found via a
+	real Queue[T].drain() repro (`threading.FastLock` reported still live by
+	the debug leak-checker after a `with self.__lock: ... return
+	self.__items` path inside a `while True:` ran) - not with-statement- or
+	loop-body-specific to any particular field type; this class isolates it
+	with a plain user-defined context manager and a str field. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'bare_field_return_from_with_inside_loop_does_not_leak_ctx', '''
+class Ctx:
+	def __enter__( self ) -> None:
+		pass
+	def __exit__( self ) -> None:
+		pass
+
+
+class Box:
+	__items: str
+	__ctx: Ctx
+
+	def __init__( self ) -> None:
+		self.__items = "x"
+		self.__ctx = Ctx()
+
+	def drain( self ) -> str:
+		while True:
+			with self.__ctx:
+				if self.__items == "x":
+					return self.__items
+		return "unreached"
+
+
+def main() -> i32:
+	b: Box = Box()
+	v: str = b.drain()
+	if v != "x":
+		return 1
+	return 0
+''' ),
+		] )
+
+
 class CapturedThenCancelledEpilogueEntryTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' regression tests for a real bug in cfg.py's shared epilogue-ladder
 	mechanism, independent of generators/defer/errdefer - pure ordinary

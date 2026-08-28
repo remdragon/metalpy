@@ -1797,6 +1797,31 @@ class CFGState:
 		# a splice never gets to just fall through to a caller-level ir.
 		# Return; it always needs a real, local landing point
 		inline_scope = self._inline_scope_stack[-1] if self._inline_scope_stack else None
+		# a confined-and-unguarded entry ANYWHERE at/after confinement_floor -
+		# not just the topmost active one - dooms the shared ladder: restore()
+		# drops it once its own loop body/branch finishes lowering, silently
+		# vanishing from whatever build_epilogue_ladder() later emits. The
+		# walk below picks the TOPMOST active entry as the jump target and
+		# stops there without inspecting anything shallower, so a confined
+		# entry sitting BELOW a flag-guarded one (e.g. a with-statement's own
+		# ctx local, pushed before its __exit__ defer entry, both still on
+		# the stack) was never checked - the defer entry's own label got
+		# handed back as "safe" while the ctx local underneath it silently
+		# lost its release. Confirmed via a real repro: `return self.x` from
+		# inside a with-block nested in a while loop leaked the with-block's
+		# own context value (the ctx local's release lives only in the
+		# loop's per-iteration/inline-unwind cleanup, never in the shared
+		# ladder). Scanning the whole eligible suffix up front - rather than
+		# only the entry the reversed walk happens to land on first - closes
+		# that gap; entries above an inline splice's own boundary_depth are
+		# excluded exactly like the reversed walk below already excludes them
+		# (they belong to the caller/outer splice, not this one).
+		if confinement_floor is not None:
+			lower_bound = inline_scope.boundary_depth if inline_scope is not None else 0
+			for j in range( max( confinement_floor, lower_bound ), len( self._epilogue_stack )):
+				entry = self._epilogue_stack[j]
+				if not entry.cancelled and not entry.is_flag_guarded:
+					return None
 		for i, entry in reversed( list( enumerate( self._epilogue_stack ))):
 			if inline_scope is not None and i < inline_scope.boundary_depth:
 				if mark_captured:
