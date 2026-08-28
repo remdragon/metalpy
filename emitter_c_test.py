@@ -18014,6 +18014,93 @@ def main() -> i32:
 		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
 
 
+class CEnumToUnderlyingScalarCastTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression test for a real gap found porting a private project:
+	`EnumName(int_value)` (CEnum construction FROM its underlying int,
+	CEnumConstructionArgumentShapeTests above) was fully supported, but the
+	REVERSE - given an enum instance, get its raw underlying value back out
+	- had no working spelling. `u8(some_foo)` failed with "... has no
+	__u8__ method - cannot convert to intrinsics.u8" (_try_lower_scalar_
+	construct_call fell straight to dunder-dispatch for any non-Scalar
+	source, never considering that a CEnum's own value_type might already
+	BE the target), and `compiler.cast(u8, some_foo)` failed with
+	"... second argument must be a scalar value, not ...Foo" (_lower_
+	compiler_cast's isinstance(value.type, Scalar) gate has no CEnum
+	exemption).
+
+	Since a CEnum's runtime representation IS its underlying type exactly
+	(the same fact CEnum CONSTRUCTION already relies on - see
+	_try_lower_construct_call's own CEnum branch), this is just the
+	identical reinterpret in reverse: fixed by teaching both
+	_try_lower_scalar_construct_call (u8(enum), the primary route, mirrors
+	how construction already works) and _lower_compiler_cast
+	(compiler.cast(u8, enum), for consistency) to recognize a CEnum source
+	whose OWN value_type matches the requested target scalar and emit a
+	bare ir.CastWrap - no range check (the target IS already the enum's
+	own declared underlying type, so it can never be narrowing), no
+	runtime dunder dispatch. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_wrong_underlying_scalar_still_rejects_via_dunder_error( self ) -> None:
+		# negative check: a scalar cast to a DIFFERENT width than the
+		# enum's own declared value_type must still fail (not silently
+		# reinterpret through the wrong width) - the CastWrap fast path
+		# only applies when target_cls IS exactly value_type
+		self._run( '\n'.join([
+			'@enum( u8 )',
+			'class Foo:',
+			'	A = 0',
+			'	B = 1',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo( u8( 1 ))',
+			'	x: u16 = u16( f )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'has no __u16__ method', self.discovery.errors.errors[0] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# both blessed routes (T(x) and compiler.cast(T, x)) extract the
+			# same underlying value, usable in ordinary scalar arithmetic/
+			# comparisons afterward, and round-trip back through the enum
+			# constructor to the original instance
+			( 'cenum_to_underlying_scalar_cast_roundtrip', '''
+import compiler
+
+@enum( u8 )
+class Foo:
+	A = 0
+	B = 1
+	C = 2
+
+def main() -> i32:
+	f: Foo = Foo( u8( 2 ))
+	via_ctor: u8 = u8( f )
+	via_cast: u8 = compiler.cast( u8, f )
+	if via_ctor != u8( 2 ):
+		return 1
+	if via_cast != u8( 2 ):
+		return 2
+	with compiler.wrap_arithmetic:
+		bumped: u8 = via_ctor + u8( 1 )
+	if bumped != u8( 3 ):
+		return 3
+	if via_ctor >= u8( 3 ):
+		return 4
+	g: Foo = Foo( via_ctor )
+	if g != f:
+		return 5
+	return 0
+''' ),
+		])
+
+
 class FixedSizeArrayFieldTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' Regression test for SYNTAX.md's documented-but-unimplemented
 	"Fixed-Size Inline Array (inside @struct): u16[32], u8[8]" - a bare
@@ -18353,6 +18440,151 @@ def main() -> i32:
 		]))
 		self.assertTrue( self.discovery.errors.errors )
 		self.assertIn( 'is not supported yet', self.discovery.errors.errors[0] )
+
+
+class FixedSizeArrayLocalVariableTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for a real gap found porting a private project:
+	`buf: u8[4] = 0` (a FixedArrayType used as a bare LOCAL, not a
+	@cstruct/@cunion field) used to crash the compiler outright with an
+	internal NotImplementedError from emitter_c.py's c_type()/_declarator()
+	("... cannot be spelled as an ordinary C type - it only exists as a
+	@cstruct/@cunion FIELD") instead of either working or failing with a
+	clean compile error - a local scratch buffer is a completely ordinary
+	thing to want (this is real C's own `uint8_t buf[4];`), unlike the
+	parameter/return-type/module-global positions FixedArrayType is still,
+	deliberately, rejected in (see the tests above).
+
+	Fixed by extending _declarator (not just _struct_or_union_body) to
+	spell the same discontinuous "TYPE NAME[N]" C array declarator for a
+	local, and by generalizing ir.GetAttrIndex/SetAttrIndex/ArrayFieldPtr/
+	AddrOfArrayIndex's existing "obj+attr" shape to accept attr='' meaning
+	"obj IS the array itself", not a field of some other object - see
+	lowering.py's _fixed_array_index_target/_fixed_array_root_operand and
+	emitter_c.py's _root_array_expr. Element-level read/write (`buf[i]`,
+	both directions), compiler.addrof(buf) (whole-array decay) and
+	compiler.addrof(buf[i]) (single-element address) all now work for a
+	local exactly like they already did for a field. A local's own
+	whole-value read (`x = buf`) is still rejected, same restriction (and
+	same reason - a bare C array isn't assignable via `=`) as a field's. '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_local_fixed_array_declares_without_crashing( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	buf: u8[4] = 0',
+			'	return',
+		]))
+		self.assertEqual( self.discovery.errors.errors, [] )
+
+	def test_local_fixed_array_rejects_reading_the_whole_value( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	buf: u8[4] = 0',
+			'	x = buf',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be read as a whole value', self.discovery.errors.errors[0] )
+
+	def test_local_fixed_array_indexed_write_literal_index_out_of_range_is_rejected( self ) -> None:
+		self._run( '\n'.join([
+			'def main() -> None:',
+			'	buf: u8[4] = 0',
+			'	buf[4] = u8( 1 )',
+			'	return',
+		]))
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'out of range', self.discovery.errors.errors[0] )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			# element-level read/write, compiler.addrof(buf) (whole-array
+			# decay to Ptr[ElemType]) passed to a real function taking
+			# Ptr[u8]/ConstPtr[u8], and compiler.addrof(buf[i]) (single-
+			# element address) - a real compile+link+run, not just -c
+			( 'local_fixed_array_index_and_addrof_roundtrip', '''
+import compiler
+
+def fill_via_ptr( p: Ptr[u8], count: usize ) -> None:
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < count:
+			p[i] = u8( i ) + u8( 10 )
+			i += usize( 1 )
+
+def sum_via_const_ptr( p: ConstPtr[u8], count: usize ) -> u8:
+	total: u8 = 0
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < count:
+			total = total + p[i]
+			i += usize( 1 )
+	return total
+
+def main() -> i32:
+	buf: u8[4] = 0
+	# element-level write/read directly on the local
+	buf[0] = u8( 1 )
+	buf[1] = u8( 2 )
+	buf[2] = u8( 3 )
+	buf[3] = u8( 4 )
+	if buf[0] != u8( 1 ):
+		return 1
+	if buf[3] != u8( 4 ):
+		return 2
+	with compiler.wrap_arithmetic:
+		total: u8 = buf[0] + buf[1] + buf[2] + buf[3]
+	if total != u8( 10 ):
+		return 3
+
+	# compiler.addrof(buf) - whole-array decay to Ptr[u8], handed to a
+	# real function expecting a plain pointer + count (the FFI out-
+	# parameter idiom this whole feature exists for)
+	fill_via_ptr( compiler.addrof( buf ), usize( 4 ))
+	if buf[0] != u8( 10 ):
+		return 4
+	if buf[3] != u8( 13 ):
+		return 5
+	via_const: u8 = sum_via_const_ptr( compiler.addrof( buf ), usize( 4 ))
+	if via_const != u8( 10 + 11 + 12 + 13 ):
+		return 6
+
+	# compiler.addrof(buf[i]) - single-element address, not the whole array
+	p: Ptr[u8] = compiler.addrof( buf[ 2 ])
+	p[0] = u8( 99 )
+	if buf[2] != u8( 99 ):
+		return 7
+	return 0
+''' ),
+			# a runtime (non-constant) index, unchecked like Ptr[T]/
+			# ConstPtr[T]'s own GetItem convention - same free-bounds-
+			# checking-only-for-literals rule the field-rooted version
+			# already has (see test_fixed_array_indexed_*_literal_index_
+			# out_of_range_is_rejected_at_compile_time above)
+			( 'local_fixed_array_runtime_index', '''
+import compiler
+
+def main() -> i32:
+	buf: u8[8] = 0
+	with compiler.wrap_arithmetic:
+		i: usize = 0
+		while i < usize( 8 ):
+			buf[i] = u8( i )
+			i += usize( 1 )
+		total: u8 = 0
+		i = 0
+		while i < usize( 8 ):
+			total = total + buf[i]
+			i += usize( 1 )
+	if total != u8( 0+1+2+3+4+5+6+7 ):
+		return 1
+	return 0
+''' ),
+		])
 
 
 class CStructPackingAndFieldAlignmentTests( test_support.RealCompileMixin, CompilerTestCase ):

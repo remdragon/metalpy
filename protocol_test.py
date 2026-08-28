@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import mpy_types
 import test_support
 from compiler import Compiler
 from discovery import Discovery
@@ -535,6 +536,119 @@ def main() -> i32:
 	ba: bytearray = bytearray( 3 )
 	if describe( ba ) != 3:
 		return 5
+	return 0
+''' ),
+		])
+
+
+class TypeVarBoundSatisfiedByTypeVarConcreteTests( unittest.TestCase ):
+	''' Unit-level coverage for mpy_types.TypeVar.bound_satisfied_by's
+	TypeVar-as-`concrete` branch: a generic call site can pass an already-
+	bounded-but-not-yet-substituted TypeVar (e.g. a caller's own `W: P`
+	forwarded into a callee's `T: P`) as the "concrete" argument being
+	checked against a bound. Before this branch existed, `base` fell
+	through to `isinstance(base, RCClass)`, which a bare TypeVar can never
+	satisfy, so the bound was always reported unmet even when the two
+	protocols were identical - a real gap surfaced while porting
+	io.write_all[T: Writer]/io.read_exact[T: Reader] callers that forward a
+	class's own protocol-bounded type param into another same-bound generic.
+	Exercised directly (not via a full compile) since the compiler's lazy,
+	per-specialization monomorphization means a TypeVar never actually
+	reaches this code path through ordinary top-level source in this
+	codebase today - every real call site bottoms out to a concrete class
+	before bound-checking runs - so this locks in the fix at the level
+	where the defect actually lived. '''
+
+	def _make_protocol( self, name: str ) -> mpy_types.Protocol:
+		return mpy_types.Protocol( stem = name, qualname = f'test.{name}', file = None, line = None )
+
+	def _make_typevar( self, stem: str, bound: 'mpy_types.Protocol|None' ) -> mpy_types.TypeVar:
+		return mpy_types.TypeVar( stem = stem, qualname = f'test.{stem}', file = None, line = None, bound = bound )
+
+	def test_typevar_bounded_by_the_same_protocol_satisfies_the_bound( self ) -> None:
+		writer = self._make_protocol( 'Writer' )
+		callee_t = self._make_typevar( 'T', writer )
+		caller_w = self._make_typevar( 'W', writer )
+		self.assertTrue( callee_t.bound_satisfied_by( caller_w ))
+
+	def test_typevar_bounded_by_a_different_protocol_fails_the_bound( self ) -> None:
+		writer = self._make_protocol( 'Writer' )
+		reader = self._make_protocol( 'Reader' )
+		callee_t = self._make_typevar( 'T', writer )
+		caller_x = self._make_typevar( 'X', reader )
+		self.assertFalse( callee_t.bound_satisfied_by( caller_x ))
+
+	def test_unbounded_typevar_fails_a_bounded_requirement( self ) -> None:
+		writer = self._make_protocol( 'Writer' )
+		callee_t = self._make_typevar( 'T', writer )
+		caller_u = self._make_typevar( 'U', None )
+		self.assertFalse( callee_t.bound_satisfied_by( caller_u ))
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+class NestedGenericProtocolBoundForwardingTests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' Real compile+run coverage for the shape gap 1 was reported in: a
+	protocol-bounded generic forwarding its own type param (self's own
+	bounded field, or a plain bounded parameter) into ANOTHER generic
+	bound by the identical protocol. These already compile clean under
+	this compiler's lazy per-specialization monomorphization (every call
+	bottoms out concrete before bound-checking runs), but are kept as real
+	end-to-end coverage for this exact shape - see
+	TypeVarBoundSatisfiedByTypeVarConcreteTests above for the unit-level
+	regression guarding the actual defect. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	def test_bounded_field_forwarded_into_same_bound_generic( self ) -> None:
+		self.assert_programs_run([
+			( 'bounded_field_forwarded_into_same_bound_generic', '''
+import compiler
+import io
+
+class DummyWriter( io.Writer ):
+	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
+		return Result.Ok( count )
+
+class Serializer[W: io.Writer]:
+	__writer: W
+	def __init__( self, writer: W ) -> None:
+		self.__writer = writer
+	def send_one( self, val: u8 ) -> Result[None, OSError]:
+		v: u8 = val
+		return io.write_all( self.__writer, compiler.addrof( v ), usize( 1 ))
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		w: DummyWriter = DummyWriter()
+		s: Serializer[DummyWriter] = Serializer[DummyWriter]( w )
+		r: Result[None, OSError] = s.send_one( u8( 5 ))
+		if r.is_err():
+			return 1
+	return 0
+''' ),
+		])
+
+	def test_plain_bounded_parameter_forwarded_into_same_bound_generic( self ) -> None:
+		self.assert_programs_run([
+			( 'plain_bounded_parameter_forwarded_into_same_bound_generic', '''
+import compiler
+import io
+
+class DummyWriter( io.Writer ):
+	def write( self, buf: ConstPtr[u8], count: usize ) -> Result[usize, OSError]:
+		return Result.Ok( count )
+
+def relay[W: io.Writer]( w: W, val: u8 ) -> Result[None, OSError]:
+	v: u8 = val
+	return io.write_all( w, compiler.addrof( v ), usize( 1 ))
+
+def main() -> i32:
+	with compiler.wrap_arithmetic:
+		w: DummyWriter = DummyWriter()
+		r: Result[None, OSError] = relay( w, u8( 5 ))
+		if r.is_err():
+			return 1
 	return 0
 ''' ),
 		])

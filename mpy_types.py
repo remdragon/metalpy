@@ -371,6 +371,16 @@ class TypeVar( Type ):
 			# conformance (for homogeneous tuples) lives on its lazily-
 			# synthesized backing RCClass instead (see tuple_storage.py)
 			base = base.backing
+		if isinstance( base, TypeVar ):
+			# concrete is itself a not-yet-substituted, already-bounded type
+			# param (e.g. a generic's own field/parameter, referenced from a
+			# call site that hasn't been monomorphized to a concrete type
+			# yet) - its own bound already proves conformance, no need to
+			# re-derive it structurally (which would always fail: a bare
+			# TypeVar is never an RCClass).
+			if base.bound is None:
+				return False
+			return resolver._same_type( base.bound, self.bound ) if resolver is not None else base.bound is self.bound
 		if not isinstance( base, RCClass ):
 			return False
 		if not isinstance( self.bound, Specialization ):
