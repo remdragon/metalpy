@@ -147,3 +147,13 @@ def BeginPaint( hWnd: HWND, lpPaint: Ptr[PAINTSTRUCT] ) -> HANDLE:
 @extern( 'user32', 'EndPaint' )
 def EndPaint( hWnd: HWND, lpPaint: ConstPtr[PAINTSTRUCT] ) -> bool:
 	...
+
+# queues a message for the target window's own thread to pick up and
+# dispatch through its normal wnd_proc call - the standard way to marshal
+# work (e.g. "please repaint now") from a background thread onto the
+# window's own thread, since window-proc callbacks (and anything a
+# window-proc-driven render path touches, e.g. a D2D1_FACTORY_TYPE_
+# SINGLE_THREADED render target) aren't safe to call from just any thread.
+@extern( 'user32', 'PostMessageW' )
+def PostMessageW( hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM ) -> bool:
+	...
