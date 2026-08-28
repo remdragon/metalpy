@@ -466,6 +466,8 @@ def _prologue_debug_ops() -> str:
 		raw_alloc_decl = 'void* GetProcessHeap( void ); void* HeapAlloc( void* hHeap, uint32_t dwFlags, uintptr_t dwBytes ); bool HeapFree( void* hHeap, uint32_t dwFlags, uint8_t* lpMem );'
 		raw_alloc_call = '(__metalpy_debug_raw_entry*)HeapAlloc( GetProcessHeap(), 0, sizeof( __metalpy_debug_raw_entry ))'
 		raw_free_call = 'HeapFree( GetProcessHeap(), 0, (uint8_t*)e )'
+		immortal_alloc_call = '(__metalpy_debug_immortal_cache_entry*)HeapAlloc( GetProcessHeap(), 0, sizeof( __metalpy_debug_immortal_cache_entry ))'
+		immortal_actual_free_call = 'HeapFree( GetProcessHeap(), 0, (uint8_t*)cached )'
 	else:
 		write_decl = 'long write( int32_t fd, const void* buf, size_t count );'
 		write_body = '\twrite( 1, s, len );\n'
@@ -485,6 +487,8 @@ def _prologue_debug_ops() -> str:
 		raw_alloc_decl = 'void* malloc( uintptr_t size ); void free( void* ptr );'
 		raw_alloc_call = '(__metalpy_debug_raw_entry*)malloc( sizeof( __metalpy_debug_raw_entry ))'
 		raw_free_call = 'free( e )'
+		immortal_alloc_call = '(__metalpy_debug_immortal_cache_entry*)malloc( sizeof( __metalpy_debug_immortal_cache_entry ))'
+		immortal_actual_free_call = 'free( cached )'
 	return f'''\
 {write_decl}
 
@@ -552,12 +556,76 @@ static inline __metalpy_maybe_unused void __metalpy_debug_raw_untrack( void* ptr
 	__metalpy_debug_lock_release();
 }}
 
+// side-table entry for a lazily-populated cache FIELD living on a compile-
+// time-immortal object (e.g. str.__utf16 on a string literal - see
+// ir.DebugTrackImmortalCache/lib/sys.py's debug_register_immortal_cache).
+// Such an object's own destructor never runs (retain/release skip
+// METALPY_IMMORTAL_REFCOUNT objects entirely), so a cache it owns would
+// otherwise report as a permanent false-positive "leak" - __metalpy_dump_
+// live_objects (below) drains this list, freeing+resetting each slot,
+// right before its real walk/report. `slot` is the FIELD's own address,
+// not the cached value - freeing then zeroing *slot lets a later cache-
+// miss safely re-populate and re-register the same slot, so calling
+// dump_live_objects() more than once in one program stays correct.
+typedef struct {{
+	__metalpy_debug_link link;
+	void** slot;
+}} __metalpy_debug_immortal_cache_entry;
+
+static __metalpy_maybe_unused __metalpy_debug_link __metalpy_debug_immortal_cache_list_head = {{ &__metalpy_debug_immortal_cache_list_head, &__metalpy_debug_immortal_cache_list_head }};
+
+static inline __metalpy_maybe_unused void __metalpy_debug_track_immortal_cache( void** slot ) {{
+	if ( !slot ) return;
+	__metalpy_debug_immortal_cache_entry* e = {immortal_alloc_call};
+	if ( !e ) return; // tracking is best-effort - must never crash the real allocation path
+	e->slot = slot;
+	__metalpy_debug_track( &__metalpy_debug_immortal_cache_list_head, &e->link );
+}}
+
 // groups RC objects by (vtable, alloc_loc) - both are pointers to static
 // storage set once at construction (one literal per Allocate CALL SITE, one
 // vtable instance per CLASS), so pointer equality alone already means
 // "same class, same source line", no string comparison needed. O(n^2) over
 // the live set - a debug/diagnostic tool, not a hot path.
 static __metalpy_maybe_unused void __metalpy_dump_live_objects( void ) {{
+	// drain immortal-object cache slots FIRST, in their own self-locking
+	// critical section (NOT nested inside the main walk's lock below,
+	// which isn't reentrant) - see __metalpy_debug_track_immortal_cache's
+	// own comment for why these must be freed before the live-object walk
+	// even starts, not as part of it. Nodes stay in the list afterward
+	// (cached now NULL, so a later re-populate + re-register just reuses
+	// the slot's own existing node on the next drain) - simpler than
+	// removing them, and the set of distinct immortal caches in any given
+	// program is compile-time-bounded anyway.
+	{{
+		// lock held only per-iteration, NOT across the untrack+free call
+		// below: __metalpy_debug_raw_untrack is itself self-locking (same
+		// non-reentrant lock), so calling it while still holding this
+		// lock would deadlock. Reading `next` before releasing keeps the
+		// walk itself safe even though the lock is briefly dropped
+		// between iterations - this list's own nodes are never removed
+		// (see this function's own header comment), so `l` always stays
+		// valid regardless.
+		__metalpy_debug_link* l = __metalpy_debug_immortal_cache_list_head.next;
+		while ( l != &__metalpy_debug_immortal_cache_list_head ) {{
+			__metalpy_debug_lock_acquire();
+			__metalpy_debug_immortal_cache_entry* e = (__metalpy_debug_immortal_cache_entry*)l;
+			void* cached = *e->slot;
+			if ( cached ) *e->slot = 0;
+			__metalpy_debug_link* next = l->next;
+			__metalpy_debug_lock_release();
+			if ( cached ) {{
+				// removes+frees cached's OWN raw-tracking side-table entry
+				// (a SEPARATE list from this one, populated by sys.alloc's
+				// own __debug_raw_track__ call) - without this the raw-
+				// buffer report below would still count it: freeing the
+				// memory alone doesn't un-register it from that table.
+				__metalpy_debug_raw_untrack( cached );
+				{immortal_actual_free_call};
+			}}
+			l = next;
+		}}
+	}}
 	// one lock for the WHOLE walk (both lists) - a concurrent track/untrack
 	// from another still-running thread must not be allowed to mutate
 	// either list mid-walk (see _prologue_debug_list's own comment)
@@ -4013,6 +4081,8 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		return [ f'\t__metalpy_debug_raw_track( (void*){_emit_operand(instr.ptr)}, (size_t){_emit_operand(instr.size)} );' ]
 	if isinstance( instr, ir.DebugRawUntrack ):
 		return [ f'\t__metalpy_debug_raw_untrack( (void*){_emit_operand(instr.ptr)} );' ]
+	if isinstance( instr, ir.DebugTrackImmortalCache ):
+		return [ f'\t__metalpy_debug_track_immortal_cache( (void**){_emit_operand(instr.slot)} );' ]
 	if isinstance( instr, ir.DumpLiveObjects ):
 		return [ '\t__metalpy_dump_live_objects();' ]
 	if isinstance( instr, ir.DebugUntrackRC ):

@@ -44,6 +44,43 @@ def alloc[T]( count: usize ) -> Ptr[T]:
 		mempoison( ptr, byte_count )
 	return ptr
 
+# mirrors emitter_c.py's own #define METALPY_IMMORTAL_REFCOUNT EXACTLY - a
+# compile-time-baked immortal object (a string literal, a static vtable
+# instance, ...) has its header ref_count set to this sentinel and
+# retain/release skip it entirely (see emitter_c.py's own
+# _field_lock_prologue comment). Duplicated here rather than derived from a
+# shared source: the #define lives in generated C text, nowhere a
+# metalpy-level import could reach.
+IMMORTAL_REFCOUNT: usize = 2147483647
+
+def debug_register_immortal_cache( slot: Ptr[Ptr[u8]] ) -> None:
+	''' debug-only, no-op in release: call right after publishing a
+	lazily-computed cache into a field on a compile-time-immortal object
+	(compiler.refcount(self) == IMMORTAL_REFCOUNT). Such a field's owner
+	is never destructed (retain/release skip IMMORTAL_REFCOUNT objects
+	entirely), so its cache would otherwise report as a permanent
+	false-positive "leak" to dump_live_objects() even though it's an
+	intentional, one-time, program-lifetime cache, not a bug.
+
+	`slot` is the field's own address (e.g.
+	compiler.addrof(self.__utf16), cast to Ptr[Ptr[u8]]) - NOT the cached
+	pointer's value - compiler.__debug_track_immortal_cache__'s own
+	side-table (emitter_c.py's __metalpy_dump_live_objects) frees AND
+	resets it right before every dump_live_objects() report, keeping
+	repeated calls in one program correct: a later cache-miss just
+	re-populates and re-registers the same slot. This has to live at the
+	compiler/emitter level, not as a plain metalpy-level list drained from
+	here - the automatic end-of-program leak-check epilogue
+	(__metalpy_deinit) calls compiler.dump_live_objects() directly, not
+	this wrapper, so a list owned only here would never get drained on
+	that path (confirmed via a real repro: a program that never calls
+	sys.dump_live_objects() itself still reported these as leaked).
+
+	NEVER call this for a non-immortal object's field: nothing guarantees
+	that slot address stays valid until the drain runs. '''
+	if compiler.target.debug:
+		compiler.__debug_track_immortal_cache__( slot )
+
 def dump_live_objects() -> None:
 	''' debug builds only: prints every still-live RC object and sys.alloc[T]
 	raw buffer, grouped by (class, allocation site) for RC objects (a single

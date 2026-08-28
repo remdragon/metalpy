@@ -946,6 +946,12 @@ class str( Sequence[str], Iterable[str], Sized ):
 
 		expected: ConstPtr[u16] = None
 		if compiler.atomic_compare_exchange( compiler.addrof( self.__utf16 ), compiler.addrof( expected ), buf ):
+			if compiler.target.debug and compiler.refcount( self ) == sys.IMMORTAL_REFCOUNT:
+				# a literal - its own __del__ never runs (see
+				# sys.IMMORTAL_REFCOUNT's own comment), so this cache would
+				# otherwise report as a false-positive "leak"; register it
+				# so dump_live_objects() frees it right before reporting
+				sys.debug_register_immortal_cache( compiler.cast( Ptr[Ptr[u8]], compiler.addrof( self.__utf16 )))
 			return buf
 		# someone else already published first - free our redundant buffer
 		# and use theirs (CAS failure wrote the actual current value into

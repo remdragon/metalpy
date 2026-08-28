@@ -986,6 +986,13 @@ class DebugRawUntrack( Instruction ): # compiler.__debug_raw_untrack__(ptr) -> N
 		return f'DebugRawUntrack( ptr={self.ptr!r} )'
 
 @dataclass( kw_only = True )
+class DebugTrackImmortalCache( Instruction ): # compiler.__debug_track_immortal_cache__(slot) -> None - records the address of a lazily-populated cache FIELD living on a compile-time-immortal object (e.g. str.__utf16 on a string literal) in a side-table list, so __metalpy_dump_live_objects (emitter_c.py) can free+reset it right before its report - an immortal object's own destructor never runs, so such a cache would otherwise report as a permanent false-positive "leak". See lib/sys.py's debug_register_immortal_cache().
+	slot: Operand
+
+	def test_repr( self ) -> str:
+		return f'DebugTrackImmortalCache( slot={self.slot!r} )'
+
+@dataclass( kw_only = True )
 class DebugQuarantine( Instruction ): # compiler.__debug_quarantine__(ptr) -> same Ptr[T] as ptr - the leak tracker's own pit (emitter_c.py's __metalpy_debug_pit_push): holds a just-freed block instead of handing it straight back to the allocator, so a double-free/UAF on it lands on reliably-poisoned memory instead of silently-reused memory. Returns whatever the pit evicted to make room for ptr (a genuine, no-longer-protected block the caller must now actually free) - null if the pit wasn't full yet. See lib/sys.py's free().
 	dest: Temp
 	ptr: Operand

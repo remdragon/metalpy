@@ -5057,6 +5057,9 @@ class FunctionLowering:
 		if self.lowering._is_compiler_call( node.value ) == '__debug_raw_untrack__':
 			self._lower_compiler_debug_raw_untrack( node.value )
 			return
+		if self.lowering._is_compiler_call( node.value ) == '__debug_track_immortal_cache__':
+			self._lower_compiler_debug_track_immortal_cache( node.value )
+			return
 		if isinstance( node.value, ast.Yield ):
 			# PLAN_GENERATORS.md Phase F - a bare (statement-position)
 			# `yield expr` inside a generator's $$__next__ body
@@ -6940,6 +6943,18 @@ class FunctionLowering:
 			self.lowering.discovery.fail( f'compiler.__debug_raw_untrack__(...) takes exactly one argument (ptr): {ast.unparse(node)}', node )
 		ptr = self._lower_expr( node.args[0], None )
 		self._emit( ir.DebugRawUntrack( ptr = ptr ))
+
+	def _lower_compiler_debug_track_immortal_cache( self, node: ast.Call ) -> None:
+		# compiler.__debug_track_immortal_cache__(slot) -> None -
+		# statement-only (mirrors compiler.__debug_raw_track__); see
+		# ir.DebugTrackImmortalCache. slot's own declared type is whatever
+		# the caller already has (Ptr[Ptr[u8]] from lib/sys.py's
+		# debug_register_immortal_cache) - no fresh type object needed
+		# here, this never returns a value of its own.
+		if len( node.args ) != 1 or node.keywords:
+			self.lowering.discovery.fail( f'compiler.__debug_track_immortal_cache__(...) takes exactly one argument (slot): {ast.unparse(node)}', node )
+		slot = self._lower_expr( node.args[0], None )
+		self._emit( ir.DebugTrackImmortalCache( slot = slot ))
 
 	def _lower_compiler_debug_quarantine( self, node: ast.Call, expected_type: Type|None ) -> ir.Operand:
 		# compiler.__debug_quarantine__(ptr) -> same Ptr[T] as ptr - see
@@ -15780,7 +15795,11 @@ class FunctionLowering:
 				for_obj_null_inits_mark = len( self._for_obj_null_inits )
 				cancel_flags_mark = self._cfg.cancel_flag_count
 				pending_temps_mark = len( self._pending_temps )
-				names_snapshot = dict( self._current_fn.names )
+				# _current_fn is None for a module-level global initializer
+				# (FunctionLowering(self, None).run_global) - no enclosing
+				# function, so no per-function local-narrowing state exists
+				# to snapshot/restore here at all
+				names_snapshot = dict( self._current_fn.names ) if self._current_fn is not None else None
 				probe_snapshot = self._cfg.snapshot()
 				probe_args = [ self._lower_overload_arg( e, i, None, candidates, node ) for i, e in enumerate( node.args ) ]
 				probe_kwargs = { kw.arg: self._lower_overload_arg( kw.value, None, kw.arg, candidates, node ) for kw in node.keywords }
@@ -15804,8 +15823,9 @@ class FunctionLowering:
 				del self._for_obj_null_inits[for_obj_null_inits_mark:]
 				self._cfg.truncate_cancel_flags( cancel_flags_mark )
 				del self._pending_temps[pending_temps_mark:]
-				self._current_fn.names.clear()
-				self._current_fn.names.update( names_snapshot )
+				if self._current_fn is not None:
+					self._current_fn.names.clear()
+					self._current_fn.names.update( names_snapshot )
 				self._cfg.hard_restore( probe_snapshot )
 			if not isinstance( init, Function ):
 				self.lowering.discovery.fail( f'{target_cls.qualname}.__init__ is overloaded - not supported yet: {ast.unparse(node)}', node )
