@@ -134,10 +134,15 @@ class _BufferedStream:
 				self.flush().or_return()
 		return Result.Ok( None )
 
-	def _release( self ) -> None:
-		''' exit-only: flush then free the backing buffer, so dump_live_objects
-		(debug builds) doesn't report this permanent, singleton allocation as a
-		leak. Package-private - see _flush_stdio's own call below. '''
+	def __del__( self ) -> None:
+		''' flush then free the backing buffer - a destructor can't propagate
+		flush() failure (see lib/builtins/__File.py's own __del__ comment),
+		deliberately ignored, not silently unchecked. Guarded so a second call
+		is a no-op: _flush_stdio calls this directly on the stdout/stderr
+		singletons (which never reach refcount 0 in a release build), and a
+		future real File wrapping this class would ALSO get here for free via
+		the ordinary RC destructor when its last reference drops - no manual
+		cleanup call needed there. '''
 		self.flush().is_ok()
 		if self._buf is not None:
 			free( self._buf )
@@ -166,10 +171,12 @@ stderr: _BufferedStream = _BufferedStream( _stderr_fd() )
 
 def _flush_stdio() -> None:
 	''' force-called from every real exit path - see this module's own
-	header comment above for why and where. Releases the buffers too (not
-	just flush()) - this is always the last real use of them. '''
-	stdout._release()
-	stderr._release()
+	header comment above for why and where. Calls __del__ directly rather
+	than waiting on refcounting (stdout/stderr are release-build-eternal
+	globals - see _BufferedStream.__del__'s own comment) - this is always
+	the last real use of them. '''
+	stdout.__del__()
+	stderr.__del__()
 
 @compiler.target( os = 'windows' )
 def cstrlen( ptr: ConstPtr[u8], max_length: usize ) -> usize:
