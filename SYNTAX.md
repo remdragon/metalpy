@@ -185,6 +185,8 @@ class bytearray:
 
 ### Destructors (`__del__`) & Memory Hooks
 * **Deterministic `__del__`**: Executed immediately when an RC object's refcount reaches `0`.
+* **Inherited `__del__`**: a subclass that doesn't redeclare `__del__` still runs whichever ancestor's `__del__` is declared, automatically — no `super()` call needed. A subclass that DOES override `__del__` (requires `@virtual` on both sides) is responsible for calling `super().__del__()` itself if it needs the base's own `__del__` logic to run too — it is not called automatically in that case (same explicit-chaining contract as `super().__init__(...)`).
+* **RC fields always release**: every RC-holding field anywhere in the inheritance chain is decref'd automatically as part of destruction, regardless of `__del__`/`super()` — this needs no user code and happens exactly once per field either way.
 * **Scope Cleanup Hooks**:
   - `defer`: Executes code block on function exit across all return paths.
   - `errdefer`: Executes code block on function exit only when returning an error (`Result.Err`).
@@ -550,6 +552,10 @@ def sys_mmap_64(...) -> Ptr[u8]:
 
 * **Single Implementation Inheritance**: Classes support single inheritance only (`class CodecError( sys.Error ):`).
 * **Interfaces & Abstract Methods**: Interface contracts use `@abstractmethod` for method stubs.
+* **`super().<method>(...)`**: calls the base class's own implementation of `<method>` directly, bypassing virtual dispatch (so it can never re-enter the subclass's own override). `super` is not a general expression — `super().<method>(...)` is recognized only as this exact call shape.
+  - `super().__init__(...)` must be a subclass `__init__`'s literal first statement whenever its base class declares a chained `__init__` (see below) — required, not optional.
+  - Any other method, including `__del__`, may call `super().<method>(...)` anywhere in its own body, any number of times — an override is otherwise never required to chain to its base's implementation at all.
+  - Overriding an inherited method (any name but `__init__`) requires `@virtual` on **both** the base's declaration and the subclass's override, or it's rejected as illegal attribute shadowing.
 * **Fallible `__init__()` Construction**:
   - Memory is allocated **before** `__init__()` is called so that instance properties can be set via `self`.
   - If `__init__()` is declared to return `Result[None, E]`, object construction syntax `Foo(...)` returns `Result[Foo, E]`.

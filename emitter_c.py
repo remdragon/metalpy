@@ -3432,7 +3432,7 @@ def _member_access_operator( obj_type: Type|None ) -> str:
 		return '->'
 	return '.'
 
-def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
+def _emit_self_operand( receiver: ir.Operand, target: Function, *, force_direct: bool = False ) -> str:
 	''' an @interface CStruct's self is ALWAYS Ptr[T] (see lowering.py's
 	self_param construction) - receiver is therefore always already a
 	pointer here, never a plain value, for both an ordinary inherited call
@@ -3491,7 +3491,7 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 		assert isinstance( concrete, RCClass )
 		target_cls = concrete
 	if isinstance( target_cls, CStruct ) and target_cls.is_interface:
-		if target.is_virtual:
+		if target.is_virtual and not force_direct:
 			receiver_pointee = receiver.type.args[0] if isinstance( receiver.type, Specialization ) else None
 			assert isinstance( receiver_pointee, CStruct ) # every @interface CStruct method's self/receiver is Ptr[T] - see lowering.py's self_param construction
 			cast_target = receiver_pointee.vtbl_owner()
@@ -3510,7 +3510,7 @@ def _emit_self_operand( receiver: ir.Operand, target: Function ) -> str:
 		# always was before RCClass had any cast logic here
 		receiver_pointee = receiver.type.base if isinstance( receiver.type, Specialization ) else receiver.type
 		assert isinstance( receiver_pointee, RCClass ) # every RCClass receiver is a (possibly Specialization-wrapped) RCClass directly
-		cast_target = receiver_pointee.vtbl_owner() if target.is_virtual else target_cls
+		cast_target = receiver_pointee.vtbl_owner() if ( target.is_virtual and not force_direct ) else target_cls
 		if cast_target is receiver_pointee:
 			return receiver_text
 		return f'({_self_c_type(cast_target)})({receiver_text})'
@@ -3520,7 +3520,7 @@ def _emit_call_args( instr: ir.Call ) -> list[str]:
 	params = instr.target.parameters or []
 	values: list[str] = []
 	if instr.receiver is not None:
-		values.append( _emit_self_operand( instr.receiver, instr.target ))
+		values.append( _emit_self_operand( instr.receiver, instr.target, force_direct = instr.is_super_call ))
 	positional = list( instr.args )
 	for i, param in enumerate( params ):
 		if i < len( positional ):
@@ -3862,7 +3862,7 @@ def _emit_instruction( instr: ir.Instruction, *, function: Function|None, declar
 		if function is not None and function.is_destructor and target_name == mangle_qualname( 'sys.free' ):
 			for i, a in enumerate( arg_texts ):
 				arg_texts[i] = f'(void*)({a})'
-		if instr.target.is_virtual:
+		if instr.target.is_virtual and not instr.is_super_call:
 			# vtable dispatch, not a direct call - _emit_self_operand already
 			# put the (possibly re-cast) receiver pointer at arg_texts[0].
 			# receiver is always a pointer (Ptr[T] for @interface CStruct,

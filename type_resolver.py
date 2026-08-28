@@ -3353,13 +3353,21 @@ class TypeResolver:
 
 		none_type = self.discovery.get_none_type()
 		qualname = f'{cls.qualname}$$__destructor__'
-		del_fn = cls.get_local( '__del__' )
+		# chain_lookup, not get_local: a subclass that doesn't redeclare
+		# __del__ at all must still run whichever ancestor's __del__ IS
+		# declared (self.__del__() below dispatches through the vtable
+		# anyway when it's @virtual, reaching the real override either
+		# way) - get_local only ever found cls's OWN __del__, silently
+		# skipping an inherited-but-not-overridden one entirely (confirmed
+		# via a real repro: a subclass with no __del__ of its own never
+		# ran its base's __del__ at all, no compile error, no crash).
+		del_fn = cls.chain_lookup( '__del__' )
 		if not isinstance( del_fn, Function ):
 			del_fn = None
 
 		body: list[ast.stmt] = []
 
-		# 1. self.__del__() if declared (fields still intact)
+		# 1. self.__del__() if declared anywhere in the chain (fields still intact)
 		if del_fn is not None:
 			body.append( ast.Expr( ast.Call(
 				func = ast.Attribute(

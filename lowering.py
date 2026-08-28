@@ -2910,6 +2910,75 @@ class FunctionLowering:
 		self._cfg.complete_base_construction( self_cls.base.flattened_attributes() )
 		return fn.node.body[1:]
 
+	# --- super().<method>(...) chaining, any method other than __init__ ------
+
+	def _super_call_shape( self, node: ast.expr ) -> str | None:
+		''' recognizes `super().<name>(...)` as an EXACT textual shape, same
+		posture as _super_init_shape (super is never a real registered name).
+		__init__ is deliberately excluded here - it stays statement-position-
+		only, handled exclusively by _lower_super_init_if_required, so this
+		never lets `super().__init__(...)` bypass that "must be the literal
+		first statement" requirement from some other position in the body.
+		Returns the method name, or None if this isn't the shape at all. '''
+		if not ( isinstance( node, ast.Call ) and isinstance( node.func, ast.Attribute )):
+			return None
+		if node.func.attr == '__init__':
+			return None
+		receiver = node.func.value
+		if not (
+			isinstance( receiver, ast.Call ) and isinstance( receiver.func, ast.Name ) and receiver.func.id == 'super'
+			and not receiver.args and not receiver.keywords
+		):
+			return None
+		return node.func.attr
+
+	def _lower_super_call( self, node: ast.Call, method_name: str, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		''' `super().<method_name>(...)` for any method other than __init__ -
+		including __del__ (there is no dispatch-mechanism reason this can't
+		work the same way ordinary methods do: __del__ itself is just an
+		ordinary @virtual method, only the *synthesized* $$__destructor__
+		vtable slot is special - see type_resolver.py's
+		_synthesize_rcclass_destructor). Resolves directly to self_cls.base's
+		OWN implementation (chain_lookup starting at .base, skipping this
+		class's own override - identical primitive _lower_super_init_if_
+		required already uses for __init__) and forces a direct call in
+		emitter_c.py (ir.Call.is_super_call) - ordinary vtable dispatch keys
+		off target.is_virtual alone and would re-enter THIS method's own
+		override through the receiver's real runtime vtable instead of
+		reaching the base's version at all. '''
+		fn = self._current_fn
+		self_cls = fn.cls if fn is not None else None
+		if not isinstance( self_cls, RCClass ):
+			self.lowering.discovery.fail(
+				f'super().{method_name}(...) can only be used inside an RCClass instance method: {ast.unparse(node)}', node,
+			)
+		if self_cls.base is None:
+			self.lowering.discovery.fail(
+				f'{self_cls.qualname} has no base class - nothing for super().{method_name}(...) to call', node,
+			)
+		target = self_cls.base.chain_lookup( method_name )
+		if not isinstance( target, Function ):
+			self.lowering.discovery.fail(
+				f'{self_cls.base.qualname} has no method {method_name!r} to call via super()', node,
+			)
+		# target might otherwise never become a real compiled unit if
+		# nothing else calls it directly - same reasoning _lower_super_
+		# init_if_required's identical _ensure_resolved call already uses
+		target = self.lowering._ensure_resolved( target )
+		self.lowering.schedule( target.return_type )
+		for param in target.parameters or []:
+			self.lowering.schedule( param.type )
+		self_node = ast.copy_location( ast.Name( id = 'self', ctx = ast.Load() ), node )
+		self_operand = self._lower_expr( self_node, None, strict = False )
+		args, kwargs = self._lower_call_args( target, node )
+		dest = self._new_temp( target.return_type )
+		self._emit( ir.Call( dest = dest, target = target, receiver = self_operand, args = args, kwargs = kwargs, is_super_call = True ))
+		if not want_result:
+			return None
+		if expected_type is None:
+			return dest
+		return self._coerce_or_check_operand( dest, expected_type, node, strict = False )
+
 	# --- temp/instruction bookkeeping ----------------------------------------
 
 	def _emit_captured( self, instr: ir.Instruction ) -> None:
@@ -18496,6 +18565,9 @@ class FunctionLowering:
 		return self._emit_generic_call( node, method_spec, monomorphized, receiver, args, kwargs, expected_type, want_result, return_type = expected_type )
 
 	def _lower_call( self, node: ast.Call, expected_type: Type|None, want_result: bool ) -> ir.Operand|None:
+		super_method_name = self._super_call_shape( node )
+		if super_method_name is not None:
+			return self._lower_super_call( node, super_method_name, expected_type, want_result )
 		match self.lowering._is_compiler_call( node ):
 			case 'caller_line' | 'caller_file' as name:
 				self.lowering.discovery.fail(
