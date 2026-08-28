@@ -1,4 +1,5 @@
 import compiler
+import fs
 
 @union
 class OwnershipError[T]:
@@ -75,49 +76,34 @@ def dump_live_objects() -> None:
 _STDIO_BUF_CAP: usize = 8192
 
 class _BufferedStream:
-	''' shared impl for stdout/stderr - only the underlying fd/handle differs,
-	selected at construction via _is_stderr. '''
+	''' buffered wrapper around a raw fs.FD - shared by stdout/stderr today,
+	general enough to become the base of real buffered file I/O later. '''
 	_buf: Ptr[u8] = None
 	_len: usize = 0
 	_is_tty: bool = False
 	_tty_checked: bool = False
-	_is_stderr: bool = False
+	_fd: fs.FD = fs.INVALID_FD
 
-	def __init__( self, is_stderr: bool ) -> None:
-		self._is_stderr = is_stderr
+	def __init__( self, fd: fs.FD ) -> None:
+		self._fd = fd
 
 	@compiler.target( os = 'windows' )
 	def _check_tty( self ) -> None:
-		from windows.kernel32 import GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+		from windows.kernel32 import GetConsoleMode
 		mode: u32 = 0
-		handle: u32 = STD_ERROR_HANDLE if self._is_stderr else STD_OUTPUT_HANDLE
-		self._is_tty = GetConsoleMode( GetStdHandle( handle ), compiler.addrof( mode ))
+		self._is_tty = GetConsoleMode( self._fd, compiler.addrof( mode ))
 		self._tty_checked = True
 
 	@compiler.target( os = not 'windows' )
 	def _check_tty( self ) -> None:
 		from crt import isatty
-		fd: i32 = 2 if self._is_stderr else 1 # STDERR_FILENO/STDOUT_FILENO
-		self._is_tty = isatty( fd ) != 0
+		self._is_tty = isatty( self._fd ) != 0
 		self._tty_checked = True
-
-	@compiler.target( os = 'windows' )
-	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
-		from fs import write_all
-		from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
-		handle: u32 = STD_ERROR_HANDLE if self._is_stderr else STD_OUTPUT_HANDLE
-		return write_all( GetStdHandle( handle ), buf, count )
-
-	@compiler.target( os = not 'windows' )
-	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
-		from fs import write_all
-		fd: i32 = 2 if self._is_stderr else 1 # STDERR_FILENO/STDOUT_FILENO
-		return write_all( fd, buf, count )
 
 	def flush( self ) -> Result[None,OSError]:
 		if self._len == 0:
 			return Result.Ok( None )
-		self._raw_write( self._buf, self._len ).or_return()
+		fs.write_all( self._fd, self._buf, self._len ).or_return()
 		self._len = 0
 		return Result.Ok( None )
 
@@ -157,8 +143,26 @@ class _BufferedStream:
 			free( self._buf )
 			self._buf = None
 
-stdout: _BufferedStream = _BufferedStream( False )
-stderr: _BufferedStream = _BufferedStream( True )
+@compiler.target( os = 'windows' )
+def _stdout_fd() -> fs.FD:
+	from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE
+	return GetStdHandle( STD_OUTPUT_HANDLE )
+
+@compiler.target( os = not 'windows' )
+def _stdout_fd() -> fs.FD:
+	return 1 # STDOUT_FILENO
+
+@compiler.target( os = 'windows' )
+def _stderr_fd() -> fs.FD:
+	from windows.kernel32 import GetStdHandle, STD_ERROR_HANDLE
+	return GetStdHandle( STD_ERROR_HANDLE )
+
+@compiler.target( os = not 'windows' )
+def _stderr_fd() -> fs.FD:
+	return 2 # STDERR_FILENO
+
+stdout: _BufferedStream = _BufferedStream( _stdout_fd() )
+stderr: _BufferedStream = _BufferedStream( _stderr_fd() )
 
 def _flush_stdio() -> None:
 	''' force-called from every real exit path - see this module's own

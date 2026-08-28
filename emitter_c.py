@@ -5812,7 +5812,7 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# compiler.functions order, and so never has this problem) - so the
 	# vtable instances have to be textually EARLIER than the globals loop, or
 	# that reference is to a not-yet-declared identifier. Confirmed by a real
-	# compile failure: lib/sys.py's `stdout: _BufferedStream = _BufferedStream(False)`
+	# compile failure: lib/sys.py's `stdout: _BufferedStream = _BufferedStream(_stdout_fd())`
 	# global's own __metalpy_init_sys$stdout(), constructing a _BufferedStream,
 	# referenced sys$_BufferedStream$$vtable before this reordering, when that vtable instance
 	# was still emitted further down, after the globals loop.
