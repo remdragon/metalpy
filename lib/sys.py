@@ -74,35 +74,45 @@ def dump_live_objects() -> None:
 
 _STDIO_BUF_CAP: usize = 8192
 
-class _Stdout:
+class _BufferedStream:
+	''' shared impl for stdout/stderr - only the underlying fd/handle differs,
+	selected at construction via _is_stderr. '''
 	_buf: Ptr[u8] = None
 	_len: usize = 0
 	_is_tty: bool = False
 	_tty_checked: bool = False
+	_is_stderr: bool = False
+
+	def __init__( self, is_stderr: bool ) -> None:
+		self._is_stderr = is_stderr
 
 	@compiler.target( os = 'windows' )
 	def _check_tty( self ) -> None:
-		from windows.kernel32 import GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE
+		from windows.kernel32 import GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
 		mode: u32 = 0
-		self._is_tty = GetConsoleMode( GetStdHandle( STD_OUTPUT_HANDLE ), compiler.addrof( mode ))
+		handle: u32 = STD_ERROR_HANDLE if self._is_stderr else STD_OUTPUT_HANDLE
+		self._is_tty = GetConsoleMode( GetStdHandle( handle ), compiler.addrof( mode ))
 		self._tty_checked = True
 
 	@compiler.target( os = not 'windows' )
 	def _check_tty( self ) -> None:
 		from crt import isatty
-		self._is_tty = isatty( 1 ) != 0 # STDOUT_FILENO is 1
+		fd: i32 = 2 if self._is_stderr else 1 # STDERR_FILENO/STDOUT_FILENO
+		self._is_tty = isatty( fd ) != 0
 		self._tty_checked = True
 
 	@compiler.target( os = 'windows' )
 	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
 		from fs import write_all
-		from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE
-		return write_all( GetStdHandle( STD_OUTPUT_HANDLE ), buf, count )
+		from windows.kernel32 import GetStdHandle, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+		handle: u32 = STD_ERROR_HANDLE if self._is_stderr else STD_OUTPUT_HANDLE
+		return write_all( GetStdHandle( handle ), buf, count )
 
 	@compiler.target( os = not 'windows' )
 	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
 		from fs import write_all
-		return write_all( 1, buf, count ) # STDOUT_FILENO is 1
+		fd: i32 = 2 if self._is_stderr else 1 # STDERR_FILENO/STDOUT_FILENO
+		return write_all( fd, buf, count )
 
 	def flush( self ) -> Result[None,OSError]:
 		if self._len == 0:
@@ -147,78 +157,8 @@ class _Stdout:
 			free( self._buf )
 			self._buf = None
 
-stdout: _Stdout = _Stdout()
-
-class _Stderr:
-	_buf: Ptr[u8] = None
-	_len: usize = 0
-	_is_tty: bool = False
-	_tty_checked: bool = False
-
-	@compiler.target( os = 'windows' )
-	def _check_tty( self ) -> None:
-		from windows.kernel32 import GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE
-		mode: u32 = 0
-		self._is_tty = GetConsoleMode( GetStdHandle( STD_ERROR_HANDLE ), compiler.addrof( mode ))
-		self._tty_checked = True
-
-	@compiler.target( os = not 'windows' )
-	def _check_tty( self ) -> None:
-		from crt import isatty
-		self._is_tty = isatty( 2 ) != 0 # STDERR_FILENO is 2
-		self._tty_checked = True
-
-	@compiler.target( os = 'windows' )
-	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
-		from fs import write_all
-		from windows.kernel32 import GetStdHandle, STD_ERROR_HANDLE
-		return write_all( GetStdHandle( STD_ERROR_HANDLE ), buf, count )
-
-	@compiler.target( os = not 'windows' )
-	def _raw_write( self, buf: ConstPtr[u8], count: usize ) -> Result[None,OSError]:
-		from fs import write_all
-		return write_all( 2, buf, count ) # STDERR_FILENO is 2
-
-	def flush( self ) -> Result[None,OSError]:
-		if self._len == 0:
-			return Result.Ok( None )
-		self._raw_write( self._buf, self._len ).or_return()
-		self._len = 0
-		return Result.Ok( None )
-
-	def write( self, s: str ) -> Result[None,OSError]:
-		if not self._tty_checked:
-			self._check_tty()
-		if self._buf is None:
-			self._buf = alloc[u8]( _STDIO_BUF_CAP )
-		n: usize = s.byte_len()
-		src: ConstPtr[u8] = s.get_cstr()
-		offset: usize = 0
-		# see _Stdout.write's identical comment above
-		with compiler.wrap_arithmetic:
-			while offset < n:
-				space: usize = _STDIO_BUF_CAP - self._len
-				if space == 0:
-					self.flush().or_return()
-					space = _STDIO_BUF_CAP
-				chunk: usize = n - offset
-				if chunk > space:
-					chunk = space
-				memcpy( self._buf + self._len, src + offset, chunk )
-				self._len += chunk
-				offset += chunk
-			if self._is_tty and n > 0 and src[ n - 1 ] == u8( 10 ):
-				self.flush().or_return()
-		return Result.Ok( None )
-
-	def _release( self ) -> None:
-		''' see _Stdout._release's identical comment above. '''
-		self.flush().is_ok()
-		if self._buf is not None:
-			free( self._buf )
-			self._buf = None
-
-stderr: _Stderr = _Stderr()
+stdout: _BufferedStream = _BufferedStream( False )
+stderr: _BufferedStream = _BufferedStream( True )
 
 def _flush_stdio() -> None:
 	''' force-called from every real exit path - see this module's own
@@ -401,7 +341,7 @@ def panic( message: str ) -> NoReturn:
 	# TODO.txt); for now always use the OS low-level unbuffered write (no
 	# allocations - important, since panic must still work when the reason
 	# we're here is an allocation failure - get_cstr()/byte_len() are both
-	# plain field reads, same as _Stdout.write's identical pattern). Every
+	# plain field reads, same as _BufferedStream.write's identical pattern). Every
 	# real call site (sys.alloc's 'out of memory', Result.unwrap's errmsg,
 	# ...) already passes a real `str`, never a raw ConstPtr[u8] - this used
 	# to be typed ConstPtr[u8] anyway, which happened to go unnoticed under
@@ -451,7 +391,7 @@ def _write_stderr_cstr( msg: ConstPtr[u8], length: usize ) -> None:
 	handle = GetStdHandle( STD_ERROR_HANDLE )
 	if handle != INVALID_HANDLE_VALUE:
 		written: u32 = 0
-		# see _Stdout.write's identical comment - u32(length) is a real
+		# see _BufferedStream.write's identical comment - u32(length) is a real
 		# narrowing cast (usize -> u32); this function returns None, so it
 		# can't propagate Check mode's Result[u32,OverflowError]
 		with compiler.wrap_arithmetic:

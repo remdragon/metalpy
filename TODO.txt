@@ -36,7 +36,7 @@ review how Claude generates C code from local variables, I think emitter_c.py
 might be doing too much work. We may need new IR to tell the emitter when to
 create local variables.
 
-sys._Stdout.write():
+sys._BufferedStream.write():
 	these are just stubs, but there are real issues here that need to be solved
 	before we can create the real File I/O interfaces for stdlib
 
@@ -540,7 +540,7 @@ emitter:
 			lib/windows/kernel32.py, lib/builtins/__init__.py etc. as they
 			exist today, rather than the self-contained fixtures the emitter
 			test suite uses) is still open, blocked partly on lib/sys.py's
-			own still-evolving File I/O design (see sys._Stdout.write() notes
+			own still-evolving File I/O design (see sys._BufferedStream.write() notes
 			above) and partly on specific known gaps surfaced by real compile
 			attempts: a missing sys.alloc[T] forward declaration, Result[_,
 			ZeroDivisionError] not being scheduled for panic-wrapped division,
@@ -724,7 +724,7 @@ File class
 
 io interfaces ( stdin, stdout, stderr )
 	sys.stdout/sys.stderr: minimal write() exists for both (lib/sys.py's
-	_Stdout/_Stderr), enough for print() and lib/logging.py's StreamHandler.
+	_BufferedStream), enough for print() and lib/logging.py's StreamHandler.
 	Still missing: a real stream object (buffering, flush, read), stdin, and
 	panic() still bypasses sys.stderr and writes directly via its own
 	private _write_stderr_cstr (see lib/sys.py's panic() comment).

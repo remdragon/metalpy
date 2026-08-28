@@ -983,7 +983,7 @@ class DebugQuarantine( Instruction ): # compiler.__debug_quarantine__(ptr) -> sa
 		return f'DebugQuarantine( dest={self.dest!r}, ptr={self.ptr!r} )'
 
 @dataclass( kw_only = True )
-class DumpLiveObjects( Instruction ): # compiler.dump_live_objects() - walks both debug-tracking lists (RC objects + raw sys.alloc buffers), aggregates by (type_name, alloc_loc), prints counts/bytes via _Stdout.write - see emitter_c.py's __metalpy_dump_live_objects
+class DumpLiveObjects( Instruction ): # compiler.dump_live_objects() - walks both debug-tracking lists (RC objects + raw sys.alloc buffers), aggregates by (type_name, alloc_loc), prints counts/bytes via _BufferedStream.write - see emitter_c.py's __metalpy_dump_live_objects
 	def test_repr( self ) -> str:
 		return 'DumpLiveObjects()'
 

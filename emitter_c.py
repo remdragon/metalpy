@@ -435,7 +435,7 @@ def _object_header_prologue() -> str:
 # this is a separate function emit_c() appends right after that one, not
 # folded into _PROLOGUE_DEBUG_LIST above. No CRT calls anywhere in here
 # (manual decimal formatting, raw OS write) - safe under --no-crt, and
-# deliberately bypasses lib/sys.py's own _Stdout/write_all path (which is
+# deliberately bypasses lib/sys.py's own _BufferedStream/write_all path (which is
 # itself just a thin wrapper over the exact same WriteFile/write(2) primitive
 # used here) rather than round-tripping through metalpy-level str/Result
 # machinery from inside a hand-written PROLOGUE C function.
@@ -5812,9 +5812,9 @@ def emit_c( compiler: Compiler, *, no_crt: bool = False, leak_check: bool = True
 	# compiler.functions order, and so never has this problem) - so the
 	# vtable instances have to be textually EARLIER than the globals loop, or
 	# that reference is to a not-yet-declared identifier. Confirmed by a real
-	# compile failure: lib/sys.py's `stdout: _Stdout = _Stdout()` global's
-	# own __metalpy_init_sys$stdout(), constructing a _Stdout, referenced
-	# sys$_Stdout$$vtable before this reordering, when that vtable instance
+	# compile failure: lib/sys.py's `stdout: _BufferedStream = _BufferedStream(False)`
+	# global's own __metalpy_init_sys$stdout(), constructing a _BufferedStream,
+	# referenced sys$_BufferedStream$$vtable before this reordering, when that vtable instance
 	# was still emitted further down, after the globals loop.
 	for cls in compiler.cstructs:
 		if cls.is_interface and not cls.type_params:
