@@ -242,6 +242,130 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
 
+	def test_pool_worker_drains_backlog_in_fifo_order( self ) -> None:
+		''' regression test for a real bug: _PoolWorker used to drain via
+		list.pop() (LAST element first, i.e. LIFO), so a job could be
+		starved behind a stream of newer submissions on the same worker.
+		Blocks worker 0 on a gate, queues a backlog of 4 tracked jobs onto
+		that SAME worker (submissions round-robin across the pool's 4
+		workers, so every 4th submission lands back on worker 0 - filler
+		jobs sent to the other 3 workers between each tracked one just
+		advance the round-robin ticket), releases the gate, and asserts
+		the 4 tracked jobs ran in submission order. '''
+		self._run( '''
+import compiler
+import atomic
+import asyncfile
+import reactor
+
+class Gate:
+	started: atomic.Atomic[i32]
+	release: atomic.Atomic[bool]
+	def __init__( self ) -> None:
+		self.started = atomic.Atomic[i32]( 0 )
+		self.release = atomic.Atomic[bool]( False )
+	def blocking( self ) -> Result[usize, OSError]:
+		self.started.fetch_add( 1 )
+		while not self.release.load():
+			pass
+		return Result.Ok( usize( 0 ))
+
+class Recorder:
+	order: list[usize]
+	def __init__( self ) -> None:
+		self.order = list[usize]()
+	def record( self, n: usize ) -> None:
+		self.order.append( n )
+
+class RealJob:
+	idx: usize
+	rec: Recorder
+	def __init__( self, idx: usize, rec: Recorder ) -> None:
+		self.idx = idx
+		self.rec = rec
+	def run( self ) -> Result[usize, OSError]:
+		self.rec.record( self.idx )
+		return Result.Ok( usize( 0 ))
+
+def busy_delay() -> None:
+	i: usize = 0
+	while i < usize( 200000000 ):
+		with compiler.wrap_arithmetic:
+			i = i + 1
+
+class Runner:
+	gate: Gate
+	rec:  Recorder
+	def __init__( self, gate: Gate, rec: Recorder ) -> None:
+		self.gate = gate
+		self.rec = rec
+	def run( self ) -> None:
+		w: reactor.Worker|None = reactor.current_worker()
+		if w is None:
+			return
+		gate: Gate = self.gate
+		rec: Recorder = self.rec
+
+		# occupies worker 0 (the first submission, ticket 0) - parks it on
+		# the gate so a real backlog can build up behind it
+		gate_work: Closure[[], Result[usize, OSError]] = gate.blocking
+		asyncfile.pool.submit( asyncfile.Job( handle = reactor.CompletionHandle(), work = gate_work, waiter = w ))
+		busy_delay()
+		if gate.started.load() != 1:
+			return
+
+		# 17 more submissions: ticket%4==0 (mod the ALREADY-consumed ticket
+		# 0) lands back on worker 0 - a real tracked job every 4th
+		# submission, filler jobs (any other worker) in between
+		next_real: usize = 0
+		i: usize = 0
+		while i < usize( 16 ):
+			with compiler.panic_arithmetic( 'test: modulus is nonzero by construction' ):
+				rem: usize = i % usize( 4 )
+			if rem == usize( 3 ):   # tickets 4, 8, 12, 16 -> worker 0
+				job: RealJob = RealJob( next_real, rec )
+				real_work: Closure[[], Result[usize, OSError]] = job.run
+				asyncfile.pool.submit( asyncfile.Job( handle = reactor.CompletionHandle(), work = real_work, waiter = w ))
+				with compiler.wrap_arithmetic:
+					next_real = next_real + usize( 1 )
+			else:
+				# captures `rec` (unused by the lambda body otherwise) so
+				# this is a real closure, not a captureless function
+				# pointer - Job.work's own field type requires Closure
+				filler_work: Closure[[], Result[usize, OSError]] = lambda: Result.Ok( usize( rec.order.__len__()))
+				asyncfile.pool.submit( asyncfile.Job( handle = reactor.CompletionHandle(), work = filler_work, waiter = w ))
+			with compiler.wrap_arithmetic:
+				i = i + 1
+
+		gate.release.store( True )
+		while rec.order.__len__() < usize( 4 ):
+			pass
+
+def run() -> i32:
+	gate = Gate()
+	rec = Recorder()
+	r: reactor.Reactor = reactor.Reactor( 1 )
+	runner = Runner( gate, rec )
+	r.spawn( runner.run )
+	r.run()
+
+	if rec.order.__len__() != usize( 4 ):
+		return 1
+	i: usize = 0
+	while i < usize( 4 ):
+		got: usize = rec.order.__getitem__( i ).unwrap( 'order index in bounds by construction' )
+		if got != i:
+			return 2   # out of submission order - LIFO regression
+		with compiler.wrap_arithmetic:
+			i = i + 1
+	return 0
+
+def main() -> i32:
+	return run()
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
+
 def _emit( compiler: Compiler ) -> str:
 	import emitter_c
 	return emitter_c.emit_c( compiler )
