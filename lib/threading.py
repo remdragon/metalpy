@@ -13,7 +13,6 @@
 
 import compiler
 import sys
-import socket
 import atomic
 
 if compiler.target.os == 'windows':
@@ -518,13 +517,11 @@ class Semaphore:
 # UnsafeList already IS FIFO order - grabbing the whole list at once
 # preserves it exactly, no separate reordering step needed.
 #
-# NOT built on ThreadPool/_PoolWorker (elsewhere in this file) despite the
-# similarity: _PoolWorker's own job list is drained via list.pop() - LAST
-# element first (see list.pop()'s own docstring), i.e. LIFO - correct for
-# independent, order-independent closures (its only current use), but
-# silently wrong for anything that needs FIFO ordering like this Queue's
-# own contract does. It also still uses the slower loopback-socket wake
-# pattern Semaphore's own header comment explains the real cost of.
+# _PoolWorker (below) is built on this, not the loopback-socket-pair +
+# list.pop() drain it used to hand-roll - that old drain took the LAST
+# element first (see list.pop()'s own docstring), i.e. LIFO, which could
+# starve an old job behind a stream of newer submissions. Queue[T]'s FIFO
+# batch-drain fixes that for free.
 # ---------------------------------------------------------------------------
 
 class Queue[T]:
@@ -591,56 +588,49 @@ class _PoolJob:
 
 
 class _PoolWorker:
-	__jobs:          list[_PoolJob]
-	__max_depth:     usize|None
-	__wake_read:     socket.Socket
-	__wake_write:    socket.Socket
-	__shutting_down: atomic.Atomic[bool]
+	# None is the shutdown sentinel - Queue[T]'s own FIFO contract means any
+	# real job submitted before request_shutdown() still runs first, same
+	# convention as sys._ThreadedStream's queue (see Queue[T]'s own header
+	# comment for why this class is built on it instead of hand-rolling a
+	# second wake+drain mechanism).
+	__queue: Queue[_PoolJob|None]
 
 	def __init__( self, max_depth: usize|None ) -> None:
-		self.__jobs = list[_PoolJob]()
-		self.__max_depth = max_depth
-		( read_side, write_side ) = socket.make_loopback_pair()
-		self.__wake_read = read_side
-		self.__wake_write = write_side
-		self.__shutting_down = atomic.Atomic[bool]( False )
+		self.__queue = Queue[_PoolJob|None]( max_depth )
 
 	def submit( self, job: _PoolJob ) -> Result[None, QueueFullError]:
-		if self.__max_depth is not None:
-			limit: usize = self.__max_depth
-			if self.__jobs.__len__() >= limit:
-				return Result.Err( QueueFullError() )
-		self.__jobs.append( job )
-		poke: bytes = b'x'
-		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.submit: wake failed' )
-		return Result.Ok( None )
+		return self.__queue.put( job )
 
 	def request_shutdown( self ) -> None:
-		self.__shutting_down.store( True )
-		poke: bytes = b'x'
-		self.__wake_write.send( poke.get_const_ptr(), usize( 1 )).unwrap( '_PoolWorker.request_shutdown: wake failed' )
+		''' pushes the None sentinel. Retries on QueueFullError instead of
+		propagating it - the worker thread is concurrently draining, so a
+		momentarily-full bounded queue frees up shortly; shutdown must not
+		be silently droppable just because the queue happened to be full
+		the instant this was called. '''
+		while True:
+			match self.__queue.put( None ):
+				case Result.Ok( _ ):
+					return
+				case Result.Err( _ ):
+					continue
 
 	def run_forever( self ) -> None:
-		''' blocks (a genuine, thread-blocking recv - no Poller, this thread
-		has nothing else to do while idle) until a poke arrives, then drains
-		and runs every job currently queued - same "at least one byte means
-		check the queue" discipline asyncfile._PoolWorker/reactor.Worker's
-		own wake-drain already use. Exits once shutdown has been requested
-		AND the queue is fully drained - a job submitted right before
-		shutdown still runs to completion, matching reactor.Reactor.
-		shutdown()'s own "does not reject work already queued" contract. '''
-		buf: bytearray = bytearray( usize( 64 ))
+		''' drains and runs every job in FIFO submission order (Queue[T]'s
+		own contract - see this class's own field comment for why). Exits
+		once the None sentinel is reached; any real job queued before it
+		still runs first, matching reactor.Reactor.shutdown()'s own "does
+		not reject work already queued" contract. '''
 		while True:
-			self.__wake_read.recv( buf.get_ptr(), usize( 64 )).unwrap( '_PoolWorker.run_forever: wake recv failed' )
-			while True:
-				match self.__jobs.pop():
-					case Result.Ok( job ):
-						work: Closure[[], None] = job.work
-						work()
-					case Result.Err( _ ):
-						break
-			if self.__shutting_down.load() and self.__jobs.__len__() == 0:
-				return
+			batch: UnsafeList[_PoolJob|None] = self.__queue.drain()
+			i: usize = 0
+			while i < batch.__len__():
+				item: _PoolJob|None = batch.__getitem__( i ).unwrap( '_PoolWorker.run_forever: batch index in bounds by construction' )
+				if item is None:
+					return
+				work: Closure[[], None] = item.work
+				work()
+				with compiler.wrap_arithmetic:
+					i = i + 1
 
 
 def default_pool_size() -> usize:
@@ -698,7 +688,14 @@ class ThreadPool:
 		single atomic RMW, so every caller gets a distinct, monotonically
 		increasing ticket with no lost updates - same effective (idx+1) %
 		len idiom as reactor.Reactor.spawn(), just computed from an
-		ever-growing ticket instead of a stored-and-wrapped index. '''
+		ever-growing ticket instead of a stored-and-wrapped index.
+
+		Ordering guarantee: FIFO per worker (each worker's own _PoolWorker
+		is a Queue[T] underneath) - a job never gets starved behind a
+		stream of newer submissions on the SAME worker. Round-robin across
+		DIFFERENT workers means no single global order across the whole
+		pool - two jobs landing on different workers can finish in either
+		order regardless of submission order. '''
 		ticket: usize = self.__next.fetch_add( usize( 1 ))
 		with compiler.panic_arithmetic( 'ThreadPool.submit: pool size is zero' ):
 			idx: usize = ticket % self.__workers.__len__()
