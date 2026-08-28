@@ -14904,16 +14904,31 @@ class FunctionLowering:
 		self._emit( ir.GetItem( dest = dest, obj = receiver, index = index ))
 		return dest
 
-	def _apply_move_hook( self, param: Parameter, operand: ir.Operand, target_qualname: str ) -> None:
+	def _apply_move_hook( self, param: Parameter, operand: ir.Operand, target_qualname: str, node: ast.AST ) -> None:
 		# the semantic half of move[T] - _check_move_argument (run earlier,
 		# inside _match_call_args) already validated the call-site syntax
 		# agrees; this is where the argument's OWN ownership state actually
 		# transitions, once its real Operand exists (needs the lowered
 		# value, not just the AST expr) - shared by every _match_call_args
 		# caller (plain calls, both generic call flavors, union-receiver
-		# dispatch), called right after each argument is lowered
+		# dispatch), called right after each argument is lowered.
+		# cfg.py's move() raises a bare CompileError (it has no ErrorCollector
+		# access - see its own module docstring), so it must be caught and
+		# re-recorded here like every other cfg.py call site does - otherwise
+		# it's an unrecorded exception, and FunctionLowering.run()'s per-
+		# statement `except CompileError: continue` recovery silently
+		# swallows it with no diagnostic at all, letting a move of a still-
+		# BORROWED argument compile clean (this was a real bug - a bare
+		# `raise CompileError` here, unlike every sibling cfg.py call site,
+		# was never caught/re-recorded, so it vanished into that recovery
+		# boundary; confirmed by a real use-after-free, see lib/ed25519.py's
+		# history).
 		if param.is_move:
-			for instr in self._cfg.move( operand, target_qualname = target_qualname, param_stem = param.stem ):
+			try:
+				instructions = self._cfg.move( operand, target_qualname = target_qualname, param_stem = param.stem )
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
+			for instr in instructions:
 				self._emit( instr )
 
 	def _lower_overload_arg( self, expr: ast.expr, position: int|None, kw_name: str|None, candidates: list[Function], node: ast.AST ) -> ir.Operand:
@@ -16047,9 +16062,9 @@ class FunctionLowering:
 			for param, _expr in keyword
 		}
 		for ( param, _expr ), operand in zip( positional, args ):
-			self._apply_move_hook( param, operand, qualname )
+			self._apply_move_hook( param, operand, qualname, node )
 		for param, _expr in keyword:
-			self._apply_move_hook( param, kwargs[param.stem], qualname )
+			self._apply_move_hook( param, kwargs[param.stem], qualname, node )
 		for ( param, _expr ), operand in zip( positional, args ):
 			self.lowering._unify_type_param( type_params, param.type, operand.type, bindings, node, qualname )
 		for param, _expr in keyword:
@@ -17329,12 +17344,12 @@ class FunctionLowering:
 		args = []
 		for param, expr in positional:
 			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, target.qualname )
+			self._apply_move_hook( param, operand, target.qualname, node )
 			args.append( operand )
 		kwargs = {}
 		for param, expr in keyword:
 			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, target.qualname )
+			self._apply_move_hook( param, operand, target.qualname, node )
 			kwargs[param.stem] = operand
 		# fill in default values for any parameter that was not
 		# explicitly provided by the call site (e.g. print(msg,
@@ -18001,9 +18016,9 @@ class FunctionLowering:
 			else:
 				kwargs[key] = result
 		for ( param, _expr ), operand in zip( positional, args ):
-			self._apply_move_hook( param, operand, target.qualname )
+			self._apply_move_hook( param, operand, target.qualname, node )
 		for param, _expr in keyword:
-			self._apply_move_hook( param, kwargs[param.stem], target.qualname )
+			self._apply_move_hook( param, kwargs[param.stem], target.qualname, node )
 
 		return self._finish_generic_call( node, target, type_params, bindings, receiver, args, kwargs, expected_type, want_result )
 		# else: this parameter position doesn't mention any of type_params
@@ -18918,8 +18933,14 @@ class FunctionLowering:
 			# scope exit on top of that - two teardown paths for one struct).
 			# Also correctly rejects calling an @move method through a merely
 			# BORROWED receiver (move()'s own OWNED precondition), which
-			# was never checked before either.
-			for instr in self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' ):
+			# was never checked before either. Caught/re-recorded here for the
+			# same reason _apply_move_hook does - move() raises a bare,
+			# unrecorded CompileError (see its own comment).
+			try:
+				instructions = self._cfg.move( receiver, target_qualname = target.qualname, param_stem = 'self' )
+			except CompileError as e:
+				self.lowering.discovery.fail( str( e ), node )
+			for instr in instructions:
 				self._emit( instr )
 
 		if isinstance( target, ( Function, Overload )) and target.stem in self.lowering._RESULT_CONSUMING_METHODS and isinstance( receiver, Variable ):
@@ -19310,7 +19331,7 @@ class FunctionLowering:
 						node,
 					)
 				if param.is_move:
-					self._apply_move_hook( param, args[i], target.qualname )
+					self._apply_move_hook( param, args[i], target.qualname, node )
 			for param in target.parameters or []:
 				if param.stem not in moved_kw:
 					continue
@@ -19328,7 +19349,7 @@ class FunctionLowering:
 						node,
 					)
 				if param.is_move:
-					self._apply_move_hook( param, kwargs[param.stem], target.qualname )
+					self._apply_move_hook( param, kwargs[param.stem], target.qualname, node )
 
 			# fill in default values for any of target's OWN parameters the
 			# call site didn't supply - mirrors _lower_call_args's identical
@@ -19685,12 +19706,12 @@ class FunctionLowering:
 		args = []
 		for param, expr in positional:
 			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, dispatch.union.qualname )
+			self._apply_move_hook( param, operand, dispatch.union.qualname, node )
 			args.append( operand )
 		kwargs = {}
 		for param, expr in keyword:
 			operand = self._lower_expr( expr, param.type )
-			self._apply_move_hook( param, operand, dispatch.union.qualname )
+			self._apply_move_hook( param, operand, dispatch.union.qualname, node )
 			kwargs[param.stem] = operand
 
 		tag_attr, data_attr, payload_cls, tags = self.lowering._union_storage.get( dispatch.union )

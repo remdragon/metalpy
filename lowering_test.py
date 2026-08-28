@@ -3467,6 +3467,67 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 
+	def test_move_of_a_borrowed_parameter_is_a_compile_error( self ) -> None:
+		# cfg.py's move() raises a bare CompileError (no ErrorCollector access
+		# of its own) - _apply_move_hook must catch and re-record it via
+		# discovery.fail(), same as every other cfg.py call site, or this
+		# silently vanishes into FunctionLowering.run()'s per-statement
+		# recovery (except CompileError: continue) and the call compiles as
+		# if the move were fine. Confirmed as a real bug: a plain (BORROWED)
+		# parameter moved into a move[T] argument compiled clean before this
+		# was fixed, for both user classes and builtin RC types alike.
+		# import_builtins=True (unlike self.discovery/self.compiler, which
+		# skip lib/sys.py) - compiler.run()'s real reachability drain (needed
+		# below) forces sys.stdio scaffolding reachable, which needs builtins
+		disco = Discovery( import_builtins = True )
+		comp = Compiler( disco )
+		code = '\n'.join([
+			'class Foo: pass',
+			'',
+			'def takeown( x: move[Foo] ) -> None:',
+			'	pass',
+			'',
+			'def borrow_then_move( x: Foo ) -> None:',
+			'	takeown( move( x ))',
+			'',
+			'def main() -> None:',
+			'	f: Foo = Foo()',
+			'	borrow_then_move( f )',
+			'	return',
+		])
+		comp.import_code( code, filename = Path( '__test__.py' ))
+		# borrow_then_move is only reached via main's own call graph - _lower_
+		# main() lowers main alone, so this needs the real scheduling/drain
+		# pass (like DefaultValueModuleContextTests' own tests) to actually
+		# lower the callee this bug lives in
+		comp.run()
+		self.assertEqual( len( disco.errors.errors ), 1 )
+		self.assertIn( 'not owned', disco.errors.errors[0] )
+
+	def test_move_of_a_borrowed_bytearray_parameter_is_a_compile_error( self ) -> None:
+		# same gap, but for a builtin RC type (bytearray) rather than a
+		# user-defined class - this is the exact shape of the real bug found
+		# in lib/ed25519.py (a use-after-free: a borrowed bytearray parameter
+		# moved into a move[bytearray] argument, silently accepted)
+		disco = Discovery( import_builtins = True )
+		comp = Compiler( disco )
+		code = '\n'.join([
+			'def takeown( buf: move[bytearray] ) -> None:',
+			'	pass',
+			'',
+			'def borrow_then_move( buf: bytearray ) -> None:',
+			'	takeown( move( buf ))',
+			'',
+			'def main() -> None:',
+			'	b: bytearray = bytearray( 4 )',
+			'	borrow_then_move( b )',
+			'	return',
+		])
+		comp.import_code( code, filename = Path( '__test__.py' ))
+		comp.run()
+		self.assertEqual( len( disco.errors.errors ), 1 )
+		self.assertIn( 'not owned', disco.errors.errors[0] )
+
 	# --- compiler.sizeof(T) ----------------------------------------------------
 
 	def test_compiler_sizeof_folds_to_const( self ) -> None:
@@ -12030,6 +12091,27 @@ class MoveParameterTests( unittest.TestCase ):
 			if isinstance( i, ir.Decref ) and getattr( i.value, 'stem', None ) == 'b'
 		]
 		self.assertEqual( decrefs_on_b, [] )
+
+	def test_move_method_call_on_a_borrowed_receiver_is_a_compile_error( self ) -> None:
+		# _lower_call's own receiver-move hook (the @move-method counterpart
+		# of _apply_move_hook, exercised by the passing test above for the
+		# OWNED case) hits the exact same bare-CompileError-swallowed-by-
+		# recovery gap for a BORROWED receiver - calling release() through a
+		# plain (non-move[T]) bytearray parameter must be rejected, not
+		# silently accepted
+		self._import( '\n'.join([
+			'def borrow_then_release( buf: bytearray ) -> None:',
+			'	buf.release()',
+			'def main() -> None:',
+			'	b: bytearray = bytearray( 5 )',
+			'	borrow_then_release( b )',
+			'	return',
+		]))
+		# borrow_then_release is only reached via main's own call graph -
+		# needs the real scheduling/drain pass, not just _lower(main) alone
+		self.compiler.run()
+		self.assertEqual( len( self.discovery.errors.errors ), 1 )
+		self.assertIn( 'not owned', self.discovery.errors.errors[0] )
 
 
 class DefaultValueModuleContextTests( unittest.TestCase ):
