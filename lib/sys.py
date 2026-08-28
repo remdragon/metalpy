@@ -1,5 +1,7 @@
 import compiler
 import fs
+import threading
+import atomic
 
 @union
 class OwnershipError[T]:
@@ -77,7 +79,22 @@ _STDIO_BUF_CAP: usize = 8192
 
 class _BufferedStream:
 	''' buffered wrapper around a raw fs.FD - shared by stdout/stderr today,
-	general enough to become the base of real buffered file I/O later. '''
+	general enough to become the base of real buffered file I/O later.
+
+	write() is @virtual specifically so _ThreadedStream (below) can
+	override it - see that class's own docstring for why it's a SEPARATE
+	subclass rather than fields/methods added directly here. A program
+	that never calls enable_threaded_stdout()/enable_threaded_stderr()
+	never references _ThreadedStream at all, so nothing under it
+	(threading.Queue/Thread) ever gets reached/lowered - true zero cost
+	when unused, unlike an earlier version of this that put the queue/
+	thread fields directly on THIS class (that made threading.Thread
+	reachable from _BufferedStream's own field layout unconditionally,
+	which - confirmed via a real test failure, thread_detection_test.py -
+	flipped compiler.spawns_threads-driven field-locking on for every
+	program merely constructing sys.stdout, not just ones actually using
+	threaded output). Subclassing avoids this entirely: a base-typed
+	pointer/handle carries no knowledge of a subclass's own fields at all. '''
 	_buf: Ptr[u8] = None
 	_len: usize = 0
 	_is_tty: bool = False
@@ -86,6 +103,15 @@ class _BufferedStream:
 
 	def __init__( self, fd: fs.FD ) -> None:
 		self._fd = fd
+
+	def fd( self ) -> fs.FD:
+		''' public accessor for _fd - needed by enable_threaded_stdout()/
+		enable_threaded_stderr() (plain module-level functions, not methods
+		of this class or a subclass) to hand the same fd to a freshly
+		constructed _ThreadedStream; a single-underscore field is only
+		reachable from this class or a subclass, not arbitrary module-level
+		code, even within this same file. '''
+		return self._fd
 
 	@compiler.target( os = 'windows' )
 	def _check_tty( self ) -> None:
@@ -107,6 +133,7 @@ class _BufferedStream:
 		self._len = 0
 		return Result.Ok( None )
 
+	@virtual
 	def write( self, s: str ) -> Result[None,OSError]:
 		if not self._tty_checked:
 			self._check_tty()
@@ -134,6 +161,7 @@ class _BufferedStream:
 				self.flush().or_return()
 		return Result.Ok( None )
 
+	@virtual
 	def __del__( self ) -> None:
 		''' flush then free the backing buffer - a destructor can't propagate
 		flush() failure (see lib/builtins/__File.py's own __del__ comment),
@@ -147,6 +175,147 @@ class _BufferedStream:
 		if self._buf is not None:
 			free( self._buf )
 			self._buf = None
+
+
+# a plain, no-reactor blocking sleep - deliberately NOT lib/time.py's own
+# sleep() (reactor-aware, and time.py/reactor.py/datetime.py already form a
+# real import cycle among themselves - see time.py's own sleep() comment).
+# sys.py is foundational (imported by nearly everything), so it stays off
+# that graph entirely rather than risk it. Only ever called with a fixed
+# 10ms interval (_ThreadedStream._shutdown()'s own poll loop below) -
+# hardcoded rather than a general ms parameter to sidestep u32 division
+# entirely (not a plain infix op on intrinsics here - would need its own
+# fallible-Result handling for no real benefit at this one fixed call site).
+@compiler.target( os = 'windows' )
+def _blocking_sleep_10ms() -> None:
+	from windows.kernel32 import Sleep
+	Sleep( u32( 10 ))
+
+@compiler.target( os = not 'windows' )
+def _blocking_sleep_10ms() -> None:
+	from posix.time import nanosleep, timespec
+	req: timespec = timespec( tv_sec = 0, tv_nsec = 10000000 )
+	nanosleep( compiler.addrof( req ), None )
+
+
+class _ThreadedStream( _BufferedStream ):
+	''' a _BufferedStream that hands write() off to a dedicated background
+	writer thread via threading.Queue[str|None], instead of buffering and
+	writing synchronously on the caller's own thread - see
+	enable_threaded_stdout()/enable_threaded_stderr() below for how a
+	stream gets upgraded to this. A completely separate subclass (not
+	fields bolted onto _BufferedStream itself) so that a program which
+	never enables this never references threading.Queue/Thread at all -
+	see _BufferedStream's own docstring for why that matters (a real,
+	confirmed compiler-level interaction, not just tidiness).
+
+	_writer_loop() drains the WHOLE queue at once (threading.Queue.drain()'s
+	own contract) and joins every pending string into ONE buffer for ONE
+	write_all() call - coalescing many small print()-driven writes into far
+	fewer syscalls is the actual point of this feature, not just moving the
+	write off the caller's thread. Write errors are NOT propagated back to
+	whichever write() call originally enqueued the string - that caller
+	already returned Result.Ok() the moment it enqueued, before any real
+	syscall ran - a known, accepted tradeoff of async I/O (same posture as
+	most queue-backed logging/output libraries). '''
+	__queue:       threading.Queue[str|None]
+	__writer:      threading.Thread|None = None
+	__writer_done: atomic.Atomic[bool]
+	__shut_down:   bool = False
+
+	def __init__( self, fd: fs.FD ) -> None:
+		super().__init__( fd )
+		self.__queue = threading.Queue[str|None]()
+		self.__writer_done = atomic.Atomic[bool]( False )
+
+	def start( self ) -> None:
+		''' spawns the background writer thread - called once, right after
+		construction, by enable_threaded_stdout()/enable_threaded_stderr()
+		(NOT from __init__ itself: capturing self in a closure before
+		every field of a still-under-construction object is assigned is
+		rejected by the compiler - a real safety rule, not a formality,
+		since the spawned thread could otherwise start running before
+		construction finishes). '''
+		def entry() -> None:
+			self._writer_loop()
+		self.__writer = threading.Thread( entry )
+
+	def _writer_loop( self ) -> None:
+		while True:
+			batch: UnsafeList[str|None] = self.__queue.drain()
+			parts: list[str] = list[str]()
+			stop: bool = False
+			i: usize = 0
+			while i < batch.__len__():
+				item: str|None = batch.__getitem__( i ).unwrap( '_writer_loop: batch index in bounds by construction' )
+				if item is None:
+					stop = True
+					break
+				parts.append( item )
+				with compiler.wrap_arithmetic:
+					i += 1
+			if parts.__len__() > 0:
+				combined: str = ''.join( parts )
+				fs.write_all( self._fd, combined.get_cstr(), combined.byte_len() ).is_ok()
+			if stop:
+				self.__writer_done.store( True )
+				return
+
+	@virtual
+	def write( self, s: str ) -> Result[None,OSError]:
+		# always Ok(None): this queue is unbounded, so put() can never
+		# actually fail - a real write() error, if any, surfaces later on
+		# the writer thread, not here - see this class's own docstring
+		self.__queue.put( s ).unwrap( '_ThreadedStream.write: unbounded queue put always succeeds' )
+		return Result.Ok( None )
+
+	def _shutdown( self ) -> None:
+		''' pushes the None sentinel, then waits with a BOUNDED timeout
+		(~2s) for the writer thread to actually finish - Thread.join()
+		itself has no timeout (WaitForSingleObject(...,INFINITE)/
+		pthread_join, neither bounded), so this polls __writer_done
+		instead of joining directly. Gives up WITHOUT joining if the
+		writer hasn't finished in time - the process is about to exit
+		either way (see __del__ below), so an unclaimed OS thread handle
+		is harmless (Windows reclaims it) / the thread is torn down with
+		the whole process regardless (POSIX). The alternative, an
+		unbounded wait, risks hanging process exit forever on a stuck
+		writer (a blocked console, a broken pipe) - exactly the scenario
+		this exists to avoid, at the cost of a possible incomplete flush
+		in that (hopefully rare) case. '''
+		maybe_writer: threading.Thread|None = self.__writer
+		if maybe_writer is None:
+			panic( '_shutdown: called before start()' )
+		writer: threading.Thread = maybe_writer
+		self.__queue.put( None ).unwrap( '_shutdown: unbounded queue put always succeeds' )
+		attempts: usize = 0
+		while attempts < 200: # 200 * 10ms = up to ~2s
+			if self.__writer_done.load():
+				writer.join()
+				return
+			_blocking_sleep_10ms()
+			with compiler.wrap_arithmetic:
+				attempts += 1
+		# gave up - see this method's own docstring
+
+	@virtual
+	def __del__( self ) -> None:
+		''' shuts the writer thread down (see _shutdown()'s own docstring).
+		Deliberately does NOT chain to the base class's own __del__ (no
+		super().__del__() - that call shape isn't supported for __del__
+		specifically, which gets special compiler-synthesized dispatch
+		rather than ordinary virtual-method resolution) - harmless to skip
+		here regardless, since write() is fully overridden above, so
+		_buf/_len (all the base __del__ actually touches) never get
+		touched on a _ThreadedStream at all; its cleanup would be a pure
+		no-op even if it did run. Guarded so a second call is a no-op,
+		same reasoning as _BufferedStream.__del__'s own comment - a second
+		Thread.join() on an already-joined thread is undefined behavior on
+		both platforms (a double CloseHandle on Windows, a reused/invalid
+		thread id on POSIX), not just redundant work. '''
+		if not self.__shut_down:
+			self._shutdown()
+			self.__shut_down = True
 
 @compiler.target( os = 'windows' )
 def _stdout_fd() -> fs.FD:
@@ -168,6 +337,35 @@ def _stderr_fd() -> fs.FD:
 
 stdout: _BufferedStream = _BufferedStream( _stdout_fd() )
 stderr: _BufferedStream = _BufferedStream( _stderr_fd() )
+
+def enable_threaded_stdout() -> None:
+	''' opt-in: replaces the global `stdout` with a _ThreadedStream, so
+	every future print()/sys.stdout.write() call enqueues onto a
+	background writer thread instead of writing synchronously - see
+	_ThreadedStream's own docstring for the real motivation (coalescing
+	many small writes into far fewer syscalls) and _BufferedStream's own
+	docstring for why this is a whole-object swap (a module-level
+	function reassigning the global) rather than a method that flips a
+	flag on the existing object in place. Flushes whatever's already
+	buffered synchronously in the OLD stream first, so nothing already
+	written gets reordered after what's about to start flowing through
+	the new queue. Not idempotency-guarded - calling this twice replaces
+	an already-threaded stream with a second one (the first's own
+	__del__ runs normally via the ordinary RC drop, shutting its writer
+	thread down correctly) - wasteful if done by mistake, not unsafe. '''
+	global stdout
+	stdout.flush().is_ok()
+	new_stream: _ThreadedStream = _ThreadedStream( stdout.fd() )
+	new_stream.start()
+	stdout = new_stream
+
+def enable_threaded_stderr() -> None:
+	''' see enable_threaded_stdout() - identical, for stderr. '''
+	global stderr
+	stderr.flush().is_ok()
+	new_stream: _ThreadedStream = _ThreadedStream( stderr.fd() )
+	new_stream.start()
+	stderr = new_stream
 
 def _flush_stdio() -> None:
 	''' force-called from every real exit path - see this module's own
