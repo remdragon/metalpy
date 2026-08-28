@@ -73,6 +73,12 @@ class D2D1_HWND_RENDER_TARGET_PROPERTIES:
 	pixelSize: D2D1_SIZE_U = D2D1_SIZE_U()
 	presentOptions: u32 = 0                   # D2D1_PRESENT_OPTIONS_NONE
 
+@cstruct
+class D2D1_BITMAP_PROPERTIES:
+	pixelFormat: D2D1_PIXEL_FORMAT = D2D1_PIXEL_FORMAT()
+	dpiX: f32 = 0.0
+	dpiY: f32 = 0.0
+
 # ---------------------------------------------------------------------------
 # D2D1CreateFactory - d2d1.dll's own entry point (not CoCreateInstance-based)
 # ---------------------------------------------------------------------------
@@ -102,7 +108,7 @@ class ID2D1RenderTarget( IUnknown ):
 	def GetFactory( self ) -> None: ... # ID2D1Resource - unused stub
 
 	@virtual
-	def CreateBitmap( self ) -> None: ... # unused stub
+	def CreateBitmap( self, size: D2D1_SIZE_U, srcData: ConstPtr[None], pitch: u32, bitmapProperties: ConstPtr[D2D1_BITMAP_PROPERTIES], bitmap: Ptr[Ptr[None]] ) -> HRESULT: ...
 	@virtual
 	def CreateBitmapFromWicBitmap( self ) -> None: ... # unused stub
 	@virtual
@@ -150,7 +156,7 @@ class ID2D1RenderTarget( IUnknown ):
 	@virtual
 	def FillOpacityMask( self ) -> None: ... # unused stub
 	@virtual
-	def DrawBitmap( self ) -> None: ... # unused stub
+	def DrawBitmap( self, bitmap: Ptr[None], destinationRectangle: ConstPtr[D2D1_RECT_F], opacity: f32, interpolationMode: u32, sourceRectangle: ConstPtr[D2D1_RECT_F] ) -> None: ...
 	@virtual
 	def DrawText( self ) -> None: ... # unused stub
 	@virtual
