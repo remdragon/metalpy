@@ -1,11 +1,13 @@
 '''
 Minimal user32.dll surface - just enough to register a window class, create
-a top-level window, and pump its message loop. Only the ANSI (`A`-suffixed)
-entry points are used throughout (matching this file's own class/window
-name handling - plain `str.get_cstr()`, no UTF-16 conversion needed), same
-posture as every other lib/windows/*.py file: no `windows.h` include (see
-lib/windows/ws2_32.py's own comment on why that conflicts with this
-compiler's generated prototypes) - every struct/function here is hand-
+a top-level window, and pump its message loop. Unicode (`W`-suffixed) entry
+points throughout - the ANSI (`A`) ones interpret their string arguments via
+the process's own CP_ACP codepage, not UTF-8, so passing str.get_cstr()
+output to them would be silently wrong for any non-ASCII text; str.to_utf16()
+(lib/builtins/__init__.py) gives a real null-terminated UTF-16LE LPCWSTR
+directly. Same posture as every other lib/windows/*.py file: no `windows.h`
+include (see lib/windows/ws2_32.py's own comment on why that conflicts with
+this compiler's generated prototypes) - every struct/function here is hand-
 transcribed from real Win32 headers/docs, not machine-generated.
 '''
 
@@ -51,7 +53,7 @@ class PAINTSTRUCT:
 	rgbReserved: u8[32] = 0
 
 @cstruct
-class WNDCLASSEXA:
+class WNDCLASSEXW:
 	cbSize: u32 = 0
 	style: u32 = 0
 	lpfnWndProc: WndProc = None
@@ -61,8 +63,8 @@ class WNDCLASSEXA:
 	hIcon: HANDLE = None
 	hCursor: HANDLE = None
 	hbrBackground: HANDLE = None
-	lpszMenuName: ConstPtr[u8] = None
-	lpszClassName: ConstPtr[u8] = None
+	lpszMenuName: ConstPtr[u16] = None
+	lpszClassName: ConstPtr[u16] = None
 	hIconSm: HANDLE = None
 
 # window styles (winuser.h) - only what's needed for one plain overlapped
@@ -82,15 +84,15 @@ SW_SHOW: i32 = 5
 WM_DESTROY: u32 = 0x0002
 WM_PAINT: u32 = 0x000F
 
-@extern( 'user32', 'RegisterClassExA' )
-def RegisterClassExA( lpwcx: ConstPtr[WNDCLASSEXA] ) -> u16: # ATOM, 0 on failure
+@extern( 'user32', 'RegisterClassExW' )
+def RegisterClassExW( lpwcx: ConstPtr[WNDCLASSEXW] ) -> u16: # ATOM, 0 on failure
 	...
 
-@extern( 'user32', 'CreateWindowExA' )
-def CreateWindowExA(
+@extern( 'user32', 'CreateWindowExW' )
+def CreateWindowExW(
 	dwExStyle: u32,
-	lpClassName: ConstPtr[u8],
-	lpWindowName: ConstPtr[u8],
+	lpClassName: ConstPtr[u16],
+	lpWindowName: ConstPtr[u16],
 	dwStyle: u32,
 	X: i32,
 	Y: i32,
@@ -103,23 +105,23 @@ def CreateWindowExA(
 ) -> HWND:
 	...
 
-@extern( 'user32', 'DefWindowProcA' )
-def DefWindowProcA( hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM ) -> LRESULT:
+@extern( 'user32', 'DefWindowProcW' )
+def DefWindowProcW( hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM ) -> LRESULT:
 	...
 
 # real return contract is a genuine 3-way result (nonzero/0/-1 on WM_QUIT
 # vs. an error) - i32, not bool, so the -1 error case survives intact;
-# callers loop `while GetMessageA(...) > 0:`
-@extern( 'user32', 'GetMessageA' )
-def GetMessageA( lpMsg: Ptr[MSG], hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32 ) -> i32:
+# callers loop `while GetMessageW(...) > 0:`
+@extern( 'user32', 'GetMessageW' )
+def GetMessageW( lpMsg: Ptr[MSG], hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32 ) -> i32:
 	...
 
 @extern( 'user32', 'TranslateMessage' )
 def TranslateMessage( lpMsg: ConstPtr[MSG] ) -> bool:
 	...
 
-@extern( 'user32', 'DispatchMessageA' )
-def DispatchMessageA( lpMsg: ConstPtr[MSG] ) -> LRESULT:
+@extern( 'user32', 'DispatchMessageW' )
+def DispatchMessageW( lpMsg: ConstPtr[MSG] ) -> LRESULT:
 	...
 
 @extern( 'user32', 'PostQuitMessage' )

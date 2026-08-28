@@ -14,10 +14,10 @@ on Tcl_CreateCommand callbacks), so it has no other way to reach them.
 
 import compiler
 from windows.user32 import (
-	HWND, WPARAM, LPARAM, LRESULT, RECT, MSG, PAINTSTRUCT, WNDCLASSEXA,
+	HWND, WPARAM, LPARAM, LRESULT, RECT, MSG, PAINTSTRUCT, WNDCLASSEXW,
 	WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, SW_SHOW, WM_DESTROY, WM_PAINT,
-	RegisterClassExA, CreateWindowExA, DefWindowProcA, GetMessageA,
-	TranslateMessage, DispatchMessageA, PostQuitMessage, ShowWindow,
+	RegisterClassExW, CreateWindowExW, DefWindowProcW, GetMessageW,
+	TranslateMessage, DispatchMessageW, PostQuitMessage, ShowWindow,
 	UpdateWindow, GetClientRect, BeginPaint, EndPaint,
 )
 from windows.com import HRESULT, SUCCEEDED
@@ -59,7 +59,7 @@ def wnd_proc( hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM ) -> LRESULT:
 		render()
 		EndPaint( hwnd, compiler.addrof( ps ))
 		return 0
-	return DefWindowProcA( hwnd, msg, wparam, lparam )
+	return DefWindowProcW( hwnd, msg, wparam, lparam )
 
 def main() -> i32:
 	global g_render_target, g_brush_red, g_brush_green, g_brush_blue
@@ -67,24 +67,24 @@ def main() -> i32:
 	class_name: str = 'MetalpyD2DDemo'
 
 	with compiler.wrap_arithmetic:
-		cb_size: u32 = u32( compiler.sizeof( WNDCLASSEXA ))
-	wc: WNDCLASSEXA = WNDCLASSEXA(
+		cb_size: u32 = u32( compiler.sizeof( WNDCLASSEXW ))
+	wc: WNDCLASSEXW = WNDCLASSEXW(
 		cbSize = cb_size,
 		lpfnWndProc = wnd_proc,
-		lpszClassName = class_name.get_cstr(),
+		lpszClassName = class_name.to_utf16(),
 	)
-	if RegisterClassExA( compiler.addrof( wc )) == 0:
-		print( 'RegisterClassExA failed' )
+	if RegisterClassExW( compiler.addrof( wc )) == 0:
+		print( 'RegisterClassExW failed' )
 		return 1
 
-	hwnd: HWND = CreateWindowExA(
-		0, class_name.get_cstr(), 'metalpy Direct2D demo'.get_cstr(),
+	hwnd: HWND = CreateWindowExW(
+		0, class_name.to_utf16(), 'metalpy Direct2D demo'.to_utf16(),
 		WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT, CW_USEDEFAULT, 500, 400,
 		None, None, None, None,
 	)
 	if hwnd is None:
-		print( 'CreateWindowExA failed' )
+		print( 'CreateWindowExW failed' )
 		return 2
 
 	factory_out: Ptr[None] = None
@@ -137,8 +137,8 @@ def main() -> i32:
 	UpdateWindow( hwnd )
 
 	msg: MSG = MSG()
-	while GetMessageA( compiler.addrof( msg ), None, 0, 0 ) > 0:
+	while GetMessageW( compiler.addrof( msg ), None, 0, 0 ) > 0:
 		TranslateMessage( compiler.addrof( msg ))
-		DispatchMessageA( compiler.addrof( msg ))
+		DispatchMessageW( compiler.addrof( msg ))
 
 	return 0
