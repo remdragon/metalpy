@@ -1,1 +1,1 @@
-@python c:\cvs\metalpy\mpy.py %*
+@python %~dp0\mpy.py %*
