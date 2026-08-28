@@ -288,6 +288,32 @@ def CreateThread(
 
 INFINITE: u32 = u32( -1 )
 
+# HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES, LONG lInitialCount, LONG
+# lMaximumCount, LPCWSTR lpName) - lpSemaphoreAttributes/lpName both NULL
+# here (an unnamed, process-local semaphore - lib/threading.py's own
+# Semaphore never needs cross-process sharing). lMaximumCount is set to
+# i32 max there too - this is a counting queue-depth signal, not a
+# resource-limiting semaphore with a real cap.
+@extern( 'kernel32', 'CreateSemaphoreW' )
+def CreateSemaphoreW(
+	lpSemaphoreAttributes: Ptr[None],
+	lInitialCount: i32,
+	lMaximumCount: i32,
+	lpName: Ptr[None],
+) -> HANDLE:
+	...
+
+# BOOL ReleaseSemaphore(HANDLE, LONG lReleaseCount, LPLONG lpPreviousCount) -
+# lpPreviousCount always NULL here (lib/threading.py's own Semaphore.post()
+# never needs the prior count back).
+@extern( 'kernel32', 'ReleaseSemaphore' )
+def ReleaseSemaphore(
+	hSemaphore: HANDLE,
+	lReleaseCount: i32,
+	lpPreviousCount: Ptr[i32],
+) -> bool:
+	...
+
 MAX_PATH: usize = 260
 
 # WIN32_FIND_DATAA (fileapi.h) - FindFirstFileA/FindNextFileA's own [out]
