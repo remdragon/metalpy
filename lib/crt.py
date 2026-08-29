@@ -483,3 +483,34 @@ def iswprint_l(
 	loc: locale_t,
 ) -> i32:
 	...
+
+# ---------------------------------------------------------------------------
+# sqrt/sqrtf - lib/builtins/__float.py's f64.sqrt()/f32.sqrt(). A single
+# hardware instruction on every real target (SQRTSD/SQRTSS on x86, FSQRT on
+# ARM) - this still goes through an ordinary libm/CRT call (no builtin-call
+# spelling reaches a compiler intrinsic from this codebase's own extern
+# mechanism), but real linkers/optimizers fold the call down to that one
+# instruction anyway. POSIX splits out 'm' (glibc keeps math functions in a
+# separate libm archive pre-2.34; -lm still resolves fine on newer glibc and
+# on macOS, where it's just an alias into libSystem) - Windows has no
+# separate libm, math functions live directly in the CRT ('c'), same as
+# every other Windows extern in this file.
+@compiler.target( os = not 'windows' )
+@extern( 'm', 'sqrt', header = 'math.h' )
+def sqrt( x: f64 ) -> f64:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'c', 'sqrt', header = 'math.h' )
+def sqrt( x: f64 ) -> f64:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'm', 'sqrtf', header = 'math.h' )
+def sqrtf( x: f32 ) -> f32:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'c', 'sqrtf', header = 'math.h' )
+def sqrtf( x: f32 ) -> f32:
+	...

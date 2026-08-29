@@ -994,6 +994,48 @@ def main() -> i32:
 	return 0
 ''', [ "f64._sign_prefix('+') on a non-negative value == \"+\"", "f64._sign_prefix('-') on a non-negative value == \"\"" ] )
 
+	def test_f64_sqrt( self ) -> None:
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	a: f64 = 4.0
+	if a.sqrt() != 2.0:
+		return 1
+	b: f64 = 2.25
+	if b.sqrt() != 1.5:
+		return 2
+	zero: f64 = 0.0
+	if zero.sqrt() != 0.0:
+		return 3
+	c: f64 = -1.0
+	if not compiler.is_nan( c.sqrt() ):
+		return 4
+	return 0
+''', [
+			'f64(4.0).sqrt() == 2.0',
+			'f64(2.25).sqrt() == 1.5',
+			'f64(0.0).sqrt() == 0.0',
+			'f64(-1.0).sqrt() is NaN',
+		] )
+
+	def test_f32_sqrt( self ) -> None:
+		self._assert_program_succeeds( '''
+def main() -> i32:
+	a: f32 = 4.0
+	if a.sqrt() != 2.0:
+		return 1
+	b: f32 = 2.25
+	if b.sqrt() != 1.5:
+		return 2
+	c: f32 = -1.0
+	if not compiler.is_nan( c.sqrt() ):
+		return 3
+	return 0
+''', [
+			'f32(4.0).sqrt() == 2.0',
+			'f32(2.25).sqrt() == 1.5',
+			'f32(-1.0).sqrt() is NaN',
+		] )
+
 
 if __name__ == '__main__':
 	unittest.main()

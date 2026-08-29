@@ -586,3 +586,24 @@ f32._repr_digits = _f32_repr_digits
 f32._repr_digits_raw = _f32_repr_digits_raw
 f32.__str__ = _f32_str
 f32.__repr__ = _f32_repr
+
+
+@private
+def _f64_sqrt( value: f64 ) -> f64:
+	''' value.sqrt() - crt.sqrt (libm/CRT, see lib/crt.py's own comment).
+	Negative input yields NaN, matching real IEEE754 sqrt (and every other
+	non-finite-producing float primitive already in this codebase, e.g.
+	compiler.is_nan/is_inf) rather than raising - this compiler has no
+	float-domain-error convention to raise through a plain `-> f64`. '''
+	from crt import sqrt as _crt_sqrt
+	return _crt_sqrt( value )
+
+
+@private
+def _f32_sqrt( value: f32 ) -> f32:
+	from crt import sqrtf as _crt_sqrtf
+	return _crt_sqrtf( value )
+
+
+f64.sqrt = _f64_sqrt
+f32.sqrt = _f32_sqrt
