@@ -6769,6 +6769,70 @@ def main() -> i32:
 		] )
 
 
+class MatchSiblingArmRebindRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' real compile+run coverage for a fixed bug (lowering.py's _stmt_Assign):
+	two arms of the SAME match statement binding DIFFERENT payload types to
+	the same name used to fail to compile ("already declared earlier in this
+	function ... with an incompatible type"), even though the arms are
+	mutually exclusive by construction and each binding only exists within
+	its own arm - found and worked around (distinct per-arm names) while
+	building lib/mysql/protocol.py's _append_param_value, see database_
+	client_investigation.md's "A real compiler limitation found and worked
+	around". Confirms both arms' bindings really do get their own,
+	independent storage (not just that it compiles) by returning a
+	distinctly-computed value from each arm. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'match_sibling_arms_rebind_same_name_different_types', '''
+@union
+class Shape:
+	Circle: i32
+	Square: u32
+
+def area_ish( s: Shape ) -> i32:
+	with compiler.wrap_arithmetic:
+		match s:
+			case Shape.Circle( v ):
+				return v * 2
+			case Shape.Square( v ):
+				return i32( v ) * 3
+
+def main() -> i32:
+	if area_ish( Shape.Circle( 5 ) ) != 10:
+		return 1
+	if area_ish( Shape.Square( 5 ) ) != 15:
+		return 2
+	return 0
+''' ),
+			( 'match_sibling_arms_rebind_same_name_same_type_still_works', '''
+@union
+class Shape:
+	Circle: i32
+	Square: i32
+
+def area_ish( s: Shape ) -> i32:
+	with compiler.wrap_arithmetic:
+		match s:
+			case Shape.Circle( v ):
+				return v * 2
+			case Shape.Square( v ):
+				return v * 3
+
+def main() -> i32:
+	if area_ish( Shape.Circle( 5 ) ) != 10:
+		return 1
+	if area_ish( Shape.Square( 5 ) ) != 15:
+		return 2
+	return 0
+''' ),
+		] )
+
+
 class MatchNestedUnionMemberRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for a fixed bug in type_resolver.py's
 	_match_pattern: `case SomeUnion.Variant(x):` resolves SomeUnion PURELY

@@ -2123,6 +2123,19 @@ class FunctionLowering:
 		# own Parameter exists (not yet constructed this early).
 		self._ever_declared_stems: set[str] = { p.stem for p in ( fn.parameters or [] )} if fn is not None else set()
 		self._current_fn = fn
+		# name -> id(the ast.Match) of whichever match statement's arm most
+		# recently declared FRESH storage for this name via a `case T(name):`
+		# binding - lets _stmt_Assign tell a SIBLING arm of that SAME match
+		# reusing the name (must get its own independent storage, arms are
+		# mutually exclusive) apart from an unrelated later reassignment or a
+		# totally different match statement reusing the name (ordinary
+		# reuse/mismatch rules apply unchanged, see _stmt_Assign's own
+		# is_match_binding handling). Never removed on del/reassignment -
+		# stale entries are harmless, only ever consulted alongside a live
+		# `existing` binding that's ALSO still a match binding for this exact
+		# name, which del/an unrelated reassignment already replaces in
+		# fn.names by then.
+		self._match_binding_origin: dict[str,int] = {}
 		# set for real in run()/run_global()/run_deinit_epilogue(), right
 		# before each starts lowering anything - None here only covers the
 		# brief window before any of those runs (never actually observed by
@@ -4417,6 +4430,28 @@ class FunctionLowering:
 			existing = self._existing_local_or_none( target.id, node, 'cannot assign to it' )
 			if existing is None:
 				existing = self._existing_loop_carried_or_none( target.id )
+			match_stmt_id = getattr( node, 'match_stmt_id', None )
+			if (
+				existing is not None and getattr( node, 'is_match_binding', False )
+				and match_stmt_id is not None and self._match_binding_origin.get( target.id ) == match_stmt_id
+			):
+				# a SIBLING arm of the SAME match statement (type_resolver.py's
+				# visit_Match tags every arm's own binding Assign with the same
+				# id(the ast.Match)) rebinding this exact name - unlike an
+				# ordinary reassignment or a genuinely separate later match
+				# statement reusing the name (both still go through the
+				# reuse-and-coerce path below, unchanged), sibling arms are
+				# mutually exclusive by construction (exactly one ever runs)
+				# and must NOT share one C-level slot - forcing that here was
+				# the actual bug (a real compile error whenever the two arms'
+				# payload types differed, even though they can never be
+				# simultaneously live). Falling through to the "no prior
+				# declaration" branch below mints this arm its OWN fresh
+				# Variable; _mark_fresh_local_declared already gives it a
+				# uid-suffixed, disambiguated C identifier (the same mechanism
+				# a del-then-redeclare already relies on), so the two arms'
+				# bindings never collide at the C level either.
+				existing = None
 			if existing is not None:
 				# a module-level global's own Variable may not have had its
 				# OWN .resolve run yet (its .type is None until then) if this
@@ -4476,6 +4511,13 @@ class FunctionLowering:
 				# ownership tracking unchanged (borrow=False there).
 				self._cfg_assign( var, operand, is_alias = is_alias, node = node, track_result = not is_match_subject, borrow = is_match_subject and is_alias )
 				if getattr( node, 'is_match_binding', False ):
+					if match_stmt_id is not None:
+						# so a LATER sibling arm of this same match statement
+						# reusing this name (the check just above, at this
+						# branch's own top) recognizes it as a same-match
+						# rebind needing its own fresh storage too, rather than
+						# an ordinary reuse to coerce-or-reject
+						self._match_binding_origin[ target.id ] = match_stmt_id
 					# type_resolver.py's _match_pattern: a `case T(name):`
 					# extracted payload. This language has no wildcard/discard
 					# binding syntax (no Rust-style `case T(_):`), so a case

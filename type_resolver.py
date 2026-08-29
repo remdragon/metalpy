@@ -8397,6 +8397,17 @@ class _ReferenceResolver( ast.NodeTransformer ):
 			# reaches this branch at all - see _match_union_member's own
 			# check above it)
 			bind.is_match_binding = True
+			# id(node) - node is the enclosing ast.Match, unchanged through
+			# every recursive _match_pattern call (see this method's own
+			# comment on original_subject_name) - lets lowering.py tell
+			# "two SIBLING arms of the SAME match statement bound this same
+			# name" (each arm's storage must stay independent, see cfg.py's
+			# _stmt_Assign is_match_binding handling) apart from "two
+			# DIFFERENT match statements happened to reuse a name" (an
+			# ordinary reassignment, must still error on a real type
+			# mismatch - lowering_test.py's own test_match_binding_name_
+			# reused_with_incompatible_type_gets_a_clear_diagnostic)
+			bind.match_stmt_id = id( node )
 			# same reasoning as visit_Match's own subj_assign comment above:
 			# this Assign is built directly, never dispatched through
 			# self.visit()/visit_Assign, so nothing populates

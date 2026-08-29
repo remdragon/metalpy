@@ -2706,6 +2706,35 @@ class Tests( unittest.TestCase ):
 		self._lower_main()
 		self.assertEqual( self.discovery.errors.errors, [] )
 
+	def test_match_sibling_arms_reusing_a_name_with_different_types_compiles( self ) -> None:
+		# the real bug (database_client_investigation.md's "compiler
+		# limitation found and worked around"): two arms of the SAME match
+		# statement binding different payload types to the same name are
+		# mutually exclusive by construction - exactly one ever runs - so
+		# they must NOT be forced to share one C-level slot the way an
+		# ordinary same-name reassignment (or a genuinely separate LATER
+		# match statement reusing the name, see the incompatible-type test
+		# above) legitimately is.
+		code = '\n'.join([
+			'@union',
+			'class Shape:',
+			'	Circle: i32',
+			'	Square: u32',
+			'',
+			'def describe( s: Shape ) -> i32:',
+			'	match s:',
+			'		case Shape.Circle( v ):',
+			'			return v',
+			'		case Shape.Square( v ):',
+			'			return i32( v )',
+			'',
+			'def main() -> i32:',
+			'	return describe( Shape.Circle( 5 ))',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertEqual( self.discovery.errors.errors, [] )
+
 	def test_match_narrowing_shadow_reuse_is_unaffected_by_binding_reuse_diagnostic( self ) -> None:
 		# the one exception the reused-binding-name diagnostic above must
 		# NOT fire for: a case pattern that reuses the SUBJECT's own name
