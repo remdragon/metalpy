@@ -92,6 +92,92 @@ def main() -> i32:
 	return 0
 '''
 
+_ZIP_STOPS_AT_SHORTER = '''
+def main() -> i32:
+	a: list[i32] = list[i32]()
+	a.append( 1 )
+	a.append( 2 )
+	a.append( 3 )
+	b: list[i32] = list[i32]()
+	b.append( 10 )
+	b.append( 20 )
+
+	pairs: list[tuple[i32,i32]] = list[tuple[i32,i32]]()
+	for p in zip( a, b ):
+		pairs.append( p )
+	if pairs.__len__() != usize( 2 ):
+		return 1
+	first: tuple[i32,i32] = pairs.__getitem__( 0 ).unwrap( 'pairs has 2 entries' )
+	if first[0] != 1 or first[1] != 10:
+		return 2
+	second: tuple[i32,i32] = pairs.__getitem__( 1 ).unwrap( 'pairs has 2 entries' )
+	if second[0] != 2 or second[1] != 20:
+		return 3
+	return 0
+'''
+
+_FILTER_KEEPS_ONLY_MATCHING = '''
+def is_even( x: i32 ) -> bool:
+	with compiler.panic_arithmetic( 'divisor is a nonzero literal' ):
+		return x % 2 == 0
+
+def main() -> i32:
+	src: list[i32] = list[i32]()
+	src.append( 1 )
+	src.append( 2 )
+	src.append( 3 )
+	src.append( 4 )
+	src.append( 5 )
+	src.append( 6 )
+	evens: list[i32] = list[i32]()
+	for x in filter( is_even, src ):
+		evens.append( x )
+	if evens.__len__() != usize( 3 ):
+		return 1
+	if evens.__getitem__( 0 ).unwrap( '' ) != 2:
+		return 2
+	if evens.__getitem__( 2 ).unwrap( '' ) != 6:
+		return 3
+	return 0
+'''
+
+_SORTED_ASCENDING_AND_REVERSE = '''
+def main() -> i32:
+	src: list[i32] = list[i32]()
+	src.append( 5 )
+	src.append( 3 )
+	src.append( 1 )
+	src.append( 4 )
+	src.append( 2 )
+
+	asc: list[i32] = sorted( src )
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < usize( 5 ):
+			if asc.__getitem__( i ).unwrap( 'i < 5' ) != i32( i ) + 1:
+				return 1
+			i += usize( 1 )
+
+	desc: list[i32] = sorted( src, reverse = True )
+	if desc.__getitem__( 0 ).unwrap( '' ) != 5:
+		return 2
+	if desc.__getitem__( 4 ).unwrap( '' ) != 1:
+		return 3
+
+	# original untouched - sorted() returns a NEW list, doesn't sort in place
+	if src.__getitem__( 0 ).unwrap( '' ) != 5:
+		return 4
+
+	empty: list[i32] = list[i32]()
+	if sorted( empty ).__len__() != usize( 0 ):
+		return 5
+	single: list[i32] = list[i32]()
+	single.append( 42 )
+	if sorted( single ).__getitem__( 0 ).unwrap( '' ) != 42:
+		return 6
+	return 0
+'''
+
 _HOMOGENEOUS_TUPLE_CONFORMANCE = '''
 def main() -> i32:
 	t: tuple[i32,i32,i32] = ( 7, 2, 9 )
@@ -240,6 +326,21 @@ class SequenceIterableBuiltinsTests( RealCompileMixin, unittest.TestCase ):
 	def test_map_and_reduce( self ) -> None:
 		self.assert_programs_run([
 			( 'map_and_reduce', _MAP_AND_REDUCE ),
+		])
+
+	def test_zip_stops_at_shorter( self ) -> None:
+		self.assert_programs_run([
+			( 'zip_stops_at_shorter', _ZIP_STOPS_AT_SHORTER ),
+		])
+
+	def test_filter_keeps_only_matching( self ) -> None:
+		self.assert_programs_run([
+			( 'filter_keeps_only_matching', _FILTER_KEEPS_ONLY_MATCHING ),
+		])
+
+	def test_sorted_ascending_and_reverse( self ) -> None:
+		self.assert_programs_run([
+			( 'sorted_ascending_and_reverse', _SORTED_ASCENDING_AND_REVERSE ),
 		])
 
 	def test_homogeneous_tuple_conformance( self ) -> None:
