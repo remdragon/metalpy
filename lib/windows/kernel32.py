@@ -244,6 +244,91 @@ def GetConsoleMode(
 ) -> bool:
 	...
 
+# BOOL SetConsoleMode(HANDLE hConsoleHandle, DWORD dwMode) - counterpart to
+# GetConsoleMode above. A terminal-viewer client (a downstream project's
+# terminal_client.mpy) uses this to turn on ENABLE_VIRTUAL_TERMINAL_PROCESSING
+# (output) / ENABLE_VIRTUAL_TERMINAL_INPUT (input) so a real ANSI/VT-aware
+# console (Windows 10+) renders a remote PTY's own escape sequences directly,
+# and reports arrow/function keys back as VT sequences instead of needing a
+# hand-rolled ReadConsoleInputW-to-escape-sequence translation.
+@extern('kernel32', 'SetConsoleMode')
+def SetConsoleMode(
+	hConsoleHandle: HANDLE,
+	dwMode: u32,
+) -> bool:
+	...
+
+# console input-mode flags (wincon.h) - GetConsoleMode/SetConsoleMode on an
+# input handle. ENABLE_PROCESSED_INPUT gates whether Ctrl+C is intercepted
+# as CTRL_C_EVENT (delivered to SetConsoleCtrlHandler, see lib/signal.py)
+# rather than delivered as a raw 0x03 byte through ReadFile/ReadConsoleInput -
+# a raw terminal viewer that wants to forward a literal Ctrl+C keystroke to a
+# remote shell (rather than have it kill the local viewer) clears this bit.
+# Ctrl+Break is NOT gated by this flag - it always reaches a registered
+# console control handler regardless, per Microsoft's own docs.
+ENABLE_PROCESSED_INPUT:        u32 = 0x0001
+ENABLE_LINE_INPUT:             u32 = 0x0002
+ENABLE_ECHO_INPUT:             u32 = 0x0004
+ENABLE_WINDOW_INPUT:           u32 = 0x0008 # reports console-resize as a WINDOW_BUFFER_SIZE_EVENT - only observable via ReadConsoleInputW, not the raw ReadFile byte stream a VT-input client actually reads, so not usable alongside ENABLE_VIRTUAL_TERMINAL_INPUT's own raw-byte-stream approach
+ENABLE_MOUSE_INPUT:            u32 = 0x0010
+ENABLE_INSERT_MODE:            u32 = 0x0020
+ENABLE_QUICK_EDIT_MODE:        u32 = 0x0040
+ENABLE_EXTENDED_FLAGS:         u32 = 0x0080
+ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200
+
+# console output-mode flags (wincon.h) - GetConsoleMode/SetConsoleMode on an
+# output handle. ENABLE_VIRTUAL_TERMINAL_PROCESSING makes WriteFile on the
+# console handle interpret ANSI/VT escape sequences for real (cursor moves,
+# SGR color codes, etc.) instead of printing them as literal text - the
+# mechanism that lets a remote PTY's own raw output be written to this
+# handle near-verbatim.
+ENABLE_PROCESSED_OUTPUT:           u32 = 0x0001
+ENABLE_WRAP_AT_EOL_OUTPUT:         u32 = 0x0002
+ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004
+
+# COORD (wincon.h): a signed (X, Y) cell position - screen-buffer or window
+# coordinates are always SHORT, never unsigned (a buffer can be indexed
+# from a negative scroll offset in principle), so i16 not u16.
+@cstruct
+class COORD:
+	X: i16 = 0
+	Y: i16 = 0
+
+# SMALL_RECT (wincon.h): SHORT Left, Top, Right, Bottom - CONSOLE_SCREEN_
+# BUFFER_INFO.srWindow's own type, the visible window's extent within the
+# (possibly larger, scrollback-holding) screen buffer.
+@cstruct
+class SMALL_RECT:
+	Left:   i16 = 0
+	Top:    i16 = 0
+	Right:  i16 = 0
+	Bottom: i16 = 0
+
+# CONSOLE_SCREEN_BUFFER_INFO (wincon.h) - GetConsoleScreenBufferInfo's own
+# [out] parameter. srWindow gives the actually-visible cols/rows (Right -
+# Left + 1, Bottom - Top + 1) - what a terminal viewer wants for TerminalOpen/
+# TerminalResize's own cols/rows, not dwSize (the full scrollback-including
+# buffer size, which can be taller/wider than what's on screen).
+@cstruct
+class CONSOLE_SCREEN_BUFFER_INFO:
+	dwSize:              COORD      = COORD()
+	dwCursorPosition:    COORD      = COORD()
+	wAttributes:         u16        = 0
+	srWindow:            SMALL_RECT = SMALL_RECT()
+	dwMaximumWindowSize: COORD      = COORD()
+
+# BOOL GetConsoleScreenBufferInfo(HANDLE hConsoleOutput,
+# PCONSOLE_SCREEN_BUFFER_INFO lpConsoleScreenBufferInfo) - used here to read
+# the real console window size (srWindow) at startup and to poll for resize
+# (no push notification reachable from a raw-ReadFile VT-input client - see
+# ENABLE_WINDOW_INPUT's own comment above).
+@extern('kernel32', 'GetConsoleScreenBufferInfo')
+def GetConsoleScreenBufferInfo(
+	hConsoleOutput: HANDLE,
+	lpConsoleScreenBufferInfo: Ptr[CONSOLE_SCREEN_BUFFER_INFO],
+) -> bool:
+	...
+
 @extern('kernel32', 'CreateFileA')
 def CreateFileA(
 	lpFileName: ConstPtr[u8],
