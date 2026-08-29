@@ -25017,6 +25017,58 @@ def main() -> i32:
 
 		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = self.compiler )
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_defer_cast_temp_across_or_return_block_and_flat_ladder( self ) -> None:
+		''' Real repro (clang, no gcc-only quirk needed this time): a defer's
+		implicit-cast ir.DeclareTemp is replayed by identity at two DIFFERENT
+		C scopes - once inline inside .or_return()'s own `{ }` error block
+		(forced there because an RC-owned local declared earlier in the same
+		if-branch is still confined/live, so current_epilogue_label() refuses
+		to hand out the shared ladder's label at that point - see cfg.py's
+		own docstring), and once more at the function's flat, goto-based
+		epilogue ladder for the sibling plain `return` below. The `declared`
+		bookkeeping used to be one set shared across both, so the ladder saw
+		the temp as "already declared" (by the or_return block) and skipped
+		its own declaration - a real "use of undeclared identifier" once the
+		block's `}` took that declaration out of scope. '''
+		source = '''
+class MyError:
+	pass
+
+def c2() -> bool:
+	return True
+
+def maybe() -> Result[i32, MyError]:
+	return Result.Ok( 1 )
+
+def use( e: MyError ) -> None:
+	pass
+
+def f( flag: bool ) -> Result[None, MyError]:
+	buf: Ptr[u8] = sys.alloc[u8]( 16 )
+	if buf is None:
+		return Result.Err( MyError() )
+	defer( sys.free( compiler.cast( Ptr[None], buf )))
+	if flag:
+		obj: MyError = MyError()
+		x: i32 = maybe().or_return()
+		use( obj )
+	if c2():
+		return Result.Err( MyError() )
+	return Result.Ok( None )
+
+def main() -> i32:
+	r: Result[None, MyError] = f( True )
+	if not r.is_err():
+		return 1
+	return 0
+'''
+		self.compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = self.compiler )
+
 
 if __name__ == '__main__':
 	unittest.main()
