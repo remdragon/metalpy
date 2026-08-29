@@ -304,17 +304,23 @@ def main() -> None:
 		# isn't safely deployable, and finding out via mpy's own exit code beats
 		# finding out when the shipped exe won't start on another machine. ---
 		bundle_errors: list[str] = []
-		for dll_name in sorted( compiler.extern_dlls ):
-			found = linker_c.find_dll( dll_name )
-			if found is None:
-				bundle_errors.append( f'{dll_name}: not found on PATH' )
-				continue
-			dest = exe_path.parent / dll_name
-			try:
-				shutil.copy2( found, dest )
-				print( f'mpy: bundled {dest}' )
-			except OSError as e:
-				bundle_errors.append( f'{dll_name}: {e}' )
+		# DLL bundling is a Windows-loader concept (copy next to the exe so
+		# the OS's own unqualified-DLL search finds it) - a non-Windows
+		# target's @extern(..., dll=...) declarations (e.g. a Windows-only
+		# lib/windows/* module reached while cross-compiling) have no
+		# runtime-copy equivalent here and must not fail the build.
+		if active_target['os'] == 'windows':
+			for dll_name in sorted( compiler.extern_dlls ):
+				found = linker_c.find_dll( dll_name )
+				if found is None:
+					bundle_errors.append( f'{dll_name}: not found on PATH' )
+					continue
+				dest = exe_path.parent / dll_name
+				try:
+					shutil.copy2( found, dest )
+					print( f'mpy: bundled {dest}' )
+				except OSError as e:
+					bundle_errors.append( f'{dll_name}: {e}' )
 
 		# --- combine 3rd-party license notices declared via
 		# @extern(..., notice=...) into one dist/THIRD-PARTY-LICENSES.txt -

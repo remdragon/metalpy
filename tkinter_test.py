@@ -38,6 +38,7 @@ def _find_tcl_install() -> Path | None:
 _TCL_DIR = _find_tcl_install()
 
 
+@unittest.skipUnless( os.name == 'nt', 'lib/tkinter.py / lib/windows/tcl.py is a Windows-only binding - skipping off Windows' )
 class TkinterTests( test_support.RealCompileMixin, unittest.TestCase ):
 	''' Real compile-and-run coverage for lib/tkinter.py's Tcl/Tk PoC:
 	window create/configure/destroy, and a Button -command callback firing
