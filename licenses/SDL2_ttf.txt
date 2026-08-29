@@ -1,7 +1,7 @@
 [metalpy note: SDL2_ttf's standard zlib license text - required by
-windows/sdl2_ttf.py's @extern(..., notice='SDL2_ttf') bindings so
-`mpy` can bundle a license notice alongside the SDL2_ttf.dll it copies
-next to a compiled program's .exe.]
+sdl2_ttf.py's @extern(..., notice='SDL2_ttf') bindings so `mpy` can
+bundle a license notice alongside the SDL2_ttf.dll it copies next to
+a compiled program's .exe.]
 
   SDL_ttf:  A companion library to SDL for working with TrueType (.ttf)
   fonts
