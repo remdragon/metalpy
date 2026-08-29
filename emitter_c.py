@@ -3757,6 +3757,29 @@ def emit_function( fn: LoweredFunction, *, prototype_only: bool = False ) -> str
 	lines.append( '}' )
 	return '\n'.join( lines )
 
+def _emit_instructions_in_block( instructions: list[ir.Instruction], *, function: Function|None, declared: set[str] ) -> list[str]:
+	''' _emit_instructions(), for a caller whose own output lands inside a
+	REAL C `{ }` block (or_return()/or_throw()/raise's own error branch, or
+	one match/except leaf's own switch-case) rather than this function's flat,
+	goto-based scope. `declared` must NOT be mutated by what happens inside
+	such a block: a defer/errdefer entry's captured instructions (including
+	an implicit-cast ir.DeclareTemp - see ir.DeclareTemp's own emitter
+	comment) are replayed BY IDENTITY at every unwind point, and one of those
+	points can easily be THIS block while another is the function's own flat
+	epilogue ladder (build_epilogue_ladder()) - confirmed by a real repro
+	(defer(sys.free(compiler.cast(...))) plus an RC-owned local confined to
+	an if-branch forces THIS block to carry the inline unwind, while a
+	sibling plain `return` elsewhere still reaches the flat ladder). Declaring
+	the temp only in here and then having the flat ladder see it in the
+	shared `declared` set and skip its own declaration produced a real clang
+	"use of undeclared identifier" - the ladder's `$tN` isn't in scope, this
+	block's own declaration having already gone out of scope with its `}`.
+	A snapshot (not the same set) fixes this: this block sees everything
+	declared OUTSIDE it (correctly still in scope, so nothing already visible
+	gets redeclared), but anything IT declares here is forgotten once it
+	returns - the next replay site, wherever it lands, declares fresh. '''
+	return _emit_instructions( instructions, function = function, declared = set( declared ))
+
 def _emit_instructions( instructions: list[ir.Instruction], *, function: Function|None, declared: set[str] ) -> list[str]:
 	''' walks a straight-line instruction list, emitting each via
 	_emit_instruction. A plain loop is enough - unlike an earlier version of
@@ -4417,7 +4440,7 @@ def _emit_or_return( instr: ir.OrReturn, function: Function, declared: set[str] 
 	# path - emitted via the same per-instruction dispatcher as the rest of the
 	# function body, so it can contain anything return_() can produce (Decref,
 	# tag-gated GetAttr/Cmp/JumpIfFalse/Jump/Label sequences, defer replays)
-	epilogue_lines = _emit_instructions( instr.epilogue, function = function, declared = declared )
+	epilogue_lines = _emit_instructions_in_block( instr.epilogue, function = function, declared = declared )
 	if instr.inline_exit is not None:
 		# PLAN_INLINE.md early-return generalization - this OrReturn is
 		# .or_return()/checked-arithmetic's own inline-unwind path reached
@@ -4534,7 +4557,7 @@ def _emit_leaf_dispatch_case(
 	declaration lets both cases assign into the same `e`. '''
 	entry = next( ( d for d in dispatch if d.leaf.qualname == leaf_type.qualname ), None )
 	if entry is not None:
-		lines: list[str] = _emit_instructions( entry.epilogue, function = function, declared = declared )
+		lines: list[str] = _emit_instructions_in_block( entry.epilogue, function = function, declared = declared )
 		if entry.bind is not None:
 			bind_c = _c_local_name( entry.bind )
 			if entry.bind.type.qualname == leaf_type.qualname:
@@ -4563,7 +4586,7 @@ def _emit_leaf_dispatch_case(
 	# reading them off function.return_type/return_slot.type here (rather
 	# than instr.value.type, which for ir.Raise isn't even a Result) is
 	# equally valid.
-	epilogue_lines = _emit_instructions( epilogue, function = function, declared = declared )
+	epilogue_lines = _emit_instructions_in_block( epilogue, function = function, declared = declared )
 	if inline_exit is not None:
 		# PLAN_INLINE.md early-return generalization, same shape as
 		# _emit_or_return's own inline_exit handling: `function` here is the
