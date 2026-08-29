@@ -257,3 +257,38 @@ def SDL_FreeSurface( surface: Surface ) -> None:
 @extern( 'SDL2', 'SDL_FreeSurface' )
 def SDL_FreeSurface( surface: Surface ) -> None:
 	...
+
+# SDL_RenderFillRect/SDL_RenderDrawRect were whitelisted into the synthesized
+# SDL2.lib/.def but never actually bound here - callers (e.g. mpygame1's
+# debug_hud.py) had to re-declare them locally. Bound properly now that
+# something else in this file needed to touch the surrounding bindings anyway.
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_RenderFillRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+def SDL_RenderFillRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_RenderFillRect' )
+def SDL_RenderFillRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_RenderDrawRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+def SDL_RenderDrawRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_RenderDrawRect' )
+def SDL_RenderDrawRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_RenderReadPixels', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+def SDL_RenderReadPixels( renderer: Renderer, rect: Ptr[Rect], format: u32, pixels: Ptr[u8], pitch: i32 ) -> i32:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_RenderReadPixels' )
+def SDL_RenderReadPixels( renderer: Renderer, rect: Ptr[Rect], format: u32, pixels: Ptr[u8], pitch: i32 ) -> i32:
+	...
