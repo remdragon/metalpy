@@ -37,6 +37,7 @@ module/import time (see pool's own comment).
 
 import compiler
 import threading
+import queue
 import atomic
 import fs
 import reactor
@@ -54,8 +55,8 @@ def _wait_error_to_os_error( werr: reactor.WaitError ) -> OSError:
 
 # ---------------------------------------------------------------------------
 # thread pool - a fixed set of daemon threads, each with its own
-# threading.Queue[Job] (FIFO batch-drain - see Queue[T]'s own header comment
-# in lib/threading.py). Previously hand-rolled a list[Job].pop()-based drain
+# queue.Queue[Job] (FIFO batch-drain - see Queue[T]'s own header comment
+# in lib/queue.py). Previously hand-rolled a list[Job].pop()-based drain
 # + loopback wake pair: pop() removes the LAST element, so a job could be
 # starved indefinitely behind a steady stream of newer submissions on the
 # same worker - a real fairness bug for a reactor-driven pool, since it
@@ -82,10 +83,10 @@ class Job:
 
 
 class _PoolWorker:
-	__queue: threading.Queue[Job]
+	__queue: queue.Queue[Job]
 
 	def __init__( self ) -> None:
-		self.__queue = threading.Queue[Job]()
+		self.__queue = queue.Queue[Job]()
 
 	def submit( self, job: Job ) -> None:
 		self.__queue.put( job ).unwrap( '_PoolWorker.submit: unbounded queue put always succeeds' )

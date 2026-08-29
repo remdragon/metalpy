@@ -13,6 +13,15 @@
 
 import compiler
 
+def sqrt( x: f64 ) -> f64:
+	''' math.sqrt - delegates to f64.sqrt(), see lib/builtins/__float.py's
+	_f64_sqrt for the NaN-on-negative-input rationale. '''
+	return x.sqrt()
+
+def sqrtf( x: f32 ) -> f32:
+	''' f32 counterpart of sqrt() - delegates to f32.sqrt(). '''
+	return x.sqrt()
+
 def floordiv_i64( a: i64, b: i64 ) -> i64:
 	''' Python-style floor division (rounds toward -infinity), unlike this
 	compiler's own // (rounds toward zero, C-style). Only ever called with a

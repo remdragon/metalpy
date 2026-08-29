@@ -14,6 +14,7 @@
 import compiler
 import sys
 import atomic
+import queue
 
 if compiler.target.os == 'windows':
 	from windows.kernel32 import SRWLOCK
@@ -409,28 +410,18 @@ class ThreadLocal[T]:
 # convention Thread itself already documents.
 # ---------------------------------------------------------------------------
 
-class QueueFullError: pass
-
-
 # ---------------------------------------------------------------------------
 # Semaphore: a counting OS semaphore - wait() blocks until the count is > 0,
 # then atomically decrements it; post() increments the count, waking one
 # blocked wait() if any (or none, if nothing is currently waiting - the
 # count just accumulates, harmlessly, for the next wait() to consume - see
-# Queue[T]'s own use below, which never depends on the exact count matching
+# queue.Queue[T]'s own use, which never depends on the exact count matching
 # the exact number of posts).
 #
-# Queue[T] (below) uses this - NOT the loopback-socket-pair pattern
+# queue.Queue[T] uses this - NOT the loopback-socket-pair pattern
 # _PoolWorker/ThreadPool use elsewhere in this file - as its own cross-
-# thread wake primitive. That choice is load-bearing, not stylistic: an
-# earlier version of Queue[T] used sockets for this, and a real benchmark
-# (a tight print()-via-Queue loop) measured it 8-10x SLOWER than not
-# threading output AT ALL - sockets route every send()/recv() through the
-# full network stack (protocol handling, buffering, driver stack entry),
-# real overhead even for a loopback pair, on top of the OS's own inherent
-# cross-thread wake latency. A semaphore is a direct, purpose-built kernel
-# object for exactly this "block until signaled" job, with none of that
-# protocol overhead - the right tool, not a micro-optimization.
+# thread wake primitive; see queue.py's own header comment for why a
+# semaphore, specifically, is the right tool there.
 # ---------------------------------------------------------------------------
 
 class Semaphore:
@@ -488,98 +479,6 @@ class Semaphore:
 		sys.free( self.__handle )
 
 
-# ---------------------------------------------------------------------------
-# Queue[T]: a thread-safe FIFO queue - put() appends and posts a Semaphore;
-# drain() blocks (via that same Semaphore) until at least one item is
-# pending, then hands back EVERY item currently queued as one UnsafeList[T],
-# in FIFO order - not a single-item get(). Draining in batches, not one
-# item at a time, is what lets a consumer (e.g. sys.py's own threaded
-# stdout writer, see sys.enable_threaded_stdout()) coalesce many small puts
-# into one larger operation - one write() syscall instead of many - instead
-# of paying per-item overhead. A plain single-item get() can be added later
-# if a real caller needs strict one-at-a-time consumption instead; nothing
-# here forecloses it.
-#
-# Deliberately minimal - no built-in shutdown/lifecycle concept. A caller
-# that needs graceful "stop, but only after everything already queued is
-# processed" should push its own sentinel value through the SAME queue
-# (e.g. Queue[str|None] with None meaning "no more data") - a plain,
-# ordinary item that naturally arrives after everything queued before it,
-# with no separate out-of-band signal for drain() to special-case. See
-# sys.py's own sys.enable_threaded_stdout()/_ThreadedStream._shutdown()
-# for a real example of that convention.
-#
-# Storage swap, not per-item removal: drain() replaces the internal
-# UnsafeList wholesale with a fresh empty one and hands back the old one -
-# O(1), no per-element shifting the way a loop of UnsafeList.erase_at(0)
-# would be (that's O(n) per pop, since erase_at shifts everything after the
-# removed slot left by one). Safe because append order within one
-# UnsafeList already IS FIFO order - grabbing the whole list at once
-# preserves it exactly, no separate reordering step needed.
-#
-# _PoolWorker (below) is built on this, not the loopback-socket-pair +
-# list.pop() drain it used to hand-roll - that old drain took the LAST
-# element first (see list.pop()'s own docstring), i.e. LIFO, which could
-# starve an old job behind a stream of newer submissions. Queue[T]'s FIFO
-# batch-drain fixes that for free.
-# ---------------------------------------------------------------------------
-
-class Queue[T]:
-	__items:     UnsafeList[T]
-	__lock:      FastLock
-	__max_depth: usize|None
-	__sem:       Semaphore
-
-	def __init__( self, max_depth: usize|None = None ) -> None:
-		''' max_depth caps put()'s own success - None (default) is
-		unbounded, matching ThreadPool's own max_queue_depth convention. '''
-		self.__items = UnsafeList[T]()
-		self.__lock = FastLock()
-		self.__max_depth = max_depth
-		self.__sem = Semaphore()
-
-	def put( self, item: T ) -> Result[None, QueueFullError]:
-		''' appends, then posts the Semaphore to wake a blocked drain()
-		call, if any - harmless (just an accumulated, unconsumed count) if
-		nothing is currently waiting; see Semaphore's own header comment
-		for why a semaphore, specifically, is the wake primitive here.
-		Posts unconditionally on every put() (unlike an earlier, socket-
-		based version of this that specifically tried to post/wake only on
-		an empty-to-non-empty transition to cut down on syscalls) - a
-		semaphore post() is a direct, cheap kernel-object operation, not a
-		network-stack round-trip, so there's no real syscall-count pressure
-		left to optimize away here; keeping every put() unconditional
-		keeps the accounting simple; harmless extra counts are drained by
-		drain()'s own loop the same way regardless. Rejected
-		(QueueFullError) once max_depth items are already pending - the
-		caller decides whether to block/drop/apply its own backpressure;
-		this never blocks the producer waiting on the CONSUMER itself
-		(only ever a brief lock hold shared with other producers/drain()). '''
-		with self.__lock:
-			if self.__max_depth is not None:
-				limit: usize = self.__max_depth
-				if self.__items.__len__() >= limit:
-					return Result.Err( QueueFullError() )
-			self.__items.append( item )
-		self.__sem.post()
-		return Result.Ok( None )
-
-	def drain( self ) -> UnsafeList[T]:
-		''' blocks until at least one item is pending, then returns EVERY
-		item currently queued (FIFO order) as one UnsafeList[T], replacing
-		the internal storage with a fresh empty one. Always blocks - there
-		is no shutdown/timeout concept here at all (see this class's own
-		header comment) - a caller that needs to stop should watch for its
-		own sentinel value inside the returned batch. '''
-		while True:
-			with self.__lock:
-				if self.__items.__len__() > 0:
-					taken: UnsafeList[T] = self.__items
-					self.__items = UnsafeList[T]()
-					return taken
-			self.__sem.wait()
-
-
 class _PoolJob:
 	work: Closure[[], None]
 
@@ -588,17 +487,17 @@ class _PoolJob:
 
 
 class _PoolWorker:
-	# None is the shutdown sentinel - Queue[T]'s own FIFO contract means any
-	# real job submitted before request_shutdown() still runs first, same
-	# convention as sys._ThreadedStream's queue (see Queue[T]'s own header
-	# comment for why this class is built on it instead of hand-rolling a
-	# second wake+drain mechanism).
-	__queue: Queue[_PoolJob|None]
+	# None is the shutdown sentinel - queue.Queue[T]'s own FIFO contract
+	# means any real job submitted before request_shutdown() still runs
+	# first, same convention as sys._ThreadedStream's queue (see queue.py's
+	# own header comment for why this class is built on it instead of
+	# hand-rolling a second wake+drain mechanism).
+	__queue: queue.Queue[_PoolJob|None]
 
 	def __init__( self, max_depth: usize|None ) -> None:
-		self.__queue = Queue[_PoolJob|None]( max_depth )
+		self.__queue = queue.Queue[_PoolJob|None]( max_depth )
 
-	def submit( self, job: _PoolJob ) -> Result[None, QueueFullError]:
+	def submit( self, job: _PoolJob ) -> Result[None, queue.QueueFullError]:
 		return self.__queue.put( job )
 
 	def request_shutdown( self ) -> None:
@@ -615,11 +514,11 @@ class _PoolWorker:
 					continue
 
 	def run_forever( self ) -> None:
-		''' drains and runs every job in FIFO submission order (Queue[T]'s
-		own contract - see this class's own field comment for why). Exits
-		once the None sentinel is reached; any real job queued before it
-		still runs first, matching reactor.Reactor.shutdown()'s own "does
-		not reject work already queued" contract. '''
+		''' drains and runs every job in FIFO submission order (queue.
+		Queue[T]'s own contract - see this class's own field comment for
+		why). Exits once the None sentinel is reached; any real job queued
+		before it still runs first, matching reactor.Reactor.shutdown()'s
+		own "does not reject work already queued" contract. '''
 		while True:
 			batch: UnsafeList[_PoolJob|None] = self.__queue.drain()
 			i: usize = 0
@@ -678,7 +577,7 @@ class ThreadPool:
 			with compiler.wrap_arithmetic:
 				i = i + 1
 
-	def submit( self, work: Closure[[], None] ) -> Result[None, QueueFullError]:
+	def submit( self, work: Closure[[], None] ) -> Result[None, queue.QueueFullError]:
 		''' round-robin across workers, via an atomic fetch_add rather than
 		a plain load-then-store on a bare usize field: two threads calling
 		submit() concurrently used to be able to both read the SAME index
@@ -691,7 +590,7 @@ class ThreadPool:
 		ever-growing ticket instead of a stored-and-wrapped index.
 
 		Ordering guarantee: FIFO per worker (each worker's own _PoolWorker
-		is a Queue[T] underneath) - a job never gets starved behind a
+		is a queue.Queue[T] underneath) - a job never gets starved behind a
 		stream of newer submissions on the SAME worker. Round-robin across
 		DIFFERENT workers means no single global order across the whole
 		pool - two jobs landing on different workers can finish in either

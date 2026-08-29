@@ -1,6 +1,7 @@
 import compiler
 import fs
 import threading
+import queue
 import atomic
 
 @union
@@ -123,7 +124,7 @@ class _BufferedStream:
 	subclass rather than fields/methods added directly here. A program
 	that never calls enable_threaded_stdout()/enable_threaded_stderr()
 	never references _ThreadedStream at all, so nothing under it
-	(threading.Queue/Thread) ever gets reached/lowered - true zero cost
+	(queue.Queue/threading.Thread) ever gets reached/lowered - true zero cost
 	when unused, unlike an earlier version of this that put the queue/
 	thread fields directly on THIS class (that made threading.Thread
 	reachable from _BufferedStream's own field layout unconditionally,
@@ -237,16 +238,16 @@ def _blocking_sleep_10ms() -> None:
 
 class _ThreadedStream( _BufferedStream ):
 	''' a _BufferedStream that hands write() off to a dedicated background
-	writer thread via threading.Queue[str|None], instead of buffering and
+	writer thread via queue.Queue[str|None], instead of buffering and
 	writing synchronously on the caller's own thread - see
 	enable_threaded_stdout()/enable_threaded_stderr() below for how a
 	stream gets upgraded to this. A completely separate subclass (not
 	fields bolted onto _BufferedStream itself) so that a program which
-	never enables this never references threading.Queue/Thread at all -
+	never enables this never references queue.Queue/threading.Thread at all -
 	see _BufferedStream's own docstring for why that matters (a real,
 	confirmed compiler-level interaction, not just tidiness).
 
-	_writer_loop() drains the WHOLE queue at once (threading.Queue.drain()'s
+	_writer_loop() drains the WHOLE queue at once (queue.Queue.drain()'s
 	own contract) and joins every pending string into ONE buffer for ONE
 	write_all() call - coalescing many small print()-driven writes into far
 	fewer syscalls is the actual point of this feature, not just moving the
@@ -255,14 +256,14 @@ class _ThreadedStream( _BufferedStream ):
 	already returned Result.Ok() the moment it enqueued, before any real
 	syscall ran - a known, accepted tradeoff of async I/O (same posture as
 	most queue-backed logging/output libraries). '''
-	__queue:       threading.Queue[str|None]
+	__queue:       queue.Queue[str|None]
 	__writer:      threading.Thread|None = None
 	__writer_done: atomic.Atomic[bool]
 	__shut_down:   bool = False
 
 	def __init__( self, fd: fs.FD ) -> None:
 		super().__init__( fd )
-		self.__queue = threading.Queue[str|None]()
+		self.__queue = queue.Queue[str|None]()
 		self.__writer_done = atomic.Atomic[bool]( False )
 
 	def start( self ) -> None:
