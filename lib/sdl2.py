@@ -17,6 +17,14 @@ import compiler
 Window: TypeAlias = Ptr[None]
 Renderer: TypeAlias = Ptr[None]
 Texture: TypeAlias = Ptr[None]
+Surface: TypeAlias = Ptr[None]
+
+@cstruct
+class Color:
+	r: u8 = 0
+	g: u8 = 0
+	b: u8 = 0
+	a: u8 = 255
 
 SDL_INIT_VIDEO: u32 = 0x00000020
 
@@ -228,4 +236,24 @@ def SDL_Delay( ms: u32 ) -> None:
 @compiler.target( os = not 'windows' )
 @extern( 'SDL2', 'SDL_Delay' )
 def SDL_Delay( ms: u32 ) -> None:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_CreateTextureFromSurface', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+def SDL_CreateTextureFromSurface( renderer: Renderer, surface: Surface ) -> Texture:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_CreateTextureFromSurface' )
+def SDL_CreateTextureFromSurface( renderer: Renderer, surface: Surface ) -> Texture:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_FreeSurface', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+def SDL_FreeSurface( surface: Surface ) -> None:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_FreeSurface' )
+def SDL_FreeSurface( surface: Surface ) -> None:
 	...

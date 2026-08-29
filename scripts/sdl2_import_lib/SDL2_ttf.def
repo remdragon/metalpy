@@ -1,0 +1,8 @@
+LIBRARY SDL2_ttf
+EXPORTS
+TTF_Init
+TTF_Quit
+TTF_OpenFont
+TTF_CloseFont
+TTF_RenderText_Solid
+TTF_SizeText

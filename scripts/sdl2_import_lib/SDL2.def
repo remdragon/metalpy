@@ -16,3 +16,5 @@ SDL_RenderCopy
 SDL_DestroyTexture
 SDL_RenderFillRect
 SDL_RenderDrawRect
+SDL_CreateTextureFromSurface
+SDL_FreeSurface
