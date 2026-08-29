@@ -262,6 +262,14 @@ def main() -> None:
 		if active_target['os'] == 'windows' and exe_path.suffix != '.exe':
 			exe_path = exe_path.with_suffix( exe_path.suffix + '.exe' )
 		ldflags = args.ldflags
+		# link-time search dirs declared via @extern(..., libdir=...) - added
+		# before the per-lib flags below so e.g. SDL2.lib is actually found
+		# without a manual --ldflags; GNU -L syntax always (CcTool.link's own
+		# _msvc_ldflag translates each token to /LIBPATH: for cl)
+		for libdir in sorted( compiler.extern_libdirs ):
+			flag = f'-L{libdir}'
+			if flag not in ldflags:
+				ldflags = ldflags + f' {flag}' if ldflags else flag
 		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue

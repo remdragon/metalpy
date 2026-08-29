@@ -3118,9 +3118,9 @@ class Discovery( ast.NodeVisitor ):
 		available = linker_c.has_symbol( cc, lib, symbol )
 		return available != negate
 
-	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...],tuple[str,...],bool]:
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...],tuple[str,...],bool,str|None]:
 		# @extern('lib', 'symbol') or
-		# @extern('lib', 'symbol', header='<name>', dll='<name>'|[...], notice='<name>'|[...], spawns_thread=True)
+		# @extern('lib', 'symbol', header='<name>', dll='<name>'|[...], libdir='<relative-path>', notice='<name>'|[...], spawns_thread=True)
 		# 'lib' is the .lib/.so name to link against, except the literal
 		# 'c' which means the platform C runtime rather than a real file on
 		# disk - that distinction is a future emitter/linker's job to act
@@ -3168,6 +3168,7 @@ class Discovery( ast.NodeVisitor ):
 		dlls: tuple[str,...] = ()
 		notices: tuple[str,...] = ()
 		spawns_thread = False
+		libdir: str|None = None
 		for kw in decorator.keywords:
 			if kw.arg == 'header':
 				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
@@ -3175,6 +3176,15 @@ class Discovery( ast.NodeVisitor ):
 				header = kw.value.value
 			elif kw.arg == 'dll':
 				dlls = _parse_str_or_str_list( kw.value, 'dll' )
+			elif kw.arg == 'libdir':
+				# link-time library search directory, resolved relative to
+				# THIS module's own file (see _parse_function, which has the
+				# module object this parse step doesn't) - independent of
+				# dll= (runtime, PATH-searched, see mpy_types.Function.
+				# extern_libdir's own comment)
+				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
+					self.fail( f'@extern(...) libdir= must be a string literal: {ast.unparse(decorator)}', node )
+				libdir = kw.value.value
 			elif kw.arg == 'notice':
 				notices = _parse_str_or_str_list( kw.value, 'notice' )
 			elif kw.arg == 'spawns_thread':
@@ -3193,7 +3203,7 @@ class Discovery( ast.NodeVisitor ):
 				spawns_thread = kw.value.value
 			else:
 				self.fail( f'@extern(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(decorator)}', node )
-		return lib_arg.value, symbol_arg.value, header, dlls, notices, spawns_thread
+		return lib_arg.value, symbol_arg.value, header, dlls, notices, spawns_thread, libdir
 
 	def _parse_function(
 		self,
@@ -3251,6 +3261,7 @@ class Discovery( ast.NodeVisitor ):
 		extern_dlls: tuple[str,...] = ()
 		extern_notices: tuple[str,...] = ()
 		extern_spawns_thread = False
+		extern_libdir_raw: str|None = None
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -3281,7 +3292,7 @@ class Discovery( ast.NodeVisitor ):
 				case 'requires_crt':
 					is_requires_crt = True
 				case 'extern':
-					extern_lib, extern_symbol, extern_header, extern_dlls, extern_notices, extern_spawns_thread = self._parse_extern_decorator( decorator, node, qualname )
+					extern_lib, extern_symbol, extern_header, extern_dlls, extern_notices, extern_spawns_thread, extern_libdir_raw = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
@@ -3425,6 +3436,14 @@ class Discovery( ast.NodeVisitor ):
 				)
 
 		module = self.module_stack[-1]
+		# libdir= is written relative to the declaring module's own file -
+		# resolved here (not in _parse_extern_decorator, which has no module
+		# reference) the same way dll='s bundling anchors to a fixed base;
+		# module.file is None only for a synthetic/no-file module, which
+		# never declares a real @extern anyway
+		if extern_libdir_raw is not None and module.file is None:
+			self.fail( f'@extern(...) libdir= on {qualname} requires the declaring module to have a real file (none here)', node )
+		extern_libdir = ( module.file.parent / extern_libdir_raw ).resolve() if extern_libdir_raw is not None and module.file is not None else None
 		fn = Function(
 			stem = node.name,
 			qualname = qualname,
@@ -3450,6 +3469,7 @@ class Discovery( ast.NodeVisitor ):
 			extern_dlls = extern_dlls,
 			extern_notices = extern_notices,
 			extern_spawns_thread = extern_spawns_thread,
+			extern_libdir = extern_libdir,
 		)
 		if extern_header is not None:
 			self.required_headers.add( extern_header )

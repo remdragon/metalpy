@@ -5,9 +5,11 @@
 # SDL2 on Win64 uses the plain C calling convention (SDLCALL == cdecl there),
 # matching every other extern in lib/windows/ - no stdcall wrapping needed.
 #
-# Not auto-discovered: SDL2.lib (link-time) and SDL2.dll (runtime) aren't
-# bundled with this repo or present anywhere on this machine as of this
-# spike - see sdl2_test.py's own module docstring for what's needed.
+# SDL2.lib (link-time import lib, synthesized - see scripts/gen_sdl2_import_
+# lib.ps1, no .lib ships with pip-installed SDL2) is found automatically via
+# each extern's libdir= pointing at scripts/sdl2_import_lib. SDL2.dll
+# (runtime) must still be on PATH at build time - see sdl2_test.py's own
+# module docstring for what's needed.
 
 Window: TypeAlias = Ptr[None]
 Renderer: TypeAlias = Ptr[None]
@@ -41,19 +43,19 @@ class Rect:
 	w: i32 = 0
 	h: i32 = 0
 
-@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_Init( flags: u32 ) -> i32:
 	...
 
-@extern( 'SDL2', 'SDL_Quit', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_Quit', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_Quit() -> None:
 	...
 
-@extern( 'SDL2', 'SDL_GetError', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_GetError', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_GetError() -> ConstPtr[u8]:
 	...
 
-@extern( 'SDL2', 'SDL_CreateWindow', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_CreateWindow', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_CreateWindow(
 	title: ConstPtr[u8],
 	x: i32,
@@ -64,11 +66,11 @@ def SDL_CreateWindow(
 ) -> Window:
 	...
 
-@extern( 'SDL2', 'SDL_DestroyWindow', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_DestroyWindow', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_DestroyWindow( window: Window ) -> None:
 	...
 
-@extern( 'SDL2', 'SDL_CreateRenderer', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_CreateRenderer', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_CreateRenderer(
 	window: Window,
 	index: i32,
@@ -76,11 +78,11 @@ def SDL_CreateRenderer(
 ) -> Renderer:
 	...
 
-@extern( 'SDL2', 'SDL_DestroyRenderer', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_DestroyRenderer', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_DestroyRenderer( renderer: Renderer ) -> None:
 	...
 
-@extern( 'SDL2', 'SDL_SetRenderDrawColor', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_SetRenderDrawColor', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_SetRenderDrawColor(
 	renderer: Renderer,
 	r: u8,
@@ -90,19 +92,19 @@ def SDL_SetRenderDrawColor(
 ) -> i32:
 	...
 
-@extern( 'SDL2', 'SDL_RenderClear', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderClear', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_RenderClear( renderer: Renderer ) -> i32:
 	...
 
-@extern( 'SDL2', 'SDL_RenderPresent', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderPresent', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_RenderPresent( renderer: Renderer ) -> None:
 	...
 
-@extern( 'SDL2', 'SDL_PollEvent', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_PollEvent', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_PollEvent( event: Ptr[Event] ) -> i32:
 	...
 
-@extern( 'SDL2', 'SDL_RenderCopy', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderCopy', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_RenderCopy(
 	renderer: Renderer,
 	texture: Texture,
@@ -111,10 +113,10 @@ def SDL_RenderCopy(
 ) -> i32:
 	...
 
-@extern( 'SDL2', 'SDL_DestroyTexture', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_DestroyTexture', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_DestroyTexture( texture: Texture ) -> None:
 	...
 
-@extern( 'SDL2', 'SDL_Delay', dll = 'SDL2.dll', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_Delay', dll = 'SDL2.dll', libdir = '../../scripts/sdl2_import_lib', notice = 'SDL2' )
 def SDL_Delay( ms: u32 ) -> None:
 	...

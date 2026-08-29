@@ -116,13 +116,6 @@ def main() -> i32:
 		self.assertIn( 'SDL_CreateWindow', c_source )
 		self.assertIn( 'SDL_PollEvent', c_source )
 
-	def _extern_ldflags( self, compiler ) -> str:
-		flags = super()._extern_ldflags( compiler )
-		if 'SDL2' in compiler.extern_libs:
-			is_cl = test_support._CC is not None and test_support._CC.name == 'cl'
-			flags += ( f' /LIBPATH:{_SDL2_LIB_DIR}' if is_cl else f' -L{_SDL2_LIB_DIR}' )
-		return flags
-
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	@unittest.skipUnless( _SDL2_LIB_DIR is not None, 'no SDL2 dev install found (checked vcpkg default '
 		'triplet + a couple of manual-install spots - see _find_sdl2_install) - skipping real link+run' )

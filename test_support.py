@@ -200,6 +200,8 @@ class RealCompileMixin:
 		own link step (including linker_c.resolve_lib_ldflag's ntdll special
 		case). 'c' is the CRT, handled by the compiler/link defaults. '''
 		flags: list[str] = []
+		for libdir in sorted( compiler.extern_libdirs ):
+			flags.append( f'-L{libdir}' )
 		for lib in sorted( compiler.extern_libs ):
 			if lib == 'c':
 				continue

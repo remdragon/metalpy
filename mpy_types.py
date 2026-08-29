@@ -1403,6 +1403,17 @@ class Function( Type, ScopeMixin ):
 	extern_lib: str|None = None
 	extern_symbol: str|None = None
 	extern_header: str|None = None # optional header that declares this @extern function; when included via require_header, the emitter skips the prototype
+	# optional directory to search for extern_lib's .lib/.so at link time,
+	# written as libdir='<relative-path>' and resolved (at parse time,
+	# against the declaring module's own file) into this absolute Path -
+	# for a vendored import lib checked into the repo next to its bindings
+	# (e.g. windows/sdl2.py + scripts/sdl2_import_lib/SDL2.lib) rather than
+	# sitting on the compiler's default library search path. Independent of
+	# dll= (that's the runtime DLL, found via PATH search, not this) -
+	# compiler.py's extern_libdirs collects these the same reachability-
+	# gated way as extern_dlls, and mpy.py's link step turns each into a
+	# -L/-LIBPATH flag.
+	extern_libdir: Path|None = None
 	# optional runtime DLL(s) (bare filenames, e.g. 'tcl86t.dll') this
 	# @extern function needs loadable at runtime - not the same as
 	# extern_lib (the .lib/.so linked against at build time, which can

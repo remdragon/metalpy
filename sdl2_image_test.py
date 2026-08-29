@@ -88,13 +88,6 @@ def main() -> i32:
 		self.assertIn( 'IMG_LoadTexture', c_source )
 		self.assertIn( 'SDL_RenderCopy', c_source )
 
-	def _extern_ldflags( self, compiler ) -> str:
-		flags = super()._extern_ldflags( compiler )
-		if 'SDL2' in compiler.extern_libs or 'SDL2_image' in compiler.extern_libs:
-			is_cl = test_support._CC is not None and test_support._CC.name == 'cl'
-			flags += ( f' /LIBPATH:{_SDL2_IMAGE_LIB_DIR}' if is_cl else f' -L{_SDL2_IMAGE_LIB_DIR}' )
-		return flags
-
 	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
 	@unittest.skipUnless( _SDL2_IMAGE_LIB_DIR is not None, 'no SDL2/SDL2_image import libs found - see '
 		'scripts/gen_sdl2_import_lib.ps1 - skipping real link+run' )
