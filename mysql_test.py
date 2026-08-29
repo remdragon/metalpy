@@ -236,9 +236,25 @@ class MySQLLiveServerTests( test_support.RealCompileMixin, unittest.TestCase ):
 		self.assert_programs_run([
 			( 'connect_and_close', f'''
 import mysql
+from mysql import MySQLError
 
 def main() -> i32:
-	conn: mysql.Connection = mysql.Connection.connect( {connect_args} ).unwrap( 'connect' )
+	conn: mysql.Connection
+	match mysql.Connection.connect( {connect_args} ):
+		case Result.Ok( c ):
+			conn = c
+		case Result.Err( e ):
+			if e == MySQLError.ConnectFailed:
+				return 10
+			if e == MySQLError.AuthFailed:
+				return 11
+			if e == MySQLError.UnsupportedAuthPlugin:
+				return 12
+			if e == MySQLError.ProtocolError:
+				return 13
+			if e == MySQLError.QueryError:
+				return 14
+			return 15
 	conn.close().unwrap( 'close' )
 	return 0
 ''' ),
@@ -269,13 +285,9 @@ def main() -> i32:
 		return 3
 
 	row: list[MySQLValue]|None = cur.fetchone().unwrap( 'fetchone' )
-	match row:
-		case None:
-			return 4
-		case _:
-			pass
-	row_vals: list[MySQLValue] = row.unwrap( 'row' )
-	match row_vals.__getitem__( usize( 1 )).unwrap( 'x' ):
+	if row is None:
+		return 4
+	match row.__getitem__( usize( 1 )).unwrap( 'x' ):
 		case MySQLValue.Str( name ):
 			if name != 'alice':
 				return 5
@@ -283,11 +295,8 @@ def main() -> i32:
 			return 6
 
 	none_row: list[MySQLValue]|None = cur.fetchone().unwrap( 'fetchone again' )
-	match none_row:
-		case None:
-			pass
-		case _:
-			return 7
+	if none_row is not None:
+		return 7
 
 	cur.execute( 'SELECT id FROM metalpy_smoke', list[MySQLValue]() ).unwrap( 'select all' )
 	all_rows: list[list[MySQLValue]] = cur.fetchall().unwrap( 'fetchall' )

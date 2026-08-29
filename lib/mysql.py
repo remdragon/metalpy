@@ -1126,6 +1126,14 @@ class _QueryResult:
 # for exactly this, since bool itself doesn't qualify. No raw numeric
 # thread-id primitive exists in this codebase's threading.py (checked
 # directly) - this sidesteps needing one.
+#
+# ThreadLocal.set() does NOT incref its argument (confirmed by a real
+# double-free crash while testing this: threading.py's set() just casts the
+# RC pointer to Ptr[None] and stores it raw) - Connection.__owner_marker
+# keeps the SAME _ThreadOwner instance alive for the Connection's whole
+# lifetime, since nothing else does. Passing a bare temporary straight into
+# set() (no other reference anywhere) gets released the moment set()
+# returns, leaving the TLS slot dangling.
 
 class _ThreadOwner:
 	present: bool
@@ -1153,6 +1161,7 @@ class Connection:
 	__sock:                socket.Socket
 	__closed:               bool
 	__owner:                threading.ThreadLocal[_ThreadOwner]
+	__owner_marker:         _ThreadOwner  # ThreadLocal.set() doesn't take ownership (no incref) - this keeps the SAME object alive for as long as the Connection is, see this file's threadsafety-enforcement header comment
 	__last_server_errno:    i32
 	__last_sqlstate:        str
 	__last_server_message:  str
@@ -1217,9 +1226,10 @@ class Connection:
 		_do_handshake_and_auth( sock, user, password, database ).or_return()
 
 		owner: threading.ThreadLocal[_ThreadOwner] = threading.ThreadLocal[_ThreadOwner]()
-		owner.set( _ThreadOwner._make() )
+		marker: _ThreadOwner = _ThreadOwner._make()
+		owner.set( marker )
 		conn: Connection = Connection.__allocate__(
-			__sock = sock, __closed = False, __owner = owner,
+			__sock = sock, __closed = False, __owner = owner, __owner_marker = marker,
 			__last_server_errno = 0, __last_sqlstate = '', __last_server_message = '',
 		)
 		# autocommit default is OFF (design doc §3) - the server itself
