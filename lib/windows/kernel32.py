@@ -752,3 +752,96 @@ def GetActiveProcessorCount(
 	GroupNumber: u16,
 ) -> u32:
 	...
+
+
+# ---------------------------------------------------------------------------
+# Process spawning - lib/subprocess.py's own Windows backend.
+#
+# CreateProcessA/STARTUPINFOA (not the W/wide variants) - matches this
+# file's own existing ANSI-only convention (CreateFileA/CreateDirectoryA/
+# FindFirstFileA/DeleteFileA all above) rather than introducing UTF-16
+# handling for just this one caller.
+# ---------------------------------------------------------------------------
+
+@cstruct
+class STARTUPINFOA:
+	cb:              u32 = 0
+	lpReserved:      Ptr[u8] = None
+	lpDesktop:       Ptr[u8] = None
+	lpTitle:         Ptr[u8] = None
+	dwX:             u32 = 0
+	dwY:             u32 = 0
+	dwXSize:         u32 = 0
+	dwYSize:         u32 = 0
+	dwXCountChars:   u32 = 0
+	dwYCountChars:   u32 = 0
+	dwFillAttribute: u32 = 0
+	dwFlags:         u32 = 0
+	wShowWindow:     u16 = 0
+	cbReserved2:     u16 = 0
+	lpReserved2:     Ptr[u8] = None
+	hStdInput:       HANDLE = None
+	hStdOutput:      HANDLE = None
+	hStdError:       HANDLE = None
+
+@cstruct
+class PROCESS_INFORMATION:
+	hProcess:    HANDLE = None
+	hThread:     HANDLE = None
+	dwProcessId: u32 = 0
+	dwThreadId:  u32 = 0
+
+@cstruct
+class SECURITY_ATTRIBUTES:
+	nLength:              u32 = 0
+	lpSecurityDescriptor: Ptr[None] = None
+	bInheritHandle:       i32 = 0
+
+STARTF_USESTDHANDLES: u32 = 0x00000100
+HANDLE_FLAG_INHERIT:  u32 = 0x00000001
+
+@extern('kernel32', 'CreateProcessA')
+def CreateProcessA(
+	lpApplicationName:    ConstPtr[u8],
+	lpCommandLine:        Ptr[u8],  # mutable - CreateProcessA may rewrite it in place
+	lpProcessAttributes:  Ptr[None],
+	lpThreadAttributes:   Ptr[None],
+	bInheritHandles:      bool,
+	dwCreationFlags:      u32,
+	lpEnvironment:        Ptr[None],
+	lpCurrentDirectory:   ConstPtr[u8],
+	lpStartupInfo:        Ptr[STARTUPINFOA],
+	lpProcessInformation: Ptr[PROCESS_INFORMATION],
+) -> bool:
+	...
+
+@extern('kernel32', 'CreatePipe')
+def CreatePipe(
+	hReadPipe:        Ptr[HANDLE],
+	hWritePipe:       Ptr[HANDLE],
+	lpPipeAttributes: Ptr[SECURITY_ATTRIBUTES],
+	nSize:            u32,
+) -> bool:
+	...
+
+@extern('kernel32', 'SetHandleInformation')
+def SetHandleInformation(
+	hObject: HANDLE,
+	dwMask:  u32,
+	dwFlags: u32,
+) -> bool:
+	...
+
+@extern('kernel32', 'GetExitCodeProcess')
+def GetExitCodeProcess(
+	hProcess:    HANDLE,
+	lpExitCode:  Ptr[u32],
+) -> bool:
+	...
+
+@extern('kernel32', 'TerminateProcess')
+def TerminateProcess(
+	hProcess:   HANDLE,
+	uExitCode:  u32,
+) -> bool:
+	...
