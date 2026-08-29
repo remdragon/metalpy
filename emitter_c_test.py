@@ -25069,6 +25069,72 @@ def main() -> i32:
 		c_source = emitter_c.emit_c( self.compiler )
 		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = self.compiler )
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_defer_cast_temp_across_uncovered_except_leaf_block_and_flat_ladder( self ) -> None:
+		''' Same bug as test_defer_cast_temp_across_or_return_block_and_flat_
+		ladder above, but via the OTHER caller of _emit_instructions_in_block:
+		_emit_leaf_dispatch_case's "uncovered leaf" branch (raise/or_throw's
+		own real function-exit path for a leaf no local `except` covers - not
+		the "target = a covered handler's label" branch, which never needs to
+		unwind the defer at all: jumping to a same-function except handler
+		isn't a function exit, so defer's cleanup rightly doesn't run there).
+		risky()'s ErrorA leaf is left uncovered here (only `except ErrorB:` is
+		present) so or_throw() must propagate it - that propagation is what
+		lands inside `_emit_leaf_dispatch_case`'s own `{ }` block (itself
+		nested inside the leaf switch's `case 0: { }`), with an RC-owned
+		local (`obj`, confined to the same if-branch as the or_throw() call)
+		forcing the defer's cast temp to be replayed right there instead of
+		via the shared ladder - exactly the confinement precondition the
+		or_return() version above needs too. A sibling plain `return` after
+		the try/except then reaches the function's flat epilogue ladder,
+		replaying the SAME ir.DeclareTemp by identity a second time. '''
+		source = '''
+class MyError:
+	pass
+
+class ErrorA:
+	pass
+
+class ErrorB:
+	pass
+
+def risky( which: i32 ) -> Result[i32, ErrorA | ErrorB]:
+	if which == 1:
+		return Result.Err( ErrorA() )
+	if which == 2:
+		return Result.Err( ErrorB() )
+	return Result.Ok( which )
+
+def c2() -> bool:
+	return True
+
+def f( flag: bool ) -> Result[i32, ErrorA | ErrorB]:
+	buf: Ptr[u8] = sys.alloc[u8]( 16 )
+	defer( sys.free( compiler.cast( Ptr[None], buf )))
+	result: i32 = 0
+	try:
+		if flag:
+			obj: MyError = MyError()
+			v: i32 = risky( 1 ).or_throw()
+			result = v
+	except ErrorB:
+		result = -2
+	if c2():
+		return Result.Err( ErrorB() )
+	return Result.Ok( result )
+
+def main() -> i32:
+	r: Result[i32, ErrorA | ErrorB] = f( True )
+	if not r.is_err():
+		return 1
+	return 0
+'''
+		self.compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		self.compiler.run()
+		self.assertEqual( self.discovery.errors.errors, [] )
+		c_source = emitter_c.emit_c( self.compiler )
+		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = self.compiler )
+
 
 if __name__ == '__main__':
 	unittest.main()
