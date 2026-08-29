@@ -345,15 +345,14 @@ class Path:
 	@staticmethod
 	def home() -> Result[Path, OSError]:
 		var_name: str = 'USERPROFILE' if compiler.target.os == 'windows' else 'HOME'
-		match os.getenv( var_name ):
-			case None:
-				# real pathlib raises RuntimeError here (not an OSError at
-				# all) - OSError.Other is a forced fit, a consequence of
-				# reusing OSError everywhere rather than inventing a new
-				# error type just for this one case.
-				return Result.Err( OSError.Other )
-			case home_str:
-				return Result.Ok( Path( home_str, _NATIVE_FLAVOR ))
+		home_str: str|None = os.getenv( var_name )
+		if home_str is None:
+			# real pathlib raises RuntimeError here (not an OSError at all) -
+			# OSError.Other is a forced fit, a consequence of reusing
+			# OSError everywhere rather than inventing a new error type
+			# just for this one case.
+			return Result.Err( OSError.Other )
+		return Result.Ok( Path( home_str, _NATIVE_FLAVOR ))
 
 	def read_bytes( self ) -> Result[bytearray, OSError]:
 		if self._flavor != _NATIVE_FLAVOR:
