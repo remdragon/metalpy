@@ -351,6 +351,81 @@ class StripLinkFlagRealCompileTests( unittest.TestCase ):
 			self.assertEqual( result.returncode, 0, f'exe exited {result.returncode} (stderr: {result.stderr})' )
 
 
+class MsvcLdflagTranslationTests( unittest.TestCase ):
+	''' CcTool.link()'s 'cl' branch used to pass ldflags straight through
+	unchanged, same as the clang/gcc branch - but link.exe doesn't understand
+	-lfoo/-Ldir (GNU syntax), only foo.lib/-lib bare names and /LIBPATH:dir.
+	Confirmed via a real repro: `--cc msvc --ldflags "-lbcrypt"` produced
+	LNK4044 "unrecognized option '/lbcrypt'; ignored" followed by LNK2019
+	unresolved-external, while the identical flags worked fine under clang/
+	gcc. See _msvc_ldflag()/CcTool.link()'s own comment. '''
+
+	def test_dash_l_becomes_dot_lib( self ) -> None:
+		self.assertEqual( linker_c._msvc_ldflag( '-lbcrypt' ), 'bcrypt.lib' )
+
+	def test_dash_L_becomes_libpath( self ) -> None:
+		self.assertEqual( linker_c._msvc_ldflag( '-Lsome/dir' ), '/LIBPATH:some/dir' )
+
+	def test_msvc_specific_flag_passes_through_unchanged( self ) -> None:
+		self.assertEqual( linker_c._msvc_ldflag( '/DEFAULTLIB:foo.lib' ), '/DEFAULTLIB:foo.lib' )
+
+	def test_bare_dash_l_or_dash_L_passes_through_unchanged( self ) -> None:
+		# no library/path name to translate - not a real -lfoo/-Ldir token
+		self.assertEqual( linker_c._msvc_ldflag( '-l' ), '-l' )
+		self.assertEqual( linker_c._msvc_ldflag( '-L' ), '-L' )
+
+	def test_link_cmd_translates_ldflags_for_cl( self ) -> None:
+		cc = linker_c.CcTool( 'cl', 'cl' )
+		with patch.object( linker_c.subprocess, 'run' ) as mock_run:
+			mock_run.return_value = subprocess.CompletedProcess( [], 0, '' )
+			cc.link( Path( 'out.exe' ), [ Path( 'a.obj' ) ], ldflags = '-lbcrypt -Lsome/dir' )
+		cmd = mock_run.call_args[0][0]
+		self.assertIn( 'bcrypt.lib', cmd )
+		self.assertIn( '/LIBPATH:some/dir', cmd )
+		self.assertNotIn( '-lbcrypt', cmd )
+		self.assertNotIn( '-Lsome/dir', cmd )
+
+	def test_link_cmd_leaves_clang_gcc_ldflags_untouched( self ) -> None:
+		cc = linker_c.CcTool( 'clang', 'clang' )
+		with patch.object( linker_c.subprocess, 'run' ) as mock_run:
+			mock_run.return_value = subprocess.CompletedProcess( [], 0, '' )
+			cc.link( Path( 'out.exe' ), [ Path( 'a.obj' ) ], ldflags = '-lbcrypt -Lsome/dir' )
+		cmd = mock_run.call_args[0][0]
+		self.assertIn( '-lbcrypt', cmd )
+		self.assertIn( '-Lsome/dir', cmd )
+
+
+@unittest.skipUnless( _CC is not None and _CC.name == 'cl', 'MSVC-only: this is the real motivating repro' )
+class MsvcLdflagRealLinkTests( unittest.TestCase ):
+	''' end-to-end: the same -lbcrypt ldflags string mpy.py's --ldflags CLI
+	option would pass through, actually resolving a real MSVC library. '''
+
+	def test_dash_l_ldflag_resolves_a_real_msvc_library( self ) -> None:
+		code = '\n'.join([
+			'#include <windows.h>',
+			'#include <bcrypt.h>',
+			'int main( void ) {',
+			'\tBCRYPT_ALG_HANDLE h;',
+			'\tNTSTATUS s = BCryptOpenAlgorithmProvider( &h, BCRYPT_RNG_ALGORITHM, NULL, 0 );',
+			'\treturn s == 0 ? 0 : 1;',
+			'}',
+		])
+		with tempfile.TemporaryDirectory() as tmp:
+			src = Path( tmp ) / 'repro.c'
+			obj = Path( tmp ) / 'repro.obj'
+			exe = Path( tmp ) / 'repro.exe'
+			src.write_text( code, encoding = 'utf-8' )
+
+			cc_result = _CC.compile( src, obj, no_crt = False )
+			self.assertEqual( cc_result.returncode, 0, f'compile failed:\n{cc_result.stdout}' )
+
+			link_result = _CC.link( exe, [ obj ], ldflags = '-lbcrypt', no_crt = False )
+			self.assertEqual( link_result.returncode, 0, f'link failed:\n{link_result.stdout}' )
+
+			result = subprocess.run( [ str( exe ) ] )
+			self.assertEqual( result.returncode, 0 )
+
+
 class FindDllTests( unittest.TestCase ):
 	''' linker_c.find_dll() - PATH-order lookup by bare filename, feeding
 	mpy.py's post-link bundling step for @extern(..., dll=...)

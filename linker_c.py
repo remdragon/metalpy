@@ -149,6 +149,20 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> bool:
 		tmp.unlink( missing_ok = True )
 
 
+def _msvc_ldflag( flag: str ) -> str:
+	'''
+	Translates one GNU-style ldflag token to its link.exe equivalent:
+	-lfoo -> foo.lib, -Ldir -> /LIBPATH:dir. Anything else (already
+	MSVC-specific, e.g. /DEFAULTLIB:... or a bare path) passes through
+	unchanged.
+	'''
+	if flag.startswith( '-l' ) and len( flag ) > 2:
+		return f'{flag[2:]}.lib'
+	if flag.startswith( '-L' ) and len( flag ) > 2:
+		return f'/LIBPATH:{flag[2:]}'
+	return flag
+
+
 class CcTool:
 	'''
 	A detected C compiler.
@@ -336,6 +350,13 @@ class CcTool:
 				chkstk_obj = _build_chkstk_obj( verbose = verbose )
 				if chkstk_obj is not None:
 					obj_args = obj_args + [ str( chkstk_obj ) ]
+			# translate the same portable -lfoo/-Ldir syntax the clang/gcc
+			# branch below accepts natively into link.exe's own foo.lib/
+			# /LIBPATH:dir - otherwise -lfoo becomes an unrecognized option
+			# (LNK4044, ignored) and the library never links, e.g. mpy.py's
+			# --ldflags is one string handed to whichever backend --cc
+			# selected, with no per-backend syntax of its own
+			extra = [ _msvc_ldflag( f ) for f in extra ]
 			cmd = [ 'link', '/nologo', f'/OUT:{exe}' ] + obj_args + extra
 			if no_crt:
 				# /SUBSYSTEM:CONSOLE is required here now too - link.exe can
