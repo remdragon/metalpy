@@ -8,3 +8,4 @@ __pycache__/
 ast_explorer.py
 count_lines.py
 FUTURE.md
+scripts/sdl2_import_lib/*.exp
