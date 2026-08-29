@@ -600,5 +600,74 @@ class ForLoopPromotedParamLeakTests( RealCompileMixin, unittest.TestCase ):
 		self.assertIn( 'count=1', foo_lines[0], f'the promoted-but-unreleased copy of item must not leak:\n{out}' )
 
 
+_INLINE_ALIASING_RETURN_USED_INLINE_LEAK = '''
+def sink( s: str ) -> None:
+	print( s )
+
+def main() -> i32:
+	n: i32 = 5
+	s: str = f'attacked {n} times'
+	sink( s.__str__() ) # __str__ is @inline `return self` - result used inline, never bound to a local
+	return 0
+'''
+
+_LIST_REPR_STR_ELEMENT_LEAK = '''
+def main() -> i32:
+	n: i32 = 5
+	s: str = f'attacked {n} times' # dynamic (non-literal) interpolation - a real heap str, unlike a literal
+	hooks: list[str] = list[str]()
+	hooks.append( s )
+	print( f'{hooks}' ) # whole-list interpolation -> list.__repr__ -> str(val) per element
+	return 0
+'''
+
+
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile RC tests' )
+class InlineAliasingReturnUsedInlineLeakTests( RealCompileMixin, unittest.TestCase ):
+	''' an @inline function whose body is a single aliasing return (`return
+	self`, e.g. str.__str__/str.__call__) needs its own extra Incref spliced
+	in (lowering_stmt.py's _incref_aliasing_return) since the returned
+	reference is still independently owned elsewhere. That Incref used to
+	attach to the SAME pre-existing operand identity (self/a parameter),
+	with nothing registering the extra unit of ownership for release unless
+	the caller happened to bind the call's result to a fresh named local
+	first (which independently tracks it) - used directly as an inline,
+	unbound call argument, the extra reference had nothing left to release
+	it at all. Fixed by materializing a genuinely fresh, cfg.fresh_temp()-
+	registered temp for the wrapped result (see _incref_aliasing_return's
+	own `wrap_fresh` parameter) so it participates in the ordinary pending-
+	temp release machinery an un-inlined call's own result already gets. '''
+
+	def _run_and_get_output( self, source: str ) -> str:
+		discovery = Discovery( import_builtins = True )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ))
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 10 )
+		self.assertEqual( result.returncode, 0,
+			f'program crashed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}'
+			f'{test_support.c_source_on_failure( c_source )}' )
+		return result.stdout.decode( 'utf-8', errors = 'replace' )
+
+	def test_inline_dunder_result_used_as_a_bare_call_argument_does_not_leak( self ) -> None:
+		out = self._run_and_get_output( _INLINE_ALIASING_RETURN_USED_INLINE_LEAK )
+		self.assertNotIn( 'builtins.str @', out, f'leaked str from an inlined `return self` used inline:\n{out}' )
+
+	def test_whole_list_fstring_interpolation_of_dynamic_str_elements_does_not_leak( self ) -> None:
+		# the original repro: list.__repr__'s own `parts.append(str(val))`
+		# hits the identical shape - str(val) rewrites to str.__call__(val),
+		# @inline splices to `val.__str__()`, @inline splices again to
+		# `return self` - the leaked reference used to only show up for a
+		# DYNAMIC (non-literal) element: a string literal is a static const,
+		# whose incref/decref are no-ops the leak checker never sees either
+		# way, so this must use a real f-string-built str to actually exercise it
+		out = self._run_and_get_output( _LIST_REPR_STR_ELEMENT_LEAK )
+		self.assertIn( '[attacked 5 times]', out )
+		self.assertNotIn( 'builtins.str @', out, f'leaked str element from whole-list f-string interpolation:\n{out}' )
+
+
 if __name__ == '__main__':
 	unittest.main()

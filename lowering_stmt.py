@@ -286,7 +286,7 @@ class StmtLoweringMixin:
 		self._flush_pending_temps()
 		self._pending_temps = older + kept
 
-	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False ) -> None:
+	def _incref_aliasing_return( self, node_expr: ast.expr, value: 'ir.Operand|None', *, force: bool = False, wrap_fresh: bool = False ) -> 'ir.Operand|None':
 		''' shared by _stmt_Return and @inline splicing (_lower_inline_call/
 		_splice_multi_statement_inline_body): an ALIASING return expression
 		(self.lowering._is_aliasing_expr - `return self`/`return self.x`)
@@ -313,9 +313,29 @@ class StmtLoweringMixin:
 		multi-statement splice's own pre-return-declared local (a real,
 		splice-scoped self._cfg entry, not aliased to any outer identity)
 		still needs the ordinary has_live_entry check, so force stays False
-		for those. '''
+		for those.
+
+		`wrap_fresh` (also @inline-splice-only): the Incref emitted below
+		attaches to `value`'s own EXISTING identity - a Variable (self/a
+		parameter) that already has its own, independent release scheduled
+		elsewhere. _stmt_Return/the generator caller are fine with that:
+		`value` there flows on into the function's own real return-value
+		slot, which is what actually carries this extra unit of ownership
+		out to the real caller. An @inline splice has no such slot - its
+		"result" IS this call EXPRESSION's own value, used directly wherever
+		the call appears (e.g. passed straight into another call's argument
+		list). If that use is inline and unbound (never assigned to a fresh
+		named local first, which WOULD independently track it), this extra
+		Incref has nothing left to track it at all - confirmed via a real
+		repro (sink(s.__str__())), str.__str__'s own `return self` inlined
+		leaked one str per call; list.__repr__'s own `parts.append(str(val))`
+		inside a loop hit the identical shape. Materializing a genuinely fresh
+		ir.Temp and registering it via cfg.fresh_temp() here - exactly what a
+		real, non-inlined call's own dest already gets - makes the splice's
+		result participate in the same pending-temp/fresh-temp release
+		machinery an ordinary call result does. '''
 		if value is None or not self.lowering._is_aliasing_expr( node_expr, value ):
-			return
+			return value
 		if self._cfg.is_fresh_temp( value ):
 			# value LOOKS aliasing from node_expr's own AST shape (a bare
 			# Name/Attribute node), but it's already a freshly-owned value -
@@ -328,10 +348,22 @@ class StmtLoweringMixin:
 			# tracked the same way an ordinary Call/Allocate result being
 			# returned is, and existing ownership-transfer handling covers
 			# that case already.
-			return
+			return value
 		if force or not self._cfg.has_live_entry( value ):
 			for instr in self._cfg.incref( value.type, value ):
 				self._emit( instr )
+			# a non-RC value (e.g. a scalar parameter, `return pad`) has no
+			# refcount for the Incref above to have touched at all - wrapping
+			# it would just be a pointless extra Temp/Assign (and a real
+			# regression: callers that scan fn.instructions for the ORIGINAL
+			# named Assign, e.g. a default-value splice check, no longer find
+			# it as the sole match)
+			if wrap_fresh and value.type is not None and value.type.is_rc():
+				fresh = self._new_temp( value.type )
+				self._emit( ir.Assign( dest = fresh, src = value ))
+				self._cfg.fresh_temp( fresh, value.type )
+				return fresh
+		return value
 
 	def _stmt_Pass( self, node: ast.Pass ) -> None:
 		pass
