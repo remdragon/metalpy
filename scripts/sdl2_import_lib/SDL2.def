@@ -1,0 +1,16 @@
+LIBRARY SDL2
+EXPORTS
+SDL_Init
+SDL_Quit
+SDL_GetError
+SDL_CreateWindow
+SDL_DestroyWindow
+SDL_CreateRenderer
+SDL_DestroyRenderer
+SDL_SetRenderDrawColor
+SDL_RenderClear
+SDL_RenderPresent
+SDL_PollEvent
+SDL_Delay
+SDL_RenderCopy
+SDL_DestroyTexture
