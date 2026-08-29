@@ -2606,6 +2606,31 @@ def map[T, U, S: Iterable[T]]( fn: Ptr[Callable[[T],U]], seq: S ) -> Generator[U
 	for item in seq.__iter__(): # not iter(seq) - see enumerate's own comment above
 		yield fn( item )
 
+def filter[T, S: Iterable[T]]( fn: Ptr[Callable[[T],bool]], seq: S ) -> Generator[T, StopIteration]:
+	for item in seq.__iter__(): # not iter(seq) - see enumerate's own comment above
+		if fn( item ):
+			yield item
+
+# 2-list only, NOT the general Iterable[T] every other function on this
+# page takes - real Python's zip() is variadic over *iterables (no
+# variadic parameters exist in this compiler at all, see SYNTAX.md's own
+# print() note) AND a generic generator body can't hold a manually-
+# advanced second iterator local (PLAN_GENERATORS.md: a generic generator
+# body referencing its own type param outside a parameter/return
+# annotation isn't supported yet - only a `for x in seq:` loop's own
+# internal iterator state is exempt). Index-based walk over two list[T]s
+# sidesteps both restrictions. Stops at the shorter list, matching real
+# zip()'s own default (not the separate strict= behavior).
+def zip[T, U]( a: list[T], b: list[U] ) -> Generator[tuple[T,U], StopIteration]:
+	na: usize = a.__len__()
+	nb: usize = b.__len__()
+	n: usize = na if na < nb else nb
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < n:
+			yield a.__getitem__( i ).unwrap( 'i < len(a) by construction' ), b.__getitem__( i ).unwrap( 'i < len(b) by construction' )
+			i += 1
+
 # IMPORTANT NOTE: because `for i in range( ... )` is such a common idiom, the
 # compiler doesn't use the range functions below in those cases for performance
 # reasons. the implementations below exist when you want to use range() in other
@@ -2644,6 +2669,61 @@ def sum[T, S: Iterable[T]]( seq: S, start: T = 0 ) -> T:
 		for item in iter( seq ):
 			start += item
 	return start
+
+# stable merge sort - natural ordering only (T's own </<=/>=), no key=
+# support (real Python's sorted(key=...) would need a second generic type
+# param for the key's own comparable type; add if a real caller needs it).
+# O(n log n), unlike an insertion/bubble sort - matches this codebase's own
+# posture elsewhere against accidental quadratic blowup (e.g. lib/queue.py's
+# own batch-drain over a per-item removal loop).
+def _merge_sorted[T]( a: list[T], b: list[T], reverse: bool ) -> list[T]:
+	out: list[T] = list[T]()
+	ia: usize = 0
+	ib: usize = 0
+	na: usize = a.__len__()
+	nb: usize = b.__len__()
+	with compiler.wrap_arithmetic:
+		while ia < na and ib < nb:
+			va: T = a.__getitem__( ia ).unwrap( 'ia < na by construction' )
+			vb: T = b.__getitem__( ib ).unwrap( 'ib < nb by construction' )
+			take_a: bool = ( va <= vb ) if not reverse else ( va >= vb )
+			if take_a:
+				out.append( va )
+				ia += 1
+			else:
+				out.append( vb )
+				ib += 1
+		while ia < na:
+			out.append( a.__getitem__( ia ).unwrap( 'ia < na by construction' ))
+			ia += 1
+		while ib < nb:
+			out.append( b.__getitem__( ib ).unwrap( 'ib < nb by construction' ))
+			ib += 1
+	return out
+
+def _merge_sort[T]( items: list[T], reverse: bool ) -> list[T]:
+	n: usize = items.__len__()
+	if n <= usize( 1 ):
+		return items
+	with compiler.panic_arithmetic( 'n > 1, checked above - divisor is never zero' ):
+		mid: usize = n // usize( 2 )
+	left: list[T] = list[T]()
+	right: list[T] = list[T]()
+	i: usize = 0
+	with compiler.wrap_arithmetic:
+		while i < mid:
+			left.append( items.__getitem__( i ).unwrap( 'i < mid by construction' ))
+			i += 1
+		while i < n:
+			right.append( items.__getitem__( i ).unwrap( 'i < n by construction' ))
+			i += 1
+	return _merge_sorted( _merge_sort( left, reverse ), _merge_sort( right, reverse ), reverse )
+
+def sorted[T, S: Iterable[T]]( seq: S, reverse: bool = False ) -> list[T]:
+	items: list[T] = list[T]()
+	for item in iter( seq ):
+		items.append( item )
+	return _merge_sort( items, reverse )
 
 def ord( s: str ) -> u32:
 	''' the inverse of chr() above - decodes s's own first (and only) code
