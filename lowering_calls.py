@@ -719,7 +719,7 @@ class CallLoweringMixin:
 				with self.lowering.discovery.module_context( module ):
 					with self.lowering.discovery.scope_context( target ):
 						result = self._lower_expr( return_expr, expected_type or target.return_type )
-						self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids )
+						result = self._incref_aliasing_return( return_expr, result, force = id( result ) in bound_ids, wrap_fresh = True )
 			finally:
 				self._inline_param_alias_ids.difference_update( bound_ids )
 				for stem, was_live in saved_live.items():
@@ -1011,7 +1011,7 @@ class CallLoweringMixin:
 						# single-statement/original multi-statement code always
 						# computed it
 						result = self._lower_expr( return_stmt.value, expected_type )
-						self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids )
+						result = self._incref_aliasing_return( return_stmt.value, result, force = id( result ) in bound_ids, wrap_fresh = True )
 						return self._finish_call_result( node, result, want_result )
 
 					assert scope_label is not None and exited_flag is not None and merge_label is not None
@@ -1060,7 +1060,7 @@ class CallLoweringMixin:
 					self._emit( ir.Jump( target = converge_label ))
 					self._emit( ir.Label( name = normal_label ))
 					trailing_value = self._lower_expr( return_stmt.value, target.return_type )
-					self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids )
+					trailing_value = self._incref_aliasing_return( return_stmt.value, trailing_value, force = id( trailing_value ) in bound_ids, wrap_fresh = True )
 					self._emit( ir.Assign( dest = result, src = trailing_value ))
 					# trailing_value's own ownership (if it's a bare temp - e.g.
 					# the Result.Ok(x) construction temp a trailing `return
