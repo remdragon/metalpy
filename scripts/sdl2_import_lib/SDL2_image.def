@@ -1,0 +1,5 @@
+LIBRARY SDL2_image
+EXPORTS
+IMG_Init
+IMG_Quit
+IMG_LoadTexture

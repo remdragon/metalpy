@@ -11,6 +11,7 @@
 
 Window: TypeAlias = Ptr[None]
 Renderer: TypeAlias = Ptr[None]
+Texture: TypeAlias = Ptr[None]
 
 SDL_INIT_VIDEO: u32 = 0x00000020
 
@@ -32,6 +33,13 @@ SDL_QUIT: u32 = 0x100
 class Event:
 	type: u32 = 0
 	_padding: u8[52] = 0
+
+@cstruct
+class Rect:
+	x: i32 = 0
+	y: i32 = 0
+	w: i32 = 0
+	h: i32 = 0
 
 @extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', notice = 'SDL2' )
 def SDL_Init( flags: u32 ) -> i32:
@@ -92,6 +100,19 @@ def SDL_RenderPresent( renderer: Renderer ) -> None:
 
 @extern( 'SDL2', 'SDL_PollEvent', dll = 'SDL2.dll', notice = 'SDL2' )
 def SDL_PollEvent( event: Ptr[Event] ) -> i32:
+	...
+
+@extern( 'SDL2', 'SDL_RenderCopy', dll = 'SDL2.dll', notice = 'SDL2' )
+def SDL_RenderCopy(
+	renderer: Renderer,
+	texture: Texture,
+	srcrect: Ptr[Rect],
+	dstrect: Ptr[Rect],
+) -> i32:
+	...
+
+@extern( 'SDL2', 'SDL_DestroyTexture', dll = 'SDL2.dll', notice = 'SDL2' )
+def SDL_DestroyTexture( texture: Texture ) -> None:
 	...
 
 @extern( 'SDL2', 'SDL_Delay', dll = 'SDL2.dll', notice = 'SDL2' )
