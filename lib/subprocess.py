@@ -206,6 +206,7 @@ def _spawn_and_wait( args: list[str], capture_output: bool, cwd: str|None ) -> R
 	cmd_len: usize = cmdline.byte_len()
 	with compiler.wrap_arithmetic:
 		cmd_buf: Ptr[u8] = sys.alloc[u8]( cmd_len + usize( 1 ))  # mutable - CreateProcessA may rewrite this buffer in place
+	defer( sys.free( compiler.cast( Ptr[None], cmd_buf )))
 	sys.memcpy( cmd_buf, cmdline.get_cstr(), cmd_len )
 	cmd_buf[cmd_len] = u8( 0 )
 
@@ -254,7 +255,6 @@ def _spawn_and_wait( args: list[str], capture_output: bool, cwd: str|None ) -> R
 		capture_output,  # bInheritHandles - only true when pipe handles need to cross
 		0, None, cwd_ptr, compiler.addrof( si ), compiler.addrof( pi ),
 	)
-	sys.free( compiler.cast( Ptr[None], cmd_buf ))  # no longer needed - CreateProcessA already made its own copy of the command line
 	if not success:
 		err: OSError = OSError( GetLastError() )
 		if capture_output:
