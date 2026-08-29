@@ -584,13 +584,17 @@ def _parse_ok_packet( payload: bytes ) -> Result[_OkResult, MySQLError]:
 
 
 class _ErrInfo:
-	errno:   i32
-	sqlstate: str
-	message:  str
+	# NOT named `errno` - MSVC's <errno.h> #defines errno to a function-call
+	# macro (_errno()), which collides with a plain struct field of that
+	# name in the emitted C (confirmed via a real MSVC compile failure:
+	# "'_errno': function cannot be member of struct").
+	server_errno: i32
+	sqlstate:     str
+	message:      str
 
 	@staticmethod
-	def _make( errno: i32, sqlstate: str, message: str ) -> _ErrInfo:
-		return _ErrInfo.__allocate__( errno = errno, sqlstate = sqlstate, message = message )
+	def _make( server_errno: i32, sqlstate: str, message: str ) -> _ErrInfo:
+		return _ErrInfo.__allocate__( server_errno = server_errno, sqlstate = sqlstate, message = message )
 
 
 def _parse_err_packet( payload: bytes ) -> Result[_ErrInfo, MySQLError]:
@@ -600,13 +604,13 @@ def _parse_err_packet( payload: bytes ) -> Result[_ErrInfo, MySQLError]:
 		return Result.Err( MySQLError.ProtocolError )
 	code: u16 = r.read_u16le().or_return()
 	with compiler.wrap_arithmetic:
-		errno: i32 = i32( code )
+		server_errno: i32 = i32( code )
 	r.skip( usize( 1 )).or_return()  # '#' sql_state_marker (CLIENT_PROTOCOL_41 always set here)
 	state_bytes: bytes = r.read_fixed_bytes( usize( 5 )).or_return()
 	sqlstate: str = state_bytes.decode().unwrap( 'sqlstate is always ASCII' )
 	msg_bytes: bytes = r.read_rest_bytes()
 	message: str = msg_bytes.decode_lossy()
-	return Result.Ok( _ErrInfo._make( errno, sqlstate, message ))
+	return Result.Ok( _ErrInfo._make( server_errno, sqlstate, message ))
 
 
 def _expect_eof( payload: bytes ) -> Result[None, MySQLError]:
@@ -1194,7 +1198,7 @@ class Connection:
 
 	@private
 	def _set_err( self, info: _ErrInfo ) -> None:
-		self.__last_server_errno = info.errno
+		self.__last_server_errno = info.server_errno
 		self.__last_sqlstate = info.sqlstate
 		self.__last_server_message = info.message
 
