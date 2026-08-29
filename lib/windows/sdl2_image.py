@@ -2,10 +2,9 @@
 # hand-transcribed from the public SDL_image API docs, cdecl, no headers
 # shipped here.
 #
-# Not auto-discovered: SDL2_image.lib (link-time) isn't bundled with this
-# repo or present anywhere on this machine - see sdl2_image_test.py's own
-# module docstring for what's needed (same synthesized-import-lib technique
-# as SDL2.lib, see scripts/gen_sdl2_import_lib.ps1).
+# SDL2_image.lib (link-time) isn't shipped by pysdl2-dll (DLL only) - see
+# scripts/gen_sdl2_import_lib.ps1 for how scripts/sdl2_import_lib/SDL2_image.lib
+# is synthesized from the DLL's own export table, same as SDL2.lib.
 
 from windows.sdl2 import Renderer, Texture
 
