@@ -451,6 +451,16 @@ next to the built executable; a function that's declared but never called contri
 nothing, and a declared DLL that can't be found anywhere on `PATH` fails the build. System
 DLLs simply never declare `dll=` in the first place.
 
+`libdir=` is optional and independent from `dll=`: it names a directory (relative to the
+declaring module's own `.py` file) to search for `lib`'s import library at link time - for a
+vendored `.lib`/`.so` checked into the repo alongside its bindings rather than sitting on the
+compiler's default library search path (e.g. `lib/windows/sdl2.py` declaring
+`libdir = '../../scripts/sdl2_import_lib'` to find `SDL2.lib`, checked in there since
+pip-installed SDL2 ships only the runtime DLL). When a function declaring `libdir=` is actually
+reached and compiled in, `mpy`'s build step adds it as a linker search path automatically - no
+manual `--ldflags` needed. System libraries on the compiler's own default search path (e.g.
+`kernel32`) never declare it.
+
 `notice=` is likewise optional and independent - both from `lib` and from `dll=`. Each
 identifier (`'TCL'`, `'ZLIB'` above) resolves to a `licenses/<NAME>.txt` file at the metalpy
 installation root, containing that dependency's actual license text. It's a separate

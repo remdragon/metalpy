@@ -103,6 +103,12 @@ class Compiler:
 		# directories on a real machine, in general) and deliberately not
 		# auto-derived from scanning a DLL's own import table.
 		self.extern_dlls: set[str] = set()
+		# link-time library search directories declared via
+		# @extern(..., libdir='<relative-path>') - same reachability-gated
+		# collection as extern_libs/extern_dlls above. mpy.py's link step
+		# turns each into a -L/-LIBPATH flag so the matching extern_libs
+		# entry can actually be found without a manual --ldflags.
+		self.extern_libdirs: set[Path] = set()
 		# 3rd-party license notice identifiers declared via
 		# @extern(..., notice='<name>'|[...]) - same reachability-gated
 		# collection point as extern_libs/extern_dlls above. A short
@@ -435,6 +441,8 @@ class Compiler:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 				self.extern_dlls.update( unit.extern_dlls )
 				self.extern_notices.update( unit.extern_notices )
+				if unit.extern_libdir is not None:
+					self.extern_libdirs.add( unit.extern_libdir )
 				if unit.extern_spawns_thread:
 					self.spawns_threads = True
 			if unit.requires_crt:
