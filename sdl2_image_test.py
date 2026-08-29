@@ -52,7 +52,7 @@ class Sdl2ImageTests( RealCompileMixin, unittest.TestCase ):
 		declarations are accepted and emit valid C, independent of whether
 		SDL2_image itself is installed. '''
 		compiler = self._compile_source( '''
-import windows.sdl2 as sdl2
+import sdl2
 import windows.sdl2_image as img
 
 def main() -> i32:
@@ -104,7 +104,7 @@ def main() -> i32:
 		generous (30s) to absorb CPU contention under the parallel test
 		harness. '''
 		c_source = self._emit( f'''
-import windows.sdl2 as sdl2
+import sdl2
 import windows.sdl2_image as img
 
 def main() -> i32:

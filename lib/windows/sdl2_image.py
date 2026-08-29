@@ -6,7 +6,7 @@
 # scripts/gen_sdl2_import_lib.ps1 for how scripts/sdl2_import_lib/SDL2_image.lib
 # is synthesized from the DLL's own export table, same as SDL2.lib.
 
-from windows.sdl2 import Renderer, Texture
+from sdl2 import Renderer, Texture
 
 IMG_INIT_PNG: i32 = 0x00000002
 

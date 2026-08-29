@@ -454,8 +454,8 @@ DLLs simply never declare `dll=` in the first place.
 `libdir=` is optional and independent from `dll=`: it names a directory (relative to the
 declaring module's own `.py` file) to search for `lib`'s import library at link time - for a
 vendored `.lib`/`.so` checked into the repo alongside its bindings rather than sitting on the
-compiler's default library search path (e.g. `lib/windows/sdl2.py` declaring
-`libdir = '../../scripts/sdl2_import_lib'` to find `SDL2.lib`, checked in there since
+compiler's default library search path (e.g. `lib/sdl2.py`'s Windows branch declaring
+`libdir = '../scripts/sdl2_import_lib'` to find `SDL2.lib`, checked in there since
 pip-installed SDL2 ships only the runtime DLL). When a function declaring `libdir=` is actually
 reached and compiled in, `mpy`'s build step adds it as a linker search path automatically - no
 manual `--ldflags` needed. System libraries on the compiler's own default search path (e.g.

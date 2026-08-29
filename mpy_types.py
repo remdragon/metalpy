@@ -1407,7 +1407,7 @@ class Function( Type, ScopeMixin ):
 	# written as libdir='<relative-path>' and resolved (at parse time,
 	# against the declaring module's own file) into this absolute Path -
 	# for a vendored import lib checked into the repo next to its bindings
-	# (e.g. windows/sdl2.py + scripts/sdl2_import_lib/SDL2.lib) rather than
+	# (e.g. sdl2.py's Windows branch + scripts/sdl2_import_lib/SDL2.lib) rather than
 	# sitting on the compiler's default library search path. Independent of
 	# dll= (that's the runtime DLL, found via PATH search, not this) -
 	# compiler.py's extern_libdirs collects these the same reachability-

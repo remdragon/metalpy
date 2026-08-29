@@ -1,4 +1,4 @@
-# Feasibility spike for lib/windows/sdl2.py: can metalpy-compiled code call
+# Feasibility spike for lib/sdl2.py: can metalpy-compiled code call
 # into SDL2's C ABI at all? Two tiers, same split as tkinter_test.py:
 #
 # 1. test_program_compiles_to_c - always runs. Proves the extern/cstruct
@@ -24,6 +24,7 @@
 #    scripts/gen_sdl2_import_lib.ps1). Confirmed working end to end this
 #    session: a real window opened, cleared, and closed.
 
+import ctypes.util
 import os
 import sys as _pysys
 import unittest
@@ -62,7 +63,8 @@ def _find_sdl2_install() -> Path | None:
 _SDL2_LIB_DIR = _find_sdl2_install()
 
 
-@unittest.skipUnless( os.name == 'nt', 'lib/windows/sdl2.py is a Windows-only binding (SDL2.dll via dll=/libdir=) - skipping off Windows' )
+@unittest.skipUnless( os.name == 'nt', 'exercises sdl2.py\'s Windows branch (SDL2.dll via dll=/libdir=) - '
+	'see Sdl2PosixTests below for the POSIX/-lSDL2 branch' )
 class Sdl2Tests( RealCompileMixin, unittest.TestCase ):
 
 	def setUp( self ) -> None:
@@ -78,7 +80,7 @@ class Sdl2Tests( RealCompileMixin, unittest.TestCase ):
 		@cstruct declarations are accepted and a real SDL2-calling program
 		emits valid C, independent of whether SDL2 itself is installed. '''
 		compiler = self._compile_source( '''
-import windows.sdl2 as sdl2
+import sdl2
 
 def main() -> i32:
 	if sdl2.SDL_Init( sdl2.SDL_INIT_VIDEO ) != 0:
@@ -134,7 +136,7 @@ def main() -> i32:
 		CPU contention under the parallel test harness (tests.py shards many
 		compile+link+run tests concurrently).'''
 		c_source = self._emit( '''
-import windows.sdl2 as sdl2
+import sdl2
 
 def main() -> i32:
 	if sdl2.SDL_Init( sdl2.SDL_INIT_VIDEO ) != 0:
@@ -179,6 +181,68 @@ def main() -> i32:
 	def _emit( self, source: str ) -> str:
 		self.compiler = self._compile_source( source )
 		return emitter_c.emit_c( self.compiler )
+
+
+_HAS_POSIX_SDL2 = ctypes.util.find_library( 'SDL2' ) is not None
+
+
+@unittest.skipUnless( os.name != 'nt', 'exercises sdl2.py\'s POSIX branch (-lSDL2) - see Sdl2Tests above '
+	'for the Windows/dll=/libdir= branch' )
+class Sdl2PosixTests( RealCompileMixin, unittest.TestCase ):
+	''' real compile+link+run against the system's libSDL2.so (e.g. `apt
+	install libsdl2-dev`), exercising sdl2.py's `os = not 'windows'` branch -
+	same program as Sdl2Tests.test_window_open_draw_close above, just linked
+	against the system package instead of a synthesized Windows import lib. '''
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (gcc/clang) found - skipping' )
+	@unittest.skipUnless( _HAS_POSIX_SDL2, 'libSDL2.so not found (install libsdl2-dev or equivalent) - '
+		'skipping real link+run' )
+	def test_window_open_draw_close( self ) -> None:
+		''' same graceful-skip-on-no-display posture as Sdl2Tests.
+		test_window_open_draw_close - see its own docstring. '''
+		compiler = self._compile_source( '''
+import sdl2
+
+def main() -> i32:
+	if sdl2.SDL_Init( sdl2.SDL_INIT_VIDEO ) != 0:
+		return 1
+
+	window: sdl2.Window = sdl2.SDL_CreateWindow(
+		"metalpy SDL2 spike".get_cstr(), sdl2.SDL_WINDOWPOS_UNDEFINED, sdl2.SDL_WINDOWPOS_UNDEFINED,
+		640, 480, sdl2.SDL_WINDOW_SHOWN )
+	if window is None:
+		return 2
+
+	renderer: sdl2.Renderer = sdl2.SDL_CreateRenderer( window, -1, sdl2.SDL_RENDERER_ACCELERATED )
+	if renderer is None:
+		return 3
+
+	event: sdl2.Event = sdl2.Event()
+	running: bool = True
+	frames: i32 = 0
+	while running and frames < 120:  # ~2s at 16ms/frame, or until the window is closed
+		while sdl2.SDL_PollEvent( compiler.addrof( event ) ) != 0:
+			if event.type == sdl2.SDL_QUIT:
+				running = False
+		sdl2.SDL_SetRenderDrawColor( renderer, 30, 60, 120, 255 )
+		sdl2.SDL_RenderClear( renderer )
+		sdl2.SDL_RenderPresent( renderer )
+		sdl2.SDL_Delay( 16 )
+		with compiler.wrap_arithmetic:
+			frames += 1
+
+	sdl2.SDL_DestroyRenderer( renderer )
+	sdl2.SDL_DestroyWindow( window )
+	sdl2.SDL_Quit()
+	return 0
+''' )
+		c_source = emitter_c.emit_c( compiler )
+		result = self._build_and_run( compiler, c_source, timeout = 30 )
+		if result.returncode == 1:
+			self.skipTest( f'SDL_Init(SDL_INIT_VIDEO) failed - no display/video subsystem available in this '
+				f'environment (stderr: {result.stderr})' )
+		self.assertEqual( result.returncode, 0,
+			f'exe exited {result.returncode}, expected 0 (stderr: {result.stderr})' )
 
 
 if __name__ == '__main__':
