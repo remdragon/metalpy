@@ -273,6 +273,31 @@ class Scalar( Type, ScopeMixin ):
 	type_params: list['TypeVar']|None = None
 	names: dict[str,Name] = field( default_factory = dict )
 
+	def is_float( self ) -> bool:
+		''' f32/f64 (float/double resolve to the same objects) - routes
+		arithmetic/cast/unary-negate through ArithmeticMode's GetFloat*
+		instead of the integer GetBinOp/GetCast/GetUnaryOp. '''
+		return self.stem in ( 'f32', 'f64' )
+
+	def is_signed( self ) -> bool:
+		''' signed integer stems - decides whether a checked Div/Mod can also
+		raise OverflowError (signed INT_MIN/-1). False for f32/f64 too (not
+		meaningful for float, and no caller needs it to be). '''
+		return self.stem in _SIGNED_INT_STEMS
+
+# signed integer scalar stems - see Scalar.is_signed
+_SIGNED_INT_STEMS: frozenset[str] = frozenset([ 'i8', 'i16', 'i32', 'i64', 'i128', 'isize' ])
+
+def is_float_scalar( t: 'Type|None' ) -> bool:
+	''' isinstance(t,Scalar)-guarded convenience for callers holding a bare
+	Type - see Scalar.is_float for the real check. '''
+	return isinstance( t, Scalar ) and t.is_float()
+
+def is_signed_scalar( t: 'Type|None' ) -> bool:
+	''' isinstance(t,Scalar)-guarded convenience for callers holding a bare
+	Type - see Scalar.is_signed for the real check. '''
+	return isinstance( t, Scalar ) and t.is_signed()
+
 def int_stem_range( t: Scalar ) -> tuple[int,int]:
 	''' (MIN, MAX), the real inclusive range of integer stem t.stem, as
 	Python ints - used to validate a literal's magnitude against its
@@ -286,9 +311,8 @@ def int_stem_range( t: Scalar ) -> tuple[int,int]:
 	width the compiler was configured for. Signedness is read directly off
 	the stem's own first letter (i vs u) - true for every integer stem
 	this compiler has (i8/i16/i32/i64/i128/isize vs u8/u16/u32/u64/u128/
-	usize) - rather than depending on lowering.py's own _SIGNED_INT_STEMS,
-	which this module (mpy_types.py, imported by both discovery.py and
-	lowering.py) can't reach without a circular import. '''
+	usize) - rather than a per-stem table, so this stays correct as new
+	stems are added without needing a matching entry here. '''
 	bits = t.sizeof * 8
 	if t.stem[0] == 'i':
 		return -(2**(bits-1)), 2**(bits-1) - 1
@@ -454,6 +478,14 @@ class Specialization( Type ):
 	@property
 	def names( self ) -> dict[str,Name]|None:
 		return getattr( self.base, 'names', None )
+
+	def pointer_stem( self ) -> str|None:
+		''' 'Ptr'/'ConstPtr' if this is a Ptr[T]/ConstPtr[T] specialization
+		(the generic pointer intrinsics, base is the Scalar named 'Ptr'/
+		'ConstPtr' - see Scalar's own docstring), else None. '''
+		if isinstance( self.base, Scalar ) and self.base.stem in ( 'Ptr', 'ConstPtr' ):
+			return self.base.stem
+		return None
 
 	# every RC/layout question about Box[i32] is really a question about Box -
 	# a generic CLASS's RC-ness comes from being an RCClass with a header,
