@@ -62,6 +62,7 @@ def _find_sdl2_install() -> Path | None:
 _SDL2_LIB_DIR = _find_sdl2_install()
 
 
+@unittest.skipUnless( os.name == 'nt', 'lib/windows/sdl2.py is a Windows-only binding (SDL2.dll via dll=/libdir=) - skipping off Windows' )
 class Sdl2Tests( RealCompileMixin, unittest.TestCase ):
 
 	def setUp( self ) -> None:
@@ -122,8 +123,17 @@ def main() -> i32:
 	def test_window_open_draw_close( self ) -> None:
 		''' real compile+link+run: opens a real window, clears it to a solid
 		color, pumps events for ~2s or until closed, checks SDL_Init/
-		SDL_CreateWindow/SDL_CreateRenderer all returned success. '''
-		self._assert_compiles_and_runs( self._emit( '''
+		SDL_CreateWindow/SDL_CreateRenderer all returned success.
+
+		A sandbox with no window station/desktop at all (e.g. a headless CI
+		runner) makes SDL_Init(SDL_INIT_VIDEO) itself fail - that's a real
+		environment limitation, not a regression, so it's reported as a skip
+		(with SDL_GetError()'s text) rather than a failure; every other
+		nonzero exit is a genuine bug and still fails the test. timeout is
+		generous (30s, vs. the ~2s the draw loop itself needs) to absorb
+		CPU contention under the parallel test harness (tests.py shards many
+		compile+link+run tests concurrently).'''
+		c_source = self._emit( '''
 import windows.sdl2 as sdl2
 
 def main() -> i32:
@@ -158,7 +168,13 @@ def main() -> i32:
 	sdl2.SDL_DestroyWindow( window )
 	sdl2.SDL_Quit()
 	return 0
-''' ), timeout = 10 )
+''' )
+		result = self._build_and_run( self.compiler, c_source, timeout = 30 )
+		if result.returncode == 1:
+			self.skipTest( f'SDL_Init(SDL_INIT_VIDEO) failed - no display/video subsystem available in this '
+				f'environment (stderr: {result.stderr})' )
+		self.assertEqual( result.returncode, 0,
+			f'exe exited {result.returncode}, expected 0 (stderr: {result.stderr})' )
 
 	def _emit( self, source: str ) -> str:
 		self.compiler = self._compile_source( source )

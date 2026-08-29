@@ -36,6 +36,7 @@ def _find_sdl2_image_install() -> Path | None:
 _SDL2_IMAGE_LIB_DIR = _find_sdl2_image_install()
 
 
+@unittest.skipUnless( os.name == 'nt', 'lib/windows/sdl2_image.py is a Windows-only binding (SDL2_image.dll via dll=/libdir=) - skipping off Windows' )
 class Sdl2ImageTests( RealCompileMixin, unittest.TestCase ):
 
 	def setUp( self ) -> None:
@@ -95,8 +96,14 @@ def main() -> i32:
 		''' real compile+link+run: opens a window, loads testdata/tiny.png via
 		IMG_LoadTexture straight to an SDL_Texture, draws it with
 		SDL_RenderCopy, presents once - checks every step returns success
-		(non-null pointers, zero return codes), not just IR-level success. '''
-		self._assert_compiles_and_runs( self._emit( f'''
+		(non-null pointers, zero return codes), not just IR-level success.
+
+		SDL_Init(SDL_INIT_VIDEO) failure (no display/video subsystem, e.g. a
+		headless CI runner) is reported as a skip rather than a failure -
+		see sdl2_test.py's test_window_open_draw_close for why. timeout is
+		generous (30s) to absorb CPU contention under the parallel test
+		harness. '''
+		c_source = self._emit( f'''
 import windows.sdl2 as sdl2
 import windows.sdl2_image as img
 
@@ -130,7 +137,13 @@ def main() -> i32:
 	img.IMG_Quit()
 	sdl2.SDL_Quit()
 	return 0
-''' ), timeout = 10 )
+''' )
+		result = self._build_and_run( self.compiler, c_source, timeout = 30 )
+		if result.returncode == 1:
+			self.skipTest( f'SDL_Init(SDL_INIT_VIDEO) failed - no display/video subsystem available in this '
+				f'environment (stderr: {result.stderr})' )
+		self.assertEqual( result.returncode, 0,
+			f'exe exited {result.returncode}, expected 0 (stderr: {result.stderr})' )
 
 	def _emit( self, source: str ) -> str:
 		self.compiler = self._compile_source( source )
