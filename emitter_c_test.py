@@ -6971,6 +6971,77 @@ def main() -> i32:
 		] )
 
 
+class MethodScopedGenericResultMatchRealCompileTests( test_support.RealCompileMixin, CompilerTestCase ):
+	''' Regression coverage for type_resolver.py's _type_of_expr Call/Attribute
+	branch: a receiver-based call to a method whose OWN type param is generic
+	(scoped to the method, e.g. `class Picker: def pick[T](self, seq: list[T])
+	-> Result[T,IndexError]`, not to the receiver's class - Picker itself isn't
+	generic) used directly as a match subject. node.resolved_callee is never
+	set for this shape (_try_resolve_callable_namespace can't resolve a plain
+	local variable receiver at this pre-lowering pass - see its own docstring),
+	so _type_of_expr's own Attribute-branch fallback ran instead - which only
+	ever substituted the RECEIVER's class type params (owner_type_params),
+	never the METHOD's own. The unsubstituted TypeVar then reached
+	emitter_c.py's c_type() while emitting the match's synthesized Result[T,
+	IndexError] union struct, a real, confirmed compile-time crash
+	(NotImplementedError: c_type: unsupported type <TypeVar ...>), not a
+	source-level type error. Found via lib/random.py's real Random.choice[T]. '''
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'method_scoped_generic_t_result_match_on_local_receiver', '''
+class Picker:
+	def pick[T]( self, seq: list[T] ) -> Result[T,IndexError]:
+		if seq.__len__() == 0:
+			return Result.Err( IndexError() )
+		return seq.__getitem__( 0 )
+
+def main() -> i32:
+	p: Picker = Picker()
+	lst: list[i32] = [ 1, 2, 3 ]
+	match p.pick( lst ):
+		case Result.Ok( v ):
+			if v != 1:
+				return 1
+		case Result.Err( _ ):
+			return 2
+	empty: list[i32] = list[i32]()
+	match p.pick( empty ):
+		case Result.Ok( _ ):
+			return 3
+		case Result.Err( _ ):
+			pass
+	return 0
+''' ),
+			# the FREE-FUNCTION-scoped counterpart (T on the function itself,
+			# no receiver at all) - confirmed to already work independently of
+			# the fix above (a bare/module-qualified generic call resolves
+			# node.resolved_callee eagerly in visit_Call, never reaching the
+			# Attribute-branch fallback at all), but had no real compile+run
+			# match coverage of its own before this
+			( 'free_function_scoped_generic_t_result_match', '''
+def pick[T]( seq: list[T] ) -> Result[T,IndexError]:
+	if seq.__len__() == 0:
+		return Result.Err( IndexError() )
+	return seq.__getitem__( 0 )
+
+def main() -> i32:
+	lst: list[i32] = [ 1, 2, 3 ]
+	match pick( lst ):
+		case Result.Ok( v ):
+			if v != 1:
+				return 1
+		case Result.Err( _ ):
+			return 2
+	return 0
+''' ),
+		] )
+
+
 class CEnumReturnCoercionTests( test_support.RealCompileMixin, CompilerTestCase ):
 	''' real compile+run coverage for _stmt_Return's own CEnum<->underlying-
 	scalar coercion - "a CEnum has exactly the same runtime representation as

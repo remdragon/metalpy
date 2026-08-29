@@ -5509,6 +5509,25 @@ class _ReferenceResolver( ast.NodeTransformer ):
 						return_type = self.resolver.monomorphizer.substitute_type_params(
 							return_type, owner_type_params, receiver_spec_for_substitution.args,
 						)
+				if return_type is not None and target.type_params:
+					# the METHOD's own type params (as opposed to its owning
+					# class's, substituted just above) - e.g. `Random.choice[T]`
+					# on the plain, non-generic Random class. Never reached for a
+					# call resolved_callee already tagged above (visit_Call's own
+					# _try_resolve_generic_call, which already returns the fully-
+					# substituted Function) - only for a receiver-based method
+					# call on a local variable, whose receiver type isn't known
+					# yet at that earlier pass (_try_resolve_callable_namespace's
+					# own docstring). Without this, a bare TypeVar reached
+					# emitter_c.py's c_type() when the return type (e.g. Result[
+					# T,E]) was used as a match subject, since nothing else ever
+					# substitutes a method-scoped type param against the ARGUMENTS
+					# for this best-effort type probe.
+					own_args = self._infer_generic_args( node, target, target.type_params )
+					if own_args is not None:
+						return_type = self.resolver.monomorphizer.substitute_type_params(
+							return_type, target.type_params, own_args,
+						)
 				return return_type
 			if isinstance( target, Overload ):
 				# an @overload-decorated method group (e.g. Result[T,E].
