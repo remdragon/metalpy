@@ -3238,7 +3238,10 @@ def _emit_neg( instr ) -> list[str]:
 			return [ f'\t{dest} = -({operand});' ] # IEEE negation: exact, just flips the sign bit (all modes route float `-` through NegWrap)
 		if stem in _SIGNED_TO_UNSIGNED:
 			uctype = _SCALAR_C_TYPES[_SIGNED_TO_UNSIGNED[stem]]
-			return [ f'\t{dest} = ({ctype})(-({uctype})({operand}));' ]
+			# (uctype)0 - x, not -x: same MSVC C4146 (unary minus on unsigned)
+			# dodge as _emit_wide_int_const, bitwise-identical two's-complement
+			# negation via subtraction from zero
+			return [ f'\t{dest} = ({ctype})(({uctype})0 - ({uctype})({operand}));' ]
 		return [ f'\t{dest} = 0;' ] # unsigned wrap-negation: only 0 maps to itself, everything else wraps to (TYPE_MAX - x + 1) - see note below
 	if mode == 'saturate':
 		dest = _emit_operand( instr.dest )
