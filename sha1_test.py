@@ -1,0 +1,120 @@
+import unittest
+
+import test_support
+from compiler import Compiler
+from discovery import Discovery
+
+
+class Sha1Tests( test_support.RealCompileMixin, unittest.TestCase ):
+	''' Real compile-and-run coverage for lib/sha1.py, against the FIPS 180-1
+	/ RFC 3174 test vectors (same set sha256_test.py checks for SHA-256). '''
+
+	def setUp( self ) -> None:
+		self.discovery = Discovery( import_builtins = True )
+		self.compiler = Compiler( self.discovery )
+
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_programs_compile_and_run( self ) -> None:
+		self.assert_programs_run([
+			( 'empty_string', '''
+import base64
+import sha1
+
+def main() -> i32:
+	empty: bytes = bytes.from_bytearray( move( bytearray( 0 ) ) )
+	digest: bytes = sha1.sha1( empty )
+	hex: bytes = base64.b16encode( digest )
+	if hex.decode().unwrap( 'x' ) != 'DA39A3EE5E6B4B0D3255BFEF95601890AFD80709':
+		return 1
+	return 0
+''' ),
+			( 'abc', '''
+import base64
+import sha1
+
+def main() -> i32:
+	data: bytes = 'abc'.encode().unwrap( 'x' )
+	digest: bytes = sha1.sha1( data )
+	hex: bytes = base64.b16encode( digest )
+	if hex.decode().unwrap( 'x' ) != 'A9993E364706816ABA3E25717850C26C9CD0D89D':
+		return 1
+	return 0
+''' ),
+			# NIST two-block vector (56 bytes) - exercises the multi-block
+			# loop and padding/length-encoding path a single-block input
+			# never reaches, same as sha256_test.py's own copy of this vector.
+			( 'nist_two_block', '''
+import base64
+import sha1
+
+def main() -> i32:
+	data: bytes = 'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq'.encode().unwrap( 'x' )
+	digest: bytes = sha1.sha1( data )
+	hex: bytes = base64.b16encode( digest )
+	if hex.decode().unwrap( 'x' ) != '84983E441C3BD26EBAAE4AA1F95129E5E54670F1':
+		return 1
+	return 0
+''' ),
+			( 'quick_brown_fox', '''
+import base64
+import sha1
+
+def main() -> i32:
+	data: bytes = 'The quick brown fox jumps over the lazy dog'.encode().unwrap( 'x' )
+	digest: bytes = sha1.sha1( data )
+	hex: bytes = base64.b16encode( digest )
+	if hex.decode().unwrap( 'x' ) != '2FD4E1C67A2D28FCED849EE1BB76E7391B93EB12':
+		return 1
+	return 0
+''' ),
+			( 'digest_length_is_20', '''
+import sha1
+
+def main() -> i32:
+	data: bytes = 'abc'.encode().unwrap( 'x' )
+	digest: bytes = sha1.sha1( data )
+	if len( digest ) != 20:
+		return 1
+	return 0
+''' ),
+			( 'different_inputs_differ', '''
+import base64
+import sha1
+
+def main() -> i32:
+	a: bytes = 'aaaa'.encode().unwrap( 'x' )
+	b: bytes = 'bbbb'.encode().unwrap( 'x' )
+	hex_a: str = base64.b16encode( sha1.sha1( a ) ).decode().unwrap( 'x' )
+	hex_b: str = base64.b16encode( sha1.sha1( b ) ).decode().unwrap( 'x' )
+	if hex_a == hex_b:
+		return 1
+	return 0
+''' ),
+			# mysql_native_password's own scramble formula (see
+			# lib/mysql/protocol.py's _scramble_native_password):
+			# SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password))) -
+			# checked here at the primitive level (chained sha1() calls +
+			# manual XOR/concat), independent of the mysql package, so a
+			# sha1.py regression and a protocol.py wiring bug show up as two
+			# distinct failures rather than one conflated one.
+			( 'double_sha1_matches_reference', '''
+import base64
+import sha1
+
+def main() -> i32:
+	pw: bytes = 'letmein'.encode().unwrap( 'x' )
+	once: bytes = sha1.sha1( pw )
+	twice: bytes = sha1.sha1( once )
+	hex_once: str = base64.b16encode( once ).decode().unwrap( 'x' )
+	hex_twice: str = base64.b16encode( twice ).decode().unwrap( 'x' )
+	if hex_once != 'B7A875FC1EA228B9061041B7CEC4BD3C52AB3CE3':
+		return 1
+	if hex_twice != 'D37C49F9CBEFBF8B6F4B165AC703AA271E079004':
+		return 2
+	return 0
+''' ),
+		] )
+
+
+if __name__ == '__main__':
+	unittest.main()
