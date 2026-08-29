@@ -258,6 +258,30 @@ def SetConsoleMode(
 ) -> bool:
 	...
 
+# BOOL AllocConsole(void) - attaches a new console to a process that has
+# none (e.g. a GUI-subsystem exe launched without one). After this,
+# GetStdHandle(STD_OUTPUT_HANDLE/STD_INPUT_HANDLE) yields real console
+# handles the same way a naturally console-subsystem process's already do.
+# Fails if a console is already attached.
+@extern('kernel32', 'AllocConsole')
+def AllocConsole() -> bool:
+	...
+
+# BOOL FreeConsole(void) - detaches the calling process's console, closing
+# its window if this process was the only thing using it. Counterpart to
+# AllocConsole - a GUI-subsystem process that allocated a console on demand
+# should free it again once done, so no stray console window is left behind.
+@extern('kernel32', 'FreeConsole')
+def FreeConsole() -> bool:
+	...
+
+# HWND GetConsoleWindow(void) - HWND of the console attached to this
+# process, or NULL if none. Useful to confirm AllocConsole actually
+# produced a visible window (as opposed to just std handles).
+@extern('kernel32', 'GetConsoleWindow')
+def GetConsoleWindow() -> HANDLE:
+	...
+
 # console input-mode flags (wincon.h) - GetConsoleMode/SetConsoleMode on an
 # input handle. ENABLE_PROCESSED_INPUT gates whether Ctrl+C is intercepted
 # as CTRL_C_EVENT (delivered to SetConsoleCtrlHandler, see lib/signal.py)

@@ -341,6 +341,11 @@ class CcTool:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
+		# caller-supplied ldflags may already pick a subsystem (e.g.
+		# /SUBSYSTEM:WINDOWS or -Wl,-subsystem:windows for a GUI-only exe) -
+		# the no_crt branches below must not clobber that with their own
+		# default CONSOLE subsystem (see has_subsystem uses below)
+		has_subsystem = any( 'subsystem' in f.lower() for f in extra )
 		if self.name == 'cl':
 			if no_crt:
 				# a freestanding MSVC build has no CRT to supply __chkstk (the
@@ -366,8 +371,12 @@ class CcTool:
 				# explicit /ENTRY without this now hits LNK1221 "a subsystem
 				# can't be inferred and must be defined" (confirmed via a
 				# real link failure) - same fix as the clang/lld-link branch
-				# below needed for the identical reason.
-				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup', '/SUBSYSTEM:CONSOLE' ]
+				# below needed for the identical reason. Only the default:
+				# an explicit /SUBSYSTEM already in ldflags (has_subsystem)
+				# wins instead - e.g. a GUI-only exe passing /SUBSYSTEM:WINDOWS.
+				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
+				if not has_subsystem:
+					cmd += [ '/SUBSYSTEM:CONSOLE' ]
 			if debug or asan:
 				cmd += [ '/DEBUG' ]
 			if strip:
@@ -425,7 +434,11 @@ class CcTool:
 				# out. gcc's own ELF/WSL target never reaches this
 				# branch in practice (mainCRTStartup is #ifdef _WIN32-only,
 				# so os.name == 'posix' there) - no GNU-ld equivalent needed.
-				cmd += [ '-Wl,-entry:mainCRTStartup', '-Wl,-subsystem:console' ]
+				# has_subsystem: same override as the 'cl' branch above - an
+				# explicit -Wl,-subsystem:... in ldflags wins over this default.
+				cmd += [ '-Wl,-entry:mainCRTStartup' ]
+				if not has_subsystem:
+					cmd += [ '-Wl,-subsystem:console' ]
 			if asan:
 				# clang/gcc's own driver acts as the linker frontend even for
 				# an objects-only link, and only links the ASan runtime when
