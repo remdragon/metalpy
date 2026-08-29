@@ -28,6 +28,7 @@ function New-ImportLib( [string]$libName, [string[]]$needed ) {
 
 New-ImportLib 'SDL2' @('SDL_Init','SDL_Quit','SDL_GetError','SDL_CreateWindow','SDL_DestroyWindow',
   'SDL_CreateRenderer','SDL_DestroyRenderer','SDL_SetRenderDrawColor','SDL_RenderClear',
-  'SDL_RenderPresent','SDL_PollEvent','SDL_Delay','SDL_RenderCopy','SDL_DestroyTexture')
+  'SDL_RenderPresent','SDL_PollEvent','SDL_Delay','SDL_RenderCopy','SDL_DestroyTexture',
+  'SDL_RenderFillRect','SDL_RenderDrawRect')
 
 New-ImportLib 'SDL2_image' @('IMG_Init','IMG_Quit','IMG_LoadTexture')

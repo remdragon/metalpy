@@ -14,3 +14,5 @@ SDL_PollEvent
 SDL_Delay
 SDL_RenderCopy
 SDL_DestroyTexture
+SDL_RenderFillRect
+SDL_RenderDrawRect
