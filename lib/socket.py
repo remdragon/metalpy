@@ -14,6 +14,7 @@
 # no generic setsockopt (only a narrow set_reuseaddr()).
 
 import compiler
+import fs
 import sys
 from atomic import Atomic
 
@@ -335,6 +336,7 @@ def _build_sockaddr_in6( host: str, port: u16 ) -> Result[SockAddrIn6, OSError]:
 # gets a name here, same as every other OSError member.
 # ---------------------------------------------------------------------------
 
+@compiler.target( portable_dns = not True )
 def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn], OSError]:
 	hints: _AddrInfo = _AddrInfo( ai_family = AF_INET, ai_socktype = socktype )
 	res_head: Ptr[None] = None
@@ -352,6 +354,273 @@ def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn
 		cur = info.ai_next
 	freeaddrinfo( res_head )
 	return Result.Ok( results )
+
+
+# ---------------------------------------------------------------------------
+# Portable DNS resolution (--portable-dns, compiler.target.portable_dns) —
+# an alternate _resolve_v4 that spawns `getent ahostsv4 <host>` instead of
+# calling getaddrinfo(). getaddrinfo/NSS dynamically dlopen()s glibc plugin
+# .so files at runtime to do real hostname resolution, REGARDLESS of whether
+# the calling binary itself was linked -static - so a -static binary built
+# against a newer glibc can still fail to even start hostname resolution on
+# an older-glibc deployment target (confirmed: GNU ld's own link-time warning
+# names this exact hazard for getaddrinfo, and identically for any other
+# NSS-backed libc call, e.g. getpwnam - this is a general glibc/NSS problem,
+# not specific to DNS). getent is a real, separately-installed system binary
+# invoked as a subprocess instead, sidestepping the in-process NSS-plugin-
+# loading problem entirely - it still uses NSS itself, but as a SEPARATE
+# process the caller doesn't need to be glibc-version-compatible with.
+#
+# Opt-in, default off: _resolve_v4 above (portable_dns = not True) keeps
+# calling getaddrinfo() exactly as before for every caller that doesn't ask
+# for this. Linux only - the (os=('windows','macos'), portable_dns=True)
+# branch further below is a poison pill, same convention as this module's
+# neighbors (e.g. lib/pty.py's macOS branch): calling
+# _PORTABLE_DNS_REQUIRES_LINUX() is a real, undefined reference, so it only
+# becomes a hard compile error for a build that actually targets Windows/
+# macOS AND requests portable_dns - never for a Linux build, and never for a
+# Windows/macOS build that leaves portable_dns off (the default).
+#
+# IPv6 (ahostsv6) is deliberately NOT covered here - no current caller needs
+# it. _resolve_v6 stays getaddrinfo-based unconditionally, even when
+# portable_dns is set. A getent-based _resolve_v6 would mirror this file
+# exactly (ahostsv6 instead of ahostsv4, SockAddrIn6/inet_pton(AF_INET6,...)
+# instead of SockAddrIn/inet_pton(AF_INET,...)) if a real caller ever needs
+# it - not speculative work today.
+#
+# Residual scope boundary (documented, not fixed by this flag): ANY program
+# with its own direct @extern binding to getpwnam/iconv/crypt/other NSS- or
+# dlopen()-backed glibc functionality bypasses this entirely - portable_dns
+# only ever changes lib/socket.py's OWN getaddrinfo call. There is no
+# general, portable replacement for those built here (deliberately, per
+# discussion - speculative work without a real current need). The genuine
+# safety net for that case is the linker's own runtime-library warning
+# (mpy.py already surfaces it by default; see mpy.py's --portable-dns help
+# text for the same note).
+# ---------------------------------------------------------------------------
+
+if compiler.target.os != 'windows' and compiler.target.os != 'macos':
+	_DnsChar = compiler.c_type( 'char', header = 'spawn.h' )
+	_DnsFileActions = compiler.c_type( 'posix_spawn_file_actions_t', header = 'spawn.h' )
+	_DnsSpawnAttr = compiler.c_type( 'posix_spawnattr_t', header = 'spawn.h' )
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'pipe' )
+def _dns_pipe( fds: Ptr[i32] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'posix_spawn_file_actions_init', header = 'spawn.h' )
+def _dns_fa_init( fa: Ptr[_DnsFileActions] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'posix_spawn_file_actions_adddup2', header = 'spawn.h' )
+def _dns_fa_adddup2( fa: Ptr[_DnsFileActions], fd: i32, newfd: i32 ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'posix_spawn_file_actions_addclose', header = 'spawn.h' )
+def _dns_fa_addclose( fa: Ptr[_DnsFileActions], fd: i32 ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'posix_spawn_file_actions_destroy', header = 'spawn.h' )
+def _dns_fa_destroy( fa: Ptr[_DnsFileActions] ) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'posix_spawnp', header = 'spawn.h' )
+def _dns_posix_spawnp(
+	pid: Ptr[i32],
+	file: ConstPtr[_DnsChar],
+	fa: Ptr[_DnsFileActions],
+	attr: Ptr[_DnsSpawnAttr],
+	argv: Ptr[Ptr[_DnsChar]],
+	envp: Ptr[Ptr[_DnsChar]],
+) -> i32:
+	...
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+@extern( 'c', 'waitpid', header = 'sys/wait.h' )
+def _dns_waitpid( pid: i32, status: Ptr[i32], options: i32 ) -> i32:
+	...
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+def _run_getent_ahostsv4( host: str ) -> Result[str, OSError]:
+	''' spawns `getent ahostsv4 <host>` (via posix_spawnp, PATH-searched -
+	no fork(), see lib/pty.py's own header comment for why this codebase
+	avoids fork() wherever a thread might be live), captures its stdout
+	through a plain pipe (not a PTY - this is a one-shot batch subprocess,
+	no terminal semantics needed), and returns the captured text verbatim.
+	getent's own EXIT CODE is NOT trustworthy here - a failed lookup still
+	exits 0 with empty stdout (confirmed against a real glibc getent) - the
+	caller must treat empty/unparseable output as failure itself, not rely
+	on this function's success to mean "found". '''
+	from crt import get_errno
+
+	fds: Ptr[i32] = sys.alloc[i32]( 2 )
+	pipe_rc: i32 = _dns_pipe( fds )
+	if pipe_rc != 0:
+		err: OSError = OSError( get_errno() )
+		sys.free( compiler.cast( Ptr[None], fds ))
+		return Result.Err( err )
+	read_fd: i32 = fds[0]
+	write_fd: i32 = fds[1]
+	sys.free( compiler.cast( Ptr[None], fds ))
+
+	fa: Ptr[_DnsFileActions] = sys.alloc[_DnsFileActions]( 1 )
+	_dns_fa_init( fa )
+	_dns_fa_adddup2( fa, write_fd, 1 ) # child's stdout -> pipe write end
+	_dns_fa_addclose( fa, read_fd )    # child has no use for the read end
+	_dns_fa_addclose( fa, write_fd )   # already duped onto fd 1 above
+
+	argv0: str = 'getent'
+	argv1: str = 'ahostsv4'
+	c_argv: Ptr[Ptr[_DnsChar]] = compiler.cast( Ptr[Ptr[_DnsChar]], sys.alloc[Ptr[u8]]( usize( 4 )))
+	c_argv[0] = compiler.cast( Ptr[_DnsChar], compiler.cast( Ptr[u8], argv0.get_cstr() ))
+	c_argv[1] = compiler.cast( Ptr[_DnsChar], compiler.cast( Ptr[u8], argv1.get_cstr() ))
+	c_argv[2] = compiler.cast( Ptr[_DnsChar], compiler.cast( Ptr[u8], host.get_cstr() ))
+	c_argv[3] = None
+
+	pid: i32 = 0
+	spawn_rc: i32 = _dns_posix_spawnp( compiler.addrof( pid ), compiler.cast( ConstPtr[_DnsChar], argv0.get_cstr() ), fa, None, c_argv, None )
+
+	_dns_fa_destroy( fa )
+	sys.free( compiler.cast( Ptr[None], fa ))
+	sys.free( compiler.cast( Ptr[None], c_argv ))
+
+	# parent always closes its own copy of the write end - file_actions
+	# already duped it into the child (if the spawn actually succeeded)
+	fs.close_raw( write_fd ).is_ok()
+
+	if spawn_rc != 0:
+		# posix_spawnp returns the error code directly (does NOT set errno)
+		fs.close_raw( read_fd ).is_ok()
+		return Result.Err( OSError( spawn_rc ))
+
+	read_result: Result[str, OSError] = _drain_fd_to_str( read_fd )
+	fs.close_raw( read_fd ).is_ok()
+	status: i32 = 0
+	_dns_waitpid( pid, compiler.addrof( status ), 0 ) # reap the child - status ignored, see this function's own docstring on why exit code isn't trusted
+	return read_result
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+def _drain_fd_to_str( fd: i32 ) -> Result[str, OSError]:
+	''' reads fd to EOF into one str - a small, standalone growable-buffer
+	loop (not RecvBuffer: that type is Socket-specific, this reads a plain
+	pipe fd). getent's own output for a single hostname lookup is tiny, so
+	the growth loop rarely runs more than once in practice. '''
+	cap: usize = usize( 4096 )
+	data: Ptr[u8] = sys.alloc[u8]( cap )
+	length: usize = 0
+	while True:
+		with compiler.wrap_arithmetic:
+			room: usize = cap - length
+		if room == 0:
+			with compiler.panic_arithmetic( 'irrational getent output size' ):
+				new_cap: usize = cap * 2
+			new_data: Ptr[u8] = sys.alloc[u8]( new_cap )
+			sys.memcpy( new_data, data, length )
+			sys.free( compiler.cast( Ptr[None], data ))
+			data = new_data
+			cap = new_cap
+			with compiler.wrap_arithmetic:
+				room = cap - length
+		with compiler.wrap_arithmetic:
+			dest: Ptr[u8] = data + length
+		match fs.read_raw( fd, dest, room ):
+			case Result.Ok( n ):
+				if n == 0:
+					break
+				with compiler.wrap_arithmetic:
+					length += n
+			case Result.Err( e ):
+				sys.free( compiler.cast( Ptr[None], data ))
+				return Result.Err( e )
+	return _finish_drain( data, length )
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+def _finish_drain( data: Ptr[u8], length: usize ) -> Result[str, OSError]:
+	''' null-terminates data[0:length) into a fresh right-sized buffer -
+	str.from_cstr's pointer overload requires it (see this file's own
+	_sockaddr_in_to_addr for the identical slen+1 idiom) - and frees data,
+	the growable buffer _drain_fd_to_str built. '''
+	with compiler.wrap_arithmetic:
+		full_len: usize = length + usize( 1 )
+	out: Ptr[u8] = sys.alloc[u8]( full_len )
+	sys.memcpy( out, data, length )
+	out[length] = 0
+	sys.free( compiler.cast( Ptr[None], data ))
+	# from_cstr copies what it needs, so out can be freed right away
+	# regardless of the outcome, rather than once per match arm below
+	result: Result[str, CodecError] = str.from_cstr( compiler.cast( ConstPtr[u8], out ), full_len )
+	sys.free( compiler.cast( Ptr[None], out ))
+	match result:
+		case Result.Ok( s ):
+			return Result.Ok( s )
+		case Result.Err( _ ):
+			return Result.Err( OSError.Invalid )
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+def _parse_ahostsv4_stream_ips( output: str ) -> list[str]:
+	''' pulls the IP literal out of every `... STREAM ...` line of a real
+	`getent ahostsv4` listing (verified format: "104.20.23.154   STREAM
+	example.com", multiple whitespace-padded columns, one line per address
+	per socket type). Filtering to STREAM lines alone already gives exactly
+	one line per unique address - getent emits one line per (address,
+	socktype) pair - so no separate dedupe step is needed. '''
+	ips: list[str] = list[str]()
+	lines: list[str] = output.split( '\n' )
+	for i in range( len( lines )):
+		raw: str = lines.__getitem__( i ).unwrap( 'ahostsv4 parse: index in bounds' )
+		line: str = raw.strip()
+		if line.byte_len() == 0:
+			continue
+		line = line.replace( '\t', ' ' )
+		while line.find( '  ' ) != isize( -1 ):
+			line = line.replace( '  ', ' ' )
+		fields: list[str] = line.split( ' ' )
+		if len( fields ) < 2:
+			continue
+		ip: str = fields.__getitem__( 0 ).unwrap( 'ahostsv4 parse: index in bounds' )
+		socktype: str = fields.__getitem__( 1 ).unwrap( 'ahostsv4 parse: index in bounds' )
+		if socktype == 'STREAM':
+			ips.append( ip )
+	return ips
+
+
+@compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
+def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn], OSError]:
+	output: str = _run_getent_ahostsv4( host ).or_return()
+	ips: list[str] = _parse_ahostsv4_stream_ips( output )
+	results: list[SockAddrIn] = list[SockAddrIn]()
+	for i in range( len( ips )):
+		ip: str = ips.__getitem__( i ).unwrap( 'ahostsv4 parse: index in bounds' )
+		match _build_sockaddr_in( ip, port ):
+			case Result.Ok( addr ):
+				results.append( addr )
+			case Result.Err( _ ):
+				pass # a malformed IP literal from getent - skip rather than fail the whole lookup
+	# the exit-code-0-on-failure gotcha: getent reports "not found" via empty/
+	# unusable output, never a nonzero exit - this is the real failure check
+	if len( results ) == 0:
+		return Result.Err( OSError.NameResolutionFailed )
+	return Result.Ok( results )
+
+# Windows/macOS + portable_dns=True - poison pill, not a runtime no-op (same
+# convention as lib/pty.py's macOS branch): _PORTABLE_DNS_REQUIRES_LINUX is a
+# real, deliberately undefined reference, so this only becomes a compile
+# error for a build that actually targets Windows/macOS AND requests
+# portable_dns - never for the Linux path above, and never for a Windows/
+# macOS build that leaves portable_dns off (the default, unaffected path).
+@compiler.target( os = ( 'windows', 'macos' ), portable_dns = True )
+def _resolve_v4( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn], OSError]:
+	return _PORTABLE_DNS_REQUIRES_LINUX()
 
 
 def _resolve_v6( host: str, port: u16, socktype: i32 ) -> Result[list[SockAddrIn6], OSError]:

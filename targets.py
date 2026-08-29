@@ -21,6 +21,7 @@ class ActiveTarget( TypedDict ):
 	debug: bool
 	posix: bool
 	has_i128: bool
+	portable_dns: bool
 
 _OS_NAMES = get_args(get_type_hints(ActiveTarget)['os'])
 _ARCH_NAMES = get_args(get_type_hints(ActiveTarget)['arch'])
@@ -47,4 +48,5 @@ def detect() -> ActiveTarget:
 		debug = True,
 		posix = family == 'unix',
 		has_i128 = True, # just default to true
+		portable_dns = False, # off by default - see mpy.py --portable-dns
 	)
