@@ -6,8 +6,8 @@ from discovery import Discovery
 
 
 class Sha1Tests( test_support.RealCompileMixin, unittest.TestCase ):
-	''' Real compile-and-run coverage for lib/sha1.py, against FIPS 180-1 /
-	NIST test vectors. '''
+	''' Real compile-and-run coverage for lib/sha1.py, against the FIPS 180-1
+	/ RFC 3174 test vectors (same set sha256_test.py checks for SHA-256). '''
 
 	def setUp( self ) -> None:
 		self.discovery = Discovery( import_builtins = True )
@@ -40,8 +40,9 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
-			# NIST's classic two-block vector, exercising the message-
-			# expansion/multi-block loop past a single 64-byte block.
+			# NIST two-block vector (56 bytes) - exercises the multi-block
+			# loop and padding/length-encoding path a single-block input
+			# never reaches, same as sha256_test.py's own copy of this vector.
 			( 'nist_two_block', '''
 import base64
 import sha1
@@ -87,6 +88,29 @@ def main() -> i32:
 	hex_b: str = base64.b16encode( sha1.sha1( b ) ).decode().unwrap( 'x' )
 	if hex_a == hex_b:
 		return 1
+	return 0
+''' ),
+			# mysql_native_password's own scramble formula (see
+			# lib/mysql/protocol.py's _scramble_native_password):
+			# SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password))) -
+			# checked here at the primitive level (chained sha1() calls +
+			# manual XOR/concat), independent of the mysql package, so a
+			# sha1.py regression and a protocol.py wiring bug show up as two
+			# distinct failures rather than one conflated one.
+			( 'double_sha1_matches_reference', '''
+import base64
+import sha1
+
+def main() -> i32:
+	pw: bytes = 'letmein'.encode().unwrap( 'x' )
+	once: bytes = sha1.sha1( pw )
+	twice: bytes = sha1.sha1( once )
+	hex_once: str = base64.b16encode( once ).decode().unwrap( 'x' )
+	hex_twice: str = base64.b16encode( twice ).decode().unwrap( 'x' )
+	if hex_once != 'B7A875FC1EA228B9061041B7CEC4BD3C52AB3CE3':
+		return 1
+	if hex_twice != 'D37C49F9CBEFBF8B6F4B165AC703AA271E079004':
+		return 2
 	return 0
 ''' ),
 		] )

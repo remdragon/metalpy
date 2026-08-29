@@ -1,16 +1,16 @@
 # sha1 - FIPS 180-1 SHA-1. One-shot digest: sha1(data) -> 20 raw digest
-# bytes. No streaming update()/digest() split, same posture as lib/
-# sha256.py - the only known caller is mysql.py's mysql_native_password
-# scramble (small fixed-size buffers).
-#
-# SHA-1 is cryptographically broken for collision resistance but still the
-# literal wire-protocol requirement for MySQL/MariaDB's mysql_native_password
-# auth plugin - not a choice, a compatibility requirement.
+# bytes. Same shape as lib/sha256.py (same padding scheme, same one-shot-only
+# scope) - added for mysql_native_password's scramble computation (see
+# lib/mysql/protocol.py), not a general-purpose crypto recommendation (SHA-1
+# is broken for collision resistance; fine here since mysql's usage is a
+# challenge-response scramble, not a signature/integrity primitive).
 
 import compiler
 
 
-_H0: list[u32] = [ 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 ]
+_H0: list[u32] = [
+	0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0,
+]
 
 
 def _rotl( x: u32, n: u32 ) -> u32:
@@ -22,8 +22,8 @@ def sha1( data: bytes|bytearray ) -> bytes:
 	n: usize = len( data )
 	in_ptr: ConstPtr[u8] = data.get_const_ptr()
 
-	# same padding scheme as sha256.sha256(): msg || 0x80 || zero pad ||
-	# 8-byte big-endian bit length, total a multiple of 64.
+	# pad: msg || 0x80 || zero bytes || 8-byte big-endian bit length, total
+	# a multiple of 64 - identical scheme to sha256's own padding.
 	with compiler.panic_arithmetic( 'padded length is a small bounded function of input length' ):
 		pad_len: usize = (( n + 9 + 63 ) // 64 ) * 64
 
@@ -59,6 +59,9 @@ def sha1( data: bytes|bytearray ) -> bytes:
 	block: usize = 0
 	with compiler.wrap_arithmetic:
 		while block < pad_len:
+			# message schedule: 16 words straight from the block, then 64 more
+			# expanded per FIPS 180-1 SS7 ("SHA-1" - the w[t-3]^w[t-8]^w[t-14]^
+			# w[t-16], rotl 1 recurrence; SHA-0's original had no rotate).
 			w: UnsafeList[u32] = UnsafeList[u32]( usize( 80 ))
 			t: usize = 0
 			while t < 16:
