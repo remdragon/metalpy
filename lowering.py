@@ -6173,7 +6173,15 @@ class FunctionLowering:
 			owner_type = self._static_type_of_value_expr( node.value )
 			if owner_type is None:
 				return None
-			return self.lowering._attr_lookup( owner_type, node.attr, node ).type
+			# a non-failing probe, not _attr_lookup - a @property getter has
+			# no static type here (reading it needs a real call, which this
+			# function never emits) and must decline (None) rather than
+			# _attr_lookup's fatal "has no attribute" for a non-Variable
+			# find. Confirmed by a real repro: `b.inner.go()` where b.inner
+			# is a property failed to compile even though `x = b.inner;
+			# x.go()` worked fine.
+			field = self.lowering._find_field( owner_type, node.attr )
+			return field.type if field is not None else None
 		if ( isinstance( node, ast.Call ) and isinstance( node.func, ast.Attribute )
 				and isinstance( node.func.value, ast.Name ) and node.func.value.id == 'compiler'
 				and node.func.attr == 'cast' and len( node.args ) == 2 ):
