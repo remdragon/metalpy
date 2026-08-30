@@ -211,6 +211,27 @@ class Thread:
 		from posix.pthread import pthread_join
 		pthread_join( self.__handle, None )
 
+	@compiler.target( os = 'windows' )
+	def detach( self ) -> None:
+		''' fire-and-forget: releases this Thread's own reference to the
+		underlying OS thread without waiting for it to finish - unlike
+		join(), safe to call on a still-running thread. Needed because
+		dropping a Thread object with neither join() nor this called leaks
+		its HANDLE forever (only join()/detach() ever call CloseHandle) -
+		the thread itself still runs to completion either way, this only
+		affects whether ITS OWN handle gets closed. '''
+		from windows.kernel32 import CloseHandle
+		CloseHandle( self.__handle )
+
+	@compiler.target( os = not 'windows' )
+	def detach( self ) -> None:
+		''' same contract as the Windows detach() above - pthread_detach
+		marks the thread so its resources are reclaimed automatically on
+		exit instead of requiring a join(), safe to call on a still-running
+		thread. '''
+		from posix.pthread import pthread_detach
+		pthread_detach( self.__handle )
+
 
 @compiler.target( os = 'windows' )
 def _thread_entry( arg: Ptr[None] ) -> u32:

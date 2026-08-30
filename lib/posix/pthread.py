@@ -71,6 +71,14 @@ def pthread_join(
 ) -> i32:
 	...
 
+# marks `thread` so its resources are reclaimed automatically on exit
+# instead of requiring a join() - same by-value pthread_t as pthread_join
+@extern('pthread', 'pthread_detach', header='pthread.h')
+def pthread_detach(
+	thread: pthread_t,
+) -> i32:
+	...
+
 
 # ---------------------------------------------------------------------------
 # TLS (thread-local storage) - lib/threading.py's own ThreadLocal[T]. pthread_key_t
