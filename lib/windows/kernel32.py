@@ -491,6 +491,20 @@ def GetCurrentDirectoryA(
 ) -> u32:
 	...
 
+# W, not A - same reasoning as MoveFileW above: the *A entry point goes
+# through the process' ANSI codepage (CP_ACP), not UTF-8, silently
+# mangling any install path outside it. hModule=None (NULL) retrieves the
+# calling process' own .exe path - the "resolve viewer.exe relative to my
+# own exe's directory" need launch_helper has (a downstream project repo), no other
+# caller here yet.
+@extern( 'kernel32', 'GetModuleFileNameW' )
+def GetModuleFileNameW(
+	hModule: HANDLE,
+	lpFilename: Ptr[u16],
+	nSize: u32,
+) -> u32:
+	...
+
 @extern( 'kernel32', 'CreateDirectoryA' )
 def CreateDirectoryA(
 	lpPathName: ConstPtr[u8],
