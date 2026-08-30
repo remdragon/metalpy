@@ -1,7 +1,7 @@
-# Regenerates scripts/sdl2_import_lib/{SDL2,SDL2_image}.lib from pip-installed
-# pysdl2-dll's bare DLLs (no .lib shipped) - see sdl2_test.py's module
-# docstring. Requires: pip install pysdl2-dll, and vcvars64 (MSVC dumpbin/
-# lib.exe) on PATH or discoverable via vswhere.
+# Regenerates scripts/sdl2_import_lib/{SDL2,SDL2_image,SDL2_ttf}.lib from
+# pip-installed pysdl2-dll's bare DLLs (no .lib shipped) - see sdl2_test.py's
+# module docstring. Requires: pip install pysdl2-dll, and vcvars64 (MSVC
+# dumpbin/lib.exe) on PATH or discoverable via vswhere.
 
 $ErrorActionPreference = 'Stop'
 
@@ -29,6 +29,10 @@ function New-ImportLib( [string]$libName, [string[]]$needed ) {
 New-ImportLib 'SDL2' @('SDL_Init','SDL_Quit','SDL_GetError','SDL_CreateWindow','SDL_DestroyWindow',
   'SDL_CreateRenderer','SDL_DestroyRenderer','SDL_SetRenderDrawColor','SDL_RenderClear',
   'SDL_RenderPresent','SDL_PollEvent','SDL_Delay','SDL_RenderCopy','SDL_DestroyTexture',
-  'SDL_RenderFillRect','SDL_RenderDrawRect')
+  'SDL_RenderFillRect','SDL_RenderDrawRect','SDL_CreateTextureFromSurface','SDL_FreeSurface',
+  'SDL_RenderReadPixels')
 
 New-ImportLib 'SDL2_image' @('IMG_Init','IMG_Quit','IMG_LoadTexture')
+
+New-ImportLib 'SDL2_ttf' @('TTF_Init','TTF_Quit','TTF_OpenFont','TTF_CloseFont',
+  'TTF_RenderText_Solid','TTF_SizeText')
