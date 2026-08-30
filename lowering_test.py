@@ -6401,6 +6401,29 @@ class Tests( unittest.TestCase ):
 		self.assertEqual( len( call_indirects ), 1 )
 		self.assertEqual( len( call_indirects[0].args ), 2 )
 
+	def test_bare_closure_construction_rejected_not_internal_crash( self ) -> None:
+		# Closure[[],None](f) - direct construction, not the lambda/bound-
+		# method routes above. Used to hit an internal AssertionError
+		# (_try_lower_construct_call's own "already resolved" assert -
+		# ClosureType is lazily resolved and this path never resolved it)
+		# before even reaching a real diagnostic; now rejected cleanly -
+		# fn/self are raw erased pointers with no privacy of their own, so
+		# allowing this would let user code fabricate a closure from
+		# arbitrary values, bypassing the incref/trampoline setup every
+		# other closure-construction route always does.
+		code = '\n'.join([
+			'def f() -> None:',
+			'	return',
+			'',
+			'def main() -> None:',
+			'	c: Closure[[], None] = Closure[[], None]( f )',
+			'	return',
+		])
+		self._import( code )
+		self._lower_main()
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'cannot be constructed directly', self.discovery.errors.errors[0] )
+
 	def test_non_callable_field_still_rejected_by_closure_call_recognizer( self ) -> None:
 		# guards the new Attribute branch above against over-matching: a
 		# plain scalar field must still fail with the pre-existing generic

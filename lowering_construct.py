@@ -8,7 +8,7 @@ import ir
 from discovery import is_stub_body
 from errors import CompileError
 from mpy_types import (
-	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, RCClass, Scalar, int_stem_range, InheritanceChainMixin,
+	Name, Type, Variable, Parameter, Function, Overload, ClassLike, Specialization, TaggedUnion, CStruct, CUnion, CEnum, TypeVar, ConditionalDispatch, RCClass, Scalar, int_stem_range, InheritanceChainMixin, ClosureType,
 )
 import overload_resolution
 from type_resolver import TypeResolver
@@ -157,6 +157,21 @@ class ConstructLoweringMixin:
 		# identical field-matching/emission logic. `label` is just how the
 		# call reads in error messages (".__allocate__(...)" vs "(...)"), so
 		# existing callers' error text doesn't change.
+		if isinstance( target_cls, ClosureType ):
+			# fn/self are raw type-erased Ptr[None] fields with no privacy
+			# marker of their own (nothing else ever constructs a
+			# ClosureType through ordinary field=value sugar to protect
+			# against) - allowing this would let user code fabricate a
+			# closure from arbitrary pointers, bypassing the incref/
+			# trampoline setup _lower_bound_method_closure/_construct_
+			# capturing_closure always do. A closure is only ever built
+			# implicitly (a lambda or bound-method reference); reject the
+			# direct-construction spelling outright rather than resolving
+			# it partially and letting a downstream check catch it.
+			self.lowering.discovery.fail(
+				f'{target_cls.qualname}{label} cannot be constructed directly - closures are only built implicitly from a lambda or bound-method reference: {ast.unparse(node)}',
+				node,
+			)
 		if node.args:
 			self.lowering.discovery.fail( f'{target_cls.qualname}{label} takes keyword arguments only: {ast.unparse(node)}', node )
 		if any( kw.arg is None for kw in node.keywords ):
@@ -723,6 +738,17 @@ class ConstructLoweringMixin:
 
 		if not isinstance( target_cls, ClassLike ):
 			return None
+		if isinstance( target_cls, ClosureType ):
+			# unlike every other ClassLike reachable here, a ClosureType is
+			# built lazily (discovery._get_or_create_closure_type) and never
+			# actually resolved by the ordinary "already resolved by the
+			# time it gets here" pipeline this method relies on below (it's
+			# not a real user class the pre-pass/monomorphizer ever
+			# schedules) - _lower_allocate_fields's own ClosureType check
+			# (reached via the no-__init__ fallthrough below) is the real
+			# rejection, this is just here so the next line's assert never
+			# sees an unresolved target_cls at all
+			return self._lower_allocate_fields( target_cls, node, expected_type, '(...)' )
 		# target_cls is already resolved by now - _try_resolve_namespace's
 		# own lookup resolves whatever it returns
 		assert target_cls.resolve is None, f'internal compiler error, {target_cls=} is not fully resolved'
