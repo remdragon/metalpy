@@ -68,6 +68,10 @@ def _parse_args() -> argparse.Namespace:
 		help = 'disable the automatic debug-build leak-check epilogue (decref globals + dump_live_objects at exit) - no effect in release builds' )
 	p.add_argument( '--assume-threaded', action = 'store_true',
 		help = 'force Part A/B\'s locking machinery on even if the program never reaches pthread_create/CreateThread - escape hatch for a program that reaches a second OS thread some other way (a raw signal handler, an externally-invoked C callback) this compiler cannot see (normally: locking is skipped whenever no reachable code ever spawns a thread)' )
+	p.add_argument( '--portable-dns', action = 'store_true',
+		help = 'Linux only: resolve hostnames (lib/socket.py connect()) by spawning `getent ahostsv4` instead of calling getaddrinfo() directly - getaddrinfo/NSS dlopen()s glibc plugin .so files at runtime regardless of -static, so a statically-linked binary built on a newer glibc can still fail to resolve hostnames on an older-glibc deployment target; this flag is what actually fixes THAT for a -static build, -static alone does not. '
+			'Independent of --ldflags=-static - combine them explicitly, neither implies the other. '
+			'SCOPE: only covers lib/socket.py\'s own getaddrinfo call. Any program with its own @extern binding straight to getpwnam/iconv/crypt/other NSS- or dlopen()-backed glibc functionality bypasses this entirely and has no portable replacement here (deliberately - no speculative build-out without a real need); the linker\'s own runtime-library warning (shown by default unless --hide-warnings) remains the real safety net for that residual case.' )
 	return p.parse_args()
 
 def _die( msg: str ) -> None:
@@ -101,6 +105,7 @@ def _build_active_target( args: argparse.Namespace, cc: linker_c.CcTool|None ) -
 	target = targets.detect()
 	target['debug'] = not args.release
 	target['has_i128'] = linker_c.has_i128( cc )
+	target['portable_dns'] = args.portable_dns
 	return target
 
 def _print_dep_report( compiler: Compiler ) -> None:
@@ -166,6 +171,8 @@ def main() -> None:
 
 	# --- build active target ---
 	active_target = _build_active_target( args, cc )
+	if args.portable_dns and active_target['os'] != 'linux':
+		_die( '--portable-dns is Linux only (getent-based; not implemented for windows/macos)' )
 
 	# --- stage 1: discovery ---
 	disco = Discovery( import_builtins = True, active_target = active_target )

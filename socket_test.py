@@ -25,9 +25,15 @@
 # py's own reasoning: exit codes keep this decoupled from a separate,
 # unrelated stdout regression).
 
+from pathlib import Path
+import shutil
+import sys
 import unittest
 
+from compiler import Compiler
+from discovery import Discovery
 import emitter_c
+import targets
 import test_support
 from test_support import RealCompileMixin
 
@@ -636,6 +642,67 @@ def main() -> i32:
 				return 2
 	return 0
 '''
+
+
+# --portable-dns (compiler.target.portable_dns) - lib/socket.py's getent-
+# based alternate _resolve_v4. Needs real network access (a live DNS lookup
+# for example.com), unlike every other case in this file (loopback-only) -
+# see lib/socket.py's own comment for why: getaddrinfo/NSS still dlopen()s
+# glibc plugins at runtime regardless of -static, -static alone doesn't fix
+# hostname resolution portability, this flag does.
+_PORTABLE_DNS_RESOLVE_LIVE_HOSTNAME = '''
+import socket
+
+def main() -> i32:
+	v4: list[str] = socket.resolve( 'example.com', socket.AF_INET ).unwrap( 'resolve v4 (portable_dns)' )
+	if len( v4 ) == 0:
+		return 1
+	return 0
+'''
+
+# the exact gotcha this flag exists to handle: getent reports "not found" via
+# empty/unusable output, NEVER a nonzero exit code - a resolver that trusted
+# getent's own exit status would wrongly report success here.
+_PORTABLE_DNS_RESOLVE_BOGUS_HOSTNAME = '''
+import socket
+
+def main() -> i32:
+	match socket.resolve( 'this-host-should-not-exist.invalid', socket.AF_INET ):
+		case Result.Ok( _ ):
+			return 1  # should have failed
+		case Result.Err( e ):
+			if e != OSError.NameResolutionFailed:
+				return 2
+	return 0
+'''
+
+
+@unittest.skipUnless( sys.platform.startswith( 'linux' ), '--portable-dns (getent-based resolution) is Linux only' )
+@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile socket tests' )
+@unittest.skipIf( shutil.which( 'getent' ) is None, 'getent not on PATH - required by --portable-dns' )
+class PortableDnsTests( RealCompileMixin, unittest.TestCase ):
+	''' Real compile-and-run coverage for --portable-dns, built with its own
+	active_target (portable_dns=True) rather than RealCompileMixin's default
+	Discovery/_compile_source, which never sets it (matches emitter_c_test.
+	py's own pattern for a non-default ActiveTarget, e.g. its _LINUX_TARGET). '''
+
+	_TARGET = { **targets.detect(), 'portable_dns': True }
+
+	def _run( self, source: str ) -> None:
+		discovery = Discovery( import_builtins = True, active_target = self._TARGET )
+		compiler = Compiler( discovery )
+		compiler.import_code( source, Path( '__main__.py' ), scope = None )
+		compiler.run()
+		self.assertEqual( discovery.errors.errors, [],
+			'compile errors:\n' + '\n'.join( str( e ) for e in discovery.errors.errors ) )
+		c_source = emitter_c.emit_c( compiler )
+		self._assert_compiles_and_runs( c_source, expected_exit = 0, compiler = compiler )
+
+	def test_resolve_live_hostname_returns_a_real_ip( self ) -> None:
+		self._run( _PORTABLE_DNS_RESOLVE_LIVE_HOSTNAME )
+
+	def test_resolve_bogus_hostname_fails_despite_getent_exit_0( self ) -> None:
+		self._run( _PORTABLE_DNS_RESOLVE_BOGUS_HOSTNAME )
 
 
 @unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping real-compile socket tests' )
