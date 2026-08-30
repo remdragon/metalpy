@@ -27,8 +27,8 @@ except ImportError:
 
 _SDL2_SCRATCH_LIB_DIR = Path( __file__ ).parent / 'scripts' / 'sdl2_import_lib'
 
-# system font used only to exercise a real TTF_OpenFont - not shipped by this
-# repo (mpygame1 carries its own CC0 font for the actual game).
+# system font used only to exercise a real TTF_OpenFont - not shipped by
+# this repo; downstream projects should bring their own font.
 _TEST_FONT_WIN = Path( r'C:\Windows\Fonts\arial.ttf' )
 _TEST_FONT_POSIX_CANDIDATES = [
 	Path( '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf' ),

@@ -259,9 +259,9 @@ def SDL_FreeSurface( surface: Surface ) -> None:
 	...
 
 # SDL_RenderFillRect/SDL_RenderDrawRect were whitelisted into the synthesized
-# SDL2.lib/.def but never actually bound here - callers (e.g. mpygame1's
-# debug_hud.py) had to re-declare them locally. Bound properly now that
-# something else in this file needed to touch the surrounding bindings anyway.
+# SDL2.lib/.def but never actually bound here - callers had to re-declare
+# them locally. Bound properly now that something else in this file needed
+# to touch the surrounding bindings anyway.
 
 @compiler.target( os = 'windows' )
 @extern( 'SDL2', 'SDL_RenderFillRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
