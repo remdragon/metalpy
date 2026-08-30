@@ -19,3 +19,5 @@ SDL_RenderDrawRect
 SDL_CreateTextureFromSurface
 SDL_FreeSurface
 SDL_RenderReadPixels
+SDL_GetMouseState
+SDL_RenderDrawLine

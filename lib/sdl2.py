@@ -292,3 +292,23 @@ def SDL_RenderReadPixels( renderer: Renderer, rect: Ptr[Rect], format: u32, pixe
 @extern( 'SDL2', 'SDL_RenderReadPixels' )
 def SDL_RenderReadPixels( renderer: Renderer, rect: Ptr[Rect], format: u32, pixels: Ptr[u8], pitch: i32 ) -> i32:
 	...
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_GetMouseState', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
+def SDL_GetMouseState( x: Ptr[i32], y: Ptr[i32] ) -> u32:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_GetMouseState' )
+def SDL_GetMouseState( x: Ptr[i32], y: Ptr[i32] ) -> u32:
+	...
+
+@compiler.target( os = 'windows' )
+@extern( 'SDL2', 'SDL_RenderDrawLine', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
+def SDL_RenderDrawLine( renderer: Renderer, x1: i32, y1: i32, x2: i32, y2: i32 ) -> i32:
+	...
+
+@compiler.target( os = not 'windows' )
+@extern( 'SDL2', 'SDL_RenderDrawLine' )
+def SDL_RenderDrawLine( renderer: Renderer, x1: i32, y1: i32, x2: i32, y2: i32 ) -> i32:
+	...
