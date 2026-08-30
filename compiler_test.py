@@ -596,6 +596,39 @@ def main() -> None:
 ''' )
 		self.assertEqual( self.compiler.extern_dlls, { 'tcl86t.dll', 'tk86t.dll' } )
 
+	def test_pip_package_registered_for_its_dll( self ) -> None:
+		self._run( '''
+@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', pip_package = 'sdl2dll' )
+def SDL_Init( flags: u32 ) -> i32:
+	...
+
+def main() -> None:
+	SDL_Init( 0 )
+''' )
+		self.assertEqual( self.compiler.extern_dll_pip_packages, { 'SDL2.dll': 'sdl2dll' } )
+
+	def test_extern_without_pip_package_leaves_the_registry_empty( self ) -> None:
+		self._run( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+
+def main() -> None:
+	Tcl_CreateInterp()
+''' )
+		self.assertEqual( self.compiler.extern_dll_pip_packages, {} )
+
+	def test_declared_but_uncalled_extern_function_does_not_register_its_pip_package( self ) -> None:
+		self._run( '''
+@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', pip_package = 'sdl2dll' )
+def SDL_Init( flags: u32 ) -> i32:
+	...
+
+def main() -> None:
+	pass
+''' )
+		self.assertEqual( self.compiler.extern_dll_pip_packages, {} )
+
 class ExternNoticeDependencyTests( CompilerTestCase ):
 	''' compiler.extern_notices - populated only from
 	@extern(..., notice=...) declarations on functions actually

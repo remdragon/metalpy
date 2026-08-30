@@ -461,6 +461,16 @@ reached and compiled in, `mpy`'s build step adds it as a linker search path auto
 manual `--ldflags` needed. System libraries on the compiler's own default search path (e.g.
 `kernel32`) never declare it.
 
+`pip_package=` is optional and independent from `libdir=`: it names a pip package whose own
+install directory `mpy`'s build step also searches for `dll=`'s entries, in addition to
+`PATH` - for a dependency whose runtime DLL ships via a pip package (e.g. `SDL2.dll` via
+`pip install pysdl2-dll`'s `sdl2dll` package) rather than a real system install. `libdir=`
+doesn't cover this: it's a link-time search path for the import `.lib`, which for a
+pip-installed dependency is typically a vendored file checked into the repo (see above),
+not the same directory as the pip package's own runtime DLL. Without `pip_package=`, such a
+DLL is only ever bundled successfully by coincidence, on a machine where something unrelated
+happens to also put a same-named file on `PATH`.
+
 `notice=` is likewise optional and independent - both from `lib` and from `dll=`. Each
 identifier (`'TCL'`, `'ZLIB'` above) resolves to a `licenses/<NAME>.txt` file at the metalpy
 installation root, containing that dependency's actual license text. It's a separate

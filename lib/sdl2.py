@@ -55,7 +55,7 @@ class Rect:
 	h: i32 = 0
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_Init( flags: u32 ) -> i32:
 	...
 
@@ -65,7 +65,7 @@ def SDL_Init( flags: u32 ) -> i32:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_Quit', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_Quit', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_Quit() -> None:
 	...
 
@@ -75,7 +75,7 @@ def SDL_Quit() -> None:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_GetError', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_GetError', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_GetError() -> ConstPtr[u8]:
 	...
 
@@ -85,7 +85,7 @@ def SDL_GetError() -> ConstPtr[u8]:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_CreateWindow', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_CreateWindow', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_CreateWindow(
 	title: ConstPtr[u8],
 	x: i32,
@@ -109,7 +109,7 @@ def SDL_CreateWindow(
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_DestroyWindow', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_DestroyWindow', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_DestroyWindow( window: Window ) -> None:
 	...
 
@@ -119,7 +119,7 @@ def SDL_DestroyWindow( window: Window ) -> None:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_CreateRenderer', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_CreateRenderer', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_CreateRenderer(
 	window: Window,
 	index: i32,
@@ -137,7 +137,7 @@ def SDL_CreateRenderer(
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_DestroyRenderer', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_DestroyRenderer', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_DestroyRenderer( renderer: Renderer ) -> None:
 	...
 
@@ -147,7 +147,7 @@ def SDL_DestroyRenderer( renderer: Renderer ) -> None:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_SetRenderDrawColor', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_SetRenderDrawColor', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_SetRenderDrawColor(
 	renderer: Renderer,
 	r: u8,
@@ -169,7 +169,7 @@ def SDL_SetRenderDrawColor(
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_RenderClear', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderClear', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_RenderClear( renderer: Renderer ) -> i32:
 	...
 
@@ -179,7 +179,7 @@ def SDL_RenderClear( renderer: Renderer ) -> i32:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_RenderPresent', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderPresent', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_RenderPresent( renderer: Renderer ) -> None:
 	...
 
@@ -189,7 +189,7 @@ def SDL_RenderPresent( renderer: Renderer ) -> None:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_PollEvent', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_PollEvent', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_PollEvent( event: Ptr[Event] ) -> i32:
 	...
 
@@ -199,7 +199,7 @@ def SDL_PollEvent( event: Ptr[Event] ) -> i32:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_RenderCopy', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderCopy', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_RenderCopy(
 	renderer: Renderer,
 	texture: Texture,
@@ -219,7 +219,7 @@ def SDL_RenderCopy(
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_DestroyTexture', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_DestroyTexture', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_DestroyTexture( texture: Texture ) -> None:
 	...
 
@@ -229,7 +229,7 @@ def SDL_DestroyTexture( texture: Texture ) -> None:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_Delay', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_Delay', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_Delay( ms: u32 ) -> None:
 	...
 
@@ -239,7 +239,7 @@ def SDL_Delay( ms: u32 ) -> None:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_CreateTextureFromSurface', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_CreateTextureFromSurface', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_CreateTextureFromSurface( renderer: Renderer, surface: Surface ) -> Texture:
 	...
 
@@ -249,7 +249,7 @@ def SDL_CreateTextureFromSurface( renderer: Renderer, surface: Surface ) -> Text
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_FreeSurface', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_FreeSurface', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_FreeSurface( surface: Surface ) -> None:
 	...
 
@@ -264,7 +264,7 @@ def SDL_FreeSurface( surface: Surface ) -> None:
 # something else in this file needed to touch the surrounding bindings anyway.
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_RenderFillRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderFillRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_RenderFillRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
 	...
 
@@ -274,7 +274,7 @@ def SDL_RenderFillRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_RenderDrawRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderDrawRect', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_RenderDrawRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
 	...
 
@@ -284,7 +284,7 @@ def SDL_RenderDrawRect( renderer: Renderer, rect: Ptr[Rect] ) -> i32:
 	...
 
 @compiler.target( os = 'windows' )
-@extern( 'SDL2', 'SDL_RenderReadPixels', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', notice = 'SDL2' )
+@extern( 'SDL2', 'SDL_RenderReadPixels', dll = 'SDL2.dll', libdir = '../scripts/sdl2_import_lib', pip_package = 'sdl2dll', notice = 'SDL2' )
 def SDL_RenderReadPixels( renderer: Renderer, rect: Ptr[Rect], format: u32, pixels: Ptr[u8], pitch: i32 ) -> i32:
 	...
 

@@ -1,10 +1,12 @@
 # stdlib imports:
 import contextlib
 import hashlib
+import importlib
 import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -466,3 +468,52 @@ class FindDllTests( unittest.TestCase ):
 		with patch.dict( os.environ, { 'PATH': os.pathsep.join([ '', '' ]) } ):
 			found = linker_c.find_dll( 'kernel32.dll' )
 		self.assertIsNone( found )
+
+	def _install_fake_pip_package( self, tmp: str, name: str, dll_relpath: str ) -> Path:
+		''' Builds a real importable package under `tmp` (added to sys.path
+		for the duration of the test) with a DLL at `dll_relpath` inside it -
+		exercises the real importlib.util.find_spec path _find_pip_package_dll
+		actually uses, rather than mocking it away. '''
+		pkg_dir = Path( tmp ) / name
+		pkg_dir.mkdir()
+		( pkg_dir / '__init__.py' ).write_text( '' )
+		dll_path = pkg_dir / dll_relpath
+		dll_path.parent.mkdir( parents = True, exist_ok = True )
+		dll_path.write_bytes( b'not a real PE, just needs to exist' )
+		sys.path.insert( 0, tmp )
+		self.addCleanup( sys.path.remove, tmp )
+		importlib.invalidate_caches()
+		return dll_path
+
+	def test_pip_package_found_when_not_on_path( self ) -> None:
+		# the actual bug this exists to fix: a pip-installed dependency's
+		# DLL (e.g. sdl2dll's SDL2.dll under sdl2dll/dll/) has no reason to
+		# be on PATH at all
+		with tempfile.TemporaryDirectory() as tmp:
+			dll_path = self._install_fake_pip_package( tmp, 'fake_pip_pkg', 'dll/fake_dep.dll' )
+			with patch.dict( os.environ, { 'PATH': '' } ):
+				found = linker_c.find_dll( 'fake_dep.dll', pip_package = 'fake_pip_pkg' )
+			self.assertEqual( found, dll_path )
+
+	def test_path_takes_precedence_over_pip_package( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			self._install_fake_pip_package( tmp, 'fake_pip_pkg2', 'dll/fake_dep.dll' )
+			path_dir = Path( tmp ) / 'on_path'
+			path_dir.mkdir()
+			path_dll = path_dir / 'fake_dep.dll'
+			path_dll.write_bytes( b'from PATH' )
+			with patch.dict( os.environ, { 'PATH': str( path_dir ) } ):
+				found = linker_c.find_dll( 'fake_dep.dll', pip_package = 'fake_pip_pkg2' )
+			self.assertEqual( found, path_dll )
+
+	def test_pip_package_not_installed_returns_none( self ) -> None:
+		with patch.dict( os.environ, { 'PATH': '' } ):
+			found = linker_c.find_dll( 'fake_dep.dll', pip_package = 'metalpy_no_such_pip_package_987' )
+		self.assertIsNone( found )
+
+	def test_pip_package_installed_but_missing_dll_returns_none( self ) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			self._install_fake_pip_package( tmp, 'fake_pip_pkg3', 'dll/fake_dep.dll' )
+			with patch.dict( os.environ, { 'PATH': '' } ):
+				found = linker_c.find_dll( 'does_not_exist_987.dll', pip_package = 'fake_pip_pkg3' )
+			self.assertIsNone( found )

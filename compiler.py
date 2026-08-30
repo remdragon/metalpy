@@ -103,6 +103,12 @@ class Compiler:
 		# directories on a real machine, in general) and deliberately not
 		# auto-derived from scanning a DLL's own import table.
 		self.extern_dlls: set[str] = set()
+		# dll name -> pip package name, from @extern(..., pip_package='<name>')
+		# entries whose dll= this covers - same reachability-gated collection
+		# as extern_dlls above. mpy.py's post-link step passes this through to
+		# linker_c.find_dll() so a pip-installed dependency's DLL is found
+		# even when nothing unrelated happens to also be on PATH.
+		self.extern_dll_pip_packages: dict[str,str] = {}
 		# link-time library search directories declared via
 		# @extern(..., libdir='<relative-path>') - same reachability-gated
 		# collection as extern_libs/extern_dlls above. mpy.py's link step
@@ -440,6 +446,9 @@ class Compiler:
 			if unit.extern_lib is not None:
 				self.extern_libs.setdefault( unit.extern_lib, set() ).add( unit.extern_symbol )
 				self.extern_dlls.update( unit.extern_dlls )
+				if unit.extern_pip_package is not None:
+					for dll_name in unit.extern_dlls:
+						self.extern_dll_pip_packages[ dll_name ] = unit.extern_pip_package
 				self.extern_notices.update( unit.extern_notices )
 				if unit.extern_libdir is not None:
 					self.extern_libdirs.add( unit.extern_libdir )

@@ -1434,6 +1434,14 @@ class Function( Type, ScopeMixin ):
 	# assumed already present on target machines. See compiler.py's
 	# extern_dlls collection and mpy.py's post-link bundling step.
 	extern_dlls: tuple[str,...] = ()
+	# optional pip package name whose install directory should also be
+	# searched for extern_dlls at bundling time (in addition to PATH, not
+	# instead of it - see linker_c.find_dll). For a dep whose DLL(s) ship
+	# via a pip package rather than a real system install (e.g. SDL2.dll
+	# via `pip install pysdl2-dll`'s sdl2dll package), relying on PATH
+	# alone only works if something else unrelated happens to have put a
+	# matching DLL there - see mpy.py's post-link bundling step.
+	extern_pip_package: str|None = None
 	# optional 3rd-party license notice identifier(s) required when this
 	# @extern function (and, transitively, whatever it bundles via
 	# extern_dlls) ships in a built program's dist/ output. Written as

@@ -318,7 +318,7 @@ def main() -> None:
 		# runtime-copy equivalent here and must not fail the build.
 		if active_target['os'] == 'windows':
 			for dll_name in sorted( compiler.extern_dlls ):
-				found = linker_c.find_dll( dll_name )
+				found = linker_c.find_dll( dll_name, pip_package = compiler.extern_dll_pip_packages.get( dll_name ) )
 				if found is None:
 					bundle_errors.append( f'{dll_name}: not found on PATH' )
 					continue

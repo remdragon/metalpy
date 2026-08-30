@@ -3452,6 +3452,34 @@ def Tcl_CreateInterp() -> Ptr[None]:
 ''' )
 		self.assertTrue( any( 'notice= must be a string literal or a list/tuple of string literals' in e for e in disco.errors.errors ))
 
+	def test_extern_pip_package_recorded( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', pip_package = 'sdl2dll' )
+def SDL_Init( flags: u32 ) -> i32:
+	...
+''' )
+		fn = mod.get_local( 'SDL_Init' )
+		fn.resolve()
+		self.assertEqual( fn.extern_pip_package, 'sdl2dll' )
+
+	def test_extern_pip_package_defaults_to_none( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'tcl86t', 'Tcl_CreateInterp', dll = 'tcl86t.dll' )
+def Tcl_CreateInterp() -> Ptr[None]:
+	...
+''' )
+		fn = mod.get_local( 'Tcl_CreateInterp' )
+		fn.resolve()
+		self.assertIsNone( fn.extern_pip_package )
+
+	def test_extern_pip_package_non_string_is_a_compile_error( self ) -> None:
+		disco, mod = self._import( '''
+@extern( 'SDL2', 'SDL_Init', dll = 'SDL2.dll', pip_package = 123 )
+def SDL_Init( flags: u32 ) -> i32:
+	...
+''' )
+		self.assertTrue( any( 'pip_package= must be a string literal' in e for e in disco.errors.errors ))
+
 	def test_ordinary_function_has_no_extern_fields( self ) -> None:
 		disco, mod = self._import( '''
 def foo() -> None:

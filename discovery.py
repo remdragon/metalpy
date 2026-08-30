@@ -3118,9 +3118,9 @@ class Discovery( ast.NodeVisitor ):
 		available = linker_c.has_symbol( cc, lib, symbol )
 		return available != negate
 
-	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...],tuple[str,...],bool,str|None]:
+	def _parse_extern_decorator( self, decorator: ast.expr, node: ast.FunctionDef, qualname: str ) -> tuple[str,str,str|None,tuple[str,...],tuple[str,...],bool,str|None,str|None]:
 		# @extern('lib', 'symbol') or
-		# @extern('lib', 'symbol', header='<name>', dll='<name>'|[...], libdir='<relative-path>', notice='<name>'|[...], spawns_thread=True)
+		# @extern('lib', 'symbol', header='<name>', dll='<name>'|[...], libdir='<relative-path>', notice='<name>'|[...], spawns_thread=True, pip_package='<name>')
 		# 'lib' is the .lib/.so name to link against, except the literal
 		# 'c' which means the platform C runtime rather than a real file on
 		# disk - that distinction is a future emitter/linker's job to act
@@ -3169,6 +3169,7 @@ class Discovery( ast.NodeVisitor ):
 		notices: tuple[str,...] = ()
 		spawns_thread = False
 		libdir: str|None = None
+		pip_package: str|None = None
 		for kw in decorator.keywords:
 			if kw.arg == 'header':
 				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
@@ -3187,6 +3188,13 @@ class Discovery( ast.NodeVisitor ):
 				libdir = kw.value.value
 			elif kw.arg == 'notice':
 				notices = _parse_str_or_str_list( kw.value, 'notice' )
+			elif kw.arg == 'pip_package':
+				# hints find_dll() to also search this pip package's install
+				# directory for dll='s entries, alongside PATH - see
+				# mpy_types.Function.extern_pip_package's own comment
+				if not isinstance( kw.value, ast.Constant ) or not isinstance( kw.value.value, str ):
+					self.fail( f'@extern(...) pip_package= must be a string literal: {ast.unparse(decorator)}', node )
+				pip_package = kw.value.value
 			elif kw.arg == 'spawns_thread':
 				# PLAN_THREAD_SAFE_SHARED_STATE.md Cost mitigation #1: marks
 				# the real OS-thread-creation syscall boundary
@@ -3203,7 +3211,7 @@ class Discovery( ast.NodeVisitor ):
 				spawns_thread = kw.value.value
 			else:
 				self.fail( f'@extern(...) unexpected keyword argument {kw.arg!r}: {ast.unparse(decorator)}', node )
-		return lib_arg.value, symbol_arg.value, header, dlls, notices, spawns_thread, libdir
+		return lib_arg.value, symbol_arg.value, header, dlls, notices, spawns_thread, libdir, pip_package
 
 	def _parse_function(
 		self,
@@ -3262,6 +3270,7 @@ class Discovery( ast.NodeVisitor ):
 		extern_notices: tuple[str,...] = ()
 		extern_spawns_thread = False
 		extern_libdir_raw: str|None = None
+		extern_pip_package: str|None = None
 		for decorator in node.decorator_list or []:
 			if self._is_compiler_target_call( decorator ):
 				if not self._matches_active_target( decorator ):
@@ -3292,7 +3301,7 @@ class Discovery( ast.NodeVisitor ):
 				case 'requires_crt':
 					is_requires_crt = True
 				case 'extern':
-					extern_lib, extern_symbol, extern_header, extern_dlls, extern_notices, extern_spawns_thread, extern_libdir_raw = self._parse_extern_decorator( decorator, node, qualname )
+					extern_lib, extern_symbol, extern_header, extern_dlls, extern_notices, extern_spawns_thread, extern_libdir_raw, extern_pip_package = self._parse_extern_decorator( decorator, node, qualname )
 				case _:
 					self.fail( f'unsupported function decorator @{decname or ast.unparse(decorator)} on {qualname}', node )
 
@@ -3470,6 +3479,7 @@ class Discovery( ast.NodeVisitor ):
 			extern_notices = extern_notices,
 			extern_spawns_thread = extern_spawns_thread,
 			extern_libdir = extern_libdir,
+			extern_pip_package = extern_pip_package,
 		)
 		if extern_header is not None:
 			self.required_headers.add( extern_header )

@@ -10,6 +10,7 @@ See ARCHITECTURE.md line 196.
 '''
 
 # stdlib imports:
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -859,14 +860,45 @@ def resolve_lib_ldflag( cc: CcTool, lib: str, symbols: set[str], verbose: bool =
 	return f'{lib}.lib' if cc.name == 'cl' else f'-l{lib}'
 
 
-def find_dll( name: str ) -> Path|None:
+def _find_pip_package_dll( pip_package: str, name: str ) -> Path|None:
+	'''
+	Locates `name` inside `pip_package`'s own installed directory tree -
+	the direct fix for dependencies whose DLL ships via pip (e.g.
+	`pip install pysdl2-dll`'s `sdl2dll` package bundling SDL2.dll under
+	sdl2dll/dll/) rather than a real system install: those DLLs have no
+	reason to be on PATH at all, and relying on PATH for them only works
+	by coincidence (e.g. some unrelated program on PATH happening to also
+	ship a same-named DLL).
+
+	Uses importlib.util.find_spec to resolve the package's install
+	location the same way `import pip_package` would, without actually
+	importing it (avoids running arbitrary package __init__ code just to
+	locate a file) - then walks its directory tree since the exact
+	subdirectory (e.g. 'dll/') is package-specific and not worth
+	hardcoding per package. Returns None if the package isn't installed
+	or doesn't contain `name` - best-effort, same as the PATH search.
+	'''
+	try:
+		spec = importlib.util.find_spec( pip_package )
+	except (ImportError, ValueError):
+		return None
+	if spec is None or not spec.submodule_search_locations:
+		return None
+	for root in spec.submodule_search_locations:
+		for candidate in Path( root ).rglob( name ):
+			if candidate.is_file():
+				return candidate
+	return None
+
+
+def find_dll( name: str, pip_package: str|None = None ) -> Path|None:
 	'''
 	Locates a runtime DLL by bare filename (e.g. 'tcl86t.dll') for
 	bundling into a build's output directory - see mpy.py's post-link
 	step, driven by compiler.extern_dlls (populated from
 	@extern(..., dll=...) declarations on functions actually reached).
 
-	Searches PATH, in order - the same place a real Windows process
+	Searches PATH first, in order - the same place a real Windows process
 	resolves an unqualified DLL import from, so "found here" is a direct
 	stand-in for "the exe would find this DLL too, if PATH weren't
 	different at run time" (e.g. on a machine without this build's own
@@ -875,9 +907,16 @@ def find_dll( name: str ) -> Path|None:
 	library at link time, a different file that can live somewhere else
 	entirely (see mpy_types.Function.extern_dll's own comment).
 
-	Returns None (best-effort) if not found anywhere on PATH - mpy.py
-	warns and continues rather than failing the build over a bundling
-	step; the exe already linked successfully.
+	`pip_package`, when given (from @extern(..., pip_package='<name>')),
+	is searched next if PATH didn't have it - see
+	_find_pip_package_dll. This is the actual fix for a dependency whose
+	DLL ships via pip rather than any real system install: without it,
+	such a DLL is only ever found on a machine where something else
+	unrelated happens to also put a same-named file on PATH.
+
+	Returns None (best-effort) if not found anywhere - mpy.py warns and
+	continues rather than failing the build over a bundling step; the
+	exe already linked successfully.
 	'''
 	for entry in os.environ.get( 'PATH', '' ).split( os.pathsep ):
 		if not entry:
@@ -885,6 +924,8 @@ def find_dll( name: str ) -> Path|None:
 		candidate = Path( entry ) / name
 		if candidate.is_file():
 			return candidate
+	if pip_package is not None:
+		return _find_pip_package_dll( pip_package, name )
 	return None
 
 
