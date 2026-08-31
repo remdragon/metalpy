@@ -56,6 +56,8 @@ def _parse_args() -> argparse.Namespace:
 		help = 'extra flags passed through to the linker' )
 	p.add_argument( '--strip', action = 'store_true',
 		help = 'strip symbols / fold identical code for a smaller binary' )
+	p.add_argument( '--windows', action = 'store_true',
+		help = 'Windows only: build a non-console (GUI) executable - sets the linker subsystem to WINDOWS instead of the default CONSOLE, with whatever else that backend needs (entry point, etc). Combine with --ldflags for any extra libs the program itself needs (e.g. user32)' )
 	p.add_argument( '--map', action = 'store_true',
 		help = 'emit a linker map file (<output>.map) for inspecting per-symbol code size' )
 	p.add_argument( '--asan', action = 'store_true',
@@ -173,6 +175,8 @@ def main() -> None:
 	active_target = _build_active_target( args, cc )
 	if args.portable_dns and active_target['os'] != 'linux':
 		_die( '--portable-dns is Linux only (getent-based; not implemented for windows/macos)' )
+	if args.windows and active_target['os'] != 'windows':
+		_die( '--windows is Windows only (PE subsystem flag; not implemented for linux/macos)' )
 
 	# --- stage 1: discovery ---
 	disco = Discovery( import_builtins = True, active_target = active_target )
@@ -284,7 +288,7 @@ def main() -> None:
 				flag = linker_c.resolve_lib_ldflag( cc, lib, compiler.extern_libs[lib], verbose = args.v, no_crt = no_crt )
 				ldflags = ldflags + f' {flag}' if ldflags else flag
 		map_path = exe_path.with_suffix( exe_path.suffix + '.map' ) if args.map else None
-		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip, map_file = map_path )
+		link_result = cc.link( exe_path, [ obj_path ], ldflags = ldflags, verbose = args.v, no_crt = no_crt, debug = bool( active_target['debug'] ), asan = args.asan, strip = args.strip, map_file = map_path, gui = args.windows )
 		if link_result.returncode != 0:
 			print( f'mpy: {cc.name} link failed:', file = sys.stderr )
 			print( link_result.stdout, file = sys.stderr )

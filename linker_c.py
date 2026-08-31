@@ -153,7 +153,8 @@ def atomic_write_cache( cache_file: Path, data: 'bytes|str' ) -> bool:
 def _msvc_ldflag( flag: str ) -> str:
 	'''
 	Translates one GNU-style ldflag token to its link.exe equivalent:
-	-lfoo -> foo.lib, -Ldir -> /LIBPATH:dir. Anything else (already
+	-lfoo -> foo.lib, -Ldir -> /LIBPATH:dir, -Wl,-subsystem:X ->
+	/SUBSYSTEM:X, -Wl,-entry:X -> /ENTRY:X. Anything else (already
 	MSVC-specific, e.g. /DEFAULTLIB:... or a bare path) passes through
 	unchanged.
 	'''
@@ -161,6 +162,10 @@ def _msvc_ldflag( flag: str ) -> str:
 		return f'{flag[2:]}.lib'
 	if flag.startswith( '-L' ) and len( flag ) > 2:
 		return f'/LIBPATH:{flag[2:]}'
+	if flag.startswith( '-Wl,-subsystem:' ):
+		return f'/SUBSYSTEM:{flag.split(":", 1)[1].upper()}'
+	if flag.startswith( '-Wl,-entry:' ):
+		return f'/ENTRY:{flag.split(":", 1)[1]}'
 	return flag
 
 
@@ -338,7 +343,7 @@ class CcTool:
 			text = True,
 		)
 
-	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False, map_file: Path|None = None ) -> subprocess.CompletedProcess[str]:
+	def link( self, exe: Path, objs: list[Path], ldflags: str = '', verbose: bool = False, no_crt: bool = False, debug: bool = True, asan: bool = False, strip: bool = False, map_file: Path|None = None, gui: bool = False ) -> subprocess.CompletedProcess[str]:
 		''' link one or more .o files into an executable '''
 		obj_args = [ str( o ) for o in objs ]
 		extra = ldflags.split() if ldflags else []
@@ -347,6 +352,23 @@ class CcTool:
 		# the no_crt branches below must not clobber that with their own
 		# default CONSOLE subsystem (see has_subsystem uses below)
 		has_subsystem = any( 'subsystem' in f.lower() for f in extra )
+		if gui and not has_subsystem:
+			# mpy.py's --windows: same effect as the caller spelling out
+			# -Wl,-subsystem:windows themselves, in whichever syntax this
+			# backend wants (translated below). Entry point only needs
+			# adding here for a CRT-linked build - the no_crt branches
+			# below already force their own entry unconditionally
+			extra += [ '-Wl,-subsystem:windows' ]
+			if not no_crt:
+				extra += [ '-Wl,-entry:mainCRTStartup' ]
+			has_subsystem = True
+		# does the (possibly just-added) subsystem choice specifically ask
+		# for WINDOWS? both backends' default entry-point inference below
+		# only works for CONSOLE (a plain `main`) - WINDOWS instead defaults
+		# to expecting WinMain, which this compiler never emits (see the
+		# entry-forcing blocks below for both backends)
+		wants_windows_subsystem = any( 'subsystem' in f.lower() and 'windows' in f.lower() for f in extra )
+		has_entry = any( f.lower().startswith( ( '/entry:', '-wl,-entry:' ) ) for f in extra )
 		if self.name == 'cl':
 			if no_crt:
 				# a freestanding MSVC build has no CRT to supply __chkstk (the
@@ -378,6 +400,13 @@ class CcTool:
 				cmd += [ '/NODEFAULTLIB', '/ENTRY:mainCRTStartup' ]
 				if not has_subsystem:
 					cmd += [ '/SUBSYSTEM:CONSOLE' ]
+			elif wants_windows_subsystem and not has_entry:
+				# CRT-linked build: link.exe's own entry-point inference
+				# only fires for the default CONSOLE subsystem (`main` ->
+				# mainCRTStartup) - forcing WINDOWS makes it look for
+				# WinMain (-> WinMainCRTStartup) instead, which this
+				# compiler never emits, so spell the real entry out
+				cmd += [ '/ENTRY:mainCRTStartup' ]
 			if debug or asan:
 				cmd += [ '/DEBUG' ]
 			if strip:
@@ -440,6 +469,11 @@ class CcTool:
 				cmd += [ '-Wl,-entry:mainCRTStartup' ]
 				if not has_subsystem:
 					cmd += [ '-Wl,-subsystem:console' ]
+			elif wants_windows_subsystem and os.name != 'posix' and not has_entry:
+				# same fix as the 'cl' branch above, CRT-linked case: lld-link's
+				# entry inference only works for CONSOLE (`main`), WINDOWS
+				# would otherwise look for a WinMain this compiler never emits
+				cmd += [ '-Wl,-entry:mainCRTStartup' ]
 			if asan:
 				# clang/gcc's own driver acts as the linker frontend even for
 				# an objects-only link, and only links the ASan runtime when
