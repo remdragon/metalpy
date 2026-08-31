@@ -1753,26 +1753,26 @@ class TypeResolver:
 
 	def _desugar_generator_yield_from( self, fn: Function, elem_type: Type, error_type: Type ) -> dict[str,Type]:
 		''' PLAN_GENERATORS.md's StopIteration reversal - `yield from
-		<expr>` requires <expr>'s own __next__() to return EXACTLY
-		Result[elem_type,error_type] (this generator's own declared
-		shape, identity-compared - every Result[T,E] specialization is
-		interned, same posture _require_result_return's own leaves-
-		containment check already relies on) - confirmed directly with
-		the user: no covering/widening check, no auto-propagation, every
-		value (Ok AND Err alike) forwarded untouched except Err(
-		StopIteration) specifically, which terminates yield-from's own
-		loop (falls through to whatever follows the statement) rather
-		than being forwarded as this generator's own exhaustion. A
-		narrower/wider mismatch is a clear compile error directing the
-		user to write an explicit `for` loop instead (which has its own,
-		more permissive binding rule - see _desugar_iterator_for) - NOT
-		silently downgraded to that shared path, which would double-wrap
-		(the shared for-loop path always yields the UNWRAPPED bare-T/
-		Result[T,E'] binding, auto-Ok-wrapped afterward by _wrap_
-		generator_next_returns_in_ok same as any other yield - forwarding
-		an ALREADY Result[elem_type,error_type]-shaped raw next() value
-		through that same auto-wrap would produce Ok(Result[...]), not
-		Result[...] itself).
+		<expr>` requires <expr>'s own __next__() to return Result[T,E]
+		where T/E either EXACTLY match this generator's own declared
+		Result[elem_type,error_type] (identity-compared, the fast raw-
+		forward path - see _desugar_one_yield_from) or WIDEN into it
+		(every T leaf and every E leaf other than StopIteration covered
+		by elem_type/error_type respectively - same covering/widening
+		idiom _require_result_return already uses for or_return()). Every
+		value (Ok AND Err alike) is forwarded except Err(StopIteration),
+		which terminates yield-from's own loop (falls through to
+		whatever follows the statement) rather than being forwarded as
+		this generator's own exhaustion. A genuinely uncovered mismatch
+		is a clear compile error directing the user to write an explicit
+		`for` loop instead (which has its own, more permissive binding
+		rule - see _desugar_iterator_for) - NOT silently downgraded to
+		that shared path, which would double-wrap (the shared for-loop
+		path always yields the UNWRAPPED bare-T/Result[T,E'] binding,
+		auto-Ok-wrapped afterward by _wrap_generator_next_returns_in_ok
+		same as any other yield - forwarding an ALREADY Result[elem_type,
+		error_type]-shaped raw next() value through that same auto-wrap
+		would produce Ok(Result[...]), not Result[...] itself).
 
 		Run BEFORE _desugar_generator_for_loops - unlike A.4a's original
 		version, no longer reuses that shared machinery at all for this
@@ -1840,12 +1840,21 @@ class TypeResolver:
 				s,
 			)
 		inner_elem_type, inner_error_type = shape
-		if inner_elem_type is not elem_type or inner_error_type is not error_type:
+		exact = inner_elem_type is elem_type and inner_error_type is error_type
+		# covering/widening leaves-containment check, same posture
+		# _require_result_return already uses for or_return() - StopIteration
+		# is excluded from the error side since it never propagates outward
+		# (it terminates this yield-from loop instead, see below)
+		inner_error_leaves = [ leaf for leaf in self._atomic_leaves( inner_error_type ) if leaf is not stop_iteration_cls ]
+		elem_covered = all( leaf in self._atomic_leaves( elem_type ) for leaf in self._atomic_leaves( inner_elem_type ))
+		error_covered = all( leaf in self._atomic_leaves( error_type ) for leaf in inner_error_leaves )
+		if not exact and not ( elem_covered and error_covered ):
 			self.discovery.fail(
-				f'{fn.qualname}: yield from requires an EXACT match between the consumed Result[T,E] '
-				f'(Result[{inner_elem_type.qualname},{inner_error_type.qualname}]) and this generator\'s own '
-				f'declared Result[T,E] (Result[{elem_type.qualname},{error_type.qualname}]) - write an explicit '
-				f'for loop instead to handle the difference: {ast.unparse(s)}',
+				f'{fn.qualname}: yield from requires the consumed Result[T,E] '
+				f'(Result[{inner_elem_type.qualname},{inner_error_type.qualname}]) to either exactly match, or widen '
+				f'into (every leaf covered by), this generator\'s own declared Result[T,E] (Result['
+				f'{elem_type.qualname},{error_type.qualname}]) - write an explicit for loop instead to handle the '
+				f'difference: {ast.unparse(s)}',
 				s,
 			)
 
@@ -1862,9 +1871,12 @@ class TypeResolver:
 			func = ast.Attribute( value = ast.Name( id = obj_name, ctx = ast.Load() ), attr = '__next__', ctx = ast.Load() ),
 			args = [], keywords = [],
 		)
+		# __yield_from_next_N always holds the INNER shape actually returned
+		# by __next__() - Result[elem_type,error_type] only in the exact-
+		# match case; widening reconstructs a wider value explicitly below
 		next_annotation = ast.Subscript(
 			value = ast.Name( id = 'Result', ctx = ast.Load() ),
-			slice = ast.Tuple( elts = [ self._type_annotation_ast( elem_type, s ), self._type_annotation_ast( error_type, s ) ], ctx = ast.Load() ),
+			slice = ast.Tuple( elts = [ self._type_annotation_ast( inner_elem_type, s ), self._type_annotation_ast( inner_error_type, s ) ], ctx = ast.Load() ),
 			ctx = ast.Load(),
 		)
 		ast.copy_location( next_annotation, s )
@@ -1893,27 +1905,67 @@ class TypeResolver:
 			ast.copy_location( stmt, s )
 			return stmt
 
-		ok_case = ast.match_case(
-			pattern = ast.MatchClass(
-				cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
-				patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
-			),
-			guard = None,
-			body = [ forward_yield() ],
-		)
+		def shaped_yield_expr( value_expr: ast.expr ) -> ast.stmt:
+			# yields an already Result[elem_type,error_type]-shaped
+			# expression UNCHANGED as this generator's own $$__next__
+			# return - same generator_already_result_shaped treatment
+			# forward_yield uses, generalized to the widened Err arm's own
+			# freshly-constructed Result.Err(...) value
+			ast.copy_location( value_expr, s )
+			yield_expr = ast.Yield( value = value_expr )
+			ast.copy_location( yield_expr, s )
+			yield_expr.generator_already_result_shaped = True
+			stmt = ast.Expr( value = yield_expr )
+			ast.copy_location( stmt, s )
+			return stmt
+
+		if exact:
+			ok_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+				),
+				guard = None,
+				body = [ forward_yield() ],
+			)
+		else:
+			# widening: bind the Ok payload and yield it UNTAGGED - _wrap_
+			# generator_next_returns_in_ok Ok-wraps it the ordinary way, so
+			# Result.Ok(...)'s own argument coercion does the actual T
+			# widening for free, same mechanism any other yielded value
+			# already relies on. ok_bind_name's own case body contains this
+			# yield directly, so _reserve_generator_match_binding_fields
+			# auto-promotes it into a real field and cfg.py's own scope-
+			# exit tracking releases its extraction reference automatically
+			# (the SAME general mechanism any other yield-crossing match
+			# binding already relies on) - no manual decref needed here.
+			ok_bind_name = f'__yield_from_ok_{unique}'
+			ok_yield_expr = ast.Yield( value = ast.Name( id = ok_bind_name, ctx = ast.Load() ))
+			ast.copy_location( ok_yield_expr, s )
+			ok_yield_stmt = ast.Expr( value = ok_yield_expr )
+			ast.copy_location( ok_yield_stmt, s )
+			ok_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Ok', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = ok_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
+				),
+				guard = None,
+				body = [ ok_yield_stmt ],
+			)
 
 		exhausted_break = ast.Break()
 		exhausted_break.compiler_synthesized_break = True
-		if self._atomic_leaves( error_type ) == [ stop_iteration_cls ]:
-			# error_type is BARE StopIteration - nothing else it could ever
-			# be, so Result[elem_type,error_type].Err(_) is unconditionally
-			# exhaustion - no inner match needed at all (mirrors _desugar_
-			# iterator_for's own identical remaining_error_type-is-None
-			# special case). Matching `case StopIteration(_): ... case _:
-			# ...` against a subject whose OWN static type isn't a union at
-			# all (nothing to distinguish) is rejected outright ("match
-			# subject is not a union type") - confirmed via a real repro
-			# (yield_from_rc.py, Iterator[Result[Box,StopIteration]])
+		if self._atomic_leaves( inner_error_type ) == [ stop_iteration_cls ]:
+			# inner_error_type is BARE StopIteration - nothing else it could
+			# ever be, so Result[inner_elem_type,inner_error_type].Err(_) is
+			# unconditionally exhaustion - no inner match needed at all
+			# (mirrors _desugar_iterator_for's own identical remaining_
+			# error_type-is-None special case). Matching `case
+			# StopIteration(_): ... case _: ...` against a subject whose OWN
+			# static type isn't a union at all (nothing to distinguish) is
+			# rejected outright ("match subject is not a union type") -
+			# confirmed via a real repro (yield_from_rc.py, Iterator[Result[
+			# Box,StopIteration]])
 			err_case = ast.match_case(
 				pattern = ast.MatchClass(
 					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
@@ -1922,7 +1974,7 @@ class TypeResolver:
 				guard = None,
 				body = [ exhausted_break ],
 			)
-		else:
+		elif exact:
 			err_bind_name = f'__yield_from_err_{unique}'
 			forward_body: list[ast.stmt] = []
 			if error_type.is_rc():
@@ -1959,6 +2011,59 @@ class TypeResolver:
 					),
 				],
 			)
+			ast.copy_location( inner_match, s )
+			err_case = ast.match_case(
+				pattern = ast.MatchClass(
+					cls = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					patterns = [ ast.MatchAs( name = err_bind_name ) ], kwd_attrs = [], kwd_patterns = [],
+				),
+				guard = None,
+				body = [ inner_match ],
+			)
+		else:
+			# widening: ONE explicit case per remaining (non-StopIteration)
+			# leaf, not a trailing wildcard - same reason _desugar_iterator_
+			# for's own build_leaf_case does this: a wildcard only narrows
+			# err_bind_name's own static type down to a single concrete
+			# class when EXACTLY one candidate leaf remains, staying the
+			# WHOLE inner_error_type otherwise, which would then fail
+			# Result.Err(...)'s own argument coercion whenever 2+ non-
+			# StopIteration leaves remain. Each leaf's own binding
+			# (narrowed_name) is used directly as Result.Err(...)'s own
+			# argument, yielded (tagged) in the SAME case body - that body
+			# contains this yield directly, so (same as the widened Ok arm
+			# above) _reserve_generator_match_binding_fields auto-promotes
+			# narrowed_name and cfg.py's own scope-exit tracking releases
+			# its extraction reference automatically - no manual decref
+			# needed here either.
+			err_bind_name = f'__yield_from_err_{unique}'
+			inner_cases = [
+				ast.match_case(
+					pattern = ast.MatchClass(
+						cls = ast.Name( id = 'StopIteration', ctx = ast.Load() ),
+						patterns = [ ast.MatchAs( name = None, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+					),
+					guard = None,
+					body = [ exhausted_break ],
+				),
+			]
+			for leaf in inner_error_leaves:
+				narrowed_name = f'__yield_from_err_{leaf.stem}_{unique}'
+				rewrap = ast.Call(
+					func = ast.Attribute( value = ast.Name( id = 'Result', ctx = ast.Load() ), attr = 'Err', ctx = ast.Load() ),
+					args = [ ast.Name( id = narrowed_name, ctx = ast.Load() ) ], keywords = [],
+				)
+				ast.copy_location( rewrap, s ); ast.copy_location( rewrap.func, s ); ast.copy_location( rewrap.func.value, s )
+				leaf_body: list[ast.stmt] = [ shaped_yield_expr( rewrap ) ]
+				inner_cases.append( ast.match_case(
+					pattern = ast.MatchClass(
+						cls = ast.Name( id = leaf.stem, ctx = ast.Load() ),
+						patterns = [ ast.MatchAs( name = narrowed_name, pattern = None ) ], kwd_attrs = [], kwd_patterns = [],
+					),
+					guard = None,
+					body = leaf_body,
+				))
+			inner_match = ast.Match( subject = ast.Name( id = err_bind_name, ctx = ast.Load() ), cases = inner_cases )
 			ast.copy_location( inner_match, s )
 			err_case = ast.match_case(
 				pattern = ast.MatchClass(
