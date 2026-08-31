@@ -23960,6 +23960,161 @@ def main() -> i32:
 ''' ),
 		])
 
+	@unittest.skipUnless( test_support.HAS_CC, 'no C compiler (clang/gcc/msvc) found - skipping' )
+	def test_yield_from_type_expansion( self ) -> None:
+		# yield from used to require an EXACT match between the consumed
+		# Iterator[Result[T,E]] and the outer generator's own declared
+		# Result[T,E] - a narrower inner T or E, covered by a wider outer
+		# union, was rejected outright ("write an explicit for loop
+		# instead"). Now widens the same way _require_result_return's
+		# or_return() coverage check already does, on both sides.
+		self.assert_programs_run([
+			( 'yield_from_widens_ok_element_type_into_a_wider_union', '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+	yield 2
+
+def outer() -> Iterator[Result[i32 | str, StopIteration]]:
+	yield from inner()
+	yield "done"
+
+def main() -> i32:
+	g = outer()
+	r0 = g.__next__()
+	match r0:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( v0 ):
+			match v0:
+				case i32( n ):
+					if n != 1:
+						return 1
+				case str( _ ):
+					return 1
+	r1 = g.__next__()
+	match r1:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( v1 ):
+			match v1:
+				case i32( n ):
+					if n != 2:
+						return 2
+				case str( _ ):
+					return 2
+	r2 = g.__next__()
+	match r2:
+		case Result.Err( _ ):
+			return 3
+		case Result.Ok( v2 ):
+			match v2:
+				case i32( _ ):
+					return 3
+				case str( s ):
+					if s != "done":
+						return 3
+	r3 = g.__next__()
+	match r3:
+		case Result.Err( _ ):
+			pass
+		case Result.Ok( _ ):
+			return 4
+	return 0
+''' ),
+			( 'yield_from_widens_err_error_type_into_a_wider_union', '''
+class OtherError:
+	pass
+
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+	yield 2
+
+def outer( fail: bool ) -> Iterator[Result[i32, OtherError | StopIteration]]:
+	yield from inner()
+	if fail:
+		return Result.Err( OtherError() )
+
+def main() -> i32:
+	g = outer( True )
+	r0 = g.__next__()
+	match r0:
+		case Result.Err( _ ):
+			return 1
+		case Result.Ok( v0 ):
+			if v0 != 1:
+				return 1
+	r1 = g.__next__()
+	match r1:
+		case Result.Err( _ ):
+			return 2
+		case Result.Ok( v1 ):
+			if v1 != 2:
+				return 2
+	r2 = g.__next__()
+	match r2:
+		case Result.Ok( _ ):
+			return 3
+		case Result.Err( e2 ):
+			match e2:
+				case StopIteration( _ ):
+					return 3
+				case OtherError( _ ):
+					pass
+	return 0
+''' ),
+			( 'yield_from_widens_rc_ok_and_err_payloads_with_correct_refcounts', '''
+class Box:
+	n: i32
+	def __init__( self, n: i32 ) -> None:
+		self.n = n
+
+class OtherError:
+	b: Box
+	def __init__( self, b: Box ) -> None:
+		self.b = b
+
+def inner( b: Box ) -> Iterator[Result[Box, StopIteration]]:
+	yield b
+
+def outer( b: Box, err: Box ) -> Iterator[Result[Box, OtherError | StopIteration]]:
+	yield from inner( b )
+	return Result.Err( OtherError( err ) )
+
+def consume_fully( b: Box, err: Box ) -> None:
+	g = outer( b, err )
+	x = g.__next__().is_ok()
+	y = g.__next__().is_err()
+	if x and y: pass
+
+def main() -> i32:
+	b = Box( n = 1 )
+	err = Box( n = 2 )
+	consume_fully( b, err )
+	if compiler.refcount( b ) != 1:
+		return 1
+	if compiler.refcount( err ) != 1:
+		return 2
+	return 0
+''' ),
+		])
+
+	def test_yield_from_still_rejects_a_genuinely_uncovered_mismatch( self ) -> None:
+		# widening only admits a NARROWER inner Result[T,E] into a WIDER
+		# outer one (every leaf covered) - an outer type that doesn't cover
+		# inner's T is still a clean compile error, not silently accepted.
+		self._run( '''
+def inner() -> Iterator[Result[i32, StopIteration]]:
+	yield 1
+
+def outer() -> Iterator[Result[str, StopIteration]]:
+	yield from inner()
+
+def main() -> None:
+	g = outer()
+''' )
+		self.assertTrue( self.discovery.errors.errors )
+		self.assertIn( 'yield from requires', str( self.discovery.errors.errors[0] ))
+
 	def test_yield_wrong_element_type_is_rejected( self ) -> None:
 		# found while testing A.4a's own yield-from forwarding, but
 		# generator-unrelated and pre-existing: _emit_generator_yield_
