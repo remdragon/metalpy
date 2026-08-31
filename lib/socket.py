@@ -11,7 +11,7 @@
 # SOCK_DGRAM, blocking calls only. Addresses are host: str, port: u16 with
 # host a pre-resolved IPv4/IPv6 literal (no DNS/getaddrinfo - a self-contained
 # follow-up). No Unix domain sockets, no raw sockets, no non-blocking/select,
-# no generic setsockopt (only a narrow set_reuseaddr()).
+# no generic setsockopt (only narrow set_reuseaddr()/set_keepalive() methods).
 
 import compiler
 import fs
@@ -41,6 +41,7 @@ if compiler.target.os == 'windows':
 		sendto as _c_sendto, recvfrom as _c_recvfrom,
 		shutdown as _c_shutdown, getsockname as _c_getsockname,
 		setsockopt as _c_setsockopt,
+		WSAIoctl,
 		inet_pton, inet_ntop,
 		getaddrinfo, freeaddrinfo,
 	)
@@ -141,6 +142,30 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Keepalive tuning constants - POSIX only (Windows tunes everything through
+# WSAIoctl(SIO_KEEPALIVE_VALS) instead, see _set_keepalive_raw below, so no
+# setsockopt-level constant is needed there). SO_KEEPALIVE/IPPROTO_TCP/
+# TCP_KEEPINTVL/TCP_KEEPCNT share the same name on Linux and macOS, but the
+# idle-time knob doesn't: macOS calls it TCP_KEEPALIVE where Linux (and every
+# other POSIX target here) calls it TCP_KEEPIDLE - a real three-way split,
+# not just a value difference cexpr's host-header lookup already absorbs.
+# ---------------------------------------------------------------------------
+
+if compiler.target.os == 'macos':
+	SO_KEEPALIVE:  i32 = compiler.cexpr( 'SO_KEEPALIVE',  'sys/socket.h', i32 )
+	IPPROTO_TCP:   i32 = compiler.cexpr( 'IPPROTO_TCP',   'netinet/in.h', i32 )
+	TCP_KEEPALIVE: i32 = compiler.cexpr( 'TCP_KEEPALIVE', 'netinet/tcp.h', i32 )
+	TCP_KEEPINTVL: i32 = compiler.cexpr( 'TCP_KEEPINTVL', 'netinet/tcp.h', i32 )
+	TCP_KEEPCNT:   i32 = compiler.cexpr( 'TCP_KEEPCNT',   'netinet/tcp.h', i32 )
+elif compiler.target.os != 'windows':
+	SO_KEEPALIVE:  i32 = compiler.cexpr( 'SO_KEEPALIVE',  'sys/socket.h', i32 )
+	IPPROTO_TCP:   i32 = compiler.cexpr( 'IPPROTO_TCP',   'netinet/in.h', i32 )
+	TCP_KEEPIDLE:  i32 = compiler.cexpr( 'TCP_KEEPIDLE',  'netinet/tcp.h', i32 )
+	TCP_KEEPINTVL: i32 = compiler.cexpr( 'TCP_KEEPINTVL', 'netinet/tcp.h', i32 )
+	TCP_KEEPCNT:   i32 = compiler.cexpr( 'TCP_KEEPCNT',   'netinet/tcp.h', i32 )
+
+
+# ---------------------------------------------------------------------------
 # SockAddrIn / SockAddrIn6 — textbook-stable BSD sockets ABI, identical on
 # Windows/Linux/macOS. sin_zero/sin6_addr are unrolled into individual u8
 # fields, NOT a `u8[N]` fixed-size array: SYNTAX.md documents that array
@@ -228,6 +253,25 @@ class _AddrInfo:
 	ai_addr:      Ptr[None] = None
 	ai_canonname: Ptr[u8] = None
 	ai_next:      Ptr[None] = None
+
+
+# struct tcp_keepalive { u_long onoff, keepalivetime, keepaliveinterval; } -
+# Windows-only, the WSAIoctl(SIO_KEEPALIVE_VALS) input buffer. u_long is
+# always 32 bits on Windows (LLP64), hence u32 fields, not usize.
+# SIO_KEEPALIVE_VALS itself is _WSAIOW(IOC_VENDOR, 4) - a well-known, ABI-
+# stable value (0x98000004), hardcoded rather than cexpr'd, matching this
+# file's own SHUT_RD/etc precedent of pulling genuinely-portable constants
+# via cexpr but hardcoding Windows-specific ones that aren't in winsock2.h
+# as a plain #define.
+@compiler.target( os = 'windows' )
+@cstruct
+class _TcpKeepalive:
+	onoff:              u32 = 0
+	keepalivetime:      u32 = 0
+	keepaliveinterval:  u32 = 0
+
+if compiler.target.os == 'windows':
+	SIO_KEEPALIVE_VALS: u32 = u32( 0x98000004 )
 
 
 def _htons( port: u16 ) -> u16:
@@ -989,6 +1033,78 @@ def _set_reuseaddr_raw( sock: SOCKET, enable: bool ) -> Result[None, OSError]:
 	return Result.Ok( None )
 
 
+# idle_secs/interval_secs/probes are only meaningful when enable=True - kept
+# unconditional (not Optional) since a disable call ignores them anyway, and
+# every caller already has sensible values in hand (Socket.set_keepalive's
+# own defaults). Windows has no per-socket probe-count knob (see
+# _set_keepalive_raw's own Windows body below) - probes is silently ignored
+# there, not an error, matching this file's existing posture of Windows/
+# POSIX behavioral parity wherever the OS genuinely can't support a knob
+# (e.g. `probes` has no equivalent structurally, unlike e.g. SO_REUSEADDR
+# which both platforms support identically).
+
+@compiler.target( os = 'windows' )
+def _set_keepalive_raw( sock: SOCKET, enable: bool, idle_secs: u32, interval_secs: u32, probes: u32 ) -> Result[None, OSError]:
+	with compiler.wrap_arithmetic:
+		idle_ms: u32 = idle_secs * 1000
+		interval_ms: u32 = interval_secs * 1000
+	kv: _TcpKeepalive = _TcpKeepalive(
+		onoff = u32( 1 ) if enable else u32( 0 ),
+		keepalivetime = idle_ms,
+		keepaliveinterval = interval_ms,
+	)
+	bytes_returned: u32 = 0
+	rc: i32 = WSAIoctl(
+		sock, SIO_KEEPALIVE_VALS,
+		compiler.cast( Ptr[None], compiler.addrof( kv )), compiler.sizeof( _TcpKeepalive ),
+		None, u32( 0 ),
+		compiler.addrof( bytes_returned ), None, None,
+	)
+	if rc != 0:
+		return Result.Err( OSError( WSAGetLastError() ))
+	return Result.Ok( None )
+
+@compiler.target( os = 'macos' )
+def _set_keepalive_raw( sock: SOCKET, enable: bool, idle_secs: u32, interval_secs: u32, probes: u32 ) -> Result[None, OSError]:
+	from crt import get_errno
+	value: i32 = 1 if enable else 0
+	if _c_setsockopt( sock, SOL_SOCKET, SO_KEEPALIVE, compiler.cast( ConstPtr[u8], compiler.addrof( value )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if not enable:
+		return Result.Ok( None )
+	with compiler.wrap_arithmetic:
+		idle: i32 = i32( idle_secs )
+		interval: i32 = i32( interval_secs )
+		cnt: i32 = i32( probes )
+	if _c_setsockopt( sock, IPPROTO_TCP, TCP_KEEPALIVE, compiler.cast( ConstPtr[u8], compiler.addrof( idle )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if _c_setsockopt( sock, IPPROTO_TCP, TCP_KEEPINTVL, compiler.cast( ConstPtr[u8], compiler.addrof( interval )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if _c_setsockopt( sock, IPPROTO_TCP, TCP_KEEPCNT, compiler.cast( ConstPtr[u8], compiler.addrof( cnt )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+@compiler.target( os = not ( 'windows', 'macos' ))
+def _set_keepalive_raw( sock: SOCKET, enable: bool, idle_secs: u32, interval_secs: u32, probes: u32 ) -> Result[None, OSError]:
+	from crt import get_errno
+	value: i32 = 1 if enable else 0
+	if _c_setsockopt( sock, SOL_SOCKET, SO_KEEPALIVE, compiler.cast( ConstPtr[u8], compiler.addrof( value )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if not enable:
+		return Result.Ok( None )
+	with compiler.wrap_arithmetic:
+		idle: i32 = i32( idle_secs )
+		interval: i32 = i32( interval_secs )
+		cnt: i32 = i32( probes )
+	if _c_setsockopt( sock, IPPROTO_TCP, TCP_KEEPIDLE, compiler.cast( ConstPtr[u8], compiler.addrof( idle )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if _c_setsockopt( sock, IPPROTO_TCP, TCP_KEEPINTVL, compiler.cast( ConstPtr[u8], compiler.addrof( interval )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	if _c_setsockopt( sock, IPPROTO_TCP, TCP_KEEPCNT, compiler.cast( ConstPtr[u8], compiler.addrof( cnt )), u32( 4 )) < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( None )
+
+
 # ---------------------------------------------------------------------------
 # WSAStartup-once lifecycle — no "run at import" mechanism exists in this
 # language (module-level code is declarative, not imperative init-on-first-
@@ -1196,6 +1312,18 @@ class Socket:
 
 	def set_reuseaddr( self, enable: bool ) -> Result[None, OSError]:
 		return _set_reuseaddr_raw( self.__sock, enable )
+
+	def set_keepalive( self, enable: bool, idle_secs: u32 = 30, interval_secs: u32 = 10, probes: u32 = 3 ) -> Result[None, OSError]:
+		''' SO_KEEPALIVE, tuned to notice a peer that vanished without an
+		orderly close (network partition, a frozen/crashed host - no FIN/RST
+		ever arrives, so a blocking recv() on this socket would otherwise
+		hang forever). Defaults are much shorter than any OS default (2 hours
+		on both Windows and Linux) - roughly a minute to first failure, not
+		just eventual cleanup. idle_secs/interval_secs/probes only matter
+		when enable=True. probes is POSIX-only: Windows' keepalive probe
+		count is a fixed machine-wide registry value, not settable per
+		socket - the parameter is silently ignored there. '''
+		return _set_keepalive_raw( self.__sock, enable, idle_secs, interval_secs, probes )
 
 	def fileno( self ) -> SOCKET:
 		''' the raw OS socket handle - POSIX fd (i32) or Windows SOCKET

@@ -241,3 +241,21 @@ def WSAPoll(
 	timeout: i32,
 ) -> i32:
 	...
+
+# WSAIoctl - lpOverlapped/lpCompletionRoutine always NULL here (every current
+# caller is a synchronous SIO_KEEPALIVE_VALS call, lib/socket.py's own
+# _set_keepalive_raw), so both stay opaque Ptr[None] rather than binding
+# WSAOVERLAPPED's real layout - nothing here ever populates them.
+@extern( 'ws2_32', 'WSAIoctl' )
+def WSAIoctl(
+	s: SOCKET,
+	dwIoControlCode: u32,
+	lpvInBuffer: Ptr[None],
+	cbInBuffer: u32,
+	lpvOutBuffer: Ptr[None],
+	cbOutBuffer: u32,
+	lpcbBytesReturned: Ptr[u32],
+	lpOverlapped: Ptr[None],
+	lpCompletionRoutine: Ptr[None],
+) -> i32:
+	...

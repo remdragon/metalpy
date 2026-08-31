@@ -147,6 +147,30 @@ def main() -> i32:
 		self.assertEqual( self.discovery.errors.errors, [] )
 		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0, timeout = 20 )
 
+	def test_set_keepalive_passthrough( self ) -> None:
+		''' TcpConnection.set_keepalive() is a thin passthrough to the
+		underlying Socket (see lib/tcp.py's own docstring for why it needs
+		one at all - __sock is private, so this is the only way a caller
+		holding a TcpConnection can reach it). Just confirms the calls
+		succeed on a real connected pair, same bar as lib/socket.py's own
+		set_reuseaddr/set_keepalive tests - no OS-internal timing asserted. '''
+		self._run( '''
+import tcp
+
+def main() -> i32:
+	listener: tcp.TcpListener = tcp.TcpListener.bind( '127.0.0.1', u16( 0 )).unwrap( 'bind' )
+	addr = listener.getsockname().unwrap( 'getsockname' )
+	client: tcp.TcpConnection = tcp.connect( '127.0.0.1', addr.port ).unwrap( 'connect' )
+	server_side: tcp.TcpConnection = listener.accept().unwrap( 'accept' )
+
+	client.set_keepalive( True, u32( 5 ), u32( 5 ), u32( 3 )).unwrap( 'client set_keepalive on' )
+	client.set_keepalive( False ).unwrap( 'client set_keepalive off' )
+	server_side.set_keepalive( True ).unwrap( 'server_side set_keepalive on' )
+	return 0
+''' )
+		self.assertEqual( self.discovery.errors.errors, [] )
+		self._assert_compiles_and_runs( _emit( self.compiler ), expected_exit = 0 )
+
 def _emit( compiler: Compiler ) -> str:
 	import emitter_c
 	return emitter_c.emit_c( compiler )

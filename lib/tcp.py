@@ -70,6 +70,15 @@ class TcpConnection( io.Reader, io.Writer ):
 	def fileno( self ) -> socket.SOCKET:
 		return self.__sock.fileno()
 
+	def set_keepalive( self, enable: bool, idle_secs: u32 = 30, interval_secs: u32 = 10, probes: u32 = 3 ) -> Result[None, OSError]:
+		''' passthrough to the underlying Socket - see Socket.set_keepalive's
+		own docstring. __sock is private, so this is the only way a caller
+		holding a TcpConnection (not a raw Socket) can turn this on - and
+		read()/write()'s own blocking retry loops above are exactly the code
+		this exists to unstick when a peer vanishes without an orderly
+		close. '''
+		return self.__sock.set_keepalive( enable, idle_secs, interval_secs, probes )
+
 	def close( self ) -> None:
 		self.__sock.close()
 

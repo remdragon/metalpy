@@ -463,6 +463,30 @@ def main() -> i32:
 	return 0
 '''
 
+# set_keepalive() round-trip on a real connected pair - only confirms the
+# setsockopt/WSAIoctl calls themselves succeed, same bar as
+# _SET_REUSEADDR_ALLOWS_REBIND above (OS-internal probe timing isn't
+# something a test can assert on without waiting real minutes).
+_SET_KEEPALIVE_ROUND_TRIP = '''
+import socket
+
+def main() -> i32:
+	listener: socket.Socket = socket.Socket.tcp().unwrap( 'listener create' )
+	listener.bind( '127.0.0.1', u16( 0 )).unwrap( 'listener bind' )
+	listener.listen().unwrap( 'listener listen' )
+	bound: socket.SocketAddr = listener.getsockname().unwrap( 'listener getsockname' )
+
+	client: socket.Socket = socket.Socket.tcp().unwrap( 'client create' )
+	client.connect( '127.0.0.1', bound.port ).unwrap( 'client connect' )
+	( server_side, _addr ) = listener.accept().unwrap( 'accept' )
+
+	client.set_keepalive( True, u32( 5 ), u32( 5 ), u32( 3 )).unwrap( 'client set_keepalive on, custom values' )
+	client.set_keepalive( True ).unwrap( 'client set_keepalive on, defaults' )
+	client.set_keepalive( False ).unwrap( 'client set_keepalive off' )
+	server_side.set_keepalive( True ).unwrap( 'server_side set_keepalive on' )
+	return 0
+'''
+
 # bind()+immediate close() to obtain a real closed local port (rather than
 # assuming some external port is closed), then connect() to it.
 _CONNECT_REFUSED = '''
@@ -744,6 +768,9 @@ class SocketBehaviorTests( RealCompileMixin, unittest.TestCase ):
 
 	def test_set_reuseaddr_allows_rebind( self ) -> None:
 		self._run( _SET_REUSEADDR_ALLOWS_REBIND )
+
+	def test_set_keepalive_round_trip( self ) -> None:
+		self._run( _SET_KEEPALIVE_ROUND_TRIP )
 
 	def test_connect_refused( self ) -> None:
 		self._run( _CONNECT_REFUSED )
