@@ -306,7 +306,7 @@ if compiler.target.os != 'windows' and compiler.target.os != 'macos':
 	Char = compiler.c_type( 'char', header = 'spawn.h' )
 
 @compiler.target( os = not ( 'windows', 'macos' ))
-@extern( 'c', 'pipe' )
+@extern( 'c', 'pipe', header = 'unistd.h' )
 def _pipe2( fds: Ptr[i32] ) -> i32:
 	...
 

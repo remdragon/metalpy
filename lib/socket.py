@@ -449,7 +449,7 @@ if compiler.target.os != 'windows' and compiler.target.os != 'macos':
 	_DnsSpawnAttr = compiler.c_type( 'posix_spawnattr_t', header = 'spawn.h' )
 
 @compiler.target( os = not ( 'windows', 'macos' ), portable_dns = True )
-@extern( 'c', 'pipe' )
+@extern( 'c', 'pipe', header = 'unistd.h' )
 def _dns_pipe( fds: Ptr[i32] ) -> i32:
 	...
 
