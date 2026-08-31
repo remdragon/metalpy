@@ -1095,7 +1095,7 @@ def read_column_defs( sock: Socket, count: u64 ) -> Result[list[ColumnDef], MySQ
 	i: usize = 0
 	with compiler.wrap_arithmetic:
 		while i < n:
-			( _seq, payload ) = read_packet( sock ).or_return()
+			( _, payload ) = read_packet( sock ).or_return()
 			cols.append( parse_column_def( payload ).or_return() )
 			i += 1
 	read_packet( sock ).or_return()  # trailing EOF - discarded

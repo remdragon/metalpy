@@ -10564,6 +10564,31 @@ def main() -> i32:
 		return 1
 	return 0
 ''' ),
+			# `_` discard target - Python/Rust/Go convention for "read once,
+			# never bind" - no local is declared for it at all (see
+			# lowering_stmt.py's own comment), so nothing is left to trigger
+			# -Wunused-variable; repeated `_` in the same tuple must not
+			# collide as if it were an ordinary re-declared name
+			( 'tuple_unpack_discard_target', '''
+def main() -> i32:
+	t: tuple[i32, str, i32] = ( 10, "hi", 20 )
+	( a, _, _ ) = t
+	if a != 10:
+		return 1
+	return 0
+''' ),
+			# an RC element (str) discarded via `_` - same shape as
+			# tuple_unpack_rc_element_dropped_without_crashing above, but the
+			# discarded element is never bound to a local at all (stays owned
+			# by the tuple's own storage, released with it)
+			( 'tuple_unpack_discard_rc_element_dropped_without_crashing', '''
+def main() -> i32:
+	t: tuple[str, i32] = ( "owned", 5 )
+	( _, n ) = t
+	if n != 5:
+		return 1
+	return 0
+''' ),
 			# match-case tuple pattern - case Result.Ok((a, b)): on a real
 			# Result[tuple[...], ...], the actual motivating shape
 			# (sock.accept().or_return()-adjacent) from the webchat exercise

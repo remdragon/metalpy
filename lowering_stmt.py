@@ -1403,6 +1403,13 @@ class StmtLoweringMixin:
 					)
 				for i, elt in enumerate( target.elts ):
 					assert isinstance( elt, ast.Name )
+					if elt.id == '_':
+						# conventional discard (Python/Rust/Go/etc) - the
+						# element stays owned by `value`'s own tuple storage
+						# and is released with it; no local, no GetAttr, no
+						# -Wunused-variable to silence because nothing is
+						# ever declared
+						continue
 					attr_var = self.lowering._attr_lookup( resolved_value_type, f'_{i}', node )
 					elem = self._new_temp( attr_var.type )
 					self._emit( ir.GetAttr( dest = elem, obj = value, attr = f'_{i}' ))

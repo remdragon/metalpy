@@ -88,7 +88,7 @@ class Connection:
 		per doc SS10. '''
 		self._guard().or_return()
 		send_packet( self.__sock, 0, build_com_query( sql )).or_return()
-		( _seq, payload ) = read_packet( self.__sock ).or_return()
+		( _, payload ) = read_packet( self.__sock ).or_return()
 		header: u8 = payload.__getitem__( usize( 0 )).unwrap( 'a real response packet is never empty' )
 		if header == 0x00 or header == 0xFE:
 			parse_ok_packet( payload ).or_return()
@@ -141,7 +141,7 @@ class Connection:
 			with compiler.wrap_arithmetic:
 				switch_seq: u8 = _seq2 + 1
 			send_packet( sock, switch_seq, scramble2 ).or_return()
-			( _seq3, payload3 ) = read_packet( sock ).or_return()
+			( _, payload3 ) = read_packet( sock ).or_return()
 			payload2 = payload3
 			header = payload2.__getitem__( usize( 0 )).unwrap( 'a real response packet is never empty' )
 
@@ -208,7 +208,7 @@ class Cursor:
 		sock: Socket = self._guard().or_return()
 
 		send_packet( sock, 0, build_com_stmt_prepare( sql )).or_return()
-		( _seq, first_payload ) = read_packet( sock ).or_return()
+		( _, first_payload ) = read_packet( sock ).or_return()
 		first_byte: u8 = first_payload.__getitem__( usize( 0 )).unwrap( 'a real response packet is never empty' )
 		if first_byte == 0xFF:
 			err = parse_err_packet( first_payload ).or_return()
@@ -235,7 +235,7 @@ class Cursor:
 			return Result.Err( MySQLError.TypeMismatch )
 
 		send_packet( sock, 0, build_com_stmt_execute( prep.statement_id, params )).or_return()
-		( _seq2, exec_payload ) = read_packet( sock ).or_return()
+		( _, exec_payload ) = read_packet( sock ).or_return()
 		exec_header: u8 = exec_payload.__getitem__( usize( 0 )).unwrap( 'a real response packet is never empty' )
 
 		if exec_header == 0xFF:
@@ -266,7 +266,7 @@ class Cursor:
 		rows: list[list[MySQLValue]] = list[list[MySQLValue]]()
 		with compiler.wrap_arithmetic:
 			while True:
-				( _seq3, row_payload ) = read_packet( sock ).or_return()
+				( _, row_payload ) = read_packet( sock ).or_return()
 				row_header: u8 = row_payload.__getitem__( usize( 0 )).unwrap( 'a real row packet is never empty' )
 				if row_header == 0xFE and len( row_payload ) < usize( 9 ):
 					break  # EOF
