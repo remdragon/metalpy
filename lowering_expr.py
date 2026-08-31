@@ -2509,6 +2509,12 @@ class ExprLoweringMixin:
 		# into dest either.
 		is_and = isinstance( node.op, ast.And )
 		end_label = self._new_label( 'booland' if is_and else 'boolor' )
+		# only reachable when some non-last operand takes the runtime-split
+		# path below; an all-compile-time-decisive chain (e.g. `True and x`)
+		# falls through to dest without ever jumping here, so unless we
+		# track that and skip emitting the label, C sees a dead `L:;` -
+		# unused-label warning.
+		end_label_used = False
 		dest = self._new_temp( expected_type ) if expected_type is not None else None
 
 		def lower_operand( value_node: ast.expr ) -> tuple[int, ir.Operand]:
@@ -2648,11 +2654,13 @@ class ExprLoweringMixin:
 			self._emit( skip_opcode( cond = cond, target = continue_label ))
 			emit_decisive( operand_start, value_node, operand, False )
 			self._emit( ir.Jump( target = end_label ))
+			end_label_used = True
 			self._emit( ir.Label( name = continue_label ))
 			self._pending_temps = pending_snapshot
 			self._cfg.restore_temp_states( temp_states_snapshot )
 			self._flush_branch_temps( operand_start, dest )
-		self._emit( ir.Label( name = end_label ))
+		if end_label_used:
+			self._emit( ir.Label( name = end_label ))
 		self._cfg.fresh_temp( dest, dest.type )
 		return dest
 
