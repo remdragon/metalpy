@@ -45,6 +45,7 @@ if compiler.target.os != 'windows' and compiler.target.os != 'macos':
 	O_NOCTTY: i32 = compiler.cexpr( 'O_NOCTTY', 'fcntl.h', i32 )
 	POSIX_SPAWN_SETSID: i16 = compiler.cexpr( 'POSIX_SPAWN_SETSID', 'spawn.h', i16 )
 	TIOCSWINSZ: u64 = compiler.cexpr( 'TIOCSWINSZ', 'sys/ioctl.h', u64 )
+	WNOHANG: i32 = compiler.cexpr( 'WNOHANG', 'sys/wait.h', i32 )
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +284,22 @@ def wait( pid: i32 ) -> Result[i32, OSError]:
 	return Result.Ok( status )
 
 
+@compiler.target( os = not ( 'windows', 'macos' ))
+def try_wait( pid: i32 ) -> Result[bool, OSError]:
+	''' non-blocking check (WNOHANG) for whether pid has already exited -
+	Ok(True) if so, Ok(False) if still running. For catching an immediate
+	post-spawn exec failure right after spawn_attached: posix_spawn itself
+	can return success while the exec inside the child still fails (e.g. a
+	privilege check like /bin/login's vhangup()), so a caller can't trust
+	Ok(pid) alone as proof the child is actually alive. '''
+	from crt import get_errno
+	status: i32 = 0
+	rc: i32 = waitpid( pid, compiler.addrof( status ), WNOHANG )
+	if rc < 0:
+		return Result.Err( OSError( get_errno() ))
+	return Result.Ok( rc != 0 )
+
+
 @compiler.target( os = 'macos' )
 def open_pty() -> Result[PtyPair, OSError]:
 	return _MACOS_PTY_NOT_YET_IMPLEMENTED()
@@ -297,4 +314,8 @@ def resize( master: fs.FD, rows: u16, cols: u16 ) -> Result[None, OSError]:
 
 @compiler.target( os = 'macos' )
 def wait( pid: i32 ) -> Result[i32, OSError]:
+	return _MACOS_PTY_NOT_YET_IMPLEMENTED()
+
+@compiler.target( os = 'macos' )
+def try_wait( pid: i32 ) -> Result[bool, OSError]:
 	return _MACOS_PTY_NOT_YET_IMPLEMENTED()
