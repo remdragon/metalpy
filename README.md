@@ -21,6 +21,10 @@ to Python as possible, here are the solutions that I came up with:
 	* Exceptions are out
 		- Result objects that can't be ignored, inspired by Rust
 		- defer and errdefer for resource cleanup, inspired by Zig
+		- local try/except/finally syntax is supported as an alternate way to
+			handle Result objects (via .or_throw()), but it's not real
+			exceptions/unwinding - it only reaches a handler within the same
+			function, not across calls
 	* "everything is an object" is not supported
 	* Multiple Inheritance is not supported
 		- very hard to get right for very little benefit
@@ -65,8 +69,11 @@ Features that exist now:
 	* dependency report showing every object included in the compilation and
 		what triggered its inclusion, useful for troubleshooting executable
 		bloat.
+	* local try/except/else/finally syntax over Result objects (via
+		.or_throw() / raise EXPR), still not real exceptions/unwinding
 
 Features that are being scoped and built right now:
+
 	* generators (mostly functional, currently researching the ability to
 		support inline generators)
 	* url parser
@@ -76,6 +83,7 @@ Features that are being scoped and built right now:
 	* tkinter library
 
 Features that are planned but not built yet:
+
 	* with statements (there is a compiler hack for defer/errdefer using with
 		statement syntax, but this isn't general with support yet)
 	* threadsafe Queue
@@ -86,9 +94,11 @@ Features that are planned but not built yet:
 	* unblocking socket i/o and file i/o
 
 Features that would be nice to have:
+
 	* pip-like package manager
 
 Python functionality that I have no plans to implement:
+
 	* async/await
 		- I'm open to others wanting to do this work, no interest in it myself
 	* multiple inheritance
