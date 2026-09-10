@@ -71,31 +71,37 @@ Features that exist now:
 		bloat.
 	* local try/except/else/finally syntax over Result objects (via
 		.or_throw() / raise EXPR), still not real exceptions/unwinding
+	* generators - yield, .send(), yield from, loops, and re-entrant nesting
+		all work
+	* with statements - general context-manager protocol, not just the
+		defer/errdefer hack
+	* threadsafe Queue
+	* url parser (lib/urllib/parse.py)
+	* email.message, including parsing (lib/email/)
+	* http client (lib/http/client.py)
+	* json library
+	* unblocking socket i/o and file i/o (lib/poller.py, reactor.py,
+		asyncfile.py, tcp.py, tcpserver.py) - performant, but the API
+		surface is probably still missing features
 
 Features that are being scoped and built right now:
 
-	* generators (mostly functional, currently researching the ability to
-		support inline generators)
-	* url parser
-	* email.message (needed by http client)
-	* http client
-	* json library
-	* tkinter library
+	* http server - functional and performant, but missing import
+		ergonomics; blocked on user decorator function support (to
+		register handlers by http method)
+	* user decorator functions
+	* tkinter library - proof-of-concept only (a Tk root + a single Button
+		widget), missing Entry/Frame/other widgets, layout, StringVar
 
 Features that are planned but not built yet:
 
-	* with statements (there is a compiler hack for defer/errdefer using with
-		statement syntax, but this isn't general with support yet)
-	* threadsafe Queue
-	* http server
 	* smtp library
-	* email parsing
 	* parser library
-	* unblocking socket i/o and file i/o
 
 Features that would be nice to have:
 
 	* pip-like package manager
+	* inline generators (a generator body spliced via @inline)
 
 Python functionality that I have no plans to implement:
 
